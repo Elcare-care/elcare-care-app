@@ -1,0 +1,95 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+  binaryTargets = ["native", "linux-musl-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model SyncState {
+  id               Int      @id @default(1)
+  lastLedger       Int      @default(0)
+  lastLedgerHash   String?
+  updatedAt        DateTime @updatedAt
+}
+
+model Listing {
+  listingId       BigInt   @id
+  artist          String
+  owner           String?
+  price           Decimal  @db.Decimal(32, 7)
+  currency        String
+  collection      String
+  nftTokenId      BigInt
+  token           String
+  status          String   // "Active", "Sold", "Cancelled", "Auction"
+  recipients      Json?
+  createdAtLedger Int
+  updatedAtLedger Int
+  @@index([artist])
+  @@index([status])
+  @@index([updatedAtLedger])
+}
+
+model Auction {
+  auctionId       BigInt   @id
+  creator         String
+  collection      String
+  nftTokenId      BigInt
+  token           String
+  reservePrice    Decimal  @db.Decimal(32, 7)
+  highestBid      Decimal  @db.Decimal(32, 7)
+  highestBidder   String?
+  endTime         BigInt
+  status          String   // "Active", "Finalized", "Cancelled"
+  recipients      Json?
+  createdAtLedger Int
+  updatedAtLedger Int
+  @@index([updatedAtLedger])
+}
+
+model Offer {
+  offerId         BigInt   @id
+  listingId       BigInt
+  offerer         String
+  amount          Decimal  @db.Decimal(32, 7)
+  token           String
+  status          String   // "Pending", "Accepted", "Rejected", "Withdrawn"
+  createdAtLedger Int
+  updatedAtLedger Int
+  @@index([listingId])
+}
+
+
+model MarketplaceEvent {
+  id              Int      @id @default(autoincrement())
+  listingId       BigInt?
+  eventType       String   // "LISTING_CREATED", "ARTWORK_SOLD", etc.
+  actor           String
+  data            Json
+  ledgerSequence  Int
+  ledgerTimestamp DateTime @default(now())
+  @@index([actor])
+  @@index([eventType])
+  @@index([listingId])
+  @@index([ledgerSequence])
+  @@index([listingId, ledgerSequence])
+  @@unique([listingId, eventType, ledgerSequence])
+}
+
+model Collection {
+  id              Int      @id @default(autoincrement())
+  contractAddress String   @unique
+  kind            String   // "normal_721" | "normal_1155" | "lazy_721" | "lazy_1155"
+  creator         String
+  name            String?
+  symbol          String?
+  deployedAtLedger Int
+  createdAt       DateTime @default(now())
+  @@index([creator])
+}

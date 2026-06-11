@@ -1,0 +1,244 @@
+/* ─────────────────────────────────────────────────────────────
+   globals.css — ElcareHub: African Cultural Marketplace
+   Palette: Kente Gold · Benin Terracotta · Sahara Sunset ·
+            Baobab Earth · Nile Green · Tuareg Indigo
+───────────────────────────────────────────────────────────── */
+
+@import url('https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,400;0,600;0,700;0,800;0,900;1,400;1,700&family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ── CSS Variables — Africa-inspired token set ─────────────── */
+:root {
+  --gold:        #D4A017;
+  --gold-light:  #FCD34D;
+  --terra:       #C1440E;
+  --sunset:      #E87722;
+  --earth-dark:  #120E04;
+  --earth-mid:   #4E3D1A;
+  --green:       #1E9E63;
+  --canvas:      #FBF7F0;
+  --canvas-warm: #F5ECD8;
+}
+
+@layer base {
+  html {
+    font-family: 'Inter', system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    scroll-behavior: smooth;
+  }
+
+  body {
+    overflow-x: hidden;
+    background-color: var(--canvas);
+  }
+
+  /* Kente-gold scrollbar */
+  ::-webkit-scrollbar       { width: 5px; height: 5px; }
+  ::-webkit-scrollbar-track { background: #F5ECD8; }
+  ::-webkit-scrollbar-thumb { background: var(--gold); border-radius: 9999px; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--sunset); }
+
+  ::selection {
+    background: rgba(212, 160, 23, 0.28);
+    color: #3D2B04;
+  }
+}
+
+@layer components {
+
+  /* ── Kente Stripe Divider ────────────────────────────────── */
+  .kente-divider {
+    height: 8px;
+    background: var(--kente, repeating-linear-gradient(
+      90deg,
+      #D4A017 0px,  #D4A017 14px,
+      #C1440E 14px, #C1440E 28px,
+      #1E9E63 28px, #1E9E63 42px,
+      #E87722 42px, #E87722 56px,
+      #4B4FCC 56px, #4B4FCC 70px
+    ));
+    opacity: 0.9;
+  }
+
+  /* legacy alias */
+  .tribal-strip { @apply kente-divider; }
+  .african-divider {
+    position: relative;
+    height: 28px;
+    width: 100%;
+    overflow: hidden;
+  }
+  .african-divider::after {
+    content: '';
+    position: absolute;
+    top: 50%;
+    left: 0; right: 0;
+    height: 4px;
+    background: linear-gradient(90deg,
+      transparent 0%, #D4A017 20%, #C1440E 50%, #D4A017 80%, transparent 100%);
+    transform: translateY(-50%);
+  }
+
+  /* ── Glassmorphism ──────────────────────────────────────── */
+  .glass-card {
+    background: rgba(255, 255, 255, 0.06);
+    backdrop-filter: blur(18px);
+    -webkit-backdrop-filter: blur(18px);
+    border: 1px solid rgba(255, 255, 255, 0.09);
+  }
+
+  .glass-card-warm {
+    background: rgba(212, 160, 23, 0.07);
+    backdrop-filter: blur(18px);
+    -webkit-backdrop-filter: blur(18px);
+    border: 1px solid rgba(212, 160, 23, 0.15);
+  }
+
+  .glass-dark {
+    background: rgba(18, 14, 4, 0.55);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    border: 1px solid rgba(212, 160, 23, 0.12);
+  }
+
+  /* ── Shimmer / shimmer-text ─────────────────────────────── */
+  .shimmer-text {
+    background: linear-gradient(
+      110deg,
+      #FCD34D 15%,
+      #FBF7F0 35%,
+      #D4A017 50%,
+      #E87722 65%,
+      #FCD34D 85%
+    );
+    background-size: 220% auto;
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+    animation: shimmer 3s linear infinite;
+  }
+
+  /* ── Hover lift ─────────────────────────────────────────── */
+  .hover-lift {
+    transition: transform 0.3s ease, box-shadow 0.3s ease;
+  }
+  .hover-lift:hover {
+    transform: translateY(-6px);
+    box-shadow: 0 24px 48px rgba(18, 14, 4, 0.35);
+  }
+
+  /* ── Kente border pattern (overlay) ────────────────────── */
+  .kente-border {
+    background-image:
+      repeating-linear-gradient(0deg,
+        #D4A017 0px, #D4A017 2px, transparent 2px, transparent 8px),
+      repeating-linear-gradient(90deg,
+        #C1440E 0px, #C1440E 2px, transparent 2px, transparent 8px);
+    background-size: 8px 8px;
+  }
+
+  /* ── Adinkra floating ornament ──────────────────────────── */
+  .adinkra-pattern { position: relative; }
+  .adinkra-pattern::before {
+    content: '◆ ✦ ◆ ✦ ◆ ✦ ◆ ✦ ◆';
+    position: absolute;
+    top: -16px;
+    left: 50%;
+    transform: translateX(-50%);
+    font-size: 10px;
+    letter-spacing: 14px;
+    color: #D4A017;
+    opacity: 0.45;
+    white-space: nowrap;
+  }
+
+  /* ── Corner accent brackets ─────────────────────────────── */
+  .corner-accent { position: relative; }
+  .corner-accent::before,
+  .corner-accent::after {
+    content: '';
+    position: absolute;
+    width: 28px; height: 28px;
+    border-color: #D4A017;
+    opacity: 0.55;
+    z-index: 2;
+  }
+  .corner-accent::before {
+    top: -1px; left: -1px;
+    border-top: 2.5px solid;
+    border-left: 2.5px solid;
+  }
+  .corner-accent::after {
+    bottom: -1px; right: -1px;
+    border-bottom: 2.5px solid;
+    border-right: 2.5px solid;
+  }
+
+  /* ── Mudcloth dark section background ───────────────────── */
+  .mudcloth-bg {
+    background-color: #120E04;
+    background-image:
+      radial-gradient(circle at 20% 20%, rgba(212,160,23,0.06) 0%, transparent 55%),
+      radial-gradient(circle at 80% 80%, rgba(193,68,14,0.05) 0%, transparent 55%),
+      radial-gradient(circle at 50% 50%, rgba(30,158,99,0.04) 0%, transparent 60%);
+  }
+
+  /* ── Warm canvas section ────────────────────────────────── */
+  .canvas-bg {
+    background-color: #FBF7F0;
+    background-image:
+      radial-gradient(circle at 10% 90%, rgba(212,160,23,0.06) 0%, transparent 50%),
+      radial-gradient(circle at 90% 10%, rgba(193,68,14,0.04) 0%, transparent 50%);
+  }
+
+  /* ── Stat card glow on hover ────────────────────────────── */
+  .stat-card {
+    @apply glass-card rounded-2xl p-8 transition-all duration-500 cursor-default;
+  }
+  .stat-card:hover {
+    border-color: rgba(212, 160, 23, 0.30);
+    box-shadow: 0 0 40px rgba(212, 160, 23, 0.10),
+                inset 0 0 20px rgba(212, 160, 23, 0.04);
+    transform: translateY(-4px);
+  }
+
+  /* ── Primary button ─────────────────────────────────────── */
+  .btn-primary {
+    @apply inline-flex items-center gap-2.5 rounded-xl font-semibold text-white
+           transition-all duration-300 shadow-lg;
+    background: linear-gradient(135deg, #D4A017 0%, #E87722 100%);
+    box-shadow: 0 8px 24px rgba(212,160,23,0.30);
+  }
+  .btn-primary:hover {
+    background: linear-gradient(135deg, #E8B520 0%, #F08530 100%);
+    box-shadow: 0 12px 36px rgba(212,160,23,0.45);
+    transform: translateY(-2px);
+  }
+  .btn-primary:active { transform: translateY(0); }
+
+  /* ── Outline button ─────────────────────────────────────── */
+  .btn-outline {
+    @apply inline-flex items-center gap-2.5 rounded-xl font-medium
+           border border-white/20 bg-white/5 backdrop-blur-sm text-white
+           transition-all duration-300;
+  }
+  .btn-outline:hover {
+    @apply border-white/35 bg-white/10;
+  }
+}
+
+@layer utilities {
+  .text-balance { text-wrap: balance; }
+
+  .animation-delay-100  { animation-delay: 0.1s; }
+  .animation-delay-200  { animation-delay: 0.2s; }
+  .animation-delay-300  { animation-delay: 0.3s; }
+  .animation-delay-400  { animation-delay: 0.4s; }
+  .animation-delay-600  { animation-delay: 0.6s; }
+  .animation-delay-800  { animation-delay: 0.8s; }
+  .animation-delay-1000 { animation-delay: 1s; }
+}
