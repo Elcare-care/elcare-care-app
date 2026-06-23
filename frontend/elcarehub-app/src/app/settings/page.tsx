@@ -454,12 +454,12 @@ export default function SettingsPage() {
             disabled={saving}
             className="flex items-center justify-center gap-2 flex-1 rounded-xl bg-brand-500 px-6 py-3 text-sm font-semibold text-white shadow-lg shadow-brand-500/25 hover:bg-brand-600 disabled:opacity-50 disabled:cursor-not-allowed transition-all"
           >
-            {saving … (
+            {saving ? (
               <>
                 <RefreshCw className="h-4 w-4 animate-spin" />
                 Saving...
               </>
-            ) : saved … (
+            ) : saved ? (
               <>
                 <Check className="h-4 w-4" />
                 Saved!
