@@ -1,4 +1,4 @@
-// ─────────────────────────────────────────────────────────────
+﻿// ─────────────────────────────────────────────────────────────
 // hooks/useAuctions.ts — Auction data + actions hooks
 // ─────────────────────────────────────────────────────────────
 
@@ -17,6 +17,7 @@ import {
 import { fetchAuctions } from "@/lib/indexer";
 import { uploadImageToIPFS, uploadMetadataToIPFS, ArtworkMetadata } from "@/lib/ipfs";
 import { getReadableErrorMessage } from "@/lib/errors";
+import { config } from "@/lib/config";
 import { useTransientErrorToast } from "./useTransientErrorToast";
 import { assertSupportedTokenAddress } from "@/lib/token-support";
 import { DEFAULT_TOKEN } from "@/config/tokens";
@@ -33,6 +34,8 @@ export function useAuctions() {
   useTransientErrorToast(error);
 
   const refresh = useCallback(async () => {
+    // No contract configured - return empty gracefully
+    if (!config.contractId) { setAuctions([]); return; }
     setIsLoading(true);
     setError(null);
     try {
