@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Unit tests for useAdmin.ts hooks.
  */
 import React from 'react';
@@ -43,7 +43,7 @@ jest.mock('@stellar/stellar-sdk', () => ({
 }));
 
 jest.mock('@/lib/config', () => ({
-  config: { horizonUrl: 'https://horizon-testnet.stellar.org' },
+  config: { contractId: 'CTEST123', horizonUrl: 'https://horizon-testnet.stellar.org', networkPassphrase: 'Test SDF Network ; September 2015', network: 'testnet', rpcUrl: 'https://soroban-testnet.stellar.org', indexerUrl: '' },
 }));
 
 import {

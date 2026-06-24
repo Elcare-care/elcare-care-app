@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Unit tests for useMarketplace.ts hooks.
  * All external dependencies are mocked.
  */
@@ -36,7 +36,7 @@ jest.mock('@/lib/indexer', () => ({
 }));
 
 jest.mock('@/lib/config', () => ({
-  config: { indexerUrl: '' },
+  config: { contractId: 'CTEST123', indexerUrl: '', networkPassphrase: 'Test SDF Network ; September 2015', network: 'testnet', rpcUrl: 'https://soroban-testnet.stellar.org' },
 }));
 
 jest.mock('@/lib/ipfs', () => ({

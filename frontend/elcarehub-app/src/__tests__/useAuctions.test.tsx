@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Unit tests for useAuctions.ts hooks.
  * All blockchain / indexer calls are mocked.
  */

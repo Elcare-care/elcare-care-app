@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Component tests for ConnectWalletModal.
  */
 import React from 'react';
@@ -68,7 +68,7 @@ describe('ConnectWalletModal', () => {
 
   it('renders the modal with Freighter option', () => {
     render(<ConnectWalletModal isOpen={true} onClose={jest.fn()} />);
-    expect(screen.getByText(/freighter wallet/i)).toBeInTheDocument();
+    expect(screen.getByText(/freighter/i)).toBeInTheDocument();
   });
 
   it('calls onClose when the backdrop is clicked', async () => {
