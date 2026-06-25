@@ -141,6 +141,37 @@ impl AuctionFinalizedEvent {
     }
 }
 
+/// Emitted when a qualifying late bid triggers the anti-sniping extension rule.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuctionExtendedEvent {
+    pub auction_id: u64,
+    /// The new end time after the extension has been applied.
+    pub new_end_time: u64,
+}
+
+impl AuctionExtendedEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events().publish((AUCTION_EXTENDED,), self);
+    }
+}
+
+/// Emitted when a creator cancels an auction that has received no bids.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuctionCancelledEvent {
+    pub auction_id: u64,
+    pub cancelled_by: Address,
+}
+
+impl AuctionCancelledEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events().publish((AUCTION_CANCELLED,), self);
+    }
+}
+
 impl ListingUpdatedEvent {
     #[allow(deprecated)]
     pub fn publish(self, env: &Env) {
