@@ -32,6 +32,10 @@ pub enum MarketplaceError {
     InvalidRoyalty = 24,
     /// Token attempted at purchase time but is no longer whitelisted
     TokenNotWhitelisted = 25,
+    /// The sum of all Recipient basis-point values plus the protocol fee exceeds
+    /// 10 000 bps (100%).  Rejected at listing creation and on any update that
+    /// would mutate recipients, so an invalid split can never be persisted.
+    RoyaltyExceedsLimit = 26,
 }
 
 #[contracttype]
@@ -46,6 +50,9 @@ pub enum ListingStatus {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Recipient {
     pub address: Address,
+    /// Share expressed in basis points (0 – 10 000).
+    /// The sum of all recipient `percentage` values plus the protocol fee bps
+    /// must not exceed 10 000 (100 %).
     pub percentage: u32,
 }
 

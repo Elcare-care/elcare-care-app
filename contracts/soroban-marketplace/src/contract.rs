@@ -245,14 +245,14 @@ impl MarketplaceContract {
             panic_with_error!(&env, MarketplaceError::TooManyRecipients);
         }
 
-        let mut total_percentage = 0;
-        for i in 0..recipients_len {
-            total_percentage += recipients.get(i).unwrap().percentage;
-        }
+        // Read the current protocol fee so the combined bps can be validated.
+        let protocol_fee_bps =
+            crate::storage::get_protocol_fee_bps_storage(&env).unwrap_or(0);
 
-        if total_percentage != 100 {
-            panic_with_error!(&env, MarketplaceError::InvalidSplit);
-        }
+        // Reject if sum(recipient bps) + protocol_fee_bps > 10 000.
+        // This must happen before persisting the listing so an invalid split
+        // is never observable in the indexer or UI.
+        Self::validate_recipients(&env, &recipients, protocol_fee_bps);
 
         if !Self::is_token_whitelisted(&env, &token) {
             panic_with_error!(&env, MarketplaceError::Unauthorized);
@@ -333,13 +333,12 @@ impl MarketplaceContract {
         if new_recipients_len > 4 {
             panic_with_error!(&env, MarketplaceError::TooManyRecipients);
         }
-        let mut total_pct = 0u32;
-        for i in 0..new_recipients_len {
-            total_pct += new_recipients.get(i).unwrap().percentage;
-        }
-        if total_pct != 100 {
-            panic_with_error!(&env, MarketplaceError::InvalidSplit);
-        }
+
+        // Validate combined bps before persisting the mutation so an existing
+        // listing cannot be edited into an invalid state.
+        let protocol_fee_bps =
+            crate::storage::get_protocol_fee_bps_storage(&env).unwrap_or(0);
+        Self::validate_recipients(&env, &new_recipients, protocol_fee_bps);
 
         listing.price = new_price;
         listing.token = new_token;
@@ -361,6 +360,21 @@ impl MarketplaceContract {
     }
 
     pub fn buy_artwork(env: Env, buyer: Address, listing_id: u64) -> bool {
+        // ─────────────────────────────────────────────────────────────────────
+        // CHECKS-EFFECTS-INTERACTIONS ordering is strictly enforced here:
+        //   1. Acquire reentrancy lock (earliest possible).
+        //   2. Validate all inputs / listing state (Checks).
+        //   3. Mutate storage — mark listing Sold, update owner, remove from
+        //      active set, mark pending offers Rejected (Effects).
+        //   4. Emit events (Effects — Soroban events are append-only and safe).
+        //   5. Execute all external token transfers and NFT transfer (Interactions).
+        //   6. Release lock only after all state is finalized.
+        //
+        // A malicious token that tries to re-enter buy_artwork for the same
+        // listing_id will either find the lock already held (→ ReentrancyGuard)
+        // or find the listing status already Sold (→ ListingSold), in both cases
+        // reverting without double-spending.
+        // ─────────────────────────────────────────────────────────────────────
         if crate::storage::is_paused(&env) {
             panic_with_error!(&env, MarketplaceError::ContractPaused);
         }
@@ -403,6 +417,46 @@ impl MarketplaceContract {
             panic_with_error!(&env, MarketplaceError::TokenNotWhitelisted);
         }
 
+        // ── CHECKS-EFFECTS-INTERACTIONS ──────────────────────────────────────
+        // All validation is complete.  Mutate state BEFORE any cross-contract
+        // token call so that a reentrant buy_artwork on the same listing_id
+        // finds the listing already marked Sold and is rejected by the lock or
+        // by the status check, not by an inconsistent intermediate state.
+        listing.status = ListingStatus::Sold;
+        listing.owner = Some(buyer.clone());
+        save_listing(&env, &listing);
+        remove_from_active_listings(&env, listing_id);
+
+        // Reject all pending offers (state mutation only — token refunds happen
+        // in the interactions phase below).
+        let offers = load_listing_offers(&env, listing_id);
+        let mut pending_offerers: Vec<Address> = Vec::new(&env);
+        let mut pending_amounts: Vec<i128> = Vec::new(&env);
+        let mut pending_tokens: Vec<Address> = Vec::new(&env);
+        for offer_id in offers.iter() {
+            if let Some(mut offer) = load_offer(&env, offer_id) {
+                if offer.status == OfferStatus::Pending {
+                    offer.status = OfferStatus::Rejected;
+                    save_offer(&env, &offer);
+                    pending_offerers.push_back(offer.offerer.clone());
+                    pending_amounts.push_back(offer.amount);
+                    pending_tokens.push_back(offer.token.clone());
+                }
+            }
+        }
+
+        ArtworkSoldEvent {
+            listing_id,
+            artist: listing.artist.clone(),
+            buyer: buyer.clone(),
+            price: listing.price,
+            currency: listing.currency.clone(),
+            ledger_sequence: env.ledger().sequence(),
+        }
+        .publish(&env);
+
+        // ── INTERACTIONS (external calls after all state is final) ───────────
+
         Self::distribute_payout(
             &env,
             &listing.token,
@@ -427,35 +481,13 @@ impl MarketplaceContract {
             ],
         );
 
-        listing.status = ListingStatus::Sold;
-        listing.owner = Some(buyer.clone());
-        save_listing(&env, &listing);
-        remove_from_active_listings(&env, listing_id);
-
-        ArtworkSoldEvent {
-            listing_id,
-            artist: listing.artist.clone(),
-            buyer: buyer.clone(),
-            price: listing.price,
-            currency: listing.currency.clone(),
-            ledger_sequence: env.ledger().sequence(),
-        }
-        .publish(&env);
-
-        // Reject all pending offers
-        let offers = load_listing_offers(&env, listing_id);
-        for offer_id in offers.iter() {
-            if let Some(mut offer) = load_offer(&env, offer_id) {
-                if offer.status == OfferStatus::Pending {
-                    TokenClient::new(&env, &offer.token).transfer(
-                        &env.current_contract_address(),
-                        &offer.offerer,
-                        &offer.amount,
-                    );
-                    offer.status = OfferStatus::Rejected;
-                    save_offer(&env, &offer);
-                }
-            }
+        // Refund rejected offer escrows
+        for i in 0..pending_offerers.len() {
+            TokenClient::new(&env, &pending_tokens.get(i).unwrap()).transfer(
+                &env.current_contract_address(),
+                &pending_offerers.get(i).unwrap(),
+                &pending_amounts.get(i).unwrap(),
+            );
         }
 
         release_listing_lock(&env, listing_id);
@@ -816,6 +848,48 @@ impl MarketplaceContract {
             release_listing_lock(&env, listing_id);
             panic_with_error!(&env, MarketplaceError::OfferNotPending);
         }
+
+        // ── CHECKS-EFFECTS-INTERACTIONS ──────────────────────────────────────
+        // Persist all state mutations before any cross-contract call so that a
+        // reentrant attempt on the same listing sees it already Sold.
+        let accepted_offerer = offer.offerer.clone();
+        let accepted_amount = offer.amount;
+        let accepted_listing_id = offer.listing_id;
+        offer.status = OfferStatus::Accepted;
+        save_offer(&env, &offer);
+        listing.status = ListingStatus::Sold;
+        listing.owner = Some(accepted_offerer.clone());
+        save_listing(&env, &listing);
+        remove_from_active_listings(&env, accepted_listing_id);
+
+        // Mark all other pending offers as rejected (state change only).
+        let sibling_offers = load_listing_offers(&env, listing.listing_id);
+        let mut refund_offerers: Vec<Address> = Vec::new(&env);
+        let mut refund_amounts: Vec<i128> = Vec::new(&env);
+        let mut refund_tokens: Vec<Address> = Vec::new(&env);
+        for oid in sibling_offers.iter() {
+            if oid != offer_id {
+                if let Some(mut other) = load_offer(&env, oid) {
+                    if other.status == OfferStatus::Pending {
+                        other.status = OfferStatus::Rejected;
+                        save_offer(&env, &other);
+                        refund_offerers.push_back(other.offerer.clone());
+                        refund_amounts.push_back(other.amount);
+                        refund_tokens.push_back(other.token.clone());
+                    }
+                }
+            }
+        }
+
+        OfferAcceptedEvent {
+            offer_id,
+            listing_id: accepted_listing_id,
+            offerer: accepted_offerer.clone(),
+            amount: accepted_amount,
+        }
+        .publish(&env);
+
+        // ── INTERACTIONS ─────────────────────────────────────────────────────
         Self::distribute_payout(
             &env,
             &offer.token,
@@ -839,39 +913,14 @@ impl MarketplaceContract {
                 listing.token_id.into_val(&env)
             ],
         );
-        let accepted_offerer = offer.offerer.clone();
-        let accepted_amount = offer.amount;
-        let accepted_listing_id = offer.listing_id;
-        offer.status = OfferStatus::Accepted;
-        save_offer(&env, &offer);
-        listing.status = ListingStatus::Sold;
-        listing.owner = Some(accepted_offerer.clone());
-        save_listing(&env, &listing);
-        remove_from_active_listings(&env, accepted_listing_id);
 
-        OfferAcceptedEvent {
-            offer_id,
-            listing_id: accepted_listing_id,
-            offerer: accepted_offerer.clone(),
-            amount: accepted_amount,
-        }
-        .publish(&env);
-
-        let offers = load_listing_offers(&env, listing.listing_id);
-        for oid in offers.iter() {
-            if oid != offer_id {
-                if let Some(mut other) = load_offer(&env, oid) {
-                    if other.status == OfferStatus::Pending {
-                        TokenClient::new(&env, &other.token).transfer(
-                            &env.current_contract_address(),
-                            &other.offerer,
-                            &other.amount,
-                        );
-                        other.status = OfferStatus::Rejected;
-                        save_offer(&env, &other);
-                    }
-                }
-            }
+        // Refund rejected offer escrows
+        for i in 0..refund_offerers.len() {
+            TokenClient::new(&env, &refund_tokens.get(i).unwrap()).transfer(
+                &env.current_contract_address(),
+                &refund_offerers.get(i).unwrap(),
+                &refund_amounts.get(i).unwrap(),
+            );
         }
 
         release_listing_lock(&env, listing_id);
@@ -968,6 +1017,37 @@ impl MarketplaceContract {
         }
     }
 
+    /// Validate that the sum of all `Recipient.percentage` values (each expressed
+    /// in basis points, 0–10 000) plus the current protocol fee does not exceed
+    /// 10 000 bps (100 %).
+    ///
+    /// Uses `checked_add` throughout to prevent integer overflow on malformed
+    /// input.  Panics with `RoyaltyExceedsLimit` when the invariant is violated.
+    ///
+    /// # Invariants checked
+    /// * `recipients` must be non-empty (caller responsibility to guard with `InvalidSplit`).
+    /// * `sum(r.percentage) + protocol_fee_bps <= 10_000`
+    fn validate_recipients(
+        env: &Env,
+        recipients: &Vec<Recipient>,
+        protocol_fee_bps: u32,
+    ) {
+        let len = recipients.len();
+        let mut total_bps: u32 = 0;
+        for i in 0..len {
+            let bps = recipients.get(i).unwrap().percentage;
+            total_bps = total_bps
+                .checked_add(bps)
+                .unwrap_or_else(|| panic_with_error!(env, MarketplaceError::RoyaltyExceedsLimit));
+        }
+        let combined = total_bps
+            .checked_add(protocol_fee_bps)
+            .unwrap_or_else(|| panic_with_error!(env, MarketplaceError::RoyaltyExceedsLimit));
+        if combined > 10_000 {
+            panic_with_error!(env, MarketplaceError::RoyaltyExceedsLimit);
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn distribute_payout(
         env: &Env,
@@ -1011,7 +1091,7 @@ impl MarketplaceContract {
             let amt = if i == len - 1 {
                 payout - ds
             } else {
-                (payout * r.percentage as i128) / 100
+                (payout * r.percentage as i128) / 10_000
             };
             token.transfer(&env.current_contract_address(), &r.address, &amt);
             ds += amt;
