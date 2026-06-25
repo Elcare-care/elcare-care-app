@@ -524,12 +524,19 @@ impl MarketplaceContract {
             release_listing_lock(&env, listing_id);
             panic_with_error!(&env, MarketplaceError::ListingNotActive);
         }
+        // Reject self-purchase: buyer must not be the listing artist (original
+        // creator) or the current NFT owner. Using a dedicated error code so
+        // indexers and clients surface a clear reason rather than a generic 5.
         if listing.artist == buyer {
             release_listing_lock(&env, listing_id);
-            panic_with_error!(&env, MarketplaceError::CannotBuyOwnListing);
+            panic_with_error!(&env, MarketplaceError::SelfPurchaseNotAllowed);
         }
-
-        // Reject purchase if the listing has an expiry that has passed.
+        if let Some(ref owner) = listing.owner {
+            if *owner == buyer {
+                release_listing_lock(&env, listing_id);
+                panic_with_error!(&env, MarketplaceError::SelfPurchaseNotAllowed);
+            }
+        }
         if let Some(exp) = listing.expires_at {
             if env.ledger().timestamp() >= exp {
                 release_listing_lock(&env, listing_id);
@@ -584,7 +591,7 @@ impl MarketplaceContract {
         // ── INTERACTIONS (external calls after all state is final) ───────────
 
         // Use the snapshotted protocol fee from the listing, not the current global fee
-        Self::distribute_payout(
+        let fee_collected = Self::distribute_payout(
             &env,
             &listing.token,
             &listing.collection,
@@ -595,6 +602,19 @@ impl MarketplaceContract {
             true,
             listing.protocol_fee_bps, // Use snapshotted fee
         );
+
+        // Emit ProtocolFeeCollected so treasury revenue is observable on-chain.
+        if fee_collected > 0 {
+            if let Some(treasury) = crate::storage::get_treasury_storage(&env) {
+                ProtocolFeeCollectedEvent {
+                    listing_id,
+                    amount: fee_collected,
+                    token: listing.token.clone(),
+                    treasury,
+                }
+                .publish(&env);
+            }
+        }
 
         // Transfer the NFT
         env.invoke_contract::<()>(
@@ -989,7 +1009,7 @@ impl MarketplaceContract {
             // using the fee rate snapshotted at auction creation — this gives
             // the creator and bidder certainty about the net settlement amount
             // from the moment the auction was created (parity with listings).
-            Self::distribute_payout(
+            let fee_collected = Self::distribute_payout(
                 &env,
                 &auction.token,
                 &auction.collection,
@@ -1000,6 +1020,19 @@ impl MarketplaceContract {
                 false, // funds are already held in escrow; do not pull from winner
                 snapshotted_fee,
             );
+
+            // Emit ProtocolFeeCollected so treasury revenue is observable on-chain.
+            if fee_collected > 0 {
+                if let Some(treasury) = crate::storage::get_treasury_storage(&env) {
+                    ProtocolFeeCollectedEvent {
+                        listing_id: auction_id, // reuse field; auction_id identifies the trade
+                        amount: fee_collected,
+                        token: auction.token.clone(),
+                        treasury,
+                    }
+                    .publish(&env);
+                }
+            }
 
             // Transfer the NFT from the creator to the winner.
             env.invoke_contract::<()>(
@@ -1265,7 +1298,7 @@ impl MarketplaceContract {
         // ── INTERACTIONS ─────────────────────────────────────────────────────
         // Use the listing's snapshotted protocol fee so settlement matches what
         // was agreed at listing creation time.
-        Self::distribute_payout(
+        let fee_collected = Self::distribute_payout(
             &env,
             &offer.token,
             &listing.collection,
@@ -1276,6 +1309,19 @@ impl MarketplaceContract {
             false,
             listing.protocol_fee_bps, // Use snapshotted fee
         );
+
+        // Emit ProtocolFeeCollected so treasury revenue is observable on-chain.
+        if fee_collected > 0 {
+            if let Some(treasury) = crate::storage::get_treasury_storage(&env) {
+                ProtocolFeeCollectedEvent {
+                    listing_id: accepted_listing_id,
+                    amount: fee_collected,
+                    token: offer.token.clone(),
+                    treasury,
+                }
+                .publish(&env);
+            }
+        }
 
         // Transfer the NFT
         env.invoke_contract::<()>(
@@ -1455,7 +1501,7 @@ impl MarketplaceContract {
         buyer: &Address,
         transfer_from_buyer: bool,
         fee_bps: u32, // Protocol fee in bps — caller provides snapshotted or live value
-    ) {
+    ) -> i128 /* returns the protocol fee actually transferred */ {
         let token = TokenClient::new(env, token_addr);
         if transfer_from_buyer {
             token.transfer(buyer, &env.current_contract_address(), &amount);
@@ -1475,9 +1521,14 @@ impl MarketplaceContract {
             token.transfer(&env.current_contract_address(), &royalty_receiver, &royalty);
             payout -= royalty;
         }
+
+        let mut fee_collected: i128 = 0;
         if let Some(t) = crate::storage::get_treasury_storage(env) {
             let fee = payout * fee_bps as i128 / 10_000;
-            token.transfer(&env.current_contract_address(), &t, &fee);
+            if fee > 0 {
+                token.transfer(&env.current_contract_address(), &t, &fee);
+                fee_collected = fee;
+            }
             payout -= fee;
         }
         let len = recipients.len();
@@ -1492,5 +1543,6 @@ impl MarketplaceContract {
             token.transfer(&env.current_contract_address(), &r.address, &amt);
             ds += amt;
         }
+        fee_collected
     }
 }

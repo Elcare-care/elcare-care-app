@@ -42,6 +42,14 @@ pub enum MarketplaceError {
     /// `expire_listing` was called on a listing whose `expires_at` is still in
     /// the future (or the listing has no expiry).
     ListingNotExpired = 28,
+    /// A buyer attempted to purchase a listing they own (artist or current owner).
+    /// Dedicated error code so indexers and clients can surface a clear,
+    /// human-readable rejection reason distinct from the generic Unauthorized.
+    SelfPurchaseNotAllowed = 29,
+    /// finalize_auction was called before the auction end_time has passed.
+    AuctionNotEnded = 30,
+    /// cancel_auction was called on an auction that already has bids placed.
+    AuctionHasBids = 31,
 }
 
 #[contracttype]
