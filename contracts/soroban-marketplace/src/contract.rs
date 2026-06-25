@@ -28,6 +28,11 @@ use crate::{
     },
 };
 
+/// Default minimum bid increment used when no global value has been configured.
+/// A value of 1 preserves the invariant that a new bid must strictly exceed the
+/// previous highest bid.
+const DEFAULT_MIN_BID_INCREMENT: i128 = 1;
+
 #[contract]
 pub struct MarketplaceContract;
 
@@ -118,6 +123,24 @@ impl MarketplaceContract {
 
     pub fn get_protocol_fee(env: Env) -> u32 {
         crate::storage::get_protocol_fee_bps_storage(&env).unwrap_or(0)
+    }
+
+    /// Set the global minimum bid increment (in payment-token stroops). New
+    /// auctions snapshot this value at creation. Admin-only; must be non-negative.
+    pub fn set_min_bid_increment(env: Env, admin: Address, increment: i128) {
+        admin.require_auth();
+        let stored_admin = Self::get_admin(env.clone()).expect("admin not set");
+        if admin != stored_admin {
+            panic_with_error!(&env, MarketplaceError::Unauthorized);
+        }
+        if increment < 0 {
+            panic_with_error!(&env, MarketplaceError::InvalidPrice);
+        }
+        crate::storage::set_min_bid_increment_storage(&env, increment);
+    }
+
+    pub fn get_min_bid_increment(env: Env) -> i128 {
+        crate::storage::get_min_bid_increment_storage(&env).unwrap_or(DEFAULT_MIN_BID_INCREMENT)
     }
 
     // ── Pause/Unpause Mechanism ────────────────────────────
@@ -279,9 +302,7 @@ impl MarketplaceContract {
     ) -> u64 {
         Self::require_not_paused(&env);
         artist.require_auth();
-        if Self::is_artist_revoked(env.clone(), artist.clone()) {
-            panic_with_error!(&env, MarketplaceError::ArtistRevoked);
-        }
+        Self::require_not_revoked(&env, &artist);
         if price <= 0 {
             panic_with_error!(&env, MarketplaceError::InvalidPrice);
         }
@@ -713,9 +734,7 @@ impl MarketplaceContract {
     ) -> u64 {
         Self::require_not_paused(&env);
         creator.require_auth();
-        if Self::is_artist_revoked(env.clone(), creator.clone()) {
-            panic_with_error!(&env, MarketplaceError::Unauthorized);
-        }
+        Self::require_not_revoked(&env, &creator);
         if reserve_price <= 0 {
             panic_with_error!(&env, MarketplaceError::InvalidPrice);
         }
@@ -724,6 +743,10 @@ impl MarketplaceContract {
         }
         let auction_id = increment_auction_count(&env);
         let end_time = env.ledger().timestamp() + duration;
+        // Snapshot the global minimum bid increment so the auction's bidding
+        // rules are fixed at creation time, regardless of later admin changes.
+        let min_increment = crate::storage::get_min_bid_increment_storage(&env)
+            .unwrap_or(DEFAULT_MIN_BID_INCREMENT);
         let auction = Auction {
             auction_id,
             creator: creator.clone(),
@@ -736,6 +759,7 @@ impl MarketplaceContract {
             end_time,
             status: AuctionStatus::Active,
             recipients,
+            min_increment,
         };
         save_auction(&env, &auction);
         add_artist_auction_id(&env, &creator, auction_id);
@@ -765,15 +789,32 @@ impl MarketplaceContract {
         if env.ledger().timestamp() >= auction.end_time {
             panic_with_error!(&env, MarketplaceError::AuctionExpired);
         }
-        if amount <= auction.highest_bid || amount < auction.reserve_price {
+        // Enforce the minimum acceptable bid on-chain:
+        //   • first bid (no prior bidder): must be at least `reserve_price`.
+        //   • subsequent bids: must exceed the current highest bid by at least
+        //     `min_increment`, computed with checked arithmetic to avoid overflow.
+        let required_min = if auction.highest_bid == 0 {
+            auction.reserve_price
+        } else {
+            auction
+                .highest_bid
+                .checked_add(auction.min_increment)
+                .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::BidTooLow))
+        };
+        if amount < required_min {
             panic_with_error!(&env, MarketplaceError::BidTooLow);
         }
 
-        let token_client = TokenClient::new(&env, &auction.token);
-        if let Some(prev) = auction.highest_bidder.clone() {
-            token_client.transfer(&env.current_contract_address(), &prev, &auction.highest_bid);
-        }
-        token_client.transfer(&bidder, &env.current_contract_address(), &amount);
+        // Capture the previous highest bidder/amount before they are overwritten,
+        // so the escrowed funds can be refunded after state is recorded.
+        let previous_bidder = auction.highest_bidder.clone();
+        let previous_bid = auction.highest_bid;
+
+        // ── CHECKS-EFFECTS-INTERACTIONS ──────────────────────────────────────
+        // Record the new highest bid BEFORE moving any tokens, so a reentrant
+        // place_bid on the same auction observes the updated state. The whole
+        // call is atomic: if any transfer below fails, all of these effects roll
+        // back, so escrow can never be left inconsistent.
         auction.highest_bid = amount;
         auction.highest_bidder = Some(bidder.clone());
         save_auction(&env, &auction);
@@ -784,6 +825,16 @@ impl MarketplaceContract {
             bid_amount: amount,
         }
         .publish(&env);
+
+        // ── INTERACTIONS ─────────────────────────────────────────────────────
+        // Refund the previous bidder's escrow, then pull the new bid into escrow.
+        // Net effect: contract-held escrow for this auction equals `amount`, the
+        // new highest bid.
+        let token_client = TokenClient::new(&env, &auction.token);
+        if let Some(prev) = previous_bidder {
+            token_client.transfer(&env.current_contract_address(), &prev, &previous_bid);
+        }
+        token_client.transfer(&bidder, &env.current_contract_address(), &amount);
     }
 
     pub fn finalize_auction(env: Env, caller: Address, auction_id: u64) {
@@ -1174,6 +1225,17 @@ impl MarketplaceContract {
     fn require_not_paused(env: &Env) {
         if crate::storage::is_paused(env) {
             panic_with_error!(env, MarketplaceError::ContractPaused);
+        }
+    }
+
+    /// Guard that reverts with `ArtistRevoked` when `artist` has been revoked by
+    /// an admin. Call this after authentication at the start of every creation
+    /// path (listings, auctions) so a revoked artist can no longer create new
+    /// items. It deliberately does NOT guard settlement paths (buy, accept_offer,
+    /// finalize_auction), so existing items remain settleable after revocation.
+    fn require_not_revoked(env: &Env, artist: &Address) {
+        if is_artist_revoked_storage(env, artist) {
+            panic_with_error!(env, MarketplaceError::ArtistRevoked);
         }
     }
 
