@@ -513,3 +513,59 @@ pub fn is_paused(env: &Env) -> bool {
         .get::<DataKey, bool>(&DataKey::IsPaused)
         .unwrap_or(false)
 }
+
+// ── Price bounds ─────────────────────────────────────────────
+
+/// Persist the global minimum price bound (in payment-token stroops).
+pub fn set_min_price_storage(env: &Env, min: i128) {
+    env.storage().persistent().set(&DataKey::MinPrice, &min);
+    bump_entry_ttl(env, &DataKey::MinPrice);
+}
+
+/// Retrieve the global minimum price bound, or `None` if not set.
+pub fn get_min_price_storage(env: &Env) -> Option<i128> {
+    let value = env.storage().persistent().get(&DataKey::MinPrice);
+    if value.is_some() {
+        bump_entry_ttl(env, &DataKey::MinPrice);
+    }
+    value
+}
+
+/// Persist the global maximum price bound (in payment-token stroops).
+pub fn set_max_price_storage(env: &Env, max: i128) {
+    env.storage().persistent().set(&DataKey::MaxPrice, &max);
+    bump_entry_ttl(env, &DataKey::MaxPrice);
+}
+
+/// Retrieve the global maximum price bound, or `None` if not set.
+pub fn get_max_price_storage(env: &Env) -> Option<i128> {
+    let value = env.storage().persistent().get(&DataKey::MaxPrice);
+    if value.is_some() {
+        bump_entry_ttl(env, &DataKey::MaxPrice);
+    }
+    value
+}
+
+// ── Migration marker ─────────────────────────────────────────
+
+/// Record that the migration for `version` has been executed.
+/// After this call, `is_migration_done` returns `true` for the same version.
+pub fn set_migration_done(env: &Env, version: &soroban_sdk::String) {
+    let key = DataKey::MigrationDone(version.clone());
+    env.storage().persistent().set(&key, &true);
+    bump_entry_ttl(env, &key);
+}
+
+/// Returns `true` if the migration for `version` has already been applied.
+pub fn is_migration_done(env: &Env, version: &soroban_sdk::String) -> bool {
+    let key = DataKey::MigrationDone(version.clone());
+    let done = env
+        .storage()
+        .persistent()
+        .get::<_, bool>(&key)
+        .unwrap_or(false);
+    if done {
+        bump_entry_ttl(env, &key);
+    }
+    done
+}

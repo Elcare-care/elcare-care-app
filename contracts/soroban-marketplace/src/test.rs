@@ -4800,7 +4800,7 @@ fn test_cancel_auction_emits_event() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #27)")]
+#[should_panic(expected = "Error(Contract, #31)")]
 fn test_cancel_auction_with_bids_reverts() {
     let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
     client.set_admin(&artist);
