@@ -33,6 +33,7 @@ pub enum Error {
     MetadataFrozen = 9,  // base_uri cannot be updated after freeze
     AlreadyFrozen = 10,  // freeze_metadata called more than once
     InvalidBps = 11,     // basis points exceed MAX_BPS (10_000)
+    CollectionPaused = 12, // minting is paused
 }
 
 // ─── Storage Keys ─────────────────────────────────────────────────────────────
@@ -61,6 +62,7 @@ pub enum DataKey {
     // Per-token royalty overrides (persistent, optional)
     TokenRoyaltyReceiver(u64), // Address
     TokenRoyaltyBps(u64),      // u32
+    Paused,         // bool   — minting paused when true
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -141,6 +143,10 @@ impl NormalNFT721 {
         Self::extend_instance_ttl(&env);
         let creator = Self::only_creator(&env)?;
 
+        if env.storage().instance().get::<DataKey, bool>(&DataKey::Paused).unwrap_or(false) {
+            return Err(Error::CollectionPaused);
+        }
+
         let token_id: u64 = env
             .storage()
             .instance()
@@ -169,6 +175,10 @@ impl NormalNFT721 {
     pub fn batch_mint(env: Env, to: Address, uris: Vec<String>) -> Result<(), Error> {
         Self::extend_instance_ttl(&env);
         Self::only_creator(&env)?;
+
+        if env.storage().instance().get::<DataKey, bool>(&DataKey::Paused).unwrap_or(false) {
+            return Err(Error::CollectionPaused);
+        }
 
         let uris_len = uris.len();
         if uris_len == 0 {
@@ -594,6 +604,30 @@ impl NormalNFT721 {
             TTL_BUMP,
         );
         Ok(())
+    }
+
+    /// Pause minting.  Callable only by creator.
+    pub fn pause(env: Env) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
+        Self::only_creator(&env)?;
+        env.storage().instance().set(&DataKey::Paused, &true);
+        Ok(())
+    }
+
+    /// Resume minting.  Callable only by creator.
+    pub fn unpause(env: Env) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
+        Self::only_creator(&env)?;
+        env.storage().instance().set(&DataKey::Paused, &false);
+        Ok(())
+    }
+
+    /// Returns `true` if minting is currently paused.
+    pub fn is_paused(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get::<DataKey, bool>(&DataKey::Paused)
+            .unwrap_or(false)
     }
 
     /// Update the collection-level base URI.  Reverts if metadata is frozen.

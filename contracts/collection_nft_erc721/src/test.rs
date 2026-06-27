@@ -1047,3 +1047,167 @@ fn default_royalty_does_not_affect_per_token_override() {
     assert_eq!(recv, token_recv);
     assert_eq!(amount, 800i128);
 }
+
+// ── Pause mechanism ───────────────────────────────────────────────────────────
+
+#[test]
+fn is_paused_defaults_false() {
+    let (_, client, _, _) = setup();
+    assert!(!client.is_paused());
+}
+
+#[test]
+fn pause_sets_paused_flag() {
+    let (_, client, _, _) = setup();
+    client.pause();
+    assert!(client.is_paused());
+}
+
+#[test]
+fn unpause_clears_paused_flag() {
+    let (_, client, _, _) = setup();
+    client.pause();
+    client.unpause();
+    assert!(!client.is_paused());
+}
+
+#[test]
+fn mint_blocked_when_paused() {
+    let (env, client, _, _) = setup();
+    let alice = Address::generate(&env);
+    client.pause();
+    let result = client.try_mint(&alice, &String::from_str(&env, "uri"));
+    assert_eq!(result, Err(Ok(Error::CollectionPaused)));
+}
+
+#[test]
+fn batch_mint_blocked_when_paused() {
+    let (env, client, _, _) = setup();
+    let alice = Address::generate(&env);
+    client.pause();
+    let mut uris = soroban_sdk::Vec::new(&env);
+    uris.push_back(String::from_str(&env, "uri-0"));
+    let result = client.try_batch_mint(&alice, &uris);
+    assert_eq!(result, Err(Ok(Error::CollectionPaused)));
+}
+
+#[test]
+fn mint_succeeds_after_unpause() {
+    let (env, client, _, _) = setup();
+    let alice = Address::generate(&env);
+    client.pause();
+    client.unpause();
+    let id = client.mint(&alice, &String::from_str(&env, "uri"));
+    assert_eq!(client.owner_of(&id), alice);
+}
+
+#[test]
+fn transfer_unaffected_when_paused() {
+    let (env, client, _, _) = setup();
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    // Mint before pausing
+    let id = client.mint(&alice, &String::from_str(&env, "uri"));
+    client.pause();
+    // Transfer must still work while paused
+    client.transfer(&alice, &bob, &id);
+    assert_eq!(client.owner_of(&id), bob);
+}
+
+#[test]
+fn transfer_from_unaffected_when_paused() {
+    let (env, client, _, _) = setup();
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    let spender = Address::generate(&env);
+    let id = client.mint(&alice, &String::from_str(&env, "uri"));
+    client.approve(&alice, &spender, &id);
+    client.pause();
+    client.transfer_from(&spender, &alice, &bob, &id);
+    assert_eq!(client.owner_of(&id), bob);
+}
+
+#[test]
+fn burn_unaffected_when_paused() {
+    let (env, client, _, _) = setup();
+    let alice = Address::generate(&env);
+    let id = client.mint(&alice, &String::from_str(&env, "uri"));
+    client.approve(&alice, &alice, &id);
+    client.pause();
+    client.burn(&alice, &id);
+    let result = client.try_owner_of(&id);
+    assert_eq!(result, Err(Ok(Error::TokenNotFound)));
+}
+
+#[test]
+fn pause_non_creator_fails() {
+    let env = Env::default();
+    env.ledger().with_mut(|li| li.sequence_number = 1);
+    let contract_id = env.register(NormalNFT721, ());
+    let client = NormalNFT721Client::new(&env, &contract_id);
+    let creator = Address::generate(&env);
+    let receiver = Address::generate(&env);
+    client.initialize(
+        &creator,
+        &String::from_str(&env, "T"),
+        &String::from_str(&env, "T"),
+        &100u64,
+        &0u32,
+        &receiver,
+    );
+    assert!(client.try_pause().is_err());
+}
+
+#[test]
+fn unpause_non_creator_fails() {
+    let env = Env::default();
+    env.ledger().with_mut(|li| li.sequence_number = 1);
+    let contract_id = env.register(NormalNFT721, ());
+    let client = NormalNFT721Client::new(&env, &contract_id);
+    let creator = Address::generate(&env);
+    let receiver = Address::generate(&env);
+    client.initialize(
+        &creator,
+        &String::from_str(&env, "T"),
+        &String::from_str(&env, "T"),
+        &100u64,
+        &0u32,
+        &receiver,
+    );
+    assert!(client.try_unpause().is_err());
+}
+
+#[test]
+fn pause_idempotent_double_pause_stays_paused() {
+    let (_, client, _, _) = setup();
+    client.pause();
+    client.pause(); // second call must not error
+    assert!(client.is_paused());
+}
+
+#[test]
+fn unpause_idempotent_double_unpause_stays_unpaused() {
+    let (_, client, _, _) = setup();
+    client.unpause(); // never paused — must not error
+    assert!(!client.is_paused());
+}
+
+#[test]
+fn multiple_pause_unpause_cycles_work_correctly() {
+    let (env, client, _, _) = setup();
+    let alice = Address::generate(&env);
+
+    client.pause();
+    assert!(client.try_mint(&alice, &String::from_str(&env, "uri")).is_err());
+
+    client.unpause();
+    client.mint(&alice, &String::from_str(&env, "uri"));
+
+    client.pause();
+    assert!(client.try_mint(&alice, &String::from_str(&env, "uri2")).is_err());
+
+    client.unpause();
+    client.mint(&alice, &String::from_str(&env, "uri3"));
+
+    assert_eq!(client.total_supply(), 2u64);
+}
