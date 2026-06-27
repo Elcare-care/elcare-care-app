@@ -8,7 +8,8 @@
 #![allow(clippy::too_many_arguments, deprecated)]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, String, Vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Bytes, Env, String,
+    Vec,
 };
 
 const TTL_THRESHOLD: u32 = 50_000;
@@ -28,6 +29,8 @@ pub enum Error {
     MaxSupplyReached = 6,
     NotCreator = 7,
     InsufficientBalance = 8,
+    MetadataFrozen = 9, // base_uri cannot be updated after freeze
+    AlreadyFrozen = 10, // freeze_metadata called more than once
 }
 
 // ─── Storage Keys ─────────────────────────────────────────────────────────────
@@ -51,6 +54,29 @@ pub enum DataKey {
     Approved(u64),
     BalanceOf(Address),
     ApprovedForAll(Address, Address),
+    BaseUri,        // String — collection-level base URI (optional)
+    MetadataFrozen, // bool   — permanently frozen when true
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Convert a u64 to its decimal ASCII representation as a Soroban `String`.
+/// Used to build `base_uri + token_id` paths in `token_uri()`.
+fn u64_to_string(env: &Env, mut n: u64) -> String {
+    let mut buf = [0u8; 20]; // u64::MAX has 20 decimal digits
+    let mut len = 0usize;
+    if n == 0 {
+        buf[0] = b'0';
+        len = 1;
+    } else {
+        while n > 0 {
+            buf[len] = b'0' + (n % 10) as u8;
+            n /= 10;
+            len += 1;
+        }
+        buf[..len].reverse();
+    }
+    String::from_bytes(env, &buf[..len])
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -365,6 +391,23 @@ impl NormalNFT721 {
     }
 
     pub fn token_uri(env: Env, token_id: u64) -> Result<String, Error> {
+        // Verify the token exists first.
+        if !env.storage().persistent().has(&DataKey::Owner(token_id)) {
+            return Err(Error::TokenNotFound);
+        }
+        // If a base URI is set, return base_uri + token_id.
+        if let Some(base) = env
+            .storage()
+            .instance()
+            .get::<DataKey, String>(&DataKey::BaseUri)
+        {
+            let id_str = u64_to_string(&env, token_id);
+            let mut combined: Bytes = base.into();
+            let id_bytes: Bytes = id_str.into();
+            combined.append(&id_bytes);
+            return Ok(String::from(&combined));
+        }
+        // Fall back to per-token URI stored at mint time.
         env.storage()
             .persistent()
             .get(&DataKey::TokenUri(token_id))
@@ -449,6 +492,57 @@ impl NormalNFT721 {
             .set(&DataKey::RoyaltyReceiver, &receiver);
         env.storage().instance().set(&DataKey::RoyaltyBps, &bps);
         Ok(())
+    }
+
+    /// Update the collection-level base URI.  Reverts if metadata is frozen.
+    /// Callable only by creator.
+    pub fn set_base_uri(env: Env, base_uri: String) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
+        Self::only_creator(&env)?;
+        if env
+            .storage()
+            .instance()
+            .get::<DataKey, bool>(&DataKey::MetadataFrozen)
+            .unwrap_or(false)
+        {
+            return Err(Error::MetadataFrozen);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::BaseUri, &base_uri);
+        Ok(())
+    }
+
+    /// Permanently freeze metadata.  Can only be called once; subsequent calls
+    /// revert with `AlreadyFrozen`.  Callable only by creator.
+    pub fn freeze_metadata(env: Env) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
+        Self::only_creator(&env)?;
+        if env
+            .storage()
+            .instance()
+            .get::<DataKey, bool>(&DataKey::MetadataFrozen)
+            .unwrap_or(false)
+        {
+            return Err(Error::AlreadyFrozen);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::MetadataFrozen, &true);
+        Ok(())
+    }
+
+    /// Returns `true` if metadata has been permanently frozen.
+    pub fn is_metadata_frozen(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get::<DataKey, bool>(&DataKey::MetadataFrozen)
+            .unwrap_or(false)
+    }
+
+    /// Returns the stored base URI, or `None` if unset.
+    pub fn base_uri(env: Env) -> Option<String> {
+        env.storage().instance().get(&DataKey::BaseUri)
     }
 
     // ── Private helpers ───────────────────────────────────────────────────

@@ -559,3 +559,243 @@ fn next_token_id_advances_with_each_mint() {
     client.mint(&alice, &String::from_str(&env, "uri-1"));
     assert_eq!(client.next_token_id(), 2u64);
 }
+
+// ── Metadata management ───────────────────────────────────────────────────────
+
+#[test]
+fn base_uri_initially_none() {
+    let (_, client, _, _) = setup();
+    assert_eq!(client.base_uri(), None);
+}
+
+#[test]
+fn set_base_uri_stores_value() {
+    let (env, client, _, _) = setup();
+    client.set_base_uri(&String::from_str(&env, "ipfs://base/"));
+    assert_eq!(
+        client.base_uri(),
+        Some(String::from_str(&env, "ipfs://base/"))
+    );
+}
+
+#[test]
+fn set_base_uri_can_be_updated_before_freeze() {
+    let (env, client, _, _) = setup();
+    client.set_base_uri(&String::from_str(&env, "ipfs://v1/"));
+    client.set_base_uri(&String::from_str(&env, "ipfs://v2/"));
+    assert_eq!(
+        client.base_uri(),
+        Some(String::from_str(&env, "ipfs://v2/"))
+    );
+}
+
+#[test]
+fn set_base_uri_non_creator_fails() {
+    let env = Env::default();
+    env.ledger().with_mut(|li| li.sequence_number = 1);
+    // No mock_all_auths — creator auth will not be satisfied.
+    let contract_id = env.register(NormalNFT721, ());
+    let client = NormalNFT721Client::new(&env, &contract_id);
+    let creator = Address::generate(&env);
+    let royalty_receiver = Address::generate(&env);
+    client.initialize(
+        &creator,
+        &String::from_str(&env, "Test"),
+        &String::from_str(&env, "T"),
+        &100u64,
+        &0u32,
+        &royalty_receiver,
+    );
+    let result = client.try_set_base_uri(&String::from_str(&env, "ipfs://bad/"));
+    assert!(result.is_err());
+}
+
+#[test]
+fn is_metadata_frozen_defaults_false() {
+    let (_, client, _, _) = setup();
+    assert!(!client.is_metadata_frozen());
+}
+
+#[test]
+fn freeze_metadata_sets_frozen_flag() {
+    let (_, client, _, _) = setup();
+    client.freeze_metadata();
+    assert!(client.is_metadata_frozen());
+}
+
+#[test]
+fn freeze_metadata_twice_returns_already_frozen() {
+    let (_, client, _, _) = setup();
+    client.freeze_metadata();
+    let result = client.try_freeze_metadata();
+    assert_eq!(result, Err(Ok(Error::AlreadyFrozen)));
+}
+
+#[test]
+fn set_base_uri_after_freeze_returns_metadata_frozen() {
+    let (env, client, _, _) = setup();
+    client.freeze_metadata();
+    let result = client.try_set_base_uri(&String::from_str(&env, "ipfs://late/"));
+    assert_eq!(result, Err(Ok(Error::MetadataFrozen)));
+}
+
+#[test]
+fn set_base_uri_before_freeze_then_frozen_rejects_update() {
+    let (env, client, _, _) = setup();
+    client.set_base_uri(&String::from_str(&env, "ipfs://ok/"));
+    client.freeze_metadata();
+    // Attempt update after freeze
+    let result = client.try_set_base_uri(&String::from_str(&env, "ipfs://nope/"));
+    assert_eq!(result, Err(Ok(Error::MetadataFrozen)));
+    // Original base URI still intact
+    assert_eq!(
+        client.base_uri(),
+        Some(String::from_str(&env, "ipfs://ok/"))
+    );
+}
+
+#[test]
+fn freeze_metadata_non_creator_fails() {
+    let env = Env::default();
+    env.ledger().with_mut(|li| li.sequence_number = 1);
+    let contract_id = env.register(NormalNFT721, ());
+    let client = NormalNFT721Client::new(&env, &contract_id);
+    let creator = Address::generate(&env);
+    let royalty_receiver = Address::generate(&env);
+    client.initialize(
+        &creator,
+        &String::from_str(&env, "Test"),
+        &String::from_str(&env, "T"),
+        &100u64,
+        &0u32,
+        &royalty_receiver,
+    );
+    let result = client.try_freeze_metadata();
+    assert!(result.is_err());
+}
+
+#[test]
+fn token_uri_returns_base_uri_plus_token_id_when_base_set() {
+    let (env, client, _, _) = setup();
+    let alice = Address::generate(&env);
+
+    client.set_base_uri(&String::from_str(&env, "https://api.example.com/metadata/"));
+    let id = client.mint(&alice, &String::from_str(&env, "ignored-uri"));
+
+    assert_eq!(
+        client.token_uri(&id),
+        String::from_str(&env, "https://api.example.com/metadata/0")
+    );
+}
+
+#[test]
+fn token_uri_base_uri_with_multiple_tokens() {
+    let (env, client, _, _) = setup();
+    let alice = Address::generate(&env);
+
+    client.set_base_uri(&String::from_str(&env, "ipfs://col/"));
+    client.mint(&alice, &String::from_str(&env, "u0"));
+    client.mint(&alice, &String::from_str(&env, "u1"));
+    let id2 = client.mint(&alice, &String::from_str(&env, "u2"));
+
+    assert_eq!(
+        client.token_uri(&0u64),
+        String::from_str(&env, "ipfs://col/0")
+    );
+    assert_eq!(
+        client.token_uri(&1u64),
+        String::from_str(&env, "ipfs://col/1")
+    );
+    assert_eq!(
+        client.token_uri(&id2),
+        String::from_str(&env, "ipfs://col/2")
+    );
+}
+
+#[test]
+fn token_uri_falls_back_to_per_token_uri_when_no_base_uri() {
+    let (env, client, _, _) = setup();
+    let alice = Address::generate(&env);
+
+    let id = client.mint(&alice, &String::from_str(&env, "ipfs://Qmabc"));
+    // No base URI set — should return per-token URI unchanged.
+    assert_eq!(
+        client.token_uri(&id),
+        String::from_str(&env, "ipfs://Qmabc")
+    );
+}
+
+#[test]
+fn token_uri_returns_token_not_found_for_nonexistent_token() {
+    let (_, client, _, _) = setup();
+    let result = client.try_token_uri(&999u64);
+    assert_eq!(result, Err(Ok(Error::TokenNotFound)));
+}
+
+#[test]
+fn token_uri_with_base_uri_returns_not_found_for_nonexistent_token() {
+    let (env, client, _, _) = setup();
+    client.set_base_uri(&String::from_str(&env, "ipfs://col/"));
+    let result = client.try_token_uri(&999u64);
+    assert_eq!(result, Err(Ok(Error::TokenNotFound)));
+}
+
+#[test]
+fn token_uri_boundary_token_id_zero() {
+    let (env, client, _, _) = setup();
+    let alice = Address::generate(&env);
+    client.set_base_uri(&String::from_str(&env, "https://x/"));
+    let id = client.mint(&alice, &String::from_str(&env, "u"));
+    assert_eq!(id, 0u64);
+    assert_eq!(
+        client.token_uri(&id),
+        String::from_str(&env, "https://x/0")
+    );
+}
+
+#[test]
+fn token_uri_frozen_base_uri_still_returns_correct_uri() {
+    let (env, client, _, _) = setup();
+    let alice = Address::generate(&env);
+
+    client.set_base_uri(&String::from_str(&env, "ipfs://frozen/"));
+    let id = client.mint(&alice, &String::from_str(&env, "u"));
+    client.freeze_metadata();
+
+    // After freeze, token_uri still works correctly.
+    assert_eq!(
+        client.token_uri(&id),
+        String::from_str(&env, "ipfs://frozen/0")
+    );
+    // And base URI is unchanged.
+    assert_eq!(
+        client.base_uri(),
+        Some(String::from_str(&env, "ipfs://frozen/"))
+    );
+}
+
+#[test]
+fn base_uri_update_changes_token_uri_for_all_tokens() {
+    let (env, client, _, _) = setup();
+    let alice = Address::generate(&env);
+
+    client.mint(&alice, &String::from_str(&env, "old-uri-0"));
+    client.mint(&alice, &String::from_str(&env, "old-uri-1"));
+
+    // Before base URI is set, per-token URIs are returned.
+    assert_eq!(
+        client.token_uri(&0u64),
+        String::from_str(&env, "old-uri-0")
+    );
+
+    // Set base URI — overrides all tokens.
+    client.set_base_uri(&String::from_str(&env, "https://new/"));
+    assert_eq!(
+        client.token_uri(&0u64),
+        String::from_str(&env, "https://new/0")
+    );
+    assert_eq!(
+        client.token_uri(&1u64),
+        String::from_str(&env, "https://new/1")
+    );
+}
