@@ -7,6 +7,7 @@ import { startPolling } from './poller.js';
 import { rateLimiter } from './api/rate-limit-middleware.js';
 import { metricsMiddleware, handleMetrics } from './metrics.js';
 import { errorHandler } from './api/errors.js';
+import { startReconciler } from './reconciler.js';
 import prisma from './db.js';
 
 dotenv.config();
@@ -77,5 +78,10 @@ app.listen(PORT, () => {
     startPolling().catch((err) => {
         console.error('Fatal error in poller:', err);
         process.exit(1);
+    });
+
+    // Start the periodic reconciliation job (non-fatal if it fails)
+    startReconciler().catch((err) => {
+        console.error('[Reconciler] Failed to start:', err);
     });
 });
