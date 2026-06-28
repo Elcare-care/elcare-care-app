@@ -13,20 +13,55 @@ use crate::events::*;
 use crate::{
     storage::{
         acquire_auction_lock, acquire_listing_lock, add_artist_auction_id, add_artist_listing_id,
-        add_to_active_listings, clear_pending_admin_storage, get_active_listing_ids,
-        get_artist_auction_ids, get_artist_listing_ids, get_auction_count, get_listing_count,
-        get_pending_admin_storage, increment_auction_count, increment_listing_count,
-        increment_offer_count, is_artist_revoked_storage, load_auction, load_listing,
+        add_to_active_listings, append_bid_record, clear_pending_admin_storage,
+        get_active_listing_ids, get_artist_auction_ids, get_artist_listing_ids,
+        get_auction_count, get_listing_count, get_pending_admin_storage,
+        increment_auction_count, increment_listing_count, increment_offer_count,
+        is_artist_revoked_storage, load_auction, load_auction_bids, load_listing,
         load_listing_offers, load_offer, load_offerer_offers, release_auction_lock,
         release_listing_lock, remove_artist_revocation_storage, remove_from_active_listings,
         save_auction, save_listing, save_listing_offers, save_offer, save_offerer_offers,
         set_artist_revocation_storage, set_pending_admin_storage,
+        get_auction_extension_window_storage, get_auction_extension_trigger_storage,
+        set_auction_extension_window_storage, set_auction_extension_trigger_storage,
+        get_min_price_storage, get_max_price_storage,
+        set_min_price_storage, set_max_price_storage,
+        is_migration_done, set_migration_done,
     },
     types::{
-        Auction, AuctionStatus, CancelReason, Listing, ListingStatus, MarketplaceError, Offer,
-        OfferStatus, Recipient,
+        Auction, AuctionStatus, BidRecord, CancelReason, Listing, ListingStatus,
+        MarketplaceError, Offer, OfferStatus, Recipient,
     },
 };
+
+/// Default minimum bid increment used when no global value has been configured.
+/// A value of 1 preserves the invariant that a new bid must strictly exceed the
+/// previous highest bid.
+const DEFAULT_MIN_BID_INCREMENT: i128 = 1;
+
+/// Default anti-sniping extension window: 10 minutes. New auctions inherit this
+/// unless the admin has configured a different value before auction creation.
+const DEFAULT_EXTENSION_WINDOW: u64 = 600;
+
+/// Default anti-sniping trigger: a bid placed when fewer than 5 minutes remain
+/// triggers the extension. Set to 0 to disable the feature by default.
+const DEFAULT_EXTENSION_TRIGGER: u64 = 0;
+
+/// Minimum auction duration in seconds (1 hour).
+///
+/// An auction whose computed `end_time = now + duration` would be less than
+/// `MIN_AUCTION_DURATION` seconds in the future is rejected with
+/// `InvalidAuctionDuration`.  This prevents meaningless or front-runnable
+/// auctions that expire almost immediately.
+const MIN_AUCTION_DURATION: u64 = 3_600; // 1 hour
+
+/// Maximum number of bid records retained per auction in the on-chain history.
+///
+/// When a new bid is placed and the history already holds `BID_HISTORY_CAP`
+/// entries, the oldest entry is evicted so storage growth is strictly bounded.
+/// Exposed via `get_auction_bids` for contract-side verification and frontend
+/// fallback.
+const BID_HISTORY_CAP: u32 = 20;
 
 #[contract]
 pub struct MarketplaceContract;
@@ -91,6 +126,102 @@ impl MarketplaceContract {
         .publish(&env);
     }
 
+    // ── Contract versioning & migration ──────────────────────────
+
+    /// Returns the semantic version of this contract deployment.
+    ///
+    /// Callers (off-chain indexers, upgrade scripts) can use this to decide
+    /// whether a `migrate` call is necessary before using new storage keys.
+    pub fn version(env: Env) -> soroban_sdk::String {
+        soroban_sdk::String::from_str(&env, CONTRACT_VERSION)
+    }
+
+    /// Admin-guarded, idempotent storage migration entry point.
+    ///
+    /// # Idempotency
+    /// The function records a per-version marker in persistent storage the
+    /// first time it is called.  Subsequent calls for the *same* version
+    /// revert with `AlreadyMigrated` so that accidental double-invocations
+    /// during upgrade scripts are caught rather than silently re-executed.
+    ///
+    /// # Usage
+    /// Upgrade scripts should:
+    /// 1. Deploy the new WASM and invoke `migrate(admin)`.
+    /// 2. Verify `version()` returns the expected string.
+    /// 3. Any data back-fill should be performed inside this function body
+    ///    for the specific version being migrated to.
+    pub fn migrate(env: Env, admin: Address) {
+        admin.require_auth();
+        let stored_admin = Self::get_admin(env.clone()).expect("admin not set");
+        if admin != stored_admin {
+            panic_with_error!(&env, MarketplaceError::Unauthorized);
+        }
+
+        let version = soroban_sdk::String::from_str(&env, CONTRACT_VERSION);
+
+        // Guard: revert if this migration has already been applied.
+        if is_migration_done(&env, &version) {
+            panic_with_error!(&env, MarketplaceError::AlreadyMigrated);
+        }
+
+        // ── Per-version migration logic ──────────────────────────────
+        // Add version-specific storage shape changes here.  Each released
+        // version gets its own `if version == "x.y.z" { ... }` block.
+        // Example for a future 1.1.0 migration:
+        //   if version_str == "1.1.0" {
+        //       // back-fill new field on existing listings...
+        //   }
+        //
+        // For 1.0.0 there is no storage shape change — the marker alone
+        // establishes forward compatibility for subsequent upgrades.
+        // ────────────────────────────────────────────────────────────
+
+        // Record the migration marker so this version is not re-applied.
+        set_migration_done(&env, &version);
+    }
+
+    // ── Global price bounds ───────────────────────────────────────
+
+    /// Set global minimum and maximum price bounds for listings and auctions.
+    ///
+    /// Both `min` and `max` must be positive and `min <= max`.  Any subsequent
+    /// `create_listing` or `create_auction` call whose price falls outside
+    /// `[min, max]` will revert with `PriceOutOfBounds`.
+    ///
+    /// # Backward compatibility
+    /// Existing listings and auctions are NOT retroactively affected.  Only new
+    /// items created after the bounds are set are validated against them.
+    ///
+    /// # Disabling bounds
+    /// Pass `min = 0` or call the setter with very large values to make a bound
+    /// effectively permissive.  To fully remove bounds, `set_price_bounds` can
+    /// be called with `min = 1` and `max = i128::MAX / 10_000` (the existing
+    /// overflow-safety ceiling already applied in `update_listing_price`).
+    pub fn set_price_bounds(env: Env, admin: Address, min: i128, max: i128) {
+        admin.require_auth();
+        let stored_admin = Self::get_admin(env.clone()).expect("admin not set");
+        if admin != stored_admin {
+            panic_with_error!(&env, MarketplaceError::Unauthorized);
+        }
+        // Both bounds must be non-negative and min <= max.
+        if min < 0 || max < 0 || min > max {
+            panic_with_error!(&env, MarketplaceError::InvalidPrice);
+        }
+        set_min_price_storage(&env, min);
+        set_max_price_storage(&env, max);
+    }
+
+    /// Returns `(min_price, max_price)` — the current global price bounds.
+    ///
+    /// A value of `None` means the corresponding bound has not been configured
+    /// and is treated permissively (no limit in that direction).
+    pub fn get_price_bounds(env: Env) -> (Option<i128>, Option<i128>) {
+        (
+            get_min_price_storage(&env),
+            get_max_price_storage(&env),
+        )
+    }
+
     pub fn set_treasury(env: Env, admin: Address, treasury: Address) {
         admin.require_auth();
         let stored_admin = Self::get_admin(env.clone()).expect("admin not set");
@@ -118,6 +249,56 @@ impl MarketplaceContract {
 
     pub fn get_protocol_fee(env: Env) -> u32 {
         crate::storage::get_protocol_fee_bps_storage(&env).unwrap_or(0)
+    }
+
+    /// Set the global minimum bid increment (in payment-token stroops). New
+    /// auctions snapshot this value at creation. Admin-only; must be non-negative.
+    pub fn set_min_bid_increment(env: Env, admin: Address, increment: i128) {
+        admin.require_auth();
+        let stored_admin = Self::get_admin(env.clone()).expect("admin not set");
+        if admin != stored_admin {
+            panic_with_error!(&env, MarketplaceError::Unauthorized);
+        }
+        if increment < 0 {
+            panic_with_error!(&env, MarketplaceError::InvalidPrice);
+        }
+        crate::storage::set_min_bid_increment_storage(&env, increment);
+    }
+
+    pub fn get_min_bid_increment(env: Env) -> i128 {
+        crate::storage::get_min_bid_increment_storage(&env).unwrap_or(DEFAULT_MIN_BID_INCREMENT)
+    }
+
+    /// Set the global auction extension window in seconds (anti-sniping feature).
+    /// When a qualifying bid arrives near the end of an auction, the end time is
+    /// extended by this many seconds. Admin-only. New auctions snapshot this value.
+    pub fn set_auction_extension_window(env: Env, admin: Address, window: u64) {
+        admin.require_auth();
+        let stored_admin = Self::get_admin(env.clone()).expect("admin not set");
+        if admin != stored_admin {
+            panic_with_error!(&env, MarketplaceError::Unauthorized);
+        }
+        set_auction_extension_window_storage(&env, window);
+    }
+
+    pub fn get_auction_extension_window(env: Env) -> u64 {
+        get_auction_extension_window_storage(&env).unwrap_or(DEFAULT_EXTENSION_WINDOW)
+    }
+
+    /// Set the global auction extension trigger threshold in seconds (anti-sniping).
+    /// If `end_time - now < trigger` when a bid is placed, the anti-sniping rule fires.
+    /// Admin-only. New auctions snapshot this value.
+    pub fn set_auction_extension_trigger(env: Env, admin: Address, trigger: u64) {
+        admin.require_auth();
+        let stored_admin = Self::get_admin(env.clone()).expect("admin not set");
+        if admin != stored_admin {
+            panic_with_error!(&env, MarketplaceError::Unauthorized);
+        }
+        set_auction_extension_trigger_storage(&env, trigger);
+    }
+
+    pub fn get_auction_extension_trigger(env: Env) -> u64 {
+        get_auction_extension_trigger_storage(&env).unwrap_or(DEFAULT_EXTENSION_TRIGGER)
     }
 
     // ── Pause/Unpause Mechanism ────────────────────────────
@@ -275,14 +456,23 @@ impl MarketplaceContract {
         collection: Address,
         token_id: u64,
         recipients: Vec<Recipient>,
+        expires_at: Option<u64>,
     ) -> u64 {
         Self::require_not_paused(&env);
         artist.require_auth();
-        if Self::is_artist_revoked(env.clone(), artist.clone()) {
-            panic_with_error!(&env, MarketplaceError::ArtistRevoked);
-        }
+        Self::require_not_revoked(&env, &artist);
         if price <= 0 {
             panic_with_error!(&env, MarketplaceError::InvalidPrice);
+        }
+
+        // Enforce admin-configured global price bounds when set.
+        Self::require_price_in_bounds(&env, price);
+
+        // Validate expiry is strictly in the future if provided
+        if let Some(exp) = expires_at {
+            if exp <= env.ledger().timestamp() {
+                panic_with_error!(&env, MarketplaceError::InvalidPrice);
+            }
         }
 
         let recipients_len = recipients.len();
@@ -322,6 +512,7 @@ impl MarketplaceContract {
             owner: None,
             created_at: env.ledger().sequence(),
             protocol_fee_bps, // Snapshot the fee at creation time
+            expires_at,
         };
         save_listing(&env, &listing);
         add_artist_listing_id(&env, &artist, listing_id);
@@ -452,9 +643,24 @@ impl MarketplaceContract {
             release_listing_lock(&env, listing_id);
             panic_with_error!(&env, MarketplaceError::ListingNotActive);
         }
+        // Reject self-purchase: buyer must not be the listing artist (original
+        // creator) or the current NFT owner. Using a dedicated error code so
+        // indexers and clients surface a clear reason rather than a generic 5.
         if listing.artist == buyer {
             release_listing_lock(&env, listing_id);
-            panic_with_error!(&env, MarketplaceError::CannotBuyOwnListing);
+            panic_with_error!(&env, MarketplaceError::SelfPurchaseNotAllowed);
+        }
+        if let Some(ref owner) = listing.owner {
+            if *owner == buyer {
+                release_listing_lock(&env, listing_id);
+                panic_with_error!(&env, MarketplaceError::SelfPurchaseNotAllowed);
+            }
+        }
+        if let Some(exp) = listing.expires_at {
+            if env.ledger().timestamp() >= exp {
+                release_listing_lock(&env, listing_id);
+                panic_with_error!(&env, MarketplaceError::ListingExpired);
+            }
         }
 
         // Ensure token is still whitelisted at purchase time. If it was removed after listing creation, block the purchase.
@@ -504,7 +710,7 @@ impl MarketplaceContract {
         // ── INTERACTIONS (external calls after all state is final) ───────────
 
         // Use the snapshotted protocol fee from the listing, not the current global fee
-        Self::distribute_payout(
+        let fee_collected = Self::distribute_payout(
             &env,
             &listing.token,
             &listing.collection,
@@ -515,6 +721,19 @@ impl MarketplaceContract {
             true,
             listing.protocol_fee_bps, // Use snapshotted fee
         );
+
+        // Emit ProtocolFeeCollected so treasury revenue is observable on-chain.
+        if fee_collected > 0 {
+            if let Some(treasury) = crate::storage::get_treasury_storage(&env) {
+                ProtocolFeeCollectedEvent {
+                    listing_id,
+                    amount: fee_collected,
+                    token: listing.token.clone(),
+                    treasury,
+                }
+                .publish(&env);
+            }
+        }
 
         // Transfer the NFT
         env.invoke_contract::<()>(
@@ -584,91 +803,103 @@ impl MarketplaceContract {
         true
     }
 
-    /// Maximum number of listing IDs accepted by `cancel_listings`.
-    /// Calls with a larger vector revert with `BatchTooLarge`.
-    pub const MAX_BATCH_CANCEL: u32 = 20;
+    // ── update_listing_price ─────────────────────────────────────────────────
+    //
+    // Allows the listing owner to update the price of an active listing in
+    // place without cancelling and re-creating it.  The listing id and
+    // creation ledger are preserved.  A ListingPriceUpdated event is emitted
+    // with both the old and new price so indexers can reconstruct a full price
+    // history.
 
-    /// Batch-cancel multiple listings owned by `seller` in a single call.
-    ///
-    /// # Strict-mode policy
-    /// If any listing in `listing_ids`:
-    ///   - does not exist,
-    ///   - is not owned by `seller`, or
-    ///   - is not `Active`
-    /// the entire call reverts.  This prevents silent partial failures that
-    /// would leave the caller uncertain about which listings were cancelled.
-    ///
-    /// Pending offers on each cancelled listing are refunded (same as
-    /// `cancel_listing`).  One `ListingCancelledEvent` is emitted per listing.
-    ///
-    /// # Resource cap
-    /// `listing_ids.len()` must not exceed `MAX_BATCH_CANCEL`; over-cap
-    /// calls revert with `BatchTooLarge` before any state is mutated.
-    pub fn cancel_listings(env: Env, seller: Address, listing_ids: Vec<u64>) -> u32 {
+    pub fn update_listing_price(
+        env: Env,
+        seller: Address,
+        listing_id: u64,
+        new_price: i128,
+    ) -> bool {
         Self::require_not_paused(&env);
         seller.require_auth();
 
-        // ── Resource cap ────────────────────────────────────────────────────
-        if listing_ids.len() > Self::MAX_BATCH_CANCEL {
-            panic_with_error!(&env, MarketplaceError::BatchTooLarge);
+        let mut listing = load_listing(&env, listing_id)
+            .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::ListingNotFound));
+
+        // Only the listing owner (artist) may update the price.
+        if listing.artist != seller {
+            panic_with_error!(&env, MarketplaceError::Unauthorized);
         }
 
-        // ── Strict validation pass (no state mutations yet) ─────────────────
-        // Walk every id and validate ownership / status upfront so that a
-        // single bad entry causes a clean revert before any listing is mutated.
-        for i in 0..listing_ids.len() {
-            let listing_id = listing_ids.get(i).unwrap();
-            let listing = match load_listing(&env, listing_id) {
-                Some(l) => l,
-                None => panic_with_error!(&env, MarketplaceError::ListingNotFound),
-            };
-            if listing.artist != seller {
-                panic_with_error!(&env, MarketplaceError::Unauthorized);
-            }
-            if listing.status != ListingStatus::Active {
-                panic_with_error!(&env, MarketplaceError::ListingNotActive);
-            }
+        // Listing must still be active.
+        if listing.status != ListingStatus::Active {
+            panic_with_error!(&env, MarketplaceError::ListingNotActive);
         }
 
-        // ── Mutation pass ────────────────────────────────────────────────────
-        // All validations passed; now cancel each listing and refund offers.
-        let mut cancelled: u32 = 0;
-        for i in 0..listing_ids.len() {
-            let listing_id = listing_ids.get(i).unwrap();
-            let mut listing = load_listing(&env, listing_id).unwrap();
-
-            // Refund and reject all pending offers.
-            let offers = load_listing_offers(&env, listing_id);
-            for offer_id in offers.iter() {
-                if let Some(mut offer) = load_offer(&env, offer_id) {
-                    if offer.status == OfferStatus::Pending {
-                        TokenClient::new(&env, &offer.token).transfer(
-                            &env.current_contract_address(),
-                            &offer.offerer,
-                            &offer.amount,
-                        );
-                        offer.status = OfferStatus::Rejected;
-                        save_offer(&env, &offer);
-                    }
-                }
-            }
-
-            listing.status = ListingStatus::Cancelled;
-            save_listing(&env, &listing);
-            remove_from_active_listings(&env, listing_id);
-
-            ListingCancelledEvent {
-                listing_id,
-                cancelled_by: seller.clone(),
-                reason: crate::types::CancelReason::Owner,
-                ledger_sequence: env.ledger().sequence(),
-            }
-            .publish(&env);
-
-            cancelled += 1;
+        // Validate the new price is positive.
+        if new_price <= 0 {
+            panic_with_error!(&env, MarketplaceError::InvalidPrice);
         }
 
-        cancelled
+        // Upper-bound sanity: price must not exceed i128::MAX / 10_000 to avoid
+        // overflow in the payout distribution math.
+        let price_upper_bound: i128 = i128::MAX / 10_000;
+        if new_price > price_upper_bound {
+            panic_with_error!(&env, MarketplaceError::InvalidPrice);
+        }
+
+        let old_price = listing.price;
+        listing.price = new_price;
+
+        // Persist the updated listing and bump its TTL so the change is durable.
+        save_listing(&env, &listing);
+
+        crate::events::ListingPriceUpdatedEvent {
+            listing_id,
+            old_price,
+            new_price,
+            updated_by: seller.clone(),
+        }
+        .publish(&env);
+
+        true
+    }
+
+    // ── expire_listing ───────────────────────────────────────────────────────
+    //
+    // Permissionless entry point: anyone may call this to move an expired
+    // listing out of the active set.  The listing must have an `expires_at`
+    // timestamp that has already passed.  Calling it before expiry reverts
+    // with ListingNotExpired.
+
+    pub fn expire_listing(env: Env, listing_id: u64) {
+        let mut listing = load_listing(&env, listing_id)
+            .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::ListingNotFound));
+
+        // Only Active listings can be expired.
+        if listing.status != ListingStatus::Active {
+            panic_with_error!(&env, MarketplaceError::ListingNotActive);
+        }
+
+        // The listing must actually have an expiry and it must have passed.
+        let exp = match listing.expires_at {
+            Some(t) => t,
+            None => panic_with_error!(&env, MarketplaceError::ListingNotExpired),
+        };
+        if env.ledger().timestamp() < exp {
+            panic_with_error!(&env, MarketplaceError::ListingNotExpired);
+        }
+
+        // ── Effects ──────────────────────────────────────────────────────────
+        // Mark the listing Cancelled (semantically: expired).  We reuse the
+        // Cancelled status so the indexer only has to handle one terminal state.
+        listing.status = ListingStatus::Cancelled;
+        save_listing(&env, &listing);
+        remove_from_active_listings(&env, listing_id);
+
+        crate::events::ListingExpiredEvent {
+            listing_id,
+            expired_at: exp,
+            ledger_sequence: env.ledger().sequence(),
+        }
+        .publish(&env);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -684,17 +915,35 @@ impl MarketplaceContract {
     ) -> u64 {
         Self::require_not_paused(&env);
         creator.require_auth();
-        if Self::is_artist_revoked(env.clone(), creator.clone()) {
-            panic_with_error!(&env, MarketplaceError::Unauthorized);
-        }
+        Self::require_not_revoked(&env, &creator);
         if reserve_price <= 0 {
             panic_with_error!(&env, MarketplaceError::InvalidPrice);
+        }
+        // Enforce a minimum auction duration so auctions that would expire
+        // nearly immediately (or in the past) are rejected up front.
+        // MIN_AUCTION_DURATION is documented in the constant declaration above.
+        if duration < MIN_AUCTION_DURATION {
+            panic_with_error!(&env, MarketplaceError::InvalidAuctionDuration);
         }
         if !Self::is_token_whitelisted(&env, &token) {
             panic_with_error!(&env, MarketplaceError::TokenNotWhitelisted);
         }
         let auction_id = increment_auction_count(&env);
         let end_time = env.ledger().timestamp() + duration;
+        // Snapshot the global minimum bid increment so the auction's bidding
+        // rules are fixed at creation time, regardless of later admin changes.
+        let min_increment = crate::storage::get_min_bid_increment_storage(&env)
+            .unwrap_or(DEFAULT_MIN_BID_INCREMENT);
+        // Snapshot the anti-sniping parameters so the auction's extension
+        // behaviour is determined at creation, not by future admin changes.
+        let extension_window = get_auction_extension_window_storage(&env)
+            .unwrap_or(DEFAULT_EXTENSION_WINDOW);
+        let extension_trigger = get_auction_extension_trigger_storage(&env)
+            .unwrap_or(DEFAULT_EXTENSION_TRIGGER);
+        // Snapshot the global protocol fee so settlement math is fixed at
+        // creation time — consistent with how listings work (ISSUE-005 parity).
+        let protocol_fee_bps =
+            crate::storage::get_protocol_fee_bps_storage(&env).unwrap_or(0);
         let auction = Auction {
             auction_id,
             creator: creator.clone(),
@@ -707,6 +956,10 @@ impl MarketplaceContract {
             end_time,
             status: AuctionStatus::Active,
             recipients,
+            min_increment,
+            extension_window,
+            extension_trigger,
+            protocol_fee_bps,
         };
         save_auction(&env, &auction);
         add_artist_auction_id(&env, &creator, auction_id);
@@ -736,18 +989,71 @@ impl MarketplaceContract {
         if env.ledger().timestamp() >= auction.end_time {
             panic_with_error!(&env, MarketplaceError::AuctionExpired);
         }
-        if amount <= auction.highest_bid || amount < auction.reserve_price {
+        // Block shill bidding: the auction creator must not be able to bid on
+        // their own auction.  This prevents artificial price inflation and
+        // protects legitimate bidders from being outbid by the seller.
+        if bidder == auction.creator {
+            panic_with_error!(&env, MarketplaceError::SelfBidNotAllowed);
+        }
+        // Enforce the minimum acceptable bid on-chain:
+        //   • first bid (no prior bidder): must be at least `reserve_price`.
+        //   • subsequent bids: must exceed the current highest bid by at least
+        //     `min_increment`, computed with checked arithmetic to avoid overflow.
+        let required_min = if auction.highest_bid == 0 {
+            auction.reserve_price
+        } else {
+            auction
+                .highest_bid
+                .checked_add(auction.min_increment)
+                .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::BidTooLow))
+        };
+        if amount < required_min {
             panic_with_error!(&env, MarketplaceError::BidTooLow);
         }
 
-        let token_client = TokenClient::new(&env, &auction.token);
-        if let Some(prev) = auction.highest_bidder.clone() {
-            token_client.transfer(&env.current_contract_address(), &prev, &auction.highest_bid);
-        }
-        token_client.transfer(&bidder, &env.current_contract_address(), &amount);
+        // Capture the previous highest bidder/amount before they are overwritten,
+        // so the escrowed funds can be refunded after state is recorded.
+        let previous_bidder = auction.highest_bidder.clone();
+        let previous_bid = auction.highest_bid;
+
+        // ── CHECKS-EFFECTS-INTERACTIONS ──────────────────────────────────────
+        // Record the new highest bid BEFORE moving any tokens, so a reentrant
+        // place_bid on the same auction observes the updated state. The whole
+        // call is atomic: if any transfer below fails, all of these effects roll
+        // back, so escrow can never be left inconsistent.
         auction.highest_bid = amount;
         auction.highest_bidder = Some(bidder.clone());
+
+        // ── Anti-sniping: extend the auction when a bid arrives near the end ─
+        // Only fires when extension_trigger > 0 (opt-in). If the time remaining
+        // is strictly less than the trigger threshold, push the end time forward
+        // by the configured extension window.
+        let now = env.ledger().timestamp();
+        let time_remaining = auction.end_time.saturating_sub(now);
+        let mut extended = false;
+        if auction.extension_trigger > 0 && time_remaining < auction.extension_trigger {
+            auction.end_time = now
+                .checked_add(auction.extension_window)
+                .unwrap_or(auction.end_time);
+            extended = true;
+        }
+
         save_auction(&env, &auction);
+
+        // ── Record bid in bounded history ────────────────────────────────────
+        // The history is capped to BID_HISTORY_CAP entries; the oldest is
+        // evicted when the cap is reached.  Chronological (oldest-to-newest)
+        // order is preserved, so index 0 is always the earliest retained bid.
+        append_bid_record(
+            &env,
+            auction_id,
+            &BidRecord {
+                bidder: bidder.clone(),
+                amount,
+                ledger: env.ledger().sequence(),
+            },
+            BID_HISTORY_CAP,
+        );
 
         BidPlacedEvent {
             auction_id,
@@ -755,13 +1061,48 @@ impl MarketplaceContract {
             bid_amount: amount,
         }
         .publish(&env);
+
+        // Emit AuctionExtended after the bid event so indexers can correlate
+        // a single ledger's events: bid → optional extension.
+        if extended {
+            AuctionExtendedEvent {
+                auction_id,
+                new_end_time: auction.end_time,
+            }
+            .publish(&env);
+        }
+
+        // ── INTERACTIONS ─────────────────────────────────────────────────────
+        // Refund the previous bidder's escrow, then pull the new bid into escrow.
+        // Net effect: contract-held escrow for this auction equals `amount`, the
+        // new highest bid.
+        let token_client = TokenClient::new(&env, &auction.token);
+        if let Some(prev) = previous_bidder {
+            token_client.transfer(&env.current_contract_address(), &prev, &previous_bid);
+        }
+        token_client.transfer(&bidder, &env.current_contract_address(), &amount);
     }
 
     pub fn finalize_auction(env: Env, caller: Address, auction_id: u64) {
+        // ─────────────────────────────────────────────────────────────────────
+        // CHECKS-EFFECTS-INTERACTIONS ordering:
+        //   1. Acquire reentrancy lock.
+        //   2. Load & validate auction (status + time).
+        //   3. Mutate state to Finalized/Cancelled (Effects).
+        //   4. Emit event (Effects).
+        //   5. Execute all external calls — token payout and NFT transfer
+        //      (Interactions).
+        //   6. Release lock.
+        //
+        // Any caller may finalize once `now >= end_time`.  Early calls revert
+        // with AuctionNotEnded so the auction cannot be settled prematurely.
+        // A second call on an already-settled auction reverts with
+        // AuctionAlreadyFinalized regardless of who calls.
+        // ─────────────────────────────────────────────────────────────────────
         Self::require_not_paused(&env);
         caller.require_auth();
 
-        // Reentrancy guard
+        // ── 1. Reentrancy guard ───────────────────────────────────────────────
         if !acquire_auction_lock(&env, auction_id) {
             panic_with_error!(&env, MarketplaceError::ReentrancyGuard);
         }
@@ -774,65 +1115,143 @@ impl MarketplaceContract {
             }
         };
 
-        // Status check
+        // ── 2. Checks ─────────────────────────────────────────────────────────
+        // Status: reject any attempt on an already-settled auction.
         if auction.status != AuctionStatus::Active {
             release_auction_lock(&env, auction_id);
             panic_with_error!(&env, MarketplaceError::AuctionAlreadyFinalized);
         }
 
-        // Time check
+        // Time: anyone may finalize only after the auction has ended.
         if env.ledger().timestamp() < auction.end_time {
-            if caller != auction.creator {
-                release_auction_lock(&env, auction_id);
-                panic_with_error!(&env, MarketplaceError::Unauthorized);
-            }
+            release_auction_lock(&env, auction_id);
+            panic_with_error!(&env, MarketplaceError::AuctionNotEnded);
         }
 
-        let (finalized_winner, finalized_amount) =
-            if let Some(ref winner) = auction.highest_bidder.clone() {
-                // Auctions use the live global protocol fee at finalization time.
-                // (Auctions are not listings and do not snapshot the fee at creation.)
-                let auction_fee_bps =
-                    crate::storage::get_protocol_fee_bps_storage(&env).unwrap_or(0);
-                Self::distribute_payout(
-                    &env,
-                    &auction.token,
-                    &auction.collection,
-                    auction.highest_bid,
-                    &auction.creator,
-                    &auction.recipients,
-                    winner,
-                    false,
-                    auction_fee_bps,
-                );
+        // ── 3. Effects — mutate state before any interaction ──────────────────
+        // Capture settlement data before overwriting auction fields.
+        let winner = auction.highest_bidder.clone();
+        let winning_bid = auction.highest_bid;
+        let snapshotted_fee = auction.protocol_fee_bps;
 
-                // Transfer the NFT
-                env.invoke_contract::<()>(
-                    &auction.collection,
-                    &soroban_sdk::Symbol::new(&env, "transfer_from"),
-                    soroban_sdk::vec![
-                        &env,
-                        env.current_contract_address().into_val(&env),
-                        auction.creator.into_val(&env),
-                        winner.into_val(&env),
-                        auction.token_id.into_val(&env)
-                    ],
-                );
-
-                auction.status = AuctionStatus::Finalized;
-                (Some(winner.clone()), auction.highest_bid)
-            } else {
-                auction.status = AuctionStatus::Cancelled;
-                (None, 0)
-            };
-
+        if winner.is_some() {
+            auction.status = AuctionStatus::Finalized;
+        } else {
+            auction.status = AuctionStatus::Cancelled;
+        }
         save_auction(&env, &auction);
-        release_auction_lock(&env, auction_id);
 
+        // ── 4. Event ──────────────────────────────────────────────────────────
         AuctionFinalizedEvent {
             auction_id,
-            winner: finalized_winner,
-            amount: finalized_amount,
+            winner: winner.clone(),
+            amount: winning_bid,
+        }
+        .publish(&env);
+
+        // ── 5. Interactions — external calls after state is final ─────────────
+        if let Some(ref w) = winner {
+            // Distribute the winning bid to the creator and their recipients
+            // using the fee rate snapshotted at auction creation — this gives
+            // the creator and bidder certainty about the net settlement amount
+            // from the moment the auction was created (parity with listings).
+            let fee_collected = Self::distribute_payout(
+                &env,
+                &auction.token,
+                &auction.collection,
+                winning_bid,
+                &auction.creator,
+                &auction.recipients,
+                w,
+                false, // funds are already held in escrow; do not pull from winner
+                snapshotted_fee,
+            );
+
+            // Emit ProtocolFeeCollected so treasury revenue is observable on-chain.
+            if fee_collected > 0 {
+                if let Some(treasury) = crate::storage::get_treasury_storage(&env) {
+                    ProtocolFeeCollectedEvent {
+                        listing_id: auction_id, // reuse field; auction_id identifies the trade
+                        amount: fee_collected,
+                        token: auction.token.clone(),
+                        treasury,
+                    }
+                    .publish(&env);
+                }
+            }
+
+            // Transfer the NFT from the creator to the winner.
+            env.invoke_contract::<()>(
+                &auction.collection,
+                &soroban_sdk::Symbol::new(&env, "transfer_from"),
+                soroban_sdk::vec![
+                    &env,
+                    env.current_contract_address().into_val(&env),
+                    auction.creator.into_val(&env),
+                    w.into_val(&env),
+                    auction.token_id.into_val(&env)
+                ],
+            );
+        } else {
+            // No bids — return the NFT to the creator so they are not locked out.
+            env.invoke_contract::<()>(
+                &auction.collection,
+                &soroban_sdk::Symbol::new(&env, "transfer_from"),
+                soroban_sdk::vec![
+                    &env,
+                    env.current_contract_address().into_val(&env),
+                    auction.creator.into_val(&env),
+                    auction.creator.into_val(&env),
+                    auction.token_id.into_val(&env)
+                ],
+            );
+        }
+
+        // ── 6. Release lock ───────────────────────────────────────────────────
+        release_auction_lock(&env, auction_id);
+    }
+
+    /// Cancel an auction that has received **no bids**.
+    ///
+    /// Rules:
+    /// - Only the auction creator may call this.
+    /// - If `highest_bidder` is `Some(_)` the call reverts with `AuctionHasBids`
+    ///   to protect the bidder's escrowed funds.
+    /// - The auction must be `Active`; attempting to cancel an already-finalised
+    ///   or already-cancelled auction reverts with `AuctionAlreadyFinalized`.
+    ///
+    /// On success:
+    /// - Auction status is set to `Cancelled`.
+    /// - `AuctionCancelledEvent` is emitted.
+    pub fn cancel_auction(env: Env, creator: Address, auction_id: u64) {
+        Self::require_not_paused(&env);
+        creator.require_auth();
+
+        let mut auction = load_auction(&env, auction_id)
+            .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::AuctionNotFound));
+
+        // Only the original creator may cancel.
+        if auction.creator != creator {
+            panic_with_error!(&env, MarketplaceError::Unauthorized);
+        }
+
+        // Must be active — finalized / already-cancelled auctions cannot be cancelled again.
+        if auction.status != AuctionStatus::Active {
+            panic_with_error!(&env, MarketplaceError::AuctionAlreadyFinalized);
+        }
+
+        // Refuse if any bid has been placed — the bidder's escrow must not be stranded.
+        if auction.highest_bidder.is_some() {
+            panic_with_error!(&env, MarketplaceError::AuctionHasBids);
+        }
+
+        // ── EFFECTS ──────────────────────────────────────────────────────────
+        auction.status = AuctionStatus::Cancelled;
+        save_auction(&env, &auction);
+
+        AuctionCancelledEvent {
+            auction_id,
+            cancelled_by: creator.clone(),
         }
         .publish(&env);
     }
@@ -979,6 +1398,14 @@ impl MarketplaceContract {
             panic_with_error!(&env, MarketplaceError::OfferNotPending);
         }
 
+        // Reject offer acceptance if the listing has an expiry that has passed.
+        if let Some(exp) = listing.expires_at {
+            if env.ledger().timestamp() >= exp {
+                release_listing_lock(&env, listing_id);
+                panic_with_error!(&env, MarketplaceError::ListingExpired);
+            }
+        }
+
         // ── CHECKS-EFFECTS-INTERACTIONS ──────────────────────────────────────
         // Persist all state mutations before any cross-contract call so that a
         // reentrant attempt on the same listing sees it already Sold.
@@ -1022,7 +1449,7 @@ impl MarketplaceContract {
         // ── INTERACTIONS ─────────────────────────────────────────────────────
         // Use the listing's snapshotted protocol fee so settlement matches what
         // was agreed at listing creation time.
-        Self::distribute_payout(
+        let fee_collected = Self::distribute_payout(
             &env,
             &offer.token,
             &listing.collection,
@@ -1033,6 +1460,19 @@ impl MarketplaceContract {
             false,
             listing.protocol_fee_bps, // Use snapshotted fee
         );
+
+        // Emit ProtocolFeeCollected so treasury revenue is observable on-chain.
+        if fee_collected > 0 {
+            if let Some(treasury) = crate::storage::get_treasury_storage(&env) {
+                ProtocolFeeCollectedEvent {
+                    listing_id: accepted_listing_id,
+                    amount: fee_collected,
+                    token: offer.token.clone(),
+                    treasury,
+                }
+                .publish(&env);
+            }
+        }
 
         // Transfer the NFT
         env.invoke_contract::<()>(
@@ -1169,6 +1609,21 @@ impl MarketplaceContract {
         load_auction(&env, auction_id)
             .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::AuctionNotFound))
     }
+
+    /// Return the bounded bid history for `auction_id` in chronological order
+    /// (oldest bid first, newest last).
+    ///
+    /// The history is capped to `BID_HISTORY_CAP` entries on-chain; older bids
+    /// beyond the cap are not available here (use the indexer for full history).
+    /// Returns an empty vector when no bids have been placed.
+    pub fn get_auction_bids(env: Env, auction_id: u64) -> Vec<BidRecord> {
+        // Verify the auction exists before returning history so callers get a
+        // clear AuctionNotFound error rather than an empty vec for a bad id.
+        load_auction(&env, auction_id)
+            .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::AuctionNotFound));
+        load_auction_bids(&env, auction_id)
+    }
+
     pub fn get_offer(env: Env, offer_id: u64) -> Offer {
         load_offer(&env, offer_id)
             .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::OfferNotFound))
@@ -1190,12 +1645,42 @@ impl MarketplaceContract {
         admin.require_auth();
     }
 
+    /// Validates that `price` falls within the admin-configured
+    /// `[min_price, max_price]` bounds.  Missing bounds are treated permissively:
+    /// * no `min_price` stored → no lower bound enforced.
+    /// * no `max_price` stored → no upper bound enforced.
+    ///
+    /// Reverts with `PriceOutOfBounds` when the price violates a set bound.
+    fn require_price_in_bounds(env: &Env, price: i128) {
+        if let Some(min) = get_min_price_storage(env) {
+            if price < min {
+                panic_with_error!(env, MarketplaceError::PriceOutOfBounds);
+            }
+        }
+        if let Some(max) = get_max_price_storage(env) {
+            if price > max {
+                panic_with_error!(env, MarketplaceError::PriceOutOfBounds);
+            }
+        }
+    }
+
     /// Guard function that reverts with ContractPaused if the contract is paused.
     /// Should be called at the beginning of every mutating entry point.
     /// Read-only functions should NOT call this guard.
     fn require_not_paused(env: &Env) {
         if crate::storage::is_paused(env) {
             panic_with_error!(env, MarketplaceError::ContractPaused);
+        }
+    }
+
+    /// Guard that reverts with `ArtistRevoked` when `artist` has been revoked by
+    /// an admin. Call this after authentication at the start of every creation
+    /// path (listings, auctions) so a revoked artist can no longer create new
+    /// items. It deliberately does NOT guard settlement paths (buy, accept_offer,
+    /// finalize_auction), so existing items remain settleable after revocation.
+    fn require_not_revoked(env: &Env, artist: &Address) {
+        if is_artist_revoked_storage(env, artist) {
+            panic_with_error!(env, MarketplaceError::ArtistRevoked);
         }
     }
 
@@ -1255,7 +1740,7 @@ impl MarketplaceContract {
         buyer: &Address,
         transfer_from_buyer: bool,
         fee_bps: u32, // Protocol fee in bps — caller provides snapshotted or live value
-    ) {
+    ) -> i128 /* returns the protocol fee actually transferred */ {
         let token = TokenClient::new(env, token_addr);
         if transfer_from_buyer {
             token.transfer(buyer, &env.current_contract_address(), &amount);
@@ -1279,13 +1764,14 @@ impl MarketplaceContract {
             token.transfer(&env.current_contract_address(), &royalty_receiver, &royalty);
             payout -= royalty;
         }
+
+        let mut fee_collected: i128 = 0;
         if let Some(t) = crate::storage::get_treasury_storage(env) {
-            let fee = payout
-                .checked_mul(fee_bps as i128)
-                .unwrap_or_else(|| panic_with_error!(env, MarketplaceError::ArithmeticOverflow))
-                .checked_div(10_000)
-                .unwrap_or_else(|| panic_with_error!(env, MarketplaceError::ArithmeticOverflow));
-            token.transfer(&env.current_contract_address(), &t, &fee);
+            let fee = payout * fee_bps as i128 / 10_000;
+            if fee > 0 {
+                token.transfer(&env.current_contract_address(), &t, &fee);
+                fee_collected = fee;
+            }
             payout -= fee;
         }
         let len = recipients.len();
@@ -1304,5 +1790,6 @@ impl MarketplaceContract {
             token.transfer(&env.current_contract_address(), &r.address, &amt);
             ds += amt;
         }
+        fee_collected
     }
 }

@@ -1,5 +1,5 @@
 // types.rs
-use soroban_sdk::{contracterror, contracttype, Address, Bytes, Symbol};
+use soroban_sdk::{contracterror, contracttype, Address, Symbol};
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -36,11 +36,24 @@ pub enum MarketplaceError {
     /// 10 000 bps (100%).  Rejected at listing creation and on any update that
     /// would mutate recipients, so an invalid split can never be persisted.
     RoyaltyExceedsLimit = 26,
-    /// Intermediate arithmetic in fee/royalty computation would overflow i128.
-    /// Reverts cleanly instead of panicking with an unmapped trap.
-    ArithmeticOverflow = 27,
-    /// The batch_ids vector passed to cancel_listings exceeded MAX_BATCH_CANCEL.
-    BatchTooLarge = 28,
+    /// The listing has passed its `expires_at` ledger timestamp and can no
+    /// longer be purchased or updated.
+    ListingExpired = 27,
+    /// `expire_listing` was called on a listing whose `expires_at` is still in
+    /// the future (or the listing has no expiry).
+    ListingNotExpired = 28,
+    /// `finalize_auction` was called before `end_time` has passed.
+    AuctionNotEnded = 29,
+    /// `cancel_auction` was called on an auction that already has at least one
+    /// bid — cancelling would strand the bidder's escrowed funds.
+    AuctionHasBids = 30,
+    /// `create_auction` was called with an `end_time` (or `duration`) that is in
+    /// the past or shorter than `MIN_AUCTION_DURATION`.
+    InvalidAuctionDuration = 31,
+    /// `place_bid` was called by the auction creator — self-bidding (shill
+    /// bidding) is not allowed.  The bidder address must differ from the
+    /// auction's `creator` field.
+    SelfBidNotAllowed = 32,
 }
 
 #[contracttype]
@@ -93,6 +106,12 @@ pub struct Listing {
     /// This ensures the fee applied at purchase matches what was displayed when
     /// the listing was created, regardless of subsequent admin fee changes.
     pub protocol_fee_bps: u32,
+    /// Optional expiry as a Unix ledger timestamp (seconds since epoch).
+    /// When `Some(t)` and `env.ledger().timestamp() >= t`, the listing is
+    /// considered expired and cannot be purchased.  `None` means no expiry
+    /// (the listing lives until cancelled or sold).  Listings created before
+    /// this field was introduced will deserialise as `None` automatically.
+    pub expires_at: Option<u64>,
 }
 
 #[contracttype]
@@ -117,6 +136,37 @@ pub struct Auction {
     pub end_time: u64,
     pub status: AuctionStatus,
     pub recipients: soroban_sdk::Vec<Recipient>,
+    /// Minimum amount by which a new bid must exceed the current highest bid,
+    /// snapshotted from the global setting at auction creation. The first bid is
+    /// instead gated by `reserve_price`.
+    pub min_increment: i128,
+    /// How many seconds to extend the auction when a qualifying late bid arrives.
+    /// Snapshotted from the global setting at auction creation time.
+    pub extension_window: u64,
+    /// If `end_time - now < extension_trigger` seconds at bid time, the auction
+    /// end is extended by `extension_window`. Snapshotted at creation time.
+    pub extension_trigger: u64,
+    /// Protocol fee in basis points snapshotted from the global setting at
+    /// auction creation time. This ensures settlement math is fixed when the
+    /// auction is created, giving bidders and the creator certainty about the
+    /// net payout — consistent with how listings behave.
+    pub protocol_fee_bps: u32,
+}
+
+/// A single entry in the per-auction bounded bid history.
+///
+/// The history is capped to `BID_HISTORY_CAP` entries (see `contract.rs`).
+/// When the cap is reached the oldest entry is evicted so only the most
+/// recent N bids are ever persisted.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BidRecord {
+    /// The account that placed this bid.
+    pub bidder: Address,
+    /// The bid amount (in the auction's payment token stroops).
+    pub amount: i128,
+    /// The ledger sequence number at which this bid was recorded.
+    pub ledger: u32,
 }
 
 #[contracttype]
