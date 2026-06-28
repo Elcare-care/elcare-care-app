@@ -11,6 +11,57 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
+  secret-scan:
+    name: Secret Scanning (Gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  dependency-scan:
+    name: Dependency Scanning
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-audit
+        run: cargo install --locked cargo-audit
+
+      # Fails the build on high/critical Cargo advisories.
+      # To triage a false-positive, add it to .cargo/audit.toml under
+      # [advisories] ignore = ["RUSTSEC-XXXX-XXXX"].
+      - name: Cargo Audit (high/critical)
+        run: cargo audit --deny warnings
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # Fails the build on high/critical npm advisories.
+      # To triage a finding run: npm audit --audit-level=high
+      # and follow https://docs.npmjs.com/auditing-package-dependencies-for-security-vulnerabilities
+      - name: npm audit — frontend (high/critical)
+        run: npm audit --audit-level=high
+        working-directory: frontend/elcarehub-app
+
+      - name: npm audit — indexer (high/critical)
+        run: npm audit --audit-level=high
+        working-directory: indexer
+
   contracts:
     name: Build and Test Contracts
     runs-on: ubuntu-latest

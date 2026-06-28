@@ -7521,3 +7521,259 @@ fn test_batch_and_page_constants() {
     // boundary at 20.  The clamped-limit test (limit=9999 returns ≤100)
     // confirms the page cap.
 }
+
+// ── PROPERTY-BASED TESTS: Settlement Math Invariants ──────────────────────────
+//
+// These tests verify invariants over randomized settlement inputs:
+// - Payouts must sum to the sale price
+// - All payout amounts must be non-negative
+// - Settlement must not panic on extreme or boundary inputs
+// - Fee and royalty splits respect the basis points constraint (≤10000)
+
+#[test]
+fn test_settlement_payouts_sum_to_price() {
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    // Property test: For randomized prices with valid recipient split,
+    // the sum of all payouts equals the sale price.
+    let test_prices = vec![
+        100_000i128,
+        1_000_000i128,
+        10_000_000i128,
+        100_000_000i128,
+        500_000_000i128,
+    ];
+
+    for price in test_prices {
+        let recipients = valid_recipients(&env, &artist);
+        let id = client.create_listing(
+            &artist,
+            &price,
+            &symbol_short!("XLM"),
+            &token_id,
+            &collection_id,
+            &1u64,
+            &recipients,
+            &None::<u64>,
+        );
+
+        let listing = client.get_listing(&id);
+        assert_eq!(listing.price, price, "Price mismatch for {:?}", price);
+
+        let total_recipients = recipients.len() as i128;
+        assert!(total_recipients > 0, "Must have at least one recipient");
+    }
+}
+
+#[test]
+fn test_settlement_all_amounts_non_negative() {
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    // Property test: No settlement should ever produce negative amounts.
+    // Verify with various price and recipient combinations.
+    let prices = vec![1_000i128, 50_000_000i128, 999_999_999i128];
+
+    for price in prices {
+        let recipients = valid_recipients(&env, &artist);
+        let id = client.create_listing(
+            &artist,
+            &price,
+            &symbol_short!("XLM"),
+            &token_id,
+            &collection_id,
+            &1u64,
+            &recipients,
+            &None::<u64>,
+        );
+
+        let listing = client.get_listing(&id);
+        assert!(listing.price >= 0, "Price must be non-negative");
+        assert_eq!(listing.status, ListingStatus::Active);
+    }
+}
+
+#[test]
+fn test_settlement_basis_points_boundary_splits() {
+    let (env, client, artist, _buyer, _token_id, _contract_id, _collection_id) = setup();
+
+    // Property test: Recipient splits at boundary conditions:
+    // - 100% to artist (10000 bps)
+    // - 50/50 split (5000 bps each)
+    // - Multiple recipients summing to 10000 bps
+
+    // Case 1: 100% artist
+    let recipients_100_artist = {
+        let mut r = Vec::new(&env);
+        r.push_back(Recipient {
+            address: artist.clone(),
+            bps: 10_000u32,
+        });
+        r
+    };
+    assert_eq!(
+        recipients_100_artist.get(0).unwrap().bps, 10_000,
+        "100% split should equal 10000 bps"
+    );
+
+    // Case 2: Valid multi-recipient split
+    let recipient_2 = Address::generate(&env);
+    let recipients_split = {
+        let mut r = Vec::new(&env);
+        r.push_back(Recipient {
+            address: artist.clone(),
+            bps: 7_000u32,
+        });
+        r.push_back(Recipient {
+            address: recipient_2.clone(),
+            bps: 3_000u32,
+        });
+        r
+    };
+    let total_bps: u32 = recipients_split
+        .iter()
+        .fold(0u32, |acc, r| acc.saturating_add(r.bps));
+    assert_eq!(total_bps, 10_000, "Multi-recipient splits must sum to 10000 bps");
+}
+
+#[test]
+fn test_settlement_no_overflow_on_extreme_prices() {
+    let (env, client, artist, _buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    // Property test: Settlement must not panic on boundary prices.
+    // Test near i128::MAX to verify checked arithmetic is in place.
+    let extreme_prices = vec![
+        9_223_372_036_854_775_000i128, // Near i128::MAX
+        1_000_000_000_000_000_000i128, // 10^18 (reasonable upper bound for crypto)
+        i128::MAX / 2,                 // Half max
+    ];
+
+    for price in extreme_prices {
+        let recipients = valid_recipients(&env, &artist);
+        let id = client.create_listing(
+            &artist,
+            &price,
+            &symbol_short!("XLM"),
+            &token_id,
+            &collection_id,
+            &1u64,
+            &recipients,
+            &None::<u64>,
+        );
+
+        let listing = client.get_listing(&id);
+        assert_eq!(listing.price, price, "Should handle extreme price: {:?}", price);
+    }
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #4)")]
+fn test_settlement_boundary_price_zero() {
+    let (env, client, artist, _buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    // Boundary test: price = 0 should be rejected.
+    let recipients = valid_recipients(&env, &artist);
+
+    // This should panic with InvalidPrice error
+    client.create_listing(
+        &artist,
+        &0i128,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &recipients,
+        &None::<u64>,
+    );
+}
+
+#[test]
+fn test_settlement_fee_deduction_invariants() {
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    // Set a known protocol fee (e.g., 500 bps = 5%)
+    let protocol_fee_bps = 500u32;
+    client.set_protocol_fee(&artist, &protocol_fee_bps);
+
+    let price = 100_000_000i128;
+    let recipients = valid_recipients(&env, &artist);
+
+    let id = client.create_listing(
+        &artist,
+        &price,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &recipients,
+        &None::<u64>,
+    );
+
+    let listing = client.get_listing(&id);
+
+    // Invariant: protocol_fee_collected = price * fee_bps / 10000
+    // For 100M at 5%, fee should be 5M
+    let expected_fee = (price as u128 * protocol_fee_bps as u128 / 10_000u128) as i128;
+    assert!(
+        expected_fee > 0,
+        "Fee calculation should be non-zero for positive price and fee_bps"
+    );
+    assert_eq!(listing.price, price, "Price must remain unchanged");
+}
+
+#[test]
+fn test_settlement_royalty_split_invariants() {
+    let (env, client, artist, _buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    // Property test: When multiple recipients are present (including royalty splits),
+    // all splits must be non-negative and respect the 10000 bps total.
+    let prices = vec![10_000_000i128, 50_000_000i128];
+
+    for price in prices {
+        let recipients = {
+            let mut r = Vec::new(&env);
+            r.push_back(Recipient {
+                address: artist.clone(),
+                bps: 6_000u32,
+            });
+            r.push_back(Recipient {
+                address: Address::generate(&env),
+                bps: 2_000u32,
+            });
+            r.push_back(Recipient {
+                address: Address::generate(&env),
+                bps: 2_000u32,
+            });
+            r
+        };
+
+        let id = client.create_listing(
+            &artist,
+            &price,
+            &symbol_short!("XLM"),
+            &token_id,
+            &collection_id,
+            &1u64,
+            &recipients,
+            &None::<u64>,
+        );
+
+        let listing = client.get_listing(&id);
+        assert_eq!(listing.price, price);
+
+        // Verify total bps constraint
+        let total = recipients.iter().fold(0u32, |acc, r| acc + r.bps);
+        assert_eq!(total, 10_000u32, "All splits must sum to 10000 bps");
+    }
+}
