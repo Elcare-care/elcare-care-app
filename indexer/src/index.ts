@@ -5,7 +5,7 @@ import rateLimit from 'express-rate-limit';
 import routes from './api/routes.js';
 import { startPolling } from './poller.js';
 import { rateLimiter } from './api/rate-limit-middleware.js';
-import { metricsMiddleware, handleMetrics } from './metrics.js';
+import { metricsMiddleware, handleMetrics, requestLogger } from './metrics.js';
 import prisma from './db.js';
 
 dotenv.config();
@@ -36,7 +36,8 @@ app.use(cors({
 app.use(express.json());
 app.use(limiter);
 
-// Track response time metrics for all routes
+// Request logging and metrics
+app.use(requestLogger);
 app.use(metricsMiddleware);
 
 // Expose /metrics for Prometheus scrapers (bypass global rate limit)
