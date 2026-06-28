@@ -45,5 +45,8 @@
   },
   "overrides": {
     "path-to-regexp": "^8.4.0"
+  },
+  "prisma": {
+    "seed": "tsx prisma/seed.ts"
   }
 }
