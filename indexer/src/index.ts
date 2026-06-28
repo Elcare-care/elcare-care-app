@@ -6,6 +6,8 @@ import routes, { closeSSEClients } from './api/routes.js';
 import { startPolling, registerShutdownHook } from './poller.js';
 import { rateLimiter } from './api/rate-limit-middleware.js';
 import { metricsMiddleware, handleMetrics } from './metrics.js';
+import { errorHandler } from './api/errors.js';
+import { startReconciler } from './reconciler.js';
 import prisma from './db.js';
 
 dotenv.config();
@@ -48,6 +50,9 @@ app.use(rateLimiter);
 // API Routes
 app.use('/', routes);
 
+// Central error handler — must be registered after all routes
+app.use(errorHandler);
+
 // Health check
 app.get('/health', (req: express.Request, res: express.Response) => {
     res.json({ status: 'ok' });
@@ -73,6 +78,11 @@ const httpServer = app.listen(PORT, () => {
     startPolling().catch((err) => {
         console.error('Fatal error in poller:', err);
         process.exit(1);
+    });
+
+    // Start the periodic reconciliation job (non-fatal if it fails)
+    startReconciler().catch((err) => {
+        console.error('[Reconciler] Failed to start:', err);
     });
 });
 
