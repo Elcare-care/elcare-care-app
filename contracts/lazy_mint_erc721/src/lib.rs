@@ -3,20 +3,22 @@
 //! # How lazy minting works
 //!
 //! 1. Creator builds a `MintVoucher` off-chain.
-//! 2. Creator hashes it with `sha256(token_id ‖ price ‖ valid_until ‖ uri_hash)`
+//! 2. Creator hashes it with `sha256(contract_addr ‖ token_id ‖ price ‖ valid_until ‖ uri_hash ‖ currency_xdr)`
 //!    and signs the 32-byte digest with their ed25519 private key.
 //! 3. Buyer submits the voucher + signature on-chain via `redeem()`.
 //! 4. Contract re-hashes, verifies ed25519, takes payment, then mints.
 //!
-//! # Replay protection
-//! Every (token_id) is tracked in `UsedVoucher`. Once redeemed it can never
-//! be claimed again. The contract address is not included in the signed digest
-//! because each collection is a unique deployed contract address — a voucher
-//! for collection A cannot be replayed into collection B.
+//! # Replay protection (#39)
+//! Every redeemed `token_id` is tracked in `UsedVoucher`. Once redeemed it
+//! can never be claimed again (`VoucherAlreadyRedeemed`). The token_id serves
+//! as the unique voucher nonce — each collection token may be lazy-minted at
+//! most once.
 //!
-//! # Payment
-//! Accepts any Stellar Asset Contract (SAC) token.  Pass the SAC address for
-//! XLM or any USDC/custom asset.  Price = 0 means free mint.
+//! # Platform fee (#38)
+//! A per-collection `platform_fee_bps` (≤ MAX_FEE_BPS set by the launchpad) is
+//! stored at initialization. When a buyer redeems a priced voucher the fee
+//! portion is transferred to `platform_fee_receiver` and the remainder to the
+//! creator.
 #![no_std]
 #![allow(clippy::too_many_arguments, deprecated)]
 
@@ -41,7 +43,8 @@ pub enum Error {
     TokenNotFound = 5,
     MaxSupplyReached = 6,
     VoucherExpired = 7,
-    VoucherAlreadyUsed = 8,
+    /// Voucher nonce (token_id) already redeemed (#39).
+    VoucherAlreadyRedeemed = 8,
     NotCreator = 9,
     InvalidSignature = 10,
     NotAllowlisted = 11,
@@ -66,18 +69,12 @@ pub struct MintVoucher {
     pub valid_until: u64,     // ledger sequence; 0 = no expiry
 }
 
-/// Compact struct for the signed digest — only the fields that matter for
-/// security are hashed. `uri` is *not* hashed directly because `String` is
-/// opaque; instead `uri_hash` (a pre-computed sha256) is used.
-///
-/// Signed digest = sha256(token_id ‖ price ‖ valid_until ‖ uri_hash ‖ currency_xdr)
-/// All integers are big-endian.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
     Initialized,
     Creator,
-    CreatorPubkey, // BytesN<32>  ed25519 public key used to verify vouchers
+    CreatorPubkey,
     Name,
     Symbol,
     MaxSupply,
@@ -85,6 +82,10 @@ pub enum DataKey {
     TotalSupply,
     RoyaltyBps,
     RoyaltyReceiver,
+    /// Platform fee receiver address (#38).
+    PlatformFeeReceiver,
+    /// Platform fee in basis points (#38).
+    PlatformFeeBps,
     Owner(u64),
     TokenUri(u64),
     Approved(u64),
@@ -101,8 +102,6 @@ pub enum DataKey {
 pub struct LazyMint721;
 
 impl LazyMint721 {
-    /// Helper function to verify signature — panics on invalid signatures
-    /// (ed25519_verify host function aborts on bad sig)
     fn verify_signature_or_panic(
         env: &Env,
         pubkey: &BytesN<32>,
@@ -152,15 +151,19 @@ impl LazyMint721 {
 impl LazyMint721 {
     // ── Initializer ───────────────────────────────────────────────────────
 
+    /// Issue #38: accepts `platform_fee_receiver` and `platform_fee_bps` so
+    /// the launchpad can configure per-collection fee splits at deployment time.
     pub fn initialize(
         env: Env,
         creator: Address,
-        creator_pubkey: BytesN<32>, // ed25519 public key of creator wallet
+        creator_pubkey: BytesN<32>,
         name: String,
         symbol: String,
         max_supply: u64,
         royalty_bps: u32,
         royalty_receiver: Address,
+        platform_fee_receiver: Address,
+        platform_fee_bps: u32,
     ) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Initialized) {
             return Err(Error::AlreadyInitialized);
@@ -183,6 +186,12 @@ impl LazyMint721 {
         env.storage()
             .instance()
             .set(&DataKey::RoyaltyReceiver, &royalty_receiver);
+        env.storage()
+            .instance()
+            .set(&DataKey::PlatformFeeReceiver, &platform_fee_receiver);
+        env.storage()
+            .instance()
+            .set(&DataKey::PlatformFeeBps, &platform_fee_bps);
         env.storage().instance().extend_ttl(50_000, 100_000);
         Ok(())
     }
@@ -228,13 +237,13 @@ impl LazyMint721 {
             return Err(Error::VoucherExpired);
         }
 
-        // 2. Replay check
+        // 2. Replay check (#39) — token_id is the voucher nonce
         if env
             .storage()
             .persistent()
             .has(&DataKey::UsedVoucher(voucher.token_id))
         {
-            return Err(Error::VoucherAlreadyUsed);
+            return Err(Error::VoucherAlreadyRedeemed);
         }
 
         // 3. Supply check
@@ -252,8 +261,7 @@ impl LazyMint721 {
             return Err(Error::MaxSupplyReached);
         }
 
-        // 4. Signature verification
-        //    Panics on invalid signature (caught by try_redeem as host abort).
+        // 4. Signature verification — panics on invalid sig (caught by try_redeem)
         let pubkey: BytesN<32> = env
             .storage()
             .instance()
@@ -262,10 +270,44 @@ impl LazyMint721 {
         let digest = Self::_voucher_digest(&env, &voucher);
         Self::verify_signature_or_panic(&env, &pubkey, &digest, &signature);
 
-        // 5. Payment  (skip when price == 0)
+        // 5. Payment with platform fee split (#38)
         if voucher.price > 0 {
             let creator: Address = env.storage().instance().get(&DataKey::Creator).unwrap();
-            TokenClient::new(&env, &voucher.currency).transfer(&buyer, &creator, &voucher.price);
+            let fee_bps: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::PlatformFeeBps)
+                .unwrap_or(0);
+            if fee_bps > 0 {
+                let fee_receiver: Address = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::PlatformFeeReceiver)
+                    .unwrap();
+                let fee_amount = (voucher.price * fee_bps as i128) / 10_000;
+                let creator_amount = voucher.price - fee_amount;
+                if fee_amount > 0 {
+                    TokenClient::new(&env, &voucher.currency).transfer(
+                        &buyer,
+                        &fee_receiver,
+                        &fee_amount,
+                    );
+                }
+                if creator_amount > 0 {
+                    TokenClient::new(&env, &voucher.currency).transfer(
+                        &buyer,
+                        &creator,
+                        &creator_amount,
+                    );
+                }
+            } else {
+                let creator: Address = env.storage().instance().get(&DataKey::Creator).unwrap();
+                TokenClient::new(&env, &voucher.currency).transfer(
+                    &buyer,
+                    &creator,
+                    &voucher.price,
+                );
+            }
         }
 
         // 6. Mint
@@ -276,6 +318,7 @@ impl LazyMint721 {
         env.storage()
             .persistent()
             .set(&DataKey::TokenUri(token_id), &voucher.uri);
+        // Mark voucher nonce as redeemed (#39)
         env.storage()
             .persistent()
             .set(&DataKey::UsedVoucher(token_id), &true);
@@ -309,7 +352,6 @@ impl LazyMint721 {
         env.storage()
             .instance()
             .set(&DataKey::TotalSupply, &(supply + 1));
-        // NextTokenId tracks highest minted ID + 1 for supply cap enforcement
         if token_id >= next_id {
             env.storage()
                 .instance()
@@ -361,7 +403,6 @@ impl LazyMint721 {
             .get(&DataKey::Owner(token_id))
             .ok_or(Error::TokenNotFound)?;
 
-        // [SECURITY] Allow owner or authorized operator to approve (#48)
         if spender != owner
             && !Self::is_approved_for_all(env.clone(), owner.clone(), spender.clone())
         {
@@ -415,7 +456,8 @@ impl LazyMint721 {
             .unwrap_or(0)
     }
 
-    pub fn is_voucher_used(env: Env, token_id: u64) -> bool {
+    /// Returns true if the voucher nonce (token_id) has already been redeemed (#39).
+    pub fn is_voucher_redeemed(env: Env, token_id: u64) -> bool {
         env.storage()
             .persistent()
             .has(&DataKey::UsedVoucher(token_id))
@@ -442,6 +484,19 @@ impl LazyMint721 {
             env.storage()
                 .instance()
                 .get(&DataKey::RoyaltyBps)
+                .unwrap_or(0),
+        )
+    }
+
+    pub fn platform_fee_info(env: Env) -> (Address, u32) {
+        (
+            env.storage()
+                .instance()
+                .get(&DataKey::PlatformFeeReceiver)
+                .unwrap(),
+            env.storage()
+                .instance()
+                .get(&DataKey::PlatformFeeBps)
                 .unwrap_or(0),
         )
     }
@@ -543,14 +598,14 @@ impl LazyMint721 {
     /// Build the 32-byte digest that the creator must sign off-chain.
     ///
     /// Layout (all big-endian):
-    ///   8  bytes  token_id
-    ///  16  bytes  price (i128)
-    ///   8  bytes  valid_until
-    ///  32  bytes  uri_hash
-    ///  N   bytes  currency address XDR  (replay-binds to the payment token)
-    fn _voucher_digest(env: &Env, v: &MintVoucher) -> Bytes {
+    ///   N   bytes  contract_address XDR  (binds signature to this instance)
+    ///   8   bytes  token_id
+    ///  16   bytes  price (i128)
+    ///   8   bytes  valid_until
+    ///  32   bytes  uri_hash
+    ///  N   bytes  currency address XDR
+    pub fn _voucher_digest(env: &Env, v: &MintVoucher) -> Bytes {
         let mut raw = Bytes::new(env);
-        // [SECURITY] Bind signature to this contract instance to prevent replay (#49)
         raw.append(&env.current_contract_address().to_xdr(env));
         raw.extend_from_array(&v.token_id.to_be_bytes());
         raw.extend_from_array(&v.price.to_be_bytes());
@@ -561,7 +616,6 @@ impl LazyMint721 {
     }
 
     fn _transfer(env: &Env, from: &Address, to: &Address, token_id: u64) -> Result<(), Error> {
-        // [SECURITY] Clear single-token approval on every transfer (#50)
         env.storage()
             .persistent()
             .remove(&DataKey::Approved(token_id));
@@ -585,14 +639,6 @@ impl LazyMint721 {
             return Err(Error::NotOwner);
         }
 
-        env.storage()
-            .persistent()
-            .set(&DataKey::BalanceOf(from.clone()), &(from_bal - 1));
-        let from_bal: u64 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::BalanceOf(from.clone()))
-            .unwrap_or(0);
         env.storage().persistent().set(
             &DataKey::BalanceOf(from.clone()),
             &(from_bal.saturating_sub(1)),

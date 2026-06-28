@@ -28,6 +28,8 @@ fn default_init(env: &Env, client: &LazyMint721Client, creator: &Address) {
         &1000u64,
         &0u32,
         &royalty_receiver,
+        &fee_receiver,
+        &0u32,
     );
 }
 
@@ -447,6 +449,7 @@ fn test_set_merkle_root_non_creator_fails() {
     // Initialize using the same env (no auth mocking — initialize has no auth requirement)
     let pubkey = BytesN::from_array(&env, &[1u8; 32]);
     let royalty_receiver = Address::generate(&env);
+    let fee_receiver = Address::generate(&env);
     client.initialize(
         &creator,
         &pubkey,
@@ -455,6 +458,8 @@ fn test_set_merkle_root_non_creator_fails() {
         &1000u64,
         &0u32,
         &royalty_receiver,
+        &fee_receiver,
+        &0u32,
     );
 
     // Without mocked auth, the creator.require_auth() inside set_merkle_root will fail.
@@ -586,4 +591,184 @@ fn test_phase_transition_from_allowlist_to_public() {
     assert!(result_after.is_err());
     assert_ne!(result_after, Err(Ok(Error::NotAllowlisted)));
     assert_ne!(result_after, Err(Ok(Error::InvalidMerkleProof)));
+}
+
+// ─── Issue #39 — Voucher replay protection tests ──────────────────────────────
+
+fn setup_with_fee() -> (Env, LazyMint721Client<'static>, Address) {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(LazyMint721, ());
+    let client = LazyMint721Client::new(&env, &contract_id);
+    let creator = Address::generate(&env);
+    (env, client, creator)
+}
+
+/// Marking a token_id as used then trying to redeem it returns VoucherAlreadyRedeemed.
+#[test]
+fn voucher_replay_rejected_with_already_redeemed_error() {
+    let (env, client, creator) = setup_with_fee();
+
+    let pubkey = BytesN::from_array(&env, &[10u8; 32]);
+    let royalty_receiver = Address::generate(&env);
+    let fee_receiver = Address::generate(&env);
+    client.initialize(
+        &creator,
+        &pubkey,
+        &String::from_str(&env, "Replay Test"),
+        &String::from_str(&env, "RPT"),
+        &1000u64,
+        &0u32,
+        &royalty_receiver,
+        &fee_receiver,
+        &0u32,
+    );
+
+    // Manually mark token_id 5 as redeemed (simulates a prior successful redemption)
+    env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .set(&DataKey::UsedVoucher(5u64), &true);
+    });
+
+    let buyer = Address::generate(&env);
+    let currency = Address::generate(&env);
+    let voucher = crate::MintVoucher {
+        token_id: 5,
+        price: 0,
+        currency: currency.clone(),
+        uri: String::from_str(&env, "ipfs://replay"),
+        uri_hash: BytesN::from_array(&env, &[0u8; 32]),
+        valid_until: 0,
+    };
+
+    let sig = BytesN::from_array(&env, &[0u8; 64]);
+    let result = client.try_redeem(&buyer, &voucher, &sig);
+    assert_eq!(result, Err(Ok(Error::VoucherAlreadyRedeemed)));
+}
+
+/// is_voucher_redeemed returns false before and true after a successful nonce mark.
+#[test]
+fn is_voucher_redeemed_reflects_nonce_state() {
+    let (env, client, creator) = setup_with_fee();
+
+    let pubkey = BytesN::from_array(&env, &[11u8; 32]);
+    let royalty_receiver = Address::generate(&env);
+    let fee_receiver = Address::generate(&env);
+    client.initialize(
+        &creator,
+        &pubkey,
+        &String::from_str(&env, "Nonce Test"),
+        &String::from_str(&env, "NCT"),
+        &1000u64,
+        &0u32,
+        &royalty_receiver,
+        &fee_receiver,
+        &0u32,
+    );
+
+    assert!(!client.is_voucher_redeemed(&7u64));
+
+    // Mark as redeemed directly
+    env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .set(&DataKey::UsedVoucher(7u64), &true);
+    });
+
+    assert!(client.is_voucher_redeemed(&7u64));
+}
+
+/// Different token_ids (nonces) are independent — redeeming one does not block another.
+#[test]
+fn different_nonces_are_independent() {
+    let (env, client, creator) = setup_with_fee();
+
+    let pubkey = BytesN::from_array(&env, &[12u8; 32]);
+    let royalty_receiver = Address::generate(&env);
+    let fee_receiver = Address::generate(&env);
+    client.initialize(
+        &creator,
+        &pubkey,
+        &String::from_str(&env, "Nonce Indep"),
+        &String::from_str(&env, "NCI"),
+        &1000u64,
+        &0u32,
+        &royalty_receiver,
+        &fee_receiver,
+        &0u32,
+    );
+
+    // Mark token_id 1 as used
+    env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .set(&DataKey::UsedVoucher(1u64), &true);
+    });
+
+    // token_id 2 must still be unredeemed
+    assert!(client.is_voucher_redeemed(&1u64));
+    assert!(!client.is_voucher_redeemed(&2u64));
+
+    // Trying to redeem token_id 2 should fail due to bad signature (not replay)
+    let buyer = Address::generate(&env);
+    let currency = Address::generate(&env);
+    let voucher2 = crate::MintVoucher {
+        token_id: 2,
+        price: 0,
+        currency: currency.clone(),
+        uri: String::from_str(&env, "ipfs://token2"),
+        uri_hash: BytesN::from_array(&env, &[0u8; 32]),
+        valid_until: 0,
+    };
+    let bad_sig = BytesN::from_array(&env, &[0u8; 64]);
+    let result2 = client.try_redeem(&buyer, &voucher2, &bad_sig);
+    // Should fail with host abort (invalid signature), NOT VoucherAlreadyRedeemed
+    assert!(result2.is_err());
+    // Confirm it's not a VoucherAlreadyRedeemed
+    assert_ne!(result2, Err(Ok(Error::VoucherAlreadyRedeemed)));
+}
+
+/// Replay is rejected BEFORE signature verification (check ordering preserved).
+#[test]
+fn replay_check_precedes_signature_verification() {
+    let (env, client, creator) = setup_with_fee();
+
+    let pubkey = BytesN::from_array(&env, &[13u8; 32]);
+    let royalty_receiver = Address::generate(&env);
+    let fee_receiver = Address::generate(&env);
+    client.initialize(
+        &creator,
+        &pubkey,
+        &String::from_str(&env, "Order Test"),
+        &String::from_str(&env, "ORD"),
+        &1000u64,
+        &0u32,
+        &royalty_receiver,
+        &fee_receiver,
+        &0u32,
+    );
+
+    // Mark token 3 as already redeemed
+    env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .set(&DataKey::UsedVoucher(3u64), &true);
+    });
+
+    let buyer = Address::generate(&env);
+    let currency = Address::generate(&env);
+    let voucher = crate::MintVoucher {
+        token_id: 3,
+        price: 0,
+        currency: currency.clone(),
+        uri: String::from_str(&env, "ipfs://order"),
+        uri_hash: BytesN::from_array(&env, &[0u8; 32]),
+        valid_until: 0,
+    };
+
+    // Even with a completely wrong signature, we get VoucherAlreadyRedeemed (not a host abort)
+    let any_sig = BytesN::from_array(&env, &[99u8; 64]);
+    let result = client.try_redeem(&buyer, &voucher, &any_sig);
+    assert_eq!(result, Err(Ok(Error::VoucherAlreadyRedeemed)));
 }
