@@ -14,7 +14,7 @@ dotenv.config();
 
 // Fail fast — refuse to start if the contract ID is missing.
 if (!process.env.MARKETPLACE_CONTRACT_ID) {
-  console.error('[Startup] MARKETPLACE_CONTRACT_ID is not set. Exiting.');
+  logger.error('MARKETPLACE_CONTRACT_ID is not set — exiting');
   process.exit(1);
 }
 
@@ -58,10 +58,12 @@ app.get('/health', (req: express.Request, res: express.Response) => {
     res.json({ status: 'ok' });
 });
 
-// Readiness probe — returns 503 until the indexer has processed at least one ledger.
-// Use this for Kubernetes readinessProbe / Docker HEALTHCHECK so traffic is only
-// routed once the indexer is actually synced and serving real data.
+// Readiness probe — returns 503 until the indexer has processed at least one ledger,
+// or if the indexer has stalled (no progress for STALL_THRESHOLD_MS).
 app.get('/readyz', async (req: express.Request, res: express.Response) => {
+    if (isStalled()) {
+        return res.status(503).json({ status: 'stalled', reason: 'Indexer not advancing' });
+    }
     const state = await prisma.syncState.findUnique({ where: { id: 1 } });
     if (state && state.lastLedger > 0) {
         res.json({ status: 'ready', lastLedger: state.lastLedger });
@@ -76,7 +78,7 @@ const httpServer = app.listen(PORT, () => {
 
     // Start the background polling loop
     startPolling().catch((err) => {
-        console.error('Fatal error in poller:', err);
+        logger.error('Fatal error in poller', { err });
         process.exit(1);
     });
 
