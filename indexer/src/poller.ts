@@ -112,7 +112,7 @@ export async function revertLedgers(safeAtLedger: number): Promise<void> {
     // Revert listings whose status changed after the safe checkpoint back to Active
     await tx.listing.updateMany({
       where: { updatedAtLedger: { gt: safeAtLedger } },
-      data: { status: 'Active', updatedAtLedger: safeAtLedger },
+      data: { status: 'Active' as const, updatedAtLedger: safeAtLedger },
     });
 
     // Reset collections deployed after the safe checkpoint
@@ -471,7 +471,7 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
           collection,
           nftTokenId,
           token,
-          status: 'Active',
+          status: 'Active' as const,
           recipients,
           createdAtLedger: ledgerSequence,
           updatedAtLedger: ledgerSequence,
@@ -481,7 +481,7 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
           price,
           collection,
           nftTokenId,
-          status: 'Active',
+          status: 'Active' as const,
           recipients,
           updatedAtLedger: ledgerSequence,
         }
@@ -507,7 +507,7 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
       const { count } = await db.listing.updateMany({
         where: { listingId },
         data: {
-          status: 'Sold',
+          status: 'Sold' as const,
           owner: data.buyer,
           updatedAtLedger: ledgerSequence,
         },
@@ -520,7 +520,7 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
       const { count } = await db.listing.updateMany({
         where: { listingId },
         data: {
-          status: 'Cancelled',
+          status: 'Cancelled' as const,
           updatedAtLedger: ledgerSequence,
         },
       });
@@ -559,7 +559,7 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
           highestBid: '0',
           highestBidder: null,
           endTime,
-          status: 'Active',
+          status: 'Active' as const,
           recipients,
           createdAtLedger: ledgerSequence,
           updatedAtLedger: ledgerSequence,
@@ -571,7 +571,7 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
           token,
           reservePrice,
           endTime,
-          status: 'Active',
+          status: 'Active' as const,
           recipients,
           updatedAtLedger: ledgerSequence,
         }
@@ -596,7 +596,7 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
       const { count } = await db.auction.updateMany({
         where: { auctionId: listingId },
         data: {
-          status: 'Finalized',
+          status: 'Finalized' as const,
           highestBid: data.amount,
           highestBidder: data.winner || null,
           updatedAtLedger: ledgerSequence,
@@ -610,7 +610,7 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
       const { count } = await db.auction.updateMany({
         where: { auctionId: listingId },
         data: {
-          status: 'Cancelled',
+          status: 'Cancelled' as const,
           updatedAtLedger: ledgerSequence,
         },
       });
@@ -627,7 +627,7 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
           offerer: data.offerer,
           amount: data.amount,
           token: data.token,
-          status: 'Pending',
+          status: 'Pending' as const,
           createdAtLedger: ledgerSequence,
           updatedAtLedger: ledgerSequence,
         },
@@ -636,7 +636,7 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
           offerer: data.offerer,
           amount: data.amount,
           token: data.token,
-          status: 'Pending',
+          status: 'Pending' as const,
           updatedAtLedger: ledgerSequence,
         }
       });
@@ -647,14 +647,14 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
       await db.offer.update({
         where: { offerId: BigInt(data.offer_id) },
         data: {
-          status: 'Accepted',
+          status: 'Accepted' as const,
           updatedAtLedger: ledgerSequence,
         }
       });
       const { count: listingCount } = await db.listing.updateMany({
         where: { listingId: BigInt(data.listing_id) },
         data: {
-          status: 'Sold',
+          status: 'Sold' as const,
           owner: data.offerer,
           updatedAtLedger: ledgerSequence,
         }
@@ -667,7 +667,7 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
       await db.offer.update({
         where: { offerId: BigInt(data.offer_id) },
         data: {
-          status: 'Rejected',
+          status: 'Rejected' as const,
           updatedAtLedger: ledgerSequence,
         }
       });
@@ -678,7 +678,7 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
       await db.offer.update({
         where: { offerId: BigInt(data.offer_id) },
         data: {
-          status: 'Withdrawn',
+          status: 'Withdrawn' as const,
           updatedAtLedger: ledgerSequence,
         }
       });
