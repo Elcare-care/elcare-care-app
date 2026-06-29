@@ -1,5 +1,6 @@
 import express from 'express';
 import cors from 'cors';
+import compression from 'compression';
 import dotenv from 'dotenv';
 import rateLimit from 'express-rate-limit';
 import routes, { closeSSEClients } from './api/routes.js';
@@ -11,6 +12,13 @@ import { startReconciler } from './reconciler.js';
 import prisma from './db.js';
 
 dotenv.config();
+
+// Load OpenAPI spec
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const openapiPath = path.join(__dirname, '..', 'openapi.yaml');
+const openapiFile = fs.readFileSync(openapiPath, 'utf8');
+const swaggerDoc = yaml.parse(openapiFile);
 
 // Fail fast — refuse to start if the contract ID is missing.
 if (!process.env.MARKETPLACE_CONTRACT_ID) {
@@ -27,6 +35,7 @@ app.use(cors({
         : true,
     credentials: true,
 }));
+app.use(compression());
 app.use(express.json());
 
 // Apply global baseline rate limiter to all public endpoints
@@ -64,6 +73,23 @@ app.get('/readyz', async (req: express.Request, res: express.Response) => {
     } else {
         res.status(503).json({ status: 'not_ready', reason: 'No ledgers indexed yet' });
     }
+
+    // Check first ledger indexed
+    try {
+        const state = await prisma.syncState.findUnique({ where: { id: 1 } });
+        if (!state || state.lastLedger === 0) {
+            reasons.push('No ledgers indexed yet');
+        }
+    } catch (err) {
+        reasons.push('Failed to check sync state');
+    }
+
+    if (reasons.length > 0) {
+        return res.status(503).json({ status: 'not_ready', reasons });
+    }
+
+    const state = await prisma.syncState.findUnique({ where: { id: 1 } });
+    res.json({ status: 'ready', lastLedger: state?.lastLedger });
 });
 
 // Start the server

@@ -71,6 +71,8 @@ export function closeSSEClients(): void {
 
 const router = Router();
 
+router.use(etagMiddleware);
+
 const CACHE_TTL_SECONDS = parseInt(process.env.REDIS_CACHE_TTL_SECONDS || '30');
 
 async function getCached<T>(key: string, ttl: number, fetcher: () => Promise<T>): Promise<T> {
