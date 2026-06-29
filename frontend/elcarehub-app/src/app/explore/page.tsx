@@ -1,4 +1,4 @@
-﻿// ─────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
 // app/explore/page.tsx — Browse / Explore All Listings
 //
 // Full catalogue page with search, filtering, sorting, and
@@ -10,6 +10,7 @@
 import { useState, useMemo, useCallback, useEffect, useRef } from "react";
 import { Listing, stroopsToXlm } from "@/lib/contract";
 import { ListingCard } from "@/components/ListingCard";
+import { ListingCardSkeleton } from "@/components/Skeletons";
 import {
   ChevronLeft,
   ChevronRight,
@@ -294,17 +295,7 @@ export default function ExplorePage() {
         {isLoading && !error && (
           <div className="grid gap-6 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
             {Array.from({ length: PAGE_SIZE }).map((_, i) => (
-              <div
-                key={i}
-                className="animate-pulse rounded-2xl border border-gray-100 bg-white overflow-hidden"
-              >
-                <div className="aspect-square bg-gray-100" />
-                <div className="p-4 space-y-3">
-                  <div className="h-4 w-3/4 rounded bg-gray-100" />
-                  <div className="h-3 w-1/2 rounded bg-gray-100" />
-                  <div className="h-8 w-full rounded-lg bg-gray-100 mt-4" />
-                </div>
-              </div>
+              <ListingCardSkeleton key={i} />
             ))}
           </div>
         )}
