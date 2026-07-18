@@ -202,7 +202,7 @@ impl NormalNFT1155 {
         uris: Vec<String>,
     ) -> Result<(), Error> {
         Self::extend_instance_ttl(&env);
-        Self::only_creator(&env)?;
+        let creator = Self::only_creator(&env)?;
 
         let len = token_ids.len();
         if len == 0 {
@@ -282,7 +282,7 @@ impl NormalNFT1155 {
 
             // Emit TransferSingle event (ERC-1155 standard)
             env.events().publish(
-                (symbol_short!("mint"), creator, to.clone()),
+                (symbol_short!("mint"), creator.clone(), to.clone()),
                 (token_id, amount),
             );
         }
@@ -419,10 +419,8 @@ impl NormalNFT1155 {
             TTL_BUMP,
         );
 
-        env.events().publish(
-            (symbol_short!("burn"), from.clone()),
-            (token_id, amount),
-        );
+        env.events()
+            .publish((symbol_short!("burn"), from.clone()), (token_id, amount));
         Ok(())
     }
 

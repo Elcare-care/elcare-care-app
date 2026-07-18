@@ -55,6 +55,10 @@ const DEFAULT_EXTENSION_TRIGGER: u64 = 0;
 /// auctions that expire almost immediately.
 const MIN_AUCTION_DURATION: u64 = 3_600; // 1 hour
 
+/// Semantic version reported by `version()` and used as the per-version
+/// migration marker in `migrate`.
+const CONTRACT_VERSION: &str = "1.0.0";
+
 /// Maximum number of bid records retained per auction in the on-chain history.
 ///
 /// When a new bid is placed and the history already holds `BID_HISTORY_CAP`

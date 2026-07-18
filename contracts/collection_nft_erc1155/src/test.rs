@@ -288,21 +288,11 @@ fn max_supply_cap_enforced_on_mint() {
     client.set_token_max_supply(&token_id, &10u128);
 
     // Mint 5 more — exactly at cap
-    client.mint(
-        &alice,
-        &token_id,
-        &5u128,
-        &String::from_str(&env, "uri-0"),
-    );
+    client.mint(&alice, &token_id, &5u128, &String::from_str(&env, "uri-0"));
     assert_eq!(client.total_supply(&token_id), 10u128);
 
     // One more over cap — must revert with MaxSupplyReached
-    let result = client.try_mint(
-        &alice,
-        &token_id,
-        &1u128,
-        &String::from_str(&env, "uri-0"),
-    );
+    let result = client.try_mint(&alice, &token_id, &1u128, &String::from_str(&env, "uri-0"));
     assert_eq!(result, Err(Ok(crate::Error::MaxSupplyReached)));
 }
 
@@ -321,12 +311,7 @@ fn per_wallet_limit_enforced_on_mint() {
     assert_eq!(client.wallet_minted(&alice, &token_id), 3u128);
 
     // Alice tries to mint 1 more — must revert with WalletLimitReached
-    let result = client.try_mint(
-        &alice,
-        &token_id,
-        &1u128,
-        &String::from_str(&env, "uri-0"),
-    );
+    let result = client.try_mint(&alice, &token_id, &1u128, &String::from_str(&env, "uri-0"));
     assert_eq!(result, Err(Ok(crate::Error::WalletLimitReached)));
 
     // Bob can still mint (different wallet)
@@ -398,6 +383,11 @@ fn no_wallet_limit_allows_unlimited_mints() {
     assert_eq!(client.per_wallet_limit(), 0u128);
 
     let token_id = client.mint_new(&alice, &1000u128, &String::from_str(&env, "uri-0"));
-    client.mint(&alice, &token_id, &1000u128, &String::from_str(&env, "uri-0"));
+    client.mint(
+        &alice,
+        &token_id,
+        &1000u128,
+        &String::from_str(&env, "uri-0"),
+    );
     assert_eq!(client.total_supply(&token_id), 2000u128);
 }

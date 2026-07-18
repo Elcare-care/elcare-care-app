@@ -21,7 +21,7 @@
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token::TokenClient,
-    xdr::ToXdr, Address, Bytes, BytesN, Env, String, Vec,
+    xdr::ToXdr, Address, Bytes, BytesN, Env, String, Symbol, Vec,
 };
 
 // ─── Errors ──────────────────────────────────────────────────────────────────
@@ -305,6 +305,7 @@ impl LazyMint1155 {
             100_000,
         );
 
+        let creator: Address = env.storage().instance().get(&DataKey::Creator).unwrap();
         #[allow(deprecated)]
         env.events().publish(
             (symbol_short!("mint"), creator, buyer.clone()),
@@ -437,10 +438,8 @@ impl LazyMint1155 {
             .persistent()
             .extend_ttl(&DataKey::TotalSupply(token_id), 50_000, 100_000);
         #[allow(deprecated)]
-        env.events().publish(
-            (symbol_short!("burn"), from.clone()),
-            (token_id, amount),
-        );
+        env.events()
+            .publish((symbol_short!("burn"), from.clone()), (token_id, amount));
         Ok(())
     }
 

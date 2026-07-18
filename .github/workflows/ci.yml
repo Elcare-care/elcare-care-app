@@ -99,6 +99,10 @@ jobs:
 
   contracts:
     name: Build and Test Contracts
+    # Guard: the WASM build and `cargo test` below run against the whole
+    # workspace and MUST keep including `contracts/launchpad` (soroban-launchpad).
+    # Do not narrow these to a `-p` subset — the launchpad crate once bit-rotted
+    # into an uncompilable state because nothing in CI exercised it.
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository

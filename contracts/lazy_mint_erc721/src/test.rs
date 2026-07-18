@@ -20,6 +20,7 @@ fn setup_test() -> (Env, LazyMint721Client<'static>, Address) {
 fn default_init(env: &Env, client: &LazyMint721Client, creator: &Address) {
     let pubkey = BytesN::from_array(env, &[1u8; 32]);
     let royalty_receiver = Address::generate(env);
+    let fee_receiver = Address::generate(env);
     client.initialize(
         creator,
         &pubkey,
@@ -140,7 +141,12 @@ fn test_voucher_expired_returns_proper_error() {
         ..make_voucher(&env, 1)
     };
 
-    let result = client.try_redeem(&buyer, &voucher, &BytesN::from_array(&env, &[0u8; 64]), &empty_proof(&env));
+    let result = client.try_redeem(
+        &buyer,
+        &voucher,
+        &BytesN::from_array(&env, &[0u8; 64]),
+        &empty_proof(&env),
+    );
     assert_eq!(result, Err(Ok(Error::VoucherExpired)));
 }
 
@@ -152,7 +158,12 @@ fn test_invalid_signature_returns_proper_error() {
 
     let buyer = Address::generate(&env);
     let voucher = make_voucher(&env, 1);
-    let result = client.try_redeem(&buyer, &voucher, &BytesN::from_array(&env, &[0u8; 64]), &empty_proof(&env));
+    let result = client.try_redeem(
+        &buyer,
+        &voucher,
+        &BytesN::from_array(&env, &[0u8; 64]),
+        &empty_proof(&env),
+    );
     assert!(result.is_err());
 }
 
@@ -164,7 +175,12 @@ fn test_wrong_signature_format_returns_proper_error() {
 
     let buyer = Address::generate(&env);
     let voucher = make_voucher(&env, 2);
-    let result = client.try_redeem(&buyer, &voucher, &BytesN::from_array(&env, &[255u8; 64]), &empty_proof(&env));
+    let result = client.try_redeem(
+        &buyer,
+        &voucher,
+        &BytesN::from_array(&env, &[255u8; 64]),
+        &empty_proof(&env),
+    );
     assert!(result.is_err());
 }
 
@@ -179,7 +195,12 @@ fn test_signature_for_wrong_voucher_data_returns_proper_error() {
         token_id: 999,
         ..make_voucher(&env, 3)
     };
-    let result = client.try_redeem(&buyer, &modified_voucher, &BytesN::from_array(&env, &[42u8; 64]), &empty_proof(&env));
+    let result = client.try_redeem(
+        &buyer,
+        &modified_voucher,
+        &BytesN::from_array(&env, &[42u8; 64]),
+        &empty_proof(&env),
+    );
     assert!(result.is_err());
 }
 
@@ -194,7 +215,12 @@ fn test_graceful_signature_error_handling_with_payment() {
         price: 500,
         ..make_voucher(&env, 4)
     };
-    let result = client.try_redeem(&buyer, &voucher, &BytesN::from_array(&env, &[99u8; 64]), &empty_proof(&env));
+    let result = client.try_redeem(
+        &buyer,
+        &voucher,
+        &BytesN::from_array(&env, &[99u8; 64]),
+        &empty_proof(&env),
+    );
     assert!(result.is_err());
 }
 
@@ -208,7 +234,12 @@ fn test_allowlist_phase_no_root_returns_not_allowlisted() {
 
     let buyer = Address::generate(&env);
     let voucher = make_voucher(&env, 10);
-    let result = client.try_redeem(&buyer, &voucher, &BytesN::from_array(&env, &[0u8; 64]), &empty_proof(&env));
+    let result = client.try_redeem(
+        &buyer,
+        &voucher,
+        &BytesN::from_array(&env, &[0u8; 64]),
+        &empty_proof(&env),
+    );
     assert_eq!(result, Err(Ok(Error::NotAllowlisted)));
 }
 
@@ -222,7 +253,12 @@ fn test_allowlist_phase_empty_proof_returns_not_allowlisted() {
     client.set_merkle_root(&root);
 
     let voucher = make_voucher(&env, 11);
-    let result = client.try_redeem(&buyer, &voucher, &BytesN::from_array(&env, &[0u8; 64]), &empty_proof(&env));
+    let result = client.try_redeem(
+        &buyer,
+        &voucher,
+        &BytesN::from_array(&env, &[0u8; 64]),
+        &empty_proof(&env),
+    );
     assert_eq!(result, Err(Ok(Error::NotAllowlisted)));
 }
 
@@ -240,7 +276,12 @@ fn test_allowlist_phase_wrong_proof_returns_invalid_merkle_proof() {
 
     // Pass other's proof for buyer — invalid
     let voucher = make_voucher(&env, 12);
-    let result = client.try_redeem(&buyer, &voucher, &BytesN::from_array(&env, &[0u8; 64]), &proof_other);
+    let result = client.try_redeem(
+        &buyer,
+        &voucher,
+        &BytesN::from_array(&env, &[0u8; 64]),
+        &proof_other,
+    );
     assert_eq!(result, Err(Ok(Error::InvalidMerkleProof)));
 }
 
@@ -257,7 +298,12 @@ fn test_allowlist_phase_garbage_proof_returns_invalid_merkle_proof() {
     bad_proof.push_back(BytesN::from_array(&env, &[0xdeu8; 32]));
 
     let voucher = make_voucher(&env, 13);
-    let result = client.try_redeem(&buyer, &voucher, &BytesN::from_array(&env, &[0u8; 64]), &bad_proof);
+    let result = client.try_redeem(
+        &buyer,
+        &voucher,
+        &BytesN::from_array(&env, &[0u8; 64]),
+        &bad_proof,
+    );
     assert_eq!(result, Err(Ok(Error::InvalidMerkleProof)));
 }
 
@@ -274,7 +320,12 @@ fn test_allowlist_phase_non_member_with_proof_returns_invalid_merkle_proof() {
 
     // outsider tries to use addr_b's proof — doesn't match outsider's leaf
     let voucher = make_voucher(&env, 14);
-    let result = client.try_redeem(&outsider, &voucher, &BytesN::from_array(&env, &[0u8; 64]), &proof_b);
+    let result = client.try_redeem(
+        &outsider,
+        &voucher,
+        &BytesN::from_array(&env, &[0u8; 64]),
+        &proof_b,
+    );
     assert_eq!(result, Err(Ok(Error::InvalidMerkleProof)));
 }
 
@@ -293,7 +344,12 @@ fn test_allowlist_phase_valid_proof_proceeds_to_signature_check() {
     client.set_merkle_root(&root);
 
     let voucher = make_voucher(&env, 20);
-    let result = client.try_redeem(&buyer, &voucher, &BytesN::from_array(&env, &[0u8; 64]), &proof_buyer);
+    let result = client.try_redeem(
+        &buyer,
+        &voucher,
+        &BytesN::from_array(&env, &[0u8; 64]),
+        &proof_buyer,
+    );
 
     // Must NOT be NotAllowlisted or InvalidMerkleProof — proof was valid.
     // The host aborts on bad ed25519 so result is Err (not Ok).
@@ -338,7 +394,12 @@ fn test_allowlist_single_leaf_tree_valid_proof() {
     proof_buyer.push_back(leaf_c);
 
     let voucher = make_voucher(&env, 21);
-    let result = client.try_redeem(&buyer, &voucher, &BytesN::from_array(&env, &[0u8; 64]), &proof_buyer);
+    let result = client.try_redeem(
+        &buyer,
+        &voucher,
+        &BytesN::from_array(&env, &[0u8; 64]),
+        &proof_buyer,
+    );
 
     assert!(result.is_err());
     assert_ne!(result, Err(Ok(Error::NotAllowlisted)));
@@ -386,7 +447,12 @@ fn test_public_phase_bypasses_merkle_check() {
 
     let buyer = Address::generate(&env);
     let voucher = make_voucher(&env, 30);
-    let result = client.try_redeem(&buyer, &voucher, &BytesN::from_array(&env, &[0u8; 64]), &empty_proof(&env));
+    let result = client.try_redeem(
+        &buyer,
+        &voucher,
+        &BytesN::from_array(&env, &[0u8; 64]),
+        &empty_proof(&env),
+    );
 
     assert!(result.is_err());
     assert_ne!(result, Err(Ok(Error::NotAllowlisted)));
@@ -405,7 +471,12 @@ fn test_public_phase_ignores_non_empty_proof() {
     irrelevant_proof.push_back(BytesN::from_array(&env, &[0xffu8; 32]));
 
     let voucher = make_voucher(&env, 31);
-    let result = client.try_redeem(&buyer, &voucher, &BytesN::from_array(&env, &[0u8; 64]), &irrelevant_proof);
+    let result = client.try_redeem(
+        &buyer,
+        &voucher,
+        &BytesN::from_array(&env, &[0u8; 64]),
+        &irrelevant_proof,
+    );
 
     assert!(result.is_err());
     assert_ne!(result, Err(Ok(Error::NotAllowlisted)));
@@ -521,7 +592,12 @@ fn test_allowlist_phase_voucher_expiry_checked_before_merkle() {
         ..make_voucher(&env, 40)
     };
 
-    let result = client.try_redeem(&buyer, &voucher, &BytesN::from_array(&env, &[0u8; 64]), &empty_proof(&env));
+    let result = client.try_redeem(
+        &buyer,
+        &voucher,
+        &BytesN::from_array(&env, &[0u8; 64]),
+        &empty_proof(&env),
+    );
     // VoucherExpired is checked first (step 1), Merkle is step 0 — but in our
     // implementation Merkle (step 0) runs before expiry (step 1).
     // Accept either NotAllowlisted (empty proof) or VoucherExpired depending
@@ -547,14 +623,24 @@ fn test_allowlist_allows_only_listed_buyers() {
 
     // allowed buyer: proof is valid → proceeds past Merkle gate (sig will fail)
     let voucher_a = make_voucher(&env, 50);
-    let result_a = client.try_redeem(&allowed, &voucher_a, &BytesN::from_array(&env, &[0u8; 64]), &proof_allowed);
+    let result_a = client.try_redeem(
+        &allowed,
+        &voucher_a,
+        &BytesN::from_array(&env, &[0u8; 64]),
+        &proof_allowed,
+    );
     assert!(result_a.is_err());
     assert_ne!(result_a, Err(Ok(Error::NotAllowlisted)));
     assert_ne!(result_a, Err(Ok(Error::InvalidMerkleProof)));
 
     // denied buyer: empty proof → NotAllowlisted
     let voucher_d = make_voucher(&env, 51);
-    let result_d = client.try_redeem(&denied, &voucher_d, &BytesN::from_array(&env, &[0u8; 64]), &empty_proof(&env));
+    let result_d = client.try_redeem(
+        &denied,
+        &voucher_d,
+        &BytesN::from_array(&env, &[0u8; 64]),
+        &empty_proof(&env),
+    );
     assert_eq!(result_d, Err(Ok(Error::NotAllowlisted)));
 }
 
@@ -623,6 +709,8 @@ fn voucher_replay_rejected_with_already_redeemed_error() {
         &fee_receiver,
         &0u32,
     );
+    // Skip the allowlist gate so redeem reaches the replay check.
+    client.set_public_phase();
 
     // Manually mark token_id 5 as redeemed (simulates a prior successful redemption)
     env.as_contract(&client.address, || {
@@ -643,7 +731,7 @@ fn voucher_replay_rejected_with_already_redeemed_error() {
     };
 
     let sig = BytesN::from_array(&env, &[0u8; 64]);
-    let result = client.try_redeem(&buyer, &voucher, &sig);
+    let result = client.try_redeem(&buyer, &voucher, &sig, &soroban_sdk::vec![&env]);
     assert_eq!(result, Err(Ok(Error::VoucherAlreadyRedeemed)));
 }
 
@@ -722,7 +810,7 @@ fn different_nonces_are_independent() {
         valid_until: 0,
     };
     let bad_sig = BytesN::from_array(&env, &[0u8; 64]);
-    let result2 = client.try_redeem(&buyer, &voucher2, &bad_sig);
+    let result2 = client.try_redeem(&buyer, &voucher2, &bad_sig, &soroban_sdk::vec![&env]);
     // Should fail with host abort (invalid signature), NOT VoucherAlreadyRedeemed
     assert!(result2.is_err());
     // Confirm it's not a VoucherAlreadyRedeemed
@@ -748,6 +836,8 @@ fn replay_check_precedes_signature_verification() {
         &fee_receiver,
         &0u32,
     );
+    // Skip the allowlist gate so redeem reaches the replay check.
+    client.set_public_phase();
 
     // Mark token 3 as already redeemed
     env.as_contract(&client.address, || {
@@ -769,6 +859,6 @@ fn replay_check_precedes_signature_verification() {
 
     // Even with a completely wrong signature, we get VoucherAlreadyRedeemed (not a host abort)
     let any_sig = BytesN::from_array(&env, &[99u8; 64]);
-    let result = client.try_redeem(&buyer, &voucher, &any_sig);
+    let result = client.try_redeem(&buyer, &voucher, &any_sig, &soroban_sdk::vec![&env]);
     assert_eq!(result, Err(Ok(Error::VoucherAlreadyRedeemed)));
 }
