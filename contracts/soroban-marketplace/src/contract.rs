@@ -12,16 +12,20 @@ use crate::events::*;
 
 use crate::{
     storage::{
-        acquire_auction_lock, acquire_listing_lock, add_artist_auction_id, add_artist_listing_id,
-        add_to_active_listings, append_bid_record, clear_pending_admin_storage,
-        get_active_listing_ids, get_artist_auction_ids, get_artist_listing_ids,
-        get_auction_count, get_listing_count, get_pending_admin_storage,
-        increment_auction_count, increment_listing_count, increment_offer_count,
-        is_artist_revoked_storage, load_auction, load_auction_bids, load_listing,
-        load_listing_offers, load_offer, load_offerer_offers, release_auction_lock,
-        release_listing_lock, remove_artist_revocation_storage, remove_from_active_listings,
-        save_auction, save_listing, save_listing_offers, save_offer, save_offerer_offers,
-        set_artist_revocation_storage, set_pending_admin_storage,
+        acquire_auction_lock, acquire_listing_lock, active_listings_len, add_artist_auction_id,
+        add_artist_listing_id, add_listing_offer_id, add_offerer_offer_id, add_pending_offer,
+        add_to_active_listings, append_bid_record, clear_artist_cancel_cursor,
+        clear_migration_progress, clear_pending_admin_storage, clear_pending_offers,
+        get_active_listing_ids_range, get_artist_auction_ids, get_artist_cancel_cursor,
+        get_artist_listing_ids, get_auction_count, get_listing_count, get_migration_progress,
+        get_pending_admin_storage, increment_auction_count, increment_listing_count,
+        increment_offer_count, index_append, index_len, is_artist_revoked_storage, load_auction,
+        load_auction_bids, load_listing, load_listing_offers, load_offer, load_offerer_offers,
+        load_pending_offer_ids, pending_offer_count, release_auction_lock, release_listing_lock,
+        remove_artist_revocation_storage, remove_from_active_listings, remove_pending_offer,
+        save_auction, save_listing, save_offer, set_artist_cancel_cursor,
+        set_artist_revocation_storage, set_migration_progress, set_pending_admin_storage,
+        take_legacy_index_vec, DataKey, IndexId,
         get_auction_extension_window_storage, get_auction_extension_trigger_storage,
         set_auction_extension_window_storage, set_auction_extension_trigger_storage,
         get_min_price_storage, get_max_price_storage,
@@ -57,7 +61,18 @@ const MIN_AUCTION_DURATION: u64 = 3_600; // 1 hour
 
 /// Semantic version reported by `version()` and used as the per-version
 /// migration marker in `migrate`.
-const CONTRACT_VERSION: &str = "1.0.0";
+///
+/// 1.1.0 introduces bucketed (paged) index storage: the 1.1.0 migration
+/// transforms the legacy monolithic `Vec<u64>` index entries into
+/// fixed-capacity pages and rebuilds the per-listing pending-offer sets.
+const CONTRACT_VERSION: &str = "1.1.0";
+
+/// Maximum number of listing ids accepted by one `cancel_listings` batch.
+///
+/// Sized so a full batch (listing + index-page + position-key + pending-offer
+/// writes per cancellation) stays comfortably inside Soroban's per-transaction
+/// ledger-entry limits (~100 footprint entries / ~50 written entries).
+const MAX_BATCH_CANCEL: u32 = 10;
 
 /// Maximum number of bid records retained per auction in the on-chain history.
 ///
@@ -162,34 +177,184 @@ impl MarketplaceContract {
     /// 2. Verify `version()` returns the expected string.
     /// 3. Any data back-fill should be performed inside this function body
     ///    for the specific version being migrated to.
+    /// # 1.1.0 migration
+    /// Transforms the legacy monolithic `Vec<u64>` index entries
+    /// (ActiveListings, ArtistListings, ArtistAuctions, ListingOffers,
+    /// OffererOffers) into fixed-capacity pages, and rebuilds the bounded
+    /// per-listing pending-offer sets used for O(1) offer-cap enforcement.
+    /// Legacy keys are deleted as they are consumed, so re-running a partial
+    /// migration never duplicates entries.
+    ///
+    /// Run `migrate` immediately after the WASM upgrade (ideally while the
+    /// contract is paused): index writes performed between the upgrade and the
+    /// migration land in the paged storage first, so migrated legacy entries
+    /// would be appended after them, deviating from strict creation order.
+    ///
+    /// For state too large to migrate in one transaction, use the bounded
+    /// [`Self::migrate_step`] variant until it returns 0.
     pub fn migrate(env: Env, admin: Address) {
+        let version = Self::require_pending_migration(&env, &admin);
+        // Unbounded budget: run every phase to completion in this invocation.
+        Self::run_migration(&env, &version, u32::MAX);
+    }
+
+    /// Bounded, resumable variant of [`Self::migrate`]: processes at most
+    /// `max_items` migration units (one listing, auction or offer each) and
+    /// persists a cursor so the next call resumes where this one stopped.
+    ///
+    /// Returns the number of units still to process — call repeatedly until it
+    /// returns `0`, at which point the migration marker is recorded and any
+    /// further call (of this or `migrate`) reverts with `AlreadyMigrated`.
+    pub fn migrate_step(env: Env, admin: Address, max_items: u32) -> u64 {
+        let version = Self::require_pending_migration(&env, &admin);
+        Self::run_migration(&env, &version, max_items)
+    }
+
+    /// Common guard for `migrate`/`migrate_step`: admin auth + not-yet-migrated.
+    fn require_pending_migration(env: &Env, admin: &Address) -> soroban_sdk::String {
         admin.require_auth();
         let stored_admin = Self::get_admin(env.clone()).expect("admin not set");
-        if admin != stored_admin {
-            panic_with_error!(&env, MarketplaceError::Unauthorized);
+        if *admin != stored_admin {
+            panic_with_error!(env, MarketplaceError::Unauthorized);
+        }
+        let version = soroban_sdk::String::from_str(env, CONTRACT_VERSION);
+        if is_migration_done(env, &version) {
+            panic_with_error!(env, MarketplaceError::AlreadyMigrated);
+        }
+        version
+    }
+
+    /// Migration engine shared by `migrate` and `migrate_step`.
+    ///
+    /// Phases (each unit is one listing/auction/offer, so per-call work is
+    /// strictly bounded by `budget`):
+    ///   0. per listing: migrate the artist's legacy listing index and the
+    ///      listing's legacy offer index; rebuild its pending-offer set.
+    ///   1. per auction: migrate the creator's legacy auction index.
+    ///   2. per offer:   migrate the offerer's legacy offer index.
+    ///   3. move the legacy ActiveListings vector into pages + position keys.
+    ///
+    /// Returns the number of units remaining; records the completion marker
+    /// (and drops the cursor) when everything has been processed.
+    fn run_migration(env: &Env, version: &soroban_sdk::String, mut budget: u32) -> u64 {
+        let mut p = get_migration_progress(env, version);
+        let listing_count = get_listing_count(env);
+        let auction_count = get_auction_count(env);
+        let offer_count = crate::storage::get_offer_count(env);
+
+        while budget > 0 {
+            match p.phase {
+                0 => {
+                    if p.cursor >= listing_count {
+                        p.phase = 1;
+                        p.cursor = 0;
+                        continue;
+                    }
+                    let listing_id = p.cursor + 1; // ids are 1-based
+                    Self::migrate_listing_unit(env, listing_id);
+                    p.cursor += 1;
+                    budget -= 1;
+                }
+                1 => {
+                    if p.cursor >= auction_count {
+                        p.phase = 2;
+                        p.cursor = 0;
+                        continue;
+                    }
+                    let auction_id = p.cursor + 1;
+                    if let Some(auction) = load_auction(env, auction_id) {
+                        Self::migrate_legacy_index(
+                            env,
+                            &DataKey::ArtistAuctions(auction.creator.clone()),
+                            &IndexId::ArtistAuctions(auction.creator),
+                        );
+                    }
+                    p.cursor += 1;
+                    budget -= 1;
+                }
+                2 => {
+                    if p.cursor >= offer_count {
+                        p.phase = 3;
+                        p.cursor = 0;
+                        continue;
+                    }
+                    let offer_id = p.cursor + 1;
+                    if let Some(offer) = load_offer(env, offer_id) {
+                        Self::migrate_legacy_index(
+                            env,
+                            &DataKey::OffererOffers(offer.offerer.clone()),
+                            &IndexId::OffererOffers(offer.offerer),
+                        );
+                    }
+                    p.cursor += 1;
+                    budget -= 1;
+                }
+                3 => {
+                    // The legacy active index is a single entry; reading it is
+                    // the same cost the old code paid on every removal.
+                    if let Some(ids) = take_legacy_index_vec(env, &DataKey::ActiveListings) {
+                        for listing_id in ids.iter() {
+                            add_to_active_listings(env, listing_id);
+                        }
+                    }
+                    p.phase = 4;
+                    budget -= 1;
+                }
+                _ => break,
+            }
         }
 
-        let version = soroban_sdk::String::from_str(&env, CONTRACT_VERSION);
+        let remaining: u64 = match p.phase {
+            0 => (listing_count - p.cursor) + auction_count + offer_count + 1,
+            1 => (auction_count - p.cursor) + offer_count + 1,
+            2 => (offer_count - p.cursor) + 1,
+            3 => 1,
+            _ => 0,
+        };
 
-        // Guard: revert if this migration has already been applied.
-        if is_migration_done(&env, &version) {
-            panic_with_error!(&env, MarketplaceError::AlreadyMigrated);
+        if remaining == 0 {
+            clear_migration_progress(env, version);
+            set_migration_done(env, version);
+        } else {
+            set_migration_progress(env, version, &p);
         }
+        remaining
+    }
 
-        // ── Per-version migration logic ──────────────────────────────
-        // Add version-specific storage shape changes here.  Each released
-        // version gets its own `if version == "x.y.z" { ... }` block.
-        // Example for a future 1.1.0 migration:
-        //   if version_str == "1.1.0" {
-        //       // back-fill new field on existing listings...
-        //   }
-        //
-        // For 1.0.0 there is no storage shape change — the marker alone
-        // establishes forward compatibility for subsequent upgrades.
-        // ────────────────────────────────────────────────────────────
+    /// Phase-0 unit: migrate everything hanging off one listing.
+    fn migrate_listing_unit(env: &Env, listing_id: u64) {
+        let listing = match load_listing(env, listing_id) {
+            Some(l) => l,
+            None => return,
+        };
+        // The first listing of each artist migrates the artist's whole legacy
+        // index; later listings find the legacy key already consumed.
+        Self::migrate_legacy_index(
+            env,
+            &DataKey::ArtistListings(listing.artist.clone()),
+            &IndexId::ArtistListings(listing.artist.clone()),
+        );
+        // Per-listing offer history + pending-offer set rebuild.
+        if let Some(offer_ids) = take_legacy_index_vec(env, &DataKey::ListingOffers(listing_id)) {
+            for offer_id in offer_ids.iter() {
+                index_append(env, &IndexId::ListingOffers(listing_id), offer_id);
+                if let Some(offer) = load_offer(env, offer_id) {
+                    if offer.status == OfferStatus::Pending {
+                        add_pending_offer(env, listing_id, offer_id);
+                    }
+                }
+            }
+        }
+    }
 
-        // Record the migration marker so this version is not re-applied.
-        set_migration_done(&env, &version);
+    /// Move one legacy monolithic `Vec<u64>` entry into the paged index,
+    /// deleting the legacy key.  No-op when the legacy key is absent.
+    fn migrate_legacy_index(env: &Env, legacy: &DataKey, idx: &IndexId) {
+        if let Some(ids) = take_legacy_index_vec(env, legacy) {
+            for value in ids.iter() {
+                index_append(env, idx, value);
+            }
+        }
     }
 
     // ── Global price bounds ───────────────────────────────────────
@@ -364,28 +529,47 @@ impl MarketplaceContract {
         is_artist_revoked_storage(&env, &artist)
     }
 
-    /// Cancel all active listings for a revoked artist.
-    /// Called by admin after revoking an artist to clean up their active listings.
-    /// Emits ListingCancelledEvent with reason=AdminRevoked for each cancelled listing.
-    pub fn cancel_artist_listings(env: Env, admin: Address, artist: Address) {
+    /// Cancel the active listings of a revoked artist — batched and resumable.
+    ///
+    /// Called by the admin after revoking an artist to clean up their active
+    /// listings.  Processes at most `max_items` of the artist's listings per
+    /// invocation (bounding the per-transaction read/write footprint for a
+    /// prolific artist) and persists a cursor so the next call resumes where
+    /// this one stopped.  Per cancelled listing the semantics are unchanged:
+    /// every pending offer is refunded and rejected first, then the listing is
+    /// cancelled and a ListingCancelledEvent with reason=AdminRevoked is
+    /// emitted.
+    ///
+    /// Returns the number of the artist's listings still to process — call
+    /// repeatedly until it returns `0`.  Calling it for a non-revoked artist
+    /// does nothing and returns `0`.
+    pub fn cancel_artist_listings(env: Env, admin: Address, artist: Address, max_items: u32) -> u64 {
         admin.require_auth();
         let stored_admin = Self::get_admin(env.clone()).expect("admin not set");
         if admin != stored_admin {
             panic_with_error!(&env, MarketplaceError::Unauthorized);
         }
 
-        // Only cancel listings if the artist is actually revoked
+        // Only cancel listings if the artist is actually revoked.  A stale
+        // cursor from an interrupted sweep is dropped so a later re-revocation
+        // starts from the beginning (new listings may have appeared since).
         if !is_artist_revoked_storage(&env, &artist) {
-            return;
+            clear_artist_cancel_cursor(&env, &artist);
+            return 0;
         }
 
-        let listing_ids = get_artist_listing_ids(&env, &artist);
-        for listing_id in listing_ids.iter() {
+        let idx = IndexId::ArtistListings(artist.clone());
+        let total = index_len(&env, &idx);
+        let mut cursor = get_artist_cancel_cursor(&env, &artist);
+        let end = cursor.saturating_add(max_items).min(total);
+
+        while cursor < end {
+            let listing_id = crate::storage::index_get(&env, &idx, cursor).unwrap();
+            cursor += 1;
             if let Some(mut listing) = load_listing(&env, listing_id) {
                 if listing.status == ListingStatus::Active {
-                    // Refund all pending offers
-                    let offers = load_listing_offers(&env, listing_id);
-                    for offer_id in offers.iter() {
+                    // Refund-then-cancel: sweep the bounded pending-offer set.
+                    for offer_id in load_pending_offer_ids(&env, listing_id).iter() {
                         if let Some(mut offer) = load_offer(&env, offer_id) {
                             if offer.status == OfferStatus::Pending {
                                 TokenClient::new(&env, &offer.token).transfer(
@@ -398,6 +582,7 @@ impl MarketplaceContract {
                             }
                         }
                     }
+                    clear_pending_offers(&env, listing_id);
 
                     listing.status = ListingStatus::Cancelled;
                     save_listing(&env, &listing);
@@ -413,6 +598,66 @@ impl MarketplaceContract {
                 }
             }
         }
+
+        // The cursor is kept at `total` once the sweep completes: repeat calls
+        // are then true no-ops, and listings created after a reinstate/
+        // re-revoke cycle append behind the cursor so only they get swept.
+        set_artist_cancel_cursor(&env, &artist, cursor);
+        (total - cursor) as u64
+    }
+
+    /// Batch-cancel up to `MAX_BATCH_CANCEL` of the caller's own listings in a
+    /// single invocation.  Strict all-or-nothing semantics: every id must
+    /// exist, be owned by `owner` and still be Active, otherwise the whole
+    /// call reverts.  Per listing the refund-then-cancel semantics match
+    /// `cancel_listing`.  Returns the number of listings cancelled.
+    pub fn cancel_listings(env: Env, owner: Address, listing_ids: Vec<u64>) -> u32 {
+        Self::require_not_paused(&env);
+        owner.require_auth();
+
+        if listing_ids.len() > MAX_BATCH_CANCEL {
+            panic_with_error!(&env, MarketplaceError::BatchTooLarge);
+        }
+
+        for listing_id in listing_ids.iter() {
+            let mut listing = load_listing(&env, listing_id)
+                .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::ListingNotFound));
+            if listing.artist != owner {
+                panic_with_error!(&env, MarketplaceError::Unauthorized);
+            }
+            if listing.status != ListingStatus::Active {
+                panic_with_error!(&env, MarketplaceError::ListingNotActive);
+            }
+
+            for offer_id in load_pending_offer_ids(&env, listing_id).iter() {
+                if let Some(mut offer) = load_offer(&env, offer_id) {
+                    if offer.status == OfferStatus::Pending {
+                        TokenClient::new(&env, &offer.token).transfer(
+                            &env.current_contract_address(),
+                            &offer.offerer,
+                            &offer.amount,
+                        );
+                        offer.status = OfferStatus::Rejected;
+                        save_offer(&env, &offer);
+                    }
+                }
+            }
+            clear_pending_offers(&env, listing_id);
+
+            listing.status = ListingStatus::Cancelled;
+            save_listing(&env, &listing);
+            remove_from_active_listings(&env, listing_id);
+
+            ListingCancelledEvent {
+                listing_id,
+                cancelled_by: owner.clone(),
+                reason: CancelReason::Owner,
+                ledger_sequence: env.ledger().sequence(),
+            }
+            .publish(&env);
+        }
+
+        listing_ids.len()
     }
 
     // ── Token Whitelist ─────────────────────────────────────
@@ -562,13 +807,10 @@ impl MarketplaceContract {
             panic_with_error!(&env, MarketplaceError::ListingNotActive);
         }
 
-        let offers = load_listing_offers(&env, listing_id);
-        for offer_id in offers.iter() {
-            if let Some(offer) = load_offer(&env, offer_id) {
-                if offer.status == OfferStatus::Pending {
-                    panic_with_error!(&env, MarketplaceError::Unauthorized);
-                }
-            }
+        // Updates are blocked while any offer is Pending — O(1) check against
+        // the bounded pending-offer set instead of scanning offer history.
+        if pending_offer_count(&env, listing_id) > 0 {
+            panic_with_error!(&env, MarketplaceError::Unauthorized);
         }
 
         if new_price <= 0 {
@@ -692,8 +934,9 @@ impl MarketplaceContract {
         remove_from_active_listings(&env, listing_id);
 
         // Reject all pending offers (state mutation only — token refunds happen
-        // in the interactions phase below).
-        let offers = load_listing_offers(&env, listing_id);
+        // in the interactions phase below).  The sweep iterates the bounded
+        // pending-offer set (≤ MAX_OFFERS_PER_LISTING), not the full history.
+        let offers = load_pending_offer_ids(&env, listing_id);
         let mut pending_offerers: Vec<Address> = Vec::new(&env);
         let mut pending_amounts: Vec<i128> = Vec::new(&env);
         let mut pending_tokens: Vec<Address> = Vec::new(&env);
@@ -708,6 +951,7 @@ impl MarketplaceContract {
                 }
             }
         }
+        clear_pending_offers(&env, listing_id);
 
         ArtworkSoldEvent {
             listing_id,
@@ -785,8 +1029,8 @@ impl MarketplaceContract {
             panic_with_error!(&env, MarketplaceError::ListingNotActive);
         }
 
-        let offers = load_listing_offers(&env, listing_id);
-        for offer_id in offers.iter() {
+        // Refund-then-cancel over the bounded pending-offer set.
+        for offer_id in load_pending_offer_ids(&env, listing_id).iter() {
             if let Some(mut offer) = load_offer(&env, offer_id) {
                 if offer.status == OfferStatus::Pending {
                     TokenClient::new(&env, &offer.token).transfer(
@@ -799,6 +1043,7 @@ impl MarketplaceContract {
                 }
             }
         }
+        clear_pending_offers(&env, listing_id);
 
         listing.status = ListingStatus::Cancelled;
         save_listing(&env, &listing);
@@ -1296,16 +1541,9 @@ impl MarketplaceContract {
         }
         // Enforce the active-offer cap so per-listing storage is bounded.
         // Only Pending offers count; terminal offers have freed their slot.
-        let listing_offer_ids = load_listing_offers(&env, listing_id);
-        let mut active_offers: u32 = 0;
-        for oid in listing_offer_ids.iter() {
-            if let Some(offer) = load_offer(&env, oid) {
-                if offer.status == OfferStatus::Pending {
-                    active_offers += 1;
-                }
-            }
-        }
-        if active_offers >= MAX_OFFERS_PER_LISTING {
+        // O(1): one read of the bounded pending-offer set — no scan over the
+        // listing's full offer history.
+        if pending_offer_count(&env, listing_id) >= MAX_OFFERS_PER_LISTING {
             panic_with_error!(&env, MarketplaceError::OfferLimitReached);
         }
         TokenClient::new(&env, &token).transfer(&offerer, &env.current_contract_address(), &amount);
@@ -1323,12 +1561,10 @@ impl MarketplaceContract {
                 expires_at, // #32: optional expiry stored with offer
             },
         );
-        let mut lo = load_listing_offers(&env, listing_id);
-        lo.push_back(offer_id);
-        save_listing_offers(&env, listing_id, &lo);
-        let mut oo = load_offerer_offers(&env, &offerer);
-        oo.push_back(offer_id);
-        save_offerer_offers(&env, &offerer, &oo);
+        // O(1) appends: each index touches only its last page.
+        add_listing_offer_id(&env, listing_id, offer_id);
+        add_offerer_offer_id(&env, &offerer, offer_id);
+        add_pending_offer(&env, listing_id, offer_id);
 
         OfferMadeEvent {
             offer_id,
@@ -1362,6 +1598,7 @@ impl MarketplaceContract {
         );
         offer.status = OfferStatus::Withdrawn;
         save_offer(&env, &offer);
+        remove_pending_offer(&env, offer.listing_id, offer_id);
 
         OfferWithdrawnEvent {
             offer_id,
@@ -1393,6 +1630,7 @@ impl MarketplaceContract {
         );
         offer.status = OfferStatus::Rejected;
         save_offer(&env, &offer);
+        remove_pending_offer(&env, offer.listing_id, offer_id);
 
         OfferRejectedEvent {
             offer_id,
@@ -1462,8 +1700,10 @@ impl MarketplaceContract {
         remove_from_active_listings(&env, accepted_listing_id);
 
         // #31: Mark all other pending offers Rejected; collect refund data and
-        // emit OfferRejectedEvent for each.
-        let sibling_offers = load_listing_offers(&env, listing.listing_id);
+        // emit OfferRejectedEvent for each.  Sweeps the bounded pending-offer
+        // set (≤ MAX_OFFERS_PER_LISTING), then drops it — the accepted offer
+        // and every sibling have reached a terminal state.
+        let sibling_offers = load_pending_offer_ids(&env, listing.listing_id);
         let mut refund_offerers: Vec<Address> = Vec::new(&env);
         let mut refund_amounts: Vec<i128> = Vec::new(&env);
         let mut refund_tokens: Vec<Address> = Vec::new(&env);
@@ -1486,6 +1726,7 @@ impl MarketplaceContract {
                 }
             }
         }
+        clear_pending_offers(&env, listing.listing_id);
 
         OfferAcceptedEvent {
             offer_id,
@@ -1568,6 +1809,7 @@ impl MarketplaceContract {
         );
         offer.status = OfferStatus::Withdrawn;
         save_offer(&env, &offer);
+        remove_pending_offer(&env, offer.listing_id, offer_id);
 
         OfferReclaimedEvent {
             offer_id,
@@ -1597,19 +1839,29 @@ impl MarketplaceContract {
         get_artist_auction_ids(&env, &artist)
     }
 
+    /// Paginated ids of currently-active listings.
+    ///
+    /// Ordering note (deliberate change with the 1.1.0 paged storage): the
+    /// active index uses swap-removal, so after any listing leaves the set the
+    /// order is no longer strict creation order.  It is stable between
+    /// removals; clients needing chronological order should sort by id.
     pub fn get_active_listings(env: Env, limit: u32, offset: u32) -> Vec<u64> {
-        let ids = get_active_listing_ids(&env);
-        let start = offset as usize;
-        let end = (start + limit as usize).min(ids.len() as usize);
-        let mut page = Vec::new(&env);
-        for i in start..end {
-            page.push_back(ids.get(i as u32).unwrap());
-        }
-        page
+        get_active_listing_ids_range(&env, offset, limit)
     }
 
     pub fn get_active_listings_page(env: Env, start: u32, limit: u32) -> Vec<u64> {
         Self::get_active_listings(env, limit, start)
+    }
+
+    /// Total number of currently-active listings (O(1)).
+    pub fn get_active_listings_count(env: Env) -> u32 {
+        active_listings_len(&env)
+    }
+
+    /// Number of Pending offers on `listing_id` — the counter enforcing
+    /// MAX_OFFERS_PER_LISTING in `make_offer` (O(1)).
+    pub fn get_pending_offer_count(env: Env, listing_id: u64) -> u32 {
+        pending_offer_count(&env, listing_id)
     }
 
     /// Maximum `limit` accepted by `get_listings_paginated`.
@@ -1645,8 +1897,7 @@ impl MarketplaceContract {
             limit
         };
 
-        let ids = get_active_listing_ids(&env);
-        let total = ids.len();
+        let total = active_listings_len(&env);
 
         // Out-of-range start: return empty page + same cursor (no panic).
         if start >= total {
@@ -1654,9 +1905,10 @@ impl MarketplaceContract {
         }
 
         let end = (start + effective_limit).min(total);
+        // Read only the pages covering [start, end) — never the whole index.
+        let ids = get_active_listing_ids_range(&env, start, end - start);
         let mut listings: Vec<Listing> = Vec::new(&env);
-        for i in start..end {
-            let listing_id = ids.get(i).unwrap();
+        for listing_id in ids.iter() {
             if let Some(listing) = load_listing(&env, listing_id) {
                 listings.push_back(listing);
             }
