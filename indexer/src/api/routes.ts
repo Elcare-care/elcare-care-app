@@ -12,6 +12,7 @@ import {
   walletActivityQuerySchema,
   collectionsQuerySchema,
   statsQuerySchema,
+  syncGapsQuerySchema,
 } from './query-schemas.js';
 
 // ── SSE registry ───────────────────────────────────────────────────────────────
@@ -610,6 +611,104 @@ router.get('/keeper/status', async (req: Request, res: Response, next: NextFunct
     res.json(payload);
   } catch (err) {
     next(internalError('Failed to fetch keeper status'));
+  }
+});
+
+// ── GET /sync/gaps ────────────────────────────────────────────────────────────
+//
+// Returns ledger gaps with optional filtering by status/source.
+// Also includes a summary of open gaps and total missing ledgers.
+
+router.get('/sync/gaps', validateQuery(syncGapsQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
+  const { status, source, limit, offset } = (req as any).validatedQuery;
+  try {
+    const where: any = {};
+    if (status) where.status = status;
+    if (source) where.source = source;
+
+    const take = limit ?? 50;
+    const skip = offset ?? 0;
+
+    const [gaps, total, openSummary] = await Promise.all([
+      prisma.ledgerGap.findMany({
+        where,
+        orderBy: { createdAt: 'asc' },
+        take,
+        skip,
+        include: { repairJob: { select: { id: true, status: true, checkpointLedger: true, totalInserted: true } } },
+      }),
+      prisma.ledgerGap.count({ where }),
+      prisma.ledgerGap.findMany({
+        where: { status: 'Open' },
+        select: { fromLedger: true, toLedger: true },
+      }),
+    ]);
+
+    const openLedgers = openSummary.reduce(
+      (acc, g) => acc + (g.toLedger - g.fromLedger + 1), 0,
+    );
+
+    res.json({
+      summary: {
+        openGaps:    openSummary.length,
+        openLedgers,
+      },
+      total,
+      gaps: serialize(gaps),
+    });
+  } catch (err) {
+    next(internalError('Failed to fetch sync gaps'));
+  }
+});
+
+// ── GET /sync/gaps/:id ────────────────────────────────────────────────────────
+
+router.get('/sync/gaps/:id', async (req: Request, res: Response, next: NextFunction) => {
+  const id = parseInt(req.params.id, 10);
+  if (isNaN(id)) return next(badRequest('Gap ID must be an integer'));
+  try {
+    const gap = await prisma.ledgerGap.findUnique({
+      where: { id },
+      include: { repairJob: true },
+    });
+    if (!gap) return next(notFound('Gap not found'));
+    res.json(serialize(gap));
+  } catch (err) {
+    next(internalError('Failed to fetch gap'));
+  }
+});
+
+// ── GET /sync/jobs ────────────────────────────────────────────────────────────
+//
+// BackfillJob listing for operator visibility.
+
+router.get('/sync/jobs', async (req: Request, res: Response, next: NextFunction) => {
+  const status = req.query.status as string | undefined;
+  try {
+    const where: any = {};
+    if (status) where.status = status;
+    const jobs = await prisma.backfillJob.findMany({
+      where,
+      orderBy: { createdAt: 'desc' },
+      take: 100,
+    });
+    res.json(serialize(jobs));
+  } catch (err) {
+    next(internalError('Failed to fetch backfill jobs'));
+  }
+});
+
+// ── GET /sync/jobs/:id ────────────────────────────────────────────────────────
+
+router.get('/sync/jobs/:id', async (req: Request, res: Response, next: NextFunction) => {
+  const id = parseInt(req.params.id, 10);
+  if (isNaN(id)) return next(badRequest('Job ID must be an integer'));
+  try {
+    const job = await prisma.backfillJob.findUnique({ where: { id } });
+    if (!job) return next(notFound('BackfillJob not found'));
+    res.json(serialize(job));
+  } catch (err) {
+    next(internalError('Failed to fetch backfill job'));
   }
 });
 

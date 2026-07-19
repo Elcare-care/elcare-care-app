@@ -141,6 +141,61 @@ export const keeperFeeBumpsTotal = new client.Counter({
   labelNames: ['entry_point'],
 });
 
+// ── Backfill / gap-repair metrics ─────────────────────────────────────────────
+
+/** Number of Open LedgerGap rows currently in the DB (set each gap-repair cycle). */
+export const openGapsGauge = new client.Gauge({
+  name: 'indexer_open_ledger_gaps',
+  help: 'Number of LedgerGap rows currently in Open status',
+});
+
+/** Total ledgers covered by open gaps (sum of toLedger - fromLedger + 1). */
+export const openGapLedgersTotalGauge = new client.Gauge({
+  name: 'indexer_open_ledger_gap_ledgers_total',
+  help: 'Total number of ledgers covered by all Open LedgerGap rows',
+});
+
+/** Total gap rows created, labelled by source. */
+export const gapsCreatedTotal = new client.Counter({
+  name: 'indexer_ledger_gaps_created_total',
+  help: 'Total LedgerGap rows created, by source (rpc_window_skip | reorg | manual)',
+  labelNames: ['source'],
+});
+
+/** Total BackfillJob outcomes, labelled by terminal status. */
+export const backfillJobsTotal = new client.Counter({
+  name: 'indexer_backfill_jobs_total',
+  help: 'Total BackfillJob completions, by final status (Completed | Failed | Cancelled)',
+  labelNames: ['status'],
+});
+
+/** Duration of a complete BackfillJob run in seconds. */
+export const backfillDurationSeconds = new client.Histogram({
+  name: 'indexer_backfill_duration_seconds',
+  help: 'Wall-clock duration of a BackfillJob from Running to terminal state',
+  buckets: [1, 5, 15, 30, 60, 120, 300, 600, 1800],
+});
+
+/** Ledgers processed per backfill batch (useful for sizing BACKFILL_BATCH_SIZE). */
+export const backfillBatchLedgers = new client.Histogram({
+  name: 'indexer_backfill_batch_ledgers',
+  help: 'Number of ledgers processed in each backfill batch',
+  buckets: [100, 500, 1000, 2500, 5000, 10000],
+});
+
+/** Events inserted per backfill batch. */
+export const backfillBatchInserted = new client.Histogram({
+  name: 'indexer_backfill_batch_inserted_events',
+  help: 'Number of events inserted in each backfill batch',
+  buckets: [0, 1, 10, 50, 100, 500, 1000, 5000],
+});
+
+/** Number of concurrent advisory-lock contentions (two workers raced for same job). */
+export const backfillLockContentions = new client.Counter({
+  name: 'indexer_backfill_lock_contentions_total',
+  help: 'Number of times a BackfillJob advisory lock was already held by another worker',
+});
+
 // ── Expose metrics handler ────────────────────────────────────────────────────
 
 export async function handleMetrics(req: express.Request, res: express.Response) {
