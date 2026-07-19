@@ -1,9 +1,11 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import prisma from '../db.js';
 import redis from '../redis.js';
+import { Prisma } from '@prisma/client';
 import { cacheMiddleware } from './cache-middleware.js';
 import { strictRateLimiter } from './rate-limit-middleware.js';
 import { badRequest, notFound, internalError } from './errors.js';
+import { etagMiddleware } from './etag-middleware.js';
 import {
   validateQuery,
   listingsQuerySchema,
@@ -13,6 +15,7 @@ import {
   collectionsQuerySchema,
   statsQuerySchema,
 } from './query-schemas.js';
+import { enqueueIpfsFetch, fetchIpfsMetadata } from '../ipfs-cache.js';
 
 // ── SSE registry ───────────────────────────────────────────────────────────────
 
@@ -40,8 +43,7 @@ export function _resetSseState() {
   sseClients.clear();
 }
 
-// SSE clients registry
-const sseClients: Response[] = [];
+// SSE clients registry — intentionally empty comment; the Map above IS the registry.
 
 export function emitSSEEvent(event: any) {
   const id = nextSseId();
@@ -63,10 +65,10 @@ export function emitSSEEvent(event: any) {
 }
 
 export function closeSSEClients(): void {
-    for (const client of sseClients) {
+    for (const [client] of sseClients) {
         try { client.end(); } catch { /* ignore */ }
     }
-    sseClients.length = 0;
+    sseClients.clear();
 }
 
 const router = Router();
@@ -177,7 +179,13 @@ router.get('/listings/:id', async (req: Request, res: Response, next: NextFuncti
       where: { listingId: BigInt(id as string) },
     });
     if (!listing) return next(notFound('Listing not found'));
-    return res.json(serialize(listing));
+
+    // Attach cached IPFS metadata when available, or null if still pending.
+    const ipfsMetadata = listing.token
+      ? await prisma.ipfsMetadata.findUnique({ where: { cid: listing.token } }).catch(() => null)
+      : null;
+
+    return res.json(serialize({ ...listing, ipfsMetadata: ipfsMetadata ?? null }));
   } catch (err) {
     next(internalError('Failed to fetch listing details'));
   }
@@ -191,13 +199,85 @@ router.get('/listings/:id/history', async (req: Request, res: Response, next: Ne
     return next(badRequest('Invalid ID format'));
   }
   try {
-    const results = await prisma.marketplaceEvent.findMany({
-      where: { listingId: BigInt(id) },
-      orderBy: { ledgerSequence: 'asc' },
-    });
-    res.json(serialize(results));
+    const rawLimit  = parseInt(String(req.query.limit  ?? '100'), 10);
+    const rawOffset = parseInt(String(req.query.offset ?? '0'),   10);
+    const take = Math.min(isNaN(rawLimit)  ? 100  : Math.max(1, rawLimit),  500);
+    const skip = Math.min(isNaN(rawOffset) ? 0    : Math.max(0, rawOffset), 10000);
+
+    const where = { listingId: BigInt(id) };
+    const [results, total] = await Promise.all([
+      prisma.marketplaceEvent.findMany({
+        where,
+        orderBy: { ledgerSequence: 'asc' },
+        take,
+        skip,
+      }),
+      prisma.marketplaceEvent.count({ where }),
+    ]);
+    res.json({ events: serialize(results), total });
   } catch (err) {
     next(internalError('Failed to fetch listing history'));
+  }
+});
+
+// ── GET /ipfs/:cid ────────────────────────────────────────────────────────────
+//
+// Serves cached IPFS metadata for a given CID.  If the metadata is not yet
+// cached, fetches it on-demand (populating the cache), enqueues a background
+// refresh job, and returns the result.  Returns 404 when the content cannot be
+// fetched from any gateway.
+
+router.get('/ipfs/:cid', cacheMiddleware(300), async (req: Request, res: Response, next: NextFunction) => {
+  const cid = req.params.cid as string;
+  if (!cid || !/^[a-zA-Z0-9]+$/.test(cid)) {
+    return next(badRequest('Invalid CID format'));
+  }
+
+  try {
+    // 1. Serve from cache if available
+    const cached = await prisma.ipfsMetadata.findUnique({ where: { cid } });
+    if (cached) {
+      return res.json(serialize(cached));
+    }
+
+    // 2. On-demand fetch and cache (for direct /ipfs/:cid requests)
+    let raw: ReturnType<typeof Object.create>;
+    try {
+      raw = await fetchIpfsMetadata(cid);
+    } catch {
+      return next(notFound('IPFS content not available'));
+    }
+
+    const stored = await prisma.ipfsMetadata.upsert({
+      where: { cid },
+      create: {
+        cid,
+        title: typeof raw.title === 'string' ? raw.title : undefined,
+        description: typeof raw.description === 'string' ? raw.description : undefined,
+        imageUrl: typeof raw.image === 'string'
+          ? raw.image
+          : typeof raw.imageUrl === 'string' ? raw.imageUrl : undefined,
+        attributes: raw.attributes != null ? (raw.attributes as Prisma.InputJsonValue) : Prisma.JsonNull,
+        raw: raw as Prisma.InputJsonValue,
+      },
+      update: {
+        title: typeof raw.title === 'string' ? raw.title : undefined,
+        description: typeof raw.description === 'string' ? raw.description : undefined,
+        imageUrl: typeof raw.image === 'string'
+          ? raw.image
+          : typeof raw.imageUrl === 'string' ? raw.imageUrl : undefined,
+        attributes: raw.attributes != null ? (raw.attributes as Prisma.InputJsonValue) : Prisma.JsonNull,
+        fetchedAt: new Date(),
+        raw: raw as Prisma.InputJsonValue,
+      },
+    });
+
+    // 3. Ensure a queue entry exists for future refreshes (fire-and-forget)
+    enqueueIpfsFetch(cid).catch(() => { /* ignore */ });
+
+    return res.json(serialize(stored));
+  } catch (err) {
+    next(internalError('Failed to fetch IPFS metadata'));
   }
 });
 
@@ -454,35 +534,6 @@ router.get('/stats', validateQuery(statsQuerySchema), async (req: Request, res: 
   } catch (err) {
     next(internalError('Failed to fetch stats'));
   }
-});
-
-// GET /events — Server-Sent Events stream with keep-alive heartbeats
-router.get('/events', (req: Request, res: Response) => {
-    // Check connection limit
-    if (sseClients.size >= MAX_SSE_CONNECTIONS) {
-        return res.status(503).json({ error: 'Too many SSE connections' });
-    }
-
-    // Setup SSE headers
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Connection', 'keep-alive');
-    res.setHeader('Access-Control-Allow-Origin', '*');
-
-    // Setup heartbeat
-    setupSSEHeartbeat(res);
-
-    // Send initial connection message
-    res.write(`data: ${JSON.stringify({ type: 'CONNECTED' })}\n\n`);
-
-    // Cleanup on disconnect
-    res.on('close', () => {
-        cleanupSSEClient(res);
-    });
-
-    res.on('error', () => {
-        cleanupSSEClient(res);
-    });
 });
 
 // ── GET /artists/:address/metrics ─────────────────────────────────────────────

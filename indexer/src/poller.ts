@@ -10,8 +10,10 @@ import {
 import { recordProgress } from './stall.js';
 import { collectMarketplaceEvents, MAX_LEDGER_WINDOW } from './event-sync.js';
 import { withRetry } from './retry.js';
+import { logger } from './logger.js';
 import redis from './redis.js';
 import { loadConfig } from './config.js';
+import { enqueueIpfsFetch, processIpfsQueue } from './ipfs-cache.js';
 
 dotenv.config();
 
@@ -289,6 +291,14 @@ export async function startPolling() {
         recordProgress();
 
         for (const ev of newEvents) emitSSEEvent(ev);
+
+        // Run IPFS queue processor each cycle after events are persisted.
+        // Errors are caught so they never interrupt the polling loop.
+        processIpfsQueue().catch((err) =>
+          logger.error('[Poller] processIpfsQueue error', {
+            err: err instanceof Error ? err.message : String(err),
+          })
+        );
       } else if (batchEndLedger > syncState.lastLedger) {
         try {
           const ledgersRes = await server.getLedgers({
@@ -486,6 +496,16 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
           updatedAtLedger: ledgerSequence,
         }
       });
+
+      // Enqueue a background IPFS metadata fetch using the token CID.
+      // Fire-and-forget — a fetch failure must never crash the indexing path.
+      if (token) {
+        enqueueIpfsFetch(token).catch((err) => {
+          logger.warn('[processEvent] Failed to enqueue IPFS fetch', {
+            listingId: listingId?.toString(), token, err: err instanceof Error ? err.message : String(err),
+          });
+        });
+      }
       break;
     }
 

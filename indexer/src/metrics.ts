@@ -32,6 +32,27 @@ export const decodeErrorsCounter = new client.Counter({
   help: 'Total number of XDR event decode errors encountered during sync',
 });
 
+/**
+ * Per-event-type decode error counter (Feature A).
+ * Incremented by event-sync.ts on every SchemaDecodeError or unhandled
+ * exception, with a label identifying the event_type that failed.
+ * Metric name: elcarehub_event_decode_errors_total{event_type="..."}
+ */
+export const eventDecodeErrorsCounter = new client.Counter({
+  name: 'elcarehub_event_decode_errors_total',
+  help: 'Total number of per-event-type schema decode errors',
+  labelNames: ['event_type'] as const,
+});
+
+/**
+ * Gauge indicating whether the indexer is stalled (1 = stalled, 0 = healthy).
+ * Set by stall.ts based on time since last recorded progress.
+ */
+export const stalledGauge = new client.Gauge({
+  name: 'indexer_stalled',
+  help: 'Whether the indexer polling loop appears stalled (1 = stalled, 0 = healthy)',
+});
+
 export const httpRequestDurationMicroseconds = new client.Histogram({
   name: 'http_request_duration_seconds',
   help: 'Duration of HTTP requests in seconds',

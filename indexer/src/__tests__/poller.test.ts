@@ -68,6 +68,16 @@ vi.mock('../metrics.js', () => ({
   latestLedgerProcessedGauge: { set: vi.fn() },
   networkLatestLedgerGauge: { set: vi.fn() },
   syncLatencyGauge: { set: vi.fn() },
+  stalledGauge: { set: vi.fn() },
+  decodeErrorsCounter: { inc: vi.fn() },
+  eventDecodeErrorsCounter: { inc: vi.fn() },
+  rpcRetryExhaustedCounter: { inc: vi.fn() },
+}));
+
+// Prevent real IPFS gateway calls in unit tests
+vi.mock('../ipfs-cache.js', () => ({
+  enqueueIpfsFetch: vi.fn().mockResolvedValue(undefined),
+  processIpfsQueue: vi.fn().mockResolvedValue(0),
 }));
 
 // Stellar SDK mocks for offline unit testing
