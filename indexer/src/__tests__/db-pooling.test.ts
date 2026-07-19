@@ -1,12 +1,13 @@
 /**
  * Tests for database connection pooling and timeout configuration
  */
+import { vi } from 'vitest';
 
 describe('Database pooling configuration', () => {
   const originalEnv = process.env;
 
   beforeEach(() => {
-    jest.resetModules();
+    vi.resetModules();
     process.env = { ...originalEnv };
   });
 
@@ -16,7 +17,6 @@ describe('Database pooling configuration', () => {
 
   it('uses default connection limit when not configured', () => {
     delete process.env.DB_CONNECTION_LIMIT;
-    // Connection limit is set at parse time, so we verify via env parsing
     const limit = parseInt(process.env.DB_CONNECTION_LIMIT || '10', 10);
     expect(limit).toBe(10);
   });
@@ -69,10 +69,10 @@ describe('Database pooling configuration', () => {
     process.env.DB_IDLE_TIMEOUT = '40000';
     process.env.DB_ACQUIRE_TIMEOUT = '12000';
 
-    const connLimit = parseInt(process.env.DB_CONNECTION_LIMIT, 10);
-    const stmtTimeout = parseInt(process.env.DB_STATEMENT_TIMEOUT, 10);
-    const idleTimeout = parseInt(process.env.DB_IDLE_TIMEOUT, 10);
-    const acquireTimeout = parseInt(process.env.DB_ACQUIRE_TIMEOUT, 10);
+    const connLimit     = parseInt(process.env.DB_CONNECTION_LIMIT,   10);
+    const stmtTimeout   = parseInt(process.env.DB_STATEMENT_TIMEOUT,  10);
+    const idleTimeout   = parseInt(process.env.DB_IDLE_TIMEOUT,       10);
+    const acquireTimeout = parseInt(process.env.DB_ACQUIRE_TIMEOUT,   10);
 
     expect(connLimit).toEqual(25);
     expect(stmtTimeout).toEqual(20000);

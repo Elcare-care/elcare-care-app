@@ -64,23 +64,19 @@ pub enum MarketplaceError {
     /// for this listing.  A cap bounds per-listing storage growth and keeps the
     /// auto-reject sweep economically viable.
     OfferLimitReached = 35,
-    /// `create_listing` or `create_auction` was called but the marketplace could
-    /// not verify that the caller owns `token_id` on the given collection contract.
-    /// The call is rejected before any escrow is attempted.
-    NotTokenOwner = 36,
-    /// A token is already held in escrow for an active listing or auction on this
-    /// marketplace.  The same `(collection, token_id)` pair cannot be listed or
-    /// auctioned simultaneously — it must be released first via cancel/expire.
-    TokenAlreadyEscrowed = 37,
-    /// The buyer must not be the listing artist (original creator) or the current
-    /// NFT owner.
+    /// `cancel_listings` was called with more ids than MAX_BATCH_CANCEL in a
+    /// single batch — split the request into smaller batches.
+    BatchTooLarge = 36,
+    /// `migrate` was called again for a version whose migration marker is
+    /// already recorded in persistent storage.
+    AlreadyMigrated = 37,
+    /// `purchase` was attempted by the listing's own artist (or a recipient of
+    /// the listing) — self-purchase is not allowed.
     SelfPurchaseNotAllowed = 38,
-    /// Arithmetic overflow detected during price or fee computation.
-    ArithmeticOverflow = 39,
-    /// The price falls outside the admin-configured `[min_price, max_price]` bounds.
-    PriceOutOfBounds = 40,
-    /// `migrate` was called for a version that has already been applied.
-    AlreadyMigrated = 41,
+    /// A listing price violates the configured `[min, max]` price bounds.
+    PriceOutOfBounds = 39,
+    /// A checked arithmetic operation overflowed while computing fee splits.
+    ArithmeticOverflow = 40,
 }
 
 #[contracttype]

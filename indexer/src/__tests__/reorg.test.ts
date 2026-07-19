@@ -28,6 +28,10 @@ vi.mock('../metrics.js', () => ({
   latestLedgerProcessedGauge: { set: vi.fn() },
   networkLatestLedgerGauge: { set: vi.fn() },
   syncLatencyGauge: { set: vi.fn() },
+  stalledGauge: { set: vi.fn() },
+  decodeErrorsCounter: { inc: vi.fn() },
+  eventDecodeErrorsCounter: { inc: vi.fn() },
+  rpcRetryExhaustedCounter: { inc: vi.fn() },
 }));
 
 vi.mock('@stellar/stellar-sdk', () => ({

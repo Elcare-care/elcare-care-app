@@ -10,6 +10,15 @@
 //!    their own collection.  The factory calls `initialize` on the freshly
 //!    deployed contract in the same transaction — no second call needed.
 //!
+//! # Fee model
+//!
+//! Two distinct fees, deliberately typed apart:
+//! * `deploy_fee: i128` — a flat, token-denominated amount transferred from
+//!   the creator to `fee_receiver` on every `deploy_*` call.
+//! * `platform_fee_bps: u32` — a per-collection basis-point fee chosen by the
+//!   creator (≤ `MAX_FEE_BPS`), recorded in the registry and forwarded to the
+//!   lazy-mint contracts so they can split redemption proceeds.
+//!
 //! # Deterministic addresses (clone-equivalent)
 //! `env.deployer().with_current_contract(salt)` gives a deterministic address
 //! from `sha256(factory_address ‖ salt)`.  Clients can pre-compute the address
@@ -21,12 +30,13 @@
 //! Each instance gets completely isolated storage.
 
 use soroban_sdk::{
-    contract, contractimpl, symbol_short, xdr::ToXdr, Address, Bytes, BytesN, Env, String, Vec,
+    contract, contractimpl, symbol_short, token, xdr::ToXdr, Address, Bytes, BytesN, Env, String,
+    Vec,
 };
 
 use crate::{
     events, storage,
-    types::{CollectionKind, CollectionRecord, Error},
+    types::{CollectionKind, CollectionRecord, Error, WasmHashes},
 };
 
 /// Maximum allowed platform fee (20 %) — issue #38.
@@ -105,6 +115,27 @@ fn make_secure_salt(env: &Env, creator: &Address, raw_salt: &BytesN<32>) -> Byte
     env.crypto().sha256(&raw).into()
 }
 
+// ─── Shared deploy guards ─────────────────────────────────────────────────────
+
+fn require_not_paused(env: &Env) -> Result<(), Error> {
+    if storage::is_paused(env) {
+        return Err(Error::ContractPaused);
+    }
+    Ok(())
+}
+
+/// Transfers the flat deploy fee (if any) from `creator` to the treasury and
+/// emits `fee_coll`.  Returns the configured fee receiver so lazy deploys can
+/// forward it to the child contract as `platform_fee_receiver`.
+fn collect_deploy_fee(env: &Env, creator: &Address, currency: &Address) -> Address {
+    let (receiver, deploy_fee) = storage::get_fee_config(env);
+    if deploy_fee > 0 {
+        token::TokenClient::new(env, currency).transfer(creator, &receiver, &deploy_fee);
+        events::publish_deployment_fee_collected(env, creator, &receiver, deploy_fee, currency);
+    }
+    receiver
+}
+
 #[contract]
 pub struct Launchpad;
 
@@ -114,36 +145,49 @@ impl Launchpad {
     pub fn initialize(
         env: Env,
         admin: Address,
-        platform_fee_receiver: Address,
-        platform_fee_bps: u32,
+        fee_receiver: Address,
+        deploy_fee: i128,
     ) -> Result<(), Error> {
         if storage::is_initialized(&env) {
             return Err(Error::AlreadyInitialized);
         }
+        if deploy_fee < 0 {
+            return Err(Error::InvalidDeployFee);
+        }
         admin.require_auth();
         storage::set_initialized(&env);
         storage::set_admin(&env, &admin);
-        storage::set_platform_fee(&env, &platform_fee_receiver, platform_fee_bps);
+        storage::set_fee_config(&env, &fee_receiver, deploy_fee);
         Ok(())
     }
 
+    /// Records the four collection WASM hashes, bumps the version counter and
+    /// emits `wasm_set` so indexers can track factory upgrades.
     pub fn set_wasm_hashes(
         env: Env,
         wasm_normal_721: BytesN<32>,
         wasm_normal_1155: BytesN<32>,
         wasm_lazy_721: BytesN<32>,
         wasm_lazy_1155: BytesN<32>,
-    ) -> Result<(), Error> {
+    ) -> Result<u32, Error> {
         storage::extend_instance_ttl(&env);
         storage::require_admin(&env)?;
-        storage::set_wasm_hashes(
+        let version = storage::set_wasm_hashes(
             &env,
             &wasm_normal_721,
             &wasm_normal_1155,
             &wasm_lazy_721,
             &wasm_lazy_1155,
         );
-        Ok(())
+        events::publish_wasm_hashes_set(
+            &env,
+            version,
+            &wasm_normal_721,
+            &wasm_normal_1155,
+            &wasm_lazy_721,
+            &wasm_lazy_1155,
+        );
+        Ok(version)
     }
 
     // ── Deploy: Normal ERC-721 ────────────────────────────────────────────
@@ -163,6 +207,7 @@ impl Launchpad {
     ) -> Result<Address, Error> {
         storage::extend_instance_ttl(&env);
         creator.require_auth();
+        require_not_paused(&env)?;
 
         if platform_fee_bps > MAX_FEE_BPS {
             return Err(Error::InvalidFeeBps);
@@ -175,10 +220,17 @@ impl Launchpad {
                 &receiver,
                 &(fee as i128),
             );
-            events::publish_deployment_fee_collected(&env, &creator, &receiver, fee as i128, &currency);
+            events::publish_deployment_fee_collected(
+                &env,
+                &creator,
+                &receiver,
+                fee as i128,
+                &currency,
+            );
         }
 
         let wasm = storage::get_wasm_normal_721(&env).ok_or(Error::WasmHashNotSet)?;
+        collect_deploy_fee(&env, &creator, &currency);
 
         let secure_salt = make_secure_salt(&env, &creator, &salt);
         let addr = env
@@ -222,6 +274,7 @@ impl Launchpad {
     ) -> Result<Address, Error> {
         storage::extend_instance_ttl(&env);
         creator.require_auth();
+        require_not_paused(&env)?;
 
         if platform_fee_bps > MAX_FEE_BPS {
             return Err(Error::InvalidFeeBps);
@@ -234,10 +287,17 @@ impl Launchpad {
                 &receiver,
                 &(fee as i128),
             );
-            events::publish_deployment_fee_collected(&env, &creator, &receiver, fee as i128, &currency);
+            events::publish_deployment_fee_collected(
+                &env,
+                &creator,
+                &receiver,
+                fee as i128,
+                &currency,
+            );
         }
 
         let wasm = storage::get_wasm_normal_1155(&env).ok_or(Error::WasmHashNotSet)?;
+        collect_deploy_fee(&env, &creator, &currency);
 
         let secure_salt = make_secure_salt(&env, &creator, &salt);
         let addr = env
@@ -286,6 +346,7 @@ impl Launchpad {
     ) -> Result<Address, Error> {
         storage::extend_instance_ttl(&env);
         creator.require_auth();
+        require_not_paused(&env)?;
 
         if platform_fee_bps > MAX_FEE_BPS {
             return Err(Error::InvalidFeeBps);
@@ -298,10 +359,17 @@ impl Launchpad {
                 &platform_fee_receiver,
                 &(fee as i128),
             );
-            events::publish_deployment_fee_collected(&env, &creator, &receiver, fee as i128, &currency);
+            events::publish_deployment_fee_collected(
+                &env,
+                &creator,
+                &receiver,
+                fee as i128,
+                &currency,
+            );
         }
 
         let wasm = storage::get_wasm_lazy_721(&env).ok_or(Error::WasmHashNotSet)?;
+        let platform_fee_receiver = collect_deploy_fee(&env, &creator, &currency);
 
         let secure_salt = make_secure_salt(&env, &creator, &salt);
         let addr = env
@@ -349,6 +417,7 @@ impl Launchpad {
     ) -> Result<Address, Error> {
         storage::extend_instance_ttl(&env);
         creator.require_auth();
+        require_not_paused(&env)?;
 
         if platform_fee_bps > MAX_FEE_BPS {
             return Err(Error::InvalidFeeBps);
@@ -361,10 +430,17 @@ impl Launchpad {
                 &platform_fee_receiver,
                 &(fee as i128),
             );
-            events::publish_deployment_fee_collected(&env, &creator, &receiver, fee as i128, &currency);
+            events::publish_deployment_fee_collected(
+                &env,
+                &creator,
+                &receiver,
+                fee as i128,
+                &currency,
+            );
         }
 
         let wasm = storage::get_wasm_lazy_1155(&env).ok_or(Error::WasmHashNotSet)?;
+        let platform_fee_receiver = collect_deploy_fee(&env, &creator, &currency);
 
         let secure_salt = make_secure_salt(&env, &creator, &salt);
         let addr = env
@@ -397,35 +473,75 @@ impl Launchpad {
         Ok(addr)
     }
 
-    // ── Admin management ──────────────────────────────────────────────────
+    // ── Admin management (two-step transfer) ──────────────────────────────
 
+    /// Step 1: the current admin proposes a successor.  Overwrites any
+    /// previously pending proposal.  The successor must call `accept_admin`.
     pub fn transfer_admin(env: Env, new_admin: Address) -> Result<(), Error> {
         storage::extend_instance_ttl(&env);
-        storage::require_admin(&env)?;
+        let admin = storage::require_admin(&env)?;
+        storage::set_pending_admin(&env, &new_admin);
+        events::publish_admin_transfer_proposed(&env, &admin, &new_admin);
+        Ok(())
+    }
+
+    /// Step 2: the proposed successor accepts the role.
+    pub fn accept_admin(env: Env, new_admin: Address) -> Result<(), Error> {
+        storage::extend_instance_ttl(&env);
+        new_admin.require_auth();
+        let pending = storage::get_pending_admin(&env).ok_or(Error::NoPendingAdmin)?;
+        if new_admin != pending {
+            return Err(Error::NotPendingAdmin);
+        }
+        let old_admin = storage::get_admin(&env).ok_or(Error::NotInitialized)?;
         storage::set_admin(&env, &new_admin);
+        storage::clear_pending_admin(&env);
+        events::publish_admin_transfer_accepted(&env, &old_admin, &new_admin);
         Ok(())
     }
 
-    pub fn update_platform_fee(env: Env, receiver: Address, fee_bps: u32) -> Result<(), Error> {
+    /// Cancels a pending admin proposal.  Only the current admin may cancel.
+    pub fn cancel_admin_transfer(env: Env) -> Result<(), Error> {
         storage::extend_instance_ttl(&env);
-        storage::require_admin(&env)?;
-        storage::set_platform_fee(&env, &receiver, fee_bps);
+        let admin = storage::require_admin(&env)?;
+        let pending = storage::get_pending_admin(&env).ok_or(Error::NoPendingAdmin)?;
+        storage::clear_pending_admin(&env);
+        events::publish_admin_transfer_cancelled(&env, &admin, &pending);
         Ok(())
     }
 
-    /// Set only the flat deploy fee (in stroops or token smallest unit).
-    pub fn set_deploy_fee(env: Env, fee: u32) -> Result<(), Error> {
+    // ── Pause ─────────────────────────────────────────────────────────────
+
+    /// Halts all four `deploy_*` functions.
+    pub fn pause(env: Env) -> Result<(), Error> {
         storage::extend_instance_ttl(&env);
-        storage::require_admin(&env)?;
-        storage::set_deploy_fee_only(&env, fee);
+        let admin = storage::require_admin(&env)?;
+        storage::set_paused(&env, true);
+        events::publish_paused(&env, &admin, true);
         Ok(())
     }
 
-    /// Set only the treasury address that receives deploy fees.
-    pub fn set_treasury(env: Env, treasury: Address) -> Result<(), Error> {
+    pub fn unpause(env: Env) -> Result<(), Error> {
+        storage::extend_instance_ttl(&env);
+        let admin = storage::require_admin(&env)?;
+        storage::set_paused(&env, false);
+        events::publish_paused(&env, &admin, false);
+        Ok(())
+    }
+
+    // ── Fee config ────────────────────────────────────────────────────────
+
+    /// Sets both the treasury address and the flat deploy fee (token smallest
+    /// unit).  Replaces the former `set_deploy_fee` / `set_treasury` /
+    /// `update_platform_fee` trio.
+    pub fn set_fee_config(env: Env, receiver: Address, deploy_fee: i128) -> Result<(), Error> {
         storage::extend_instance_ttl(&env);
         storage::require_admin(&env)?;
-        storage::set_treasury_only(&env, &treasury);
+        if deploy_fee < 0 {
+            return Err(Error::InvalidDeployFee);
+        }
+        storage::set_fee_config(&env, &receiver, deploy_fee);
+        events::publish_fee_config_updated(&env, &receiver, deploy_fee);
         Ok(())
     }
 
@@ -457,7 +573,32 @@ impl Launchpad {
         storage::get_admin(&env).unwrap()
     }
 
-    pub fn platform_fee(env: Env) -> (Address, u32) {
-        storage::get_platform_fee(&env)
+    pub fn pending_admin(env: Env) -> Option<Address> {
+        storage::get_pending_admin(&env)
+    }
+
+    pub fn paused(env: Env) -> bool {
+        storage::is_paused(&env)
+    }
+
+    /// (fee_receiver, deploy_fee) — the treasury and flat deployment fee.
+    pub fn fee_config(env: Env) -> (Address, i128) {
+        storage::get_fee_config(&env)
+    }
+
+    /// Current collection WASM hashes plus the version counter, or `None` if
+    /// `set_wasm_hashes` was never called.
+    pub fn wasm_hashes(env: Env) -> Option<WasmHashes> {
+        Some(WasmHashes {
+            normal_721: storage::get_wasm_normal_721(&env)?,
+            normal_1155: storage::get_wasm_normal_1155(&env)?,
+            lazy_721: storage::get_wasm_lazy_721(&env)?,
+            lazy_1155: storage::get_wasm_lazy_1155(&env)?,
+            version: storage::wasm_version(&env),
+        })
+    }
+
+    pub fn wasm_version(env: Env) -> u32 {
+        storage::wasm_version(&env)
     }
 }

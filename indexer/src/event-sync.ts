@@ -1,6 +1,6 @@
 import { rpc } from '@stellar/stellar-sdk';
-import { parseMarketplaceEvent, type DecodedEvent } from './parser.js';
-import { decodeErrorsCounter } from './metrics.js';
+import { parseMarketplaceEvent, SchemaDecodeError, type DecodedEvent } from './parser.js';
+import { decodeErrorsCounter, eventDecodeErrorsCounter } from './metrics.js';
 import { withRetry } from './retry.js';
 
 export const MAX_LEDGER_WINDOW = 17_000;
@@ -10,6 +10,9 @@ type RpcEvent = {
   topic: unknown[];
   value: unknown;
   ledger: number;
+  contractId?: string;
+  txHash?: string;
+  id?: string; // Stellar event ID encodes position info
 };
 
 function toBase64(value: unknown): string {
@@ -25,9 +28,32 @@ function toBase64(value: unknown): string {
   return String(value);
 }
 
-function decodeRpcEvent(event: RpcEvent): DecodedEvent | null {
+/**
+ * Extracts a stable event index from the Stellar event ID.
+ * Stellar event IDs are formatted as "<ledger>-<txIndex>-<eventIndex>" or similar.
+ * We use the last numeric segment as the index within the ledger.
+ */
+function extractEventIndex(event: RpcEvent, fallback: number): number {
+  if (typeof event.id === 'string') {
+    const parts = event.id.split('-');
+    const last = parseInt(parts[parts.length - 1], 10);
+    if (!isNaN(last)) return last;
+  }
+  return fallback;
+}
+
+function decodeRpcEvent(event: RpcEvent, eventIndex: number): DecodedEvent | null {
   const topicStrings = event.topic.map((topic) => toBase64(topic));
-  return parseMarketplaceEvent(topicStrings, toBase64(event.value), event.ledger);
+  const contractId = event.contractId ?? '';
+  const txHash = event.txHash ?? '';
+  return parseMarketplaceEvent(
+    topicStrings,
+    toBase64(event.value),
+    event.ledger,
+    contractId,
+    txHash,
+    extractEventIndex(event, eventIndex)
+  );
 }
 
 export async function collectMarketplaceEvents(
@@ -60,15 +86,26 @@ export async function collectMarketplaceEvents(
 
       for (const [idx, event] of (response.events ?? []).entries()) {
         try {
-          const decoded = decodeRpcEvent(event);
+          const decoded = decodeRpcEvent(event, idx);
           if (decoded) decodedEvents.push(decoded);
         } catch (err) {
+          // Always increment the legacy unlabeled counter for backward compat.
           decodeErrorsCounter.inc();
-          console.error({
+
+          // Increment the per-event-type labeled counter when the schema decoder
+          // identifies the event type before failing; fall back to 'unknown'.
+          const eventType =
+            err instanceof SchemaDecodeError ? err.eventType : 'unknown';
+          eventDecodeErrorsCounter.inc({ event_type: eventType });
+
+          // Log at warn level with the raw event for post-mortem; never crash the batch.
+          console.warn({
             msg: '[EventSync] Failed to decode event — skipping',
             ledger: (event as RpcEvent).ledger,
             eventIndex: idx,
+            eventType,
             error: err instanceof Error ? err.message : String(err),
+            rawTopic: (event as RpcEvent).topic,
           });
         }
       }

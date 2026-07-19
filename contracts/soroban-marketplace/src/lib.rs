@@ -14,7 +14,6 @@ mod types;
 mod test;
 
 pub use contract::MarketplaceContract;
-pub use storage::EscrowRecord;
 pub use types::{
     BidRecord, CancelReason, Listing, ListingStatus, MarketplaceError, Offer, OfferStatus,
 };

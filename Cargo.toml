@@ -34,3 +34,8 @@ lto = true
 inherits = "release"
 debug-assertions = true
 
+# soroban-env-host v25.0.1 declares ed25519-dalek ">=2.0.0" but its source
+# code uses the v2 API. Force the entire workspace to resolve only v2.2.0 by
+# listing it as a workspace dependency (member crates inherit via dep spec).
+[workspace.dependencies]
+ed25519-dalek = "=2.2.0"
