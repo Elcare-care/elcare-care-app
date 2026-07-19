@@ -2,8 +2,11 @@ import { Router, Request, Response, NextFunction } from 'express';
 import prisma from '../db.js';
 import redis from '../redis.js';
 import { cacheMiddleware } from './cache-middleware.js';
+import { etagMiddleware } from './etag-middleware.js';
 import { strictRateLimiter } from './rate-limit-middleware.js';
 import { badRequest, notFound, internalError } from './errors.js';
+import { applyDecodedEvents } from '../poller.js';
+import { collectMarketplaceEvents } from '../event-sync.js';
 import {
   validateQuery,
   listingsQuerySchema,
@@ -14,6 +17,12 @@ import {
   statsQuerySchema,
   syncGapsQuerySchema,
 } from './query-schemas.js';
+import {
+  getOverviewStats,
+  getDailyStats,
+  getTopCollections,
+  getTopArtists,
+} from '../stats.js';
 
 // ── SSE registry ───────────────────────────────────────────────────────────────
 
@@ -41,8 +50,7 @@ export function _resetSseState() {
   sseClients.clear();
 }
 
-// SSE clients registry
-const sseClients: Response[] = [];
+// SSE clients registry — keyed by Response, value is last-seen event ID
 
 export function emitSSEEvent(event: any) {
   const id = nextSseId();
@@ -64,10 +72,10 @@ export function emitSSEEvent(event: any) {
 }
 
 export function closeSSEClients(): void {
-    for (const client of sseClients) {
+    for (const [client] of sseClients) {
         try { client.end(); } catch { /* ignore */ }
     }
-    sseClients.length = 0;
+    sseClients.clear();
 }
 
 const router = Router();
@@ -191,12 +199,22 @@ router.get('/listings/:id/history', async (req: Request, res: Response, next: Ne
   if (!/^\d+$/.test(id)) {
     return next(badRequest('Invalid ID format'));
   }
+
+  const limit  = Math.min(parseInt(String(req.query.limit  ?? '100'), 10) || 100, 500);
+  const offset = Math.min(parseInt(String(req.query.offset ?? '0'),   10) || 0,   10000);
+
   try {
-    const results = await prisma.marketplaceEvent.findMany({
-      where: { listingId: BigInt(id) },
-      orderBy: { ledgerSequence: 'asc' },
-    });
-    res.json(serialize(results));
+    const where = { listingId: BigInt(id) };
+    const [results, total] = await Promise.all([
+      prisma.marketplaceEvent.findMany({
+        where,
+        orderBy: { ledgerSequence: 'asc' },
+        take: limit,
+        skip: offset,
+      }),
+      prisma.marketplaceEvent.count({ where }),
+    ]);
+    res.json({ events: serialize(results), total });
   } catch (err) {
     next(internalError('Failed to fetch listing history'));
   }
