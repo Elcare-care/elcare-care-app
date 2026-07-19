@@ -64,6 +64,19 @@ pub enum MarketplaceError {
     /// for this listing.  A cap bounds per-listing storage growth and keeps the
     /// auto-reject sweep (ISSUE-031) economically viable.
     OfferLimitReached = 35,
+    /// `cancel_listings` was called with more ids than MAX_BATCH_CANCEL in a
+    /// single batch — split the request into smaller batches.
+    BatchTooLarge = 36,
+    /// `migrate` was called again for a version whose migration marker is
+    /// already recorded in persistent storage.
+    AlreadyMigrated = 37,
+    /// `purchase` was attempted by the listing's own artist (or a recipient of
+    /// the listing) — self-purchase is not allowed.
+    SelfPurchaseNotAllowed = 38,
+    /// A listing price violates the configured `[min, max]` price bounds.
+    PriceOutOfBounds = 39,
+    /// A checked arithmetic operation overflowed while computing fee splits.
+    ArithmeticOverflow = 40,
 }
 
 #[contracttype]

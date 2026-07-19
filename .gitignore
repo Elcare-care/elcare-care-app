@@ -1,6 +1,8 @@
 # Rust / Cargo
 target/
-Cargo.lock
+# Cargo.lock is committed on purpose: soroban-env-host declares an open
+# `ed25519-dalek >= 2.0.0` range, and 3.0.0 breaks its build.  The lockfile
+# pins 2.2.0 so CI resolves a working dependency set.
 
 # Node.js
 node_modules/

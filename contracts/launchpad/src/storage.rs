@@ -26,43 +26,59 @@ pub fn get_admin(env: &Env) -> Option<Address> {
     env.storage().instance().get(&DataKey::Admin)
 }
 
-pub fn set_platform_fee(env: &Env, receiver: &Address, bps: u32) {
+pub fn set_pending_admin(env: &Env, pending: &Address) {
     env.storage()
         .instance()
-        .set(&DataKey::PlatformFeeReceiver, receiver);
-    env.storage().instance().set(&DataKey::PlatformFeeBps, &bps);
+        .set(&DataKey::PendingAdmin, pending);
 }
 
-pub fn set_deploy_fee_only(env: &Env, fee: u32) {
-    env.storage().instance().set(&DataKey::PlatformFeeBps, &fee);
+pub fn get_pending_admin(env: &Env) -> Option<Address> {
+    env.storage().instance().get(&DataKey::PendingAdmin)
 }
 
-pub fn set_treasury_only(env: &Env, treasury: &Address) {
+pub fn clear_pending_admin(env: &Env) {
+    env.storage().instance().remove(&DataKey::PendingAdmin);
+}
+
+pub fn set_paused(env: &Env, paused: bool) {
+    env.storage().instance().set(&DataKey::Paused, &paused);
+}
+
+pub fn is_paused(env: &Env) -> bool {
     env.storage()
         .instance()
-        .set(&DataKey::PlatformFeeReceiver, treasury);
+        .get(&DataKey::Paused)
+        .unwrap_or(false)
 }
 
-pub fn get_platform_fee(env: &Env) -> (Address, u32) {
+/// Fee config: treasury address + flat deployment fee (token smallest unit).
+pub fn set_fee_config(env: &Env, receiver: &Address, deploy_fee: i128) {
+    env.storage()
+        .instance()
+        .set(&DataKey::FeeReceiver, receiver);
+    env.storage()
+        .instance()
+        .set(&DataKey::DeployFee, &deploy_fee);
+}
+
+pub fn get_fee_config(env: &Env) -> (Address, i128) {
     (
+        env.storage().instance().get(&DataKey::FeeReceiver).unwrap(),
         env.storage()
             .instance()
-            .get(&DataKey::PlatformFeeReceiver)
-            .unwrap(),
-        env.storage()
-            .instance()
-            .get(&DataKey::PlatformFeeBps)
+            .get(&DataKey::DeployFee)
             .unwrap_or(0),
     )
 }
 
+/// Stores the four hashes and bumps the version counter; returns the new version.
 pub fn set_wasm_hashes(
     env: &Env,
     normal_721: &BytesN<32>,
     normal_1155: &BytesN<32>,
     lazy_721: &BytesN<32>,
     lazy_1155: &BytesN<32>,
-) {
+) -> u32 {
     env.storage()
         .instance()
         .set(&DataKey::WasmNormal721, normal_721);
@@ -75,6 +91,18 @@ pub fn set_wasm_hashes(
     env.storage()
         .instance()
         .set(&DataKey::WasmLazy1155, lazy_1155);
+    let version = wasm_version(env) + 1;
+    env.storage()
+        .instance()
+        .set(&DataKey::WasmVersion, &version);
+    version
+}
+
+pub fn wasm_version(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&DataKey::WasmVersion)
+        .unwrap_or(0)
 }
 
 pub fn get_wasm_normal_721(env: &Env) -> Option<BytesN<32>> {

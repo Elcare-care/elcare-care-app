@@ -112,9 +112,19 @@ fn test_set_treasury_and_protocol_fee() {
     client.set_treasury(&artist, &treasury);
     assert_eq!(client.get_treasury(), Some(treasury.clone()));
 
-    // Create listing BEFORE setting protocol fee so that validate_recipients
-    // sees fee == 0 and accepts 10 000 bps recipients.
+    // The listing snapshots the protocol fee at creation, so the fee is
+    // configured first and recipients leave 500 bps of room for it.
+    client.set_protocol_fee(&artist, &500u32);
+    assert_eq!(client.get_protocol_fee(), 500u32);
+
     let price = 10_000_000_i128;
+    let recipients = vec![
+        &env,
+        Recipient {
+            address: artist.clone(),
+            percentage: 9_500, // leaves 500 bps of room for the snapshotted fee
+        },
+    ];
     let id = client.create_listing(
         &artist,
         &price,
@@ -122,13 +132,10 @@ fn test_set_treasury_and_protocol_fee() {
         &token_id,
         &collection_id,
         &1u64,
-        &valid_recipients(&env, &artist),
+        &recipients,
         &None::<u64>,
     );
 
-    // Set protocol fee to 500 bps (5%) â€” applied at purchase time
-    client.set_protocol_fee(&artist, &500u32);
-    assert_eq!(client.get_protocol_fee(), 500u32);
 
     let result = client.buy_artwork(&buyer, &id);
     assert!(result);
@@ -822,8 +829,15 @@ fn test_buy_artwork_fee_rounding_precision() {
     client.add_token_to_whitelist(&token_id);
     let treasury = Address::generate(&env);
     client.set_treasury(&artist, &treasury);
+    client.set_protocol_fee(&artist, &333u32);
     let price = 100_i128;
-    // Create listing before setting protocol fee so validate_recipients passes
+    let recipients = vec![
+        &env,
+        Recipient {
+            address: artist.clone(),
+            percentage: 9_667, // leaves 333 bps of room for the snapshotted fee
+        },
+    ];
     let id = client.create_listing(
         &artist,
         &price,
@@ -831,11 +845,9 @@ fn test_buy_artwork_fee_rounding_precision() {
         &token_id,
         &collection_id,
         &1u64,
-        &valid_recipients(&env, &artist),
+        &recipients,
         &None::<u64>,
     );
-    // Set protocol fee to 333 bps (3.33%) â€” applied at purchase time
-    client.set_protocol_fee(&artist, &333u32);
     let result = client.buy_artwork(&buyer, &id);
     assert!(result);
     let listing = client.get_listing(&id);
@@ -1134,7 +1146,7 @@ fn test_finalize_auction_no_bids() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #28)")]
+#[should_panic(expected = "Error(Contract, #29)")]
 fn test_finalize_auction_before_expiry_rejects_non_creator() {
     // Under the new rules, ALL callers — including the creator — are rejected
     // with AuctionNotEnded (#28) when finalize is called before end_time.
@@ -1788,7 +1800,7 @@ fn test_buy_already_sold_listing_fails() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #29)")]
+#[should_panic(expected = "Error(Contract, #38)")]
 fn test_buy_own_listing_fails() {
     let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
     client.set_admin(&artist);
@@ -1804,7 +1816,7 @@ fn test_buy_own_listing_fails() {
 /// Confirms the revert carries the dedicated SelfPurchaseNotAllowed code (#29),
 /// not the legacy CannotBuyOwnListing (#6), so clients can decode it reliably.
 #[test]
-#[should_panic(expected = "Error(Contract, #29)")]
+#[should_panic(expected = "Error(Contract, #38)")]
 fn test_self_purchase_not_allowed_error_code() {
     let (env, client, artist, _, token_id, _contract_id, _collection_id) = setup();
     client.set_admin(&artist);
@@ -1870,7 +1882,7 @@ fn test_buy_artwork_emits_protocol_fee_collected_event() {
 
     // Scan emitted events for ProtocolFeeCollected (topic symbol "fee_cltd")
     let all_events = env.events().all();
-    let fee_event = all_events.iter().find(|e| {
+    let fee_event = all_events.events().iter().find(|e| {
         use soroban_sdk::xdr::{ContractEventBody, ScVal};
         if let ContractEventBody::V0(body) = &e.body {
             body.topics.iter().any(|t| {
@@ -1933,7 +1945,7 @@ fn test_accept_offer_emits_protocol_fee_collected_event() {
     let expected_fee: i128 = offer_amount * 500 / 10_000;
 
     let all_events = env.events().all();
-    let fee_event = all_events.iter().find(|e| {
+    let fee_event = all_events.events().iter().find(|e| {
         use soroban_sdk::xdr::{ContractEventBody, ScVal};
         if let ContractEventBody::V0(body) = &e.body {
             body.topics.iter().any(|t| {
@@ -1996,7 +2008,7 @@ fn test_finalize_auction_emits_protocol_fee_collected_event() {
     let expected_fee: i128 = bid_amount * 500 / 10_000;
 
     let all_events = env.events().all();
-    let fee_event = all_events.iter().find(|e| {
+    let fee_event = all_events.events().iter().find(|e| {
         use soroban_sdk::xdr::{ContractEventBody, ScVal};
         if let ContractEventBody::V0(body) = &e.body {
             body.topics.iter().any(|t| {
@@ -2050,7 +2062,7 @@ fn test_no_fee_event_without_treasury() {
     client.buy_artwork(&buyer, &id);
 
     let all_events = env.events().all();
-    let fee_event = all_events.iter().find(|e| {
+    let fee_event = all_events.events().iter().find(|e| {
         use soroban_sdk::xdr::{ContractEventBody, ScVal};
         if let ContractEventBody::V0(body) = &e.body {
             body.topics.iter().any(|t| {
@@ -2490,8 +2502,15 @@ fn test_buy_artwork_pays_treasury_fee() {
     let treasury = Address::generate(&env);
     client.set_treasury(&artist, &treasury);
 
+    client.set_protocol_fee(&artist, &500u32); // 5%, snapshotted at creation
     let price = 10_000_000_i128;
-    // Create listing before setting protocol fee so validate_recipients passes
+    let recipients = vec![
+        &env,
+        Recipient {
+            address: artist.clone(),
+            percentage: 9_500, // leaves 500 bps of room for the snapshotted fee
+        },
+    ];
     let id = client.create_listing(
         &artist,
         &price,
@@ -2499,11 +2518,9 @@ fn test_buy_artwork_pays_treasury_fee() {
         &token_id,
         &collection_id,
         &1u64,
-        &valid_recipients(&env, &artist),
+        &recipients,
         &None::<u64>,
     );
-    // Set fee to 500 bps (5%) after listing creation
-    client.set_protocol_fee(&artist, &500u32); // 5%
 
     client.buy_artwork(&buyer, &id);
 
@@ -2636,7 +2653,7 @@ fn test_make_offer_negative_amount_fails() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #18)")]
+#[should_panic(expected = "Error(Contract, #33)")]
 fn test_accept_already_accepted_offer_fails() {
     let (env, client, artist, buyer, token_id, _, collection_id) = setup();
     client.set_admin(&artist);
@@ -2649,7 +2666,7 @@ fn test_accept_already_accepted_offer_fails() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #18)")]
+#[should_panic(expected = "Error(Contract, #33)")]
 fn test_reject_withdrawn_offer_fails() {
     let (env, client, artist, buyer, token_id, _, collection_id) = setup();
     client.set_admin(&artist);
@@ -3217,6 +3234,9 @@ fn test_validate_recipients_exceeds_limit_with_protocol_fee() {
     let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
     client.set_admin(&artist);
     client.add_token_to_whitelist(&token_id);
+    // Set the protocol fee BEFORE creating the listing: update_listing
+    // validates against the fee snapshotted at creation time.
+    client.set_protocol_fee(&artist, &500u32);
     // Create a listing with small recipients first
     let listing_id = client.create_listing(
         &artist,
@@ -3234,8 +3254,6 @@ fn test_validate_recipients_exceeds_limit_with_protocol_fee() {
         ],
         &None::<u64>,
     );
-    // Set protocol fee
-    client.set_protocol_fee(&artist, &500u32);
     // Try to update with recipients summing to 9_501 bps
     let bad_recipients = vec![
         &env,
@@ -3282,12 +3300,25 @@ mod mock_reentrant_token {
                 .get(&soroban_sdk::symbol_short!("atk"))
                 .unwrap();
 
-            // This nested buy_artwork should fail with ReentrancyGuard (error 22).
-            env.invoke_contract::<bool>(
+            // The nested buy_artwork must fail (ReentrancyGuard).  Record the
+            // outcome so the test can assert it after the outer call returns —
+            // a raw invoke would only surface as an opaque cross-frame panic.
+            let result = env.try_invoke_contract::<bool, soroban_sdk::Error>(
                 &marketplace_addr,
                 &soroban_sdk::Symbol::new(&env, "buy_artwork"),
                 soroban_sdk::vec![&env, attacker.into_val(&env), listing_id.into_val(&env)],
             );
+            env.storage()
+                .instance()
+                .set(&soroban_sdk::symbol_short!("blocked"), &result.is_err());
+        }
+
+        /// Returns true when the reentrant buy_artwork attempt was rejected.
+        pub fn attack_blocked(env: Env) -> bool {
+            env.storage()
+                .instance()
+                .get(&soroban_sdk::symbol_short!("blocked"))
+                .unwrap_or(false)
         }
 
         /// Helper to configure the attack parameters before triggering the transfer.
@@ -3334,11 +3365,10 @@ mod mock_reentrant_token {
 use mock_reentrant_token::MockReentrantTokenClient;
 
 #[test]
-#[should_panic(expected = "Error(Contract, #22)")]
 fn test_buy_artwork_reentrant_token_attack_fails() {
     // This test verifies that a malicious token whose transfer() callback tries
     // to re-enter buy_artwork for the same listing_id is rejected by the
-    // reentrancy lock with error #22 (ReentrancyGuard).
+    // per-listing reentrancy lock (the mock records the rejected attempt).
     let env = Env::default();
     env.mock_all_auths();
 
@@ -3371,9 +3401,16 @@ fn test_buy_artwork_reentrant_token_attack_fails() {
     token_client.set_attack_params(&contract_id, &listing_id, &attacker);
 
     // First buy_artwork call: during distribute_payout's token transfer, the
-    // malicious token will attempt to call buy_artwork again. The nested call
-    // must fail with ReentrancyGuard.
+    // malicious token attempts to call buy_artwork again.  The nested call is
+    // rejected by the per-listing lock; the outer purchase completes normally.
     client.buy_artwork(&attacker, &listing_id);
+
+    assert!(
+        token_client.attack_blocked(),
+        "nested buy_artwork must be rejected by the reentrancy guard"
+    );
+    let listing = client.get_listing(&listing_id);
+    assert_eq!(listing.status, crate::types::ListingStatus::Sold);
 }
 
 #[test]
@@ -3966,7 +4003,7 @@ fn test_reads_succeed_while_paused() {
     let ids = client.get_artist_listings(&artist);
     assert!(!ids.is_empty());
 
-    let active = client.get_active_listings(&0u32, &10u32);
+    let active = client.get_active_listings(&10u32, &0u32);
     assert!(!active.is_empty());
 
     let auction = client.get_auction(&auction_id);
@@ -4040,7 +4077,7 @@ fn test_cancel_listing_emits_owner_reason() {
     // Extract the cancellation event and verify its reason field
     let events = env.events().all();
     let mut found_cancel_event = false;
-    for event in events.iter() {
+    for event in events.events().iter() {
         use soroban_sdk::xdr::{ContractEventBody, ScVal};
         if let ContractEventBody::V0(body) = &event.body {
             // Check if the event topic matches "lst_cncl"
@@ -4089,16 +4126,17 @@ fn test_cancel_artist_listings_emits_admin_revoked_reason() {
     client.revoke_artist(&artist);
 
     // Cancel all artist listings via admin
-    client.cancel_artist_listings(&admin, &artist);
+    client.cancel_artist_listings(&admin, &artist, &u32::MAX);
+    // Capture events now: events().all() only returns the last invocation.
+    let events = env.events().all();
 
     // The listing should now be cancelled
     let listing = client.get_listing(&listing_id);
     assert_eq!(listing.status, ListingStatus::Cancelled);
 
     // Extract the cancellation event and verify its reason field == AdminRevoked
-    let events = env.events().all();
     let mut found_cancel_event = false;
-    for event in events.iter() {
+    for event in events.events().iter() {
         use soroban_sdk::xdr::{ContractEventBody, ScVal};
         if let ContractEventBody::V0(body) = &event.body {
             if body.topics.iter().any(|t| {
@@ -4160,7 +4198,7 @@ fn test_cancel_artist_listings_refunds_pending_offers() {
 
     // Revoke artist and cancel their listings
     client.revoke_artist(&artist);
-    client.cancel_artist_listings(&admin, &artist);
+    client.cancel_artist_listings(&admin, &artist, &u32::MAX);
 
     // Offer should be rejected and buyer refunded
     let offer = client.get_offer(&offer_id);
@@ -4264,7 +4302,7 @@ fn test_active_listings_index_survives_with_frequent_reads() {
     });
 
     // Read the active listings â€” this should bump the index TTL
-    let active = client.get_active_listings(&0u32, &10u32);
+    let active = client.get_active_listings(&10u32, &0u32);
     assert!(!active.is_empty());
 
     // Advance further past the original TTL window
@@ -4273,7 +4311,7 @@ fn test_active_listings_index_survives_with_frequent_reads() {
     });
 
     // The active listings index should still be accessible
-    let active2 = client.get_active_listings(&0u32, &10u32);
+    let active2 = client.get_active_listings(&10u32, &0u32);
     assert!(!active2.is_empty());
     assert_eq!(active2.len(), 2);
 }
@@ -4533,7 +4571,7 @@ fn test_err_listing_not_active_update_cancelled() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #6)")]
+#[should_panic(expected = "Error(Contract, #38)")]
 fn test_err_cannot_buy_own_listing() {
     let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
     client.set_admin(&artist);
@@ -4812,7 +4850,7 @@ fn test_err_cannot_offer_own_listing() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #18)")]
+#[should_panic(expected = "Error(Contract, #33)")]
 fn test_err_offer_not_pending_double_withdraw() {
     let (env, client, artist, buyer, token_id, _contract_id, _collection_id) = setup();
     client.set_admin(&artist);
@@ -4994,6 +5032,8 @@ fn test_bid_inside_trigger_window_extends_auction() {
 
     // This bid should trigger the extension.
     client.place_bid(&buyer, &auction_id, &1_500_000_i128);
+    // Capture events now: events().all() only returns the last invocation.
+    let events = env.events().all();
 
     let after = client.get_auction(&auction_id);
     let now = env.ledger().timestamp();
@@ -5008,15 +5048,14 @@ fn test_bid_inside_trigger_window_extends_auction() {
     );
 
     // Verify AuctionExtended event was emitted.
-    let events = env.events().all();
-    let extended_events: soroban_sdk::Vec<_> = events
-        .iter()
+    let extended_events = events
+        .events().iter()
         .filter(|e| {
             use soroban_sdk::xdr::{ContractEventBody, ScVal};
             if let ContractEventBody::V0(body) = &e.body {
                 body.topics.iter().any(|t| {
                     if let ScVal::Symbol(s) = t {
-                        core::str::from_utf8(s.0.as_slice()).unwrap_or("") == "auc_extd"
+                        core::str::from_utf8(s.0.as_slice()).unwrap_or("") == "auc_ext"
                     } else {
                         false
                     }
@@ -5025,10 +5064,9 @@ fn test_bid_inside_trigger_window_extends_auction() {
                 false
             }
         })
-        .collect();
+        .count();
     assert_eq!(
-        extended_events.len(),
-        1,
+        extended_events, 1,
         "exactly one AuctionExtended event must be emitted"
     );
 }
@@ -5065,6 +5103,8 @@ fn test_bid_outside_trigger_window_does_not_extend() {
 
     // Bid well outside the trigger window — no extension should happen.
     client.place_bid(&buyer, &auction_id, &1_500_000_i128);
+    // Capture events now: events().all() only returns the last invocation.
+    let events = env.events().all();
 
     let after = client.get_auction(&auction_id);
     assert_eq!(
@@ -5073,15 +5113,14 @@ fn test_bid_outside_trigger_window_does_not_extend() {
     );
 
     // Verify NO AuctionExtended event was emitted.
-    let events = env.events().all();
-    let extended_events: soroban_sdk::Vec<_> = events
-        .iter()
+    let extended_events = events
+        .events().iter()
         .filter(|e| {
             use soroban_sdk::xdr::{ContractEventBody, ScVal};
             if let ContractEventBody::V0(body) = &e.body {
                 body.topics.iter().any(|t| {
                     if let ScVal::Symbol(s) = t {
-                        core::str::from_utf8(s.0.as_slice()).unwrap_or("") == "auc_extd"
+                        core::str::from_utf8(s.0.as_slice()).unwrap_or("") == "auc_ext"
                     } else {
                         false
                     }
@@ -5090,10 +5129,9 @@ fn test_bid_outside_trigger_window_does_not_extend() {
                 false
             }
         })
-        .collect();
+        .count();
     assert_eq!(
-        extended_events.len(),
-        0,
+        extended_events, 0,
         "no AuctionExtended event must be emitted when bid is outside the trigger window"
     );
 }
@@ -5225,8 +5263,10 @@ fn test_multiple_late_bids_each_reset_end_time() {
     let end1 = client.get_auction(&auction_id).end_time;
     assert_eq!(end1, start + 3400 + window);
 
-    // Second late bid 100 s later (still within the extended window and the trigger).
-    env.ledger().set_timestamp(start + 3500);
+    // Second late bid at 200 s before the NEW deadline (end1 = start + 4000):
+    // the trigger compares against the extended end_time, so the bid must land
+    // inside the new window to fire again.
+    env.ledger().set_timestamp(start + 3800);
     client.place_bid(&buyer2, &auction_id, &2_000_000_i128);
     let end2 = client.get_auction(&auction_id).end_time;
     assert_eq!(
@@ -5296,8 +5336,8 @@ fn test_cancel_auction_emits_event() {
 
     // Verify AuctionCancelled event was emitted.
     let events = env.events().all();
-    let cancel_events: soroban_sdk::Vec<_> = events
-        .iter()
+    let cancel_events = events
+        .events().iter()
         .filter(|e| {
             use soroban_sdk::xdr::{ContractEventBody, ScVal};
             if let ContractEventBody::V0(body) = &e.body {
@@ -5312,16 +5352,15 @@ fn test_cancel_auction_emits_event() {
                 false
             }
         })
-        .collect();
+        .count();
     assert_eq!(
-        cancel_events.len(),
-        1,
+        cancel_events, 1,
         "exactly one AuctionCancelledEvent must be emitted"
     );
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #31)")]
+#[should_panic(expected = "Error(Contract, #30)")]
 fn test_cancel_auction_with_bids_reverts() {
     let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
     client.set_admin(&artist);
@@ -5477,7 +5516,7 @@ fn test_cancel_auction_bidder_escrow_is_safe() {
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[test]
-#[should_panic(expected = "Error(Contract, #28)")]
+#[should_panic(expected = "Error(Contract, #29)")]
 fn test_finalize_before_end_time_reverts() {
     // Nobody — not even the creator — may finalize before the auction ends.
     let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
@@ -5499,7 +5538,7 @@ fn test_finalize_before_end_time_reverts() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #28)")]
+#[should_panic(expected = "Error(Contract, #29)")]
 fn test_finalize_one_second_early_reverts() {
     // Edge case: exactly one second before end_time.
     let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
@@ -7035,7 +7074,7 @@ fn test_self_bid_blocked_uses_dedicated_error_code() {
     let err = result.unwrap_err().unwrap();
     assert_eq!(
         err,
-        crate::types::MarketplaceError::SelfBidNotAllowed,
+        crate::types::MarketplaceError::SelfBidNotAllowed.into(),
         "error must be SelfBidNotAllowed (#32), not a generic error",
     );
 }
@@ -7103,6 +7142,7 @@ fn test_create_listing_non_whitelisted_token_reverts() {
         &collection_id,
         &1u64,
         &valid_recipients(&env, &artist),
+        &None::<u64>,
     );
 }
 
@@ -7122,6 +7162,7 @@ fn test_create_listing_whitelisted_token_succeeds() {
         &collection_id,
         &1u64,
         &valid_recipients(&env, &artist),
+        &None::<u64>,
     );
     assert_eq!(listing_id, 1u64);
     assert_eq!(client.get_listing(&listing_id).token, token_id);
@@ -7144,6 +7185,7 @@ fn test_create_listing_empty_whitelist_accepts_any_token() {
         &collection_id,
         &1u64,
         &valid_recipients(&env, &artist),
+        &None::<u64>,
     );
     assert_eq!(listing_id, 1u64);
 }
@@ -7208,6 +7250,7 @@ fn test_make_offer_non_whitelisted_token_reverts() {
         &collection_id,
         &1u64,
         &valid_recipients(&env, &artist),
+        &None::<u64>,
     );
 
     // Mint the unlisted token to the buyer and register it so the transfer
@@ -7218,7 +7261,7 @@ fn test_make_offer_non_whitelisted_token_reverts() {
     StellarAssetClient::new(&env, &unlisted_token).mint(&buyer, &10_000_000_i128);
 
     // Attempt an offer using the non-whitelisted token → TokenNotWhitelisted (#25)
-    client.make_offer(&buyer, &listing_id, &500_000_i128, &unlisted_token);
+    client.make_offer(&buyer, &listing_id, &500_000_i128, &unlisted_token, &None);
 }
 
 // ── make_offer with whitelisted token succeeds ───────────────────────────────
@@ -7237,9 +7280,10 @@ fn test_make_offer_whitelisted_token_succeeds() {
         &collection_id,
         &1u64,
         &valid_recipients(&env, &artist),
+        &None::<u64>,
     );
 
-    let offer_id = client.make_offer(&buyer, &listing_id, &500_000_i128, &token_id);
+    let offer_id = client.make_offer(&buyer, &listing_id, &500_000_i128, &token_id, &None);
     assert_eq!(offer_id, 1u64);
 
     let offer = client.get_offer(&offer_id);
@@ -7257,6 +7301,10 @@ fn test_buy_artwork_token_removed_from_whitelist_after_listing() {
     let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
     client.set_admin(&artist);
     client.add_token_to_whitelist(&token_id);
+    // Keep a second token whitelisted so removing token_id leaves a
+    // non-empty whitelist (an empty whitelist means "allow any token").
+    let other_token = Address::generate(&env);
+    client.add_token_to_whitelist(&other_token);
 
     let listing_id = client.create_listing(
         &artist,
@@ -7266,6 +7314,7 @@ fn test_buy_artwork_token_removed_from_whitelist_after_listing() {
         &collection_id,
         &1u64,
         &valid_recipients(&env, &artist),
+        &None::<u64>,
     );
 
     // Admin removes the token from the whitelist after listing creation.
@@ -7291,7 +7340,15 @@ fn test_buy_artwork_checked_arithmetic_normal_price() {
     let treasury = Address::generate(&env);
     client.set_treasury(&artist, &treasury);
 
-    // Snapshot fee at 0 bps, then set 250 bps (2.5%) for purchase time.
+    // The listing snapshots the fee (250 bps) at creation time.
+    client.set_protocol_fee(&artist, &250u32);
+    let recipients = vec![
+        &env,
+        Recipient {
+            address: artist.clone(),
+            percentage: 9_750, // leaves 250 bps of room for the snapshotted fee
+        },
+    ];
     let listing_id = client.create_listing(
         &artist,
         &10_000_000_i128,
@@ -7299,9 +7356,9 @@ fn test_buy_artwork_checked_arithmetic_normal_price() {
         &token_id,
         &collection_id,
         &1u64,
-        &valid_recipients(&env, &artist),
+        &recipients,
+        &None::<u64>,
     );
-    client.set_protocol_fee(&artist, &250u32);
 
     assert!(client.buy_artwork(&buyer, &listing_id));
 
@@ -7317,17 +7374,38 @@ fn test_buy_artwork_checked_arithmetic_normal_price() {
 
 // ── Overflow boundary: near-i128::MAX price with royalty ────────────────────
 
+// A permissive token that accepts any transfer amount.  The Stellar Asset
+// Contract cannot hold balances anywhere near i128::MAX (classic balances are
+// i64), so the overflow inside the settlement arithmetic is only reachable
+// with a token whose transfers always succeed.
+mod mock_free_token {
+    use soroban_sdk::{contract, contractimpl, Address, Env};
+
+    #[contract]
+    pub struct MockFreeToken;
+
+    #[contractimpl]
+    impl MockFreeToken {
+        pub fn transfer(_env: Env, _from: Address, _to: Address, _amount: i128) {}
+        pub fn transfer_from(_env: Env, _spender: Address, _from: Address, _to: Address, _amount: i128) {}
+        pub fn approve(_env: Env, _from: Address, _spender: Address, _amount: i128, _expiration_ledger: u32) {}
+        pub fn balance(_env: Env, _id: Address) -> i128 {
+            i128::MAX
+        }
+    }
+}
+
+
 #[test]
-#[should_panic(expected = "Error(Contract, #27)")]
+#[should_panic(expected = "Error(Contract, #40)")]
 fn test_buy_artwork_overflow_price_reverts_with_arithmetic_overflow() {
-    // Use a price large enough that `price * royalty_bps` overflows i128.
-    // i128::MAX ≈ 1.7 × 10^38.  Multiplying by even 1 bps (= 1) still
-    // overflows when the price is i128::MAX itself, because i128::MAX * 1
-    // fits — so we use a royalty_bps of 10_000 (100%), which ensures
-    // i128::MAX * 10_000 overflows.
-    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    // i128::MAX * 10_000 (100% royalty in bps) overflows i128, so the royalty
+    // computation must revert with ArithmeticOverflow (#40).  A permissive
+    // mock token is used because no real token can fund an i128::MAX price.
+    let (env, client, artist, buyer, _token_id, _contract_id, collection_id) = setup();
     client.set_admin(&artist);
-    client.add_token_to_whitelist(&token_id);
+    let free_token_id = env.register(mock_free_token::MockFreeToken, ());
+    client.add_token_to_whitelist(&free_token_id);
 
     // Configure MockNft to report 100% royalty (bps=10_000) to a separate
     // royalty_receiver so the overflow path is exercised.
@@ -7336,86 +7414,54 @@ fn test_buy_artwork_overflow_price_reverts_with_arithmetic_overflow() {
         mock_nft::MockNft::set_royalty(env.clone(), royalty_receiver.clone(), 10_000u32);
     });
 
-    // Mint enough tokens to let the transfer succeed before arithmetic is reached.
-    // We use i128::MAX as the price; the overflow happens during `amount.checked_mul(10_000)`.
     let overflow_price = i128::MAX;
-    StellarAssetClient::new(&env, &token_id).mint(&buyer, &overflow_price);
-
     let listing_id = client.create_listing(
         &artist,
         &overflow_price,
         &symbol_short!("XLM"),
-        &token_id,
+        &free_token_id,
         &collection_id,
         &1u64,
         &valid_recipients(&env, &artist),
+        &None::<u64>,
     );
 
-    // Must revert with ArithmeticOverflow (#27) rather than an opaque panic.
+    // Must revert with ArithmeticOverflow (#40) rather than an opaque panic.
     client.buy_artwork(&buyer, &listing_id);
 }
 
 // ── Overflow boundary: near-i128::MAX price with protocol fee ───────────────
 
 #[test]
-#[should_panic(expected = "Error(Contract, #27)")]
+#[should_panic(expected = "Error(Contract, #40)")]
 fn test_buy_artwork_fee_overflow_reverts_with_arithmetic_overflow() {
-    // Royalty is 0 bps so the royalty path is skipped.
-    // Protocol fee is 10_000 bps (100%), which causes `payout * 10_000` to overflow.
-    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    // (i128::MAX / 2 + 1) * 2 bps overflows i128 during the royalty multiply,
+    // proving the checked arithmetic guards even small-bps settlement math.
+    let (env, client, artist, buyer, _token_id, _contract_id, collection_id) = setup();
     client.set_admin(&artist);
-    client.add_token_to_whitelist(&token_id);
-    let treasury = Address::generate(&env);
-    client.set_treasury(&artist, &treasury);
-
-    // Keep royalty at 0 (MockNft default).
-    // Set max allowed protocol fee (1 000 bps = 10%).  That alone won't
-    // overflow because 1_000 × i128::MAX already overflows, so we can use
-    // the max fee with i128::MAX price.
-    // set_protocol_fee caps at 1_000 bps, so we directly set it in storage.
-    let overflow_price = i128::MAX;
-    StellarAssetClient::new(&env, &token_id).mint(&buyer, &overflow_price);
-
-    // Create the listing with 0 bps snapshot so validate_recipients passes.
-    let listing_id = client.create_listing(
-        &artist,
-        &overflow_price,
-        &symbol_short!("XLM"),
-        &token_id,
-        &collection_id,
-        &1u64,
-        &valid_recipients(&env, &artist),
-    );
-
-    // Apply a protocol fee of 1_000 bps (maximum allowed by set_protocol_fee).
-    // The listing snapshotted 0 bps at creation, so we set a fee of 0 and
-    // instead inject the fee via the Auction path which uses the live fee.
-    // For the listing path the snapshotted fee (0) is used, so let's test
-    // the royalty overflow path: set royalty bps to 1 and use i128::MAX price —
-    // i128::MAX * 1 = i128::MAX, which does NOT overflow.  To force overflow
-    // we set royalty_bps to 2 and price to i128::MAX/2 + 1, so the multiply
-    // overflows:
-    let near_max = i128::MAX / 2 + 1;
-    StellarAssetClient::new(&env, &token_id).mint(&buyer, &near_max);
+    let free_token_id = env.register(mock_free_token::MockFreeToken, ());
+    client.add_token_to_whitelist(&free_token_id);
 
     // Set 2 bps royalty on the collection so near_max * 2 overflows.
+    let near_max = i128::MAX / 2 + 1;
     let royalty_receiver = Address::generate(&env);
     env.as_contract(&collection_id, || {
         mock_nft::MockNft::set_royalty(env.clone(), royalty_receiver.clone(), 2u32);
     });
 
-    let listing_id2 = client.create_listing(
+    let listing_id = client.create_listing(
         &artist,
         &near_max,
         &symbol_short!("XLM"),
-        &token_id,
+        &free_token_id,
         &collection_id,
         &2u64,
         &valid_recipients(&env, &artist),
+        &None::<u64>,
     );
 
-    // Must revert with ArithmeticOverflow (#27).
-    client.buy_artwork(&buyer, &listing_id2);
+    // Must revert with ArithmeticOverflow (#40).
+    client.buy_artwork(&buyer, &listing_id);
 }
 
 // ── Auction finalization uses checked arithmetic ──────────────────────────────
@@ -7479,6 +7525,7 @@ fn create_n_listings(
             collection_id,
             &(i as u64 + 1),
             &valid_recipients(env, artist),
+            &None::<u64>,
         );
         ids.push_back(id);
     }
@@ -7576,9 +7623,10 @@ fn test_cancel_listings_refunds_pending_offers() {
         &collection_id,
         &1u64,
         &valid_recipients(&env, &artist),
+        &None::<u64>,
     );
     let offer_amount = 500_000_i128;
-    client.make_offer(&buyer, &listing_id, &offer_amount, &token_id);
+    client.make_offer(&buyer, &listing_id, &offer_amount, &token_id, &None);
 
     let buyer_before = TokenClient::new(&env, &token_id).balance(&buyer);
 
@@ -7613,6 +7661,7 @@ fn test_cancel_listings_reverts_on_unauthorized_entry() {
         &collection_id,
         &1u64,
         &valid_recipients(&env, &artist),
+        &None::<u64>,
     );
     let id2 = client.create_listing(
         &buyer,
@@ -7622,6 +7671,7 @@ fn test_cancel_listings_reverts_on_unauthorized_entry() {
         &collection_id,
         &2u64,
         &valid_recipients(&env, &buyer),
+        &None::<u64>,
     );
 
     // artist tries to batch-cancel both — id2 is not owned by artist.
@@ -7648,6 +7698,7 @@ fn test_cancel_listings_reverts_on_missing_listing() {
         &collection_id,
         &1u64,
         &valid_recipients(&env, &artist),
+        &None::<u64>,
     );
 
     let mut ids = soroban_sdk::Vec::new(&env);
@@ -7673,6 +7724,7 @@ fn test_cancel_listings_reverts_on_inactive_listing() {
         &collection_id,
         &1u64,
         &valid_recipients(&env, &artist),
+        &None::<u64>,
     );
     let id2 = client.create_listing(
         &artist,
@@ -7682,6 +7734,7 @@ fn test_cancel_listings_reverts_on_inactive_listing() {
         &collection_id,
         &2u64,
         &valid_recipients(&env, &artist),
+        &None::<u64>,
     );
     // Pre-cancel id2 so it is no longer Active.
     client.cancel_listing(&artist, &id2);
@@ -7695,15 +7748,15 @@ fn test_cancel_listings_reverts_on_inactive_listing() {
 // ── over-cap batch reverts with BatchTooLarge ────────────────────────────────
 
 #[test]
-#[should_panic(expected = "Error(Contract, #28)")]
+#[should_panic(expected = "Error(Contract, #36)")]
 fn test_cancel_listings_over_cap_reverts() {
     let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
     client.set_admin(&artist);
     client.add_token_to_whitelist(&token_id);
 
-    // Build a vector of 21 ids (MAX_BATCH_CANCEL = 20).
+    // Build a vector of 11 ids (MAX_BATCH_CANCEL = 10).
     let mut ids = soroban_sdk::Vec::new(&env);
-    for i in 1u64..=21 {
+    for i in 1u64..=11 {
         ids.push_back(i);
     }
     client.cancel_listings(&artist, &ids);
@@ -7717,10 +7770,10 @@ fn test_cancel_listings_exactly_at_cap_succeeds() {
     client.set_admin(&artist);
     client.add_token_to_whitelist(&token_id);
 
-    // Create exactly MAX_BATCH_CANCEL = 20 listings.
-    let ids = create_n_listings(&env, &client, &artist, &token_id, &collection_id, 20);
+    // Create exactly MAX_BATCH_CANCEL = 10 listings.
+    let ids = create_n_listings(&env, &client, &artist, &token_id, &collection_id, 10);
     let count = client.cancel_listings(&artist, &ids);
-    assert_eq!(count, 20u32);
+    assert_eq!(count, 10u32);
 }
 
 // ── paused contract reverts batch cancel ────────────────────────────────────
@@ -7906,8 +7959,8 @@ fn test_get_listings_paginated_excludes_cancelled() {
 #[test]
 fn test_batch_and_page_constants() {
     // Verify the cap values match the documented limits.
-    // MAX_BATCH_CANCEL = 20, MAX_PAGE_LIMIT = 100.
-    assert_eq!(20u32, 20u32); // MAX_BATCH_CANCEL
+    // MAX_BATCH_CANCEL = 10, MAX_PAGE_LIMIT = 100.
+    assert_eq!(10u32, 10u32); // MAX_BATCH_CANCEL
     assert_eq!(100u32, 100u32); // MAX_PAGE_LIMIT
                                 // The over-cap test (21 ids) and the at-cap test (20 ids) confirm the
                                 // boundary at 20.  The clamped-limit test (limit=9999 returns ≤100)
@@ -7930,7 +7983,7 @@ fn test_settlement_payouts_sum_to_price() {
 
     // Property test: For randomized prices with valid recipient split,
     // the sum of all payouts equals the sale price.
-    let test_prices = vec![
+    let test_prices = [
         100_000i128,
         1_000_000i128,
         10_000_000i128,
@@ -7967,7 +8020,7 @@ fn test_settlement_all_amounts_non_negative() {
 
     // Property test: No settlement should ever produce negative amounts.
     // Verify with various price and recipient combinations.
-    let prices = vec![1_000i128, 50_000_000i128, 999_999_999i128];
+    let prices = [1_000i128, 50_000_000i128, 999_999_999i128];
 
     for price in prices {
         let recipients = valid_recipients(&env, &artist);
@@ -7999,10 +8052,10 @@ fn test_settlement_basis_points_boundary_splits() {
 
     // Case 1: 100% artist
     let recipients_100_artist = {
-        let mut r = Vec::new(&env);
+        let mut r = soroban_sdk::Vec::new(&env);
         r.push_back(Recipient {
             address: artist.clone(),
-            bps: 10_000u32,
+            percentage: 10_000u32,
         });
         r
     };
@@ -8015,14 +8068,14 @@ fn test_settlement_basis_points_boundary_splits() {
     // Case 2: Valid multi-recipient split
     let recipient_2 = Address::generate(&env);
     let recipients_split = {
-        let mut r = Vec::new(&env);
+        let mut r = soroban_sdk::Vec::new(&env);
         r.push_back(Recipient {
             address: artist.clone(),
-            bps: 7_000u32,
+            percentage: 7_000u32,
         });
         r.push_back(Recipient {
             address: recipient_2.clone(),
-            bps: 3_000u32,
+            percentage: 3_000u32,
         });
         r
     };
@@ -8043,7 +8096,7 @@ fn test_settlement_no_overflow_on_extreme_prices() {
 
     // Property test: Settlement must not panic on boundary prices.
     // Test near i128::MAX to verify checked arithmetic is in place.
-    let extreme_prices = vec![
+    let extreme_prices = [
         9_223_372_036_854_775_000i128, // Near i128::MAX
         1_000_000_000_000_000_000i128, // 10^18 (reasonable upper bound for crypto)
         i128::MAX / 2,                 // Half max
@@ -8072,7 +8125,7 @@ fn test_settlement_no_overflow_on_extreme_prices() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #4)")]
+#[should_panic(expected = "Error(Contract, #2)")]
 fn test_settlement_boundary_price_zero() {
     let (env, client, artist, _buyer, token_id, _contract_id, collection_id) = setup();
     client.set_admin(&artist);
@@ -8105,7 +8158,13 @@ fn test_settlement_fee_deduction_invariants() {
     client.set_protocol_fee(&artist, &protocol_fee_bps);
 
     let price = 100_000_000i128;
-    let recipients = valid_recipients(&env, &artist);
+    let recipients = vec![
+        &env,
+        Recipient {
+            address: artist.clone(),
+            percentage: 9_500, // leaves 500 bps of room for the snapshotted fee
+        },
+    ];
 
     let id = client.create_listing(
         &artist,
@@ -8138,22 +8197,22 @@ fn test_settlement_royalty_split_invariants() {
 
     // Property test: When multiple recipients are present (including royalty splits),
     // all splits must be non-negative and respect the 10000 bps total.
-    let prices = vec![10_000_000i128, 50_000_000i128];
+    let prices = [10_000_000i128, 50_000_000i128];
 
     for price in prices {
         let recipients = {
-            let mut r = Vec::new(&env);
+            let mut r = soroban_sdk::Vec::new(&env);
             r.push_back(Recipient {
                 address: artist.clone(),
-                bps: 6_000u32,
+                percentage: 6_000u32,
             });
             r.push_back(Recipient {
                 address: Address::generate(&env),
-                bps: 2_000u32,
+                percentage: 2_000u32,
             });
             r.push_back(Recipient {
                 address: Address::generate(&env),
-                bps: 2_000u32,
+                percentage: 2_000u32,
             });
             r
         };
@@ -8173,7 +8232,715 @@ fn test_settlement_royalty_split_invariants() {
         assert_eq!(listing.price, price);
 
         // Verify total bps constraint
-        let total = recipients.iter().fold(0u32, |acc, r| acc + r.bps);
+        let total = recipients.iter().fold(0u32, |acc, r| acc + r.percentage);
         assert_eq!(total, 10_000u32, "All splits must sum to 10000 bps");
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ISSUE: Bucketed (paged) index storage — page boundaries, pending-offer
+// counter, batched cancel_artist_listings, and the 1.1.0 migration.
+// ═══════════════════════════════════════════════════════════════════════════
+
+use crate::storage::{self, DataKey, IndexId, INDEX_PAGE_SIZE};
+
+/// Assert every structural invariant of the ActiveListings paged index against
+/// a mirror set of the ids expected to be present (order-independent).
+fn assert_active_index_invariants(
+    env: &Env,
+    contract_id: &Address,
+    expected: &soroban_sdk::Vec<u64>,
+) {
+    env.as_contract(contract_id, || {
+        let idx = IndexId::ActiveListings;
+        let len = storage::index_len(env, &idx);
+        assert_eq!(len, expected.len(), "index length must match mirror");
+
+        // Set equality with the mirror.
+        let all = storage::index_all(env, &idx);
+        assert_eq!(all.len(), expected.len());
+        for id in expected.iter() {
+            assert!(all.contains(id), "id {} missing from index", id);
+        }
+
+        // Page shape: full pages of INDEX_PAGE_SIZE, one trailing partial
+        // page, and no key for any page at or beyond the page count.
+        let pages = len.div_ceil(INDEX_PAGE_SIZE);
+        for p in 0..pages {
+            let expected_page_len = (len - p * INDEX_PAGE_SIZE).min(INDEX_PAGE_SIZE);
+            assert_eq!(
+                storage::index_load_page(env, &idx, p).len(),
+                expected_page_len,
+                "page {} has wrong length",
+                p
+            );
+        }
+        assert!(
+            !env.storage()
+                .persistent()
+                .has(&DataKey::IndexPage(idx.clone(), pages)),
+            "dead page {} must be removed",
+            pages
+        );
+        if len == 0 {
+            assert!(
+                !env.storage().persistent().has(&DataKey::IndexLen(idx.clone())),
+                "length key of an empty index must be removed"
+            );
+        }
+
+        // Position keys: every element's ActiveListingPos matches its slot.
+        for i in 0..len {
+            let id = storage::index_get(env, &idx, i).unwrap();
+            let pos = env
+                .storage()
+                .persistent()
+                .get::<DataKey, u32>(&DataKey::ActiveListingPos(id))
+                .expect("active listing must have a position key");
+            assert_eq!(pos, i, "position key of id {} is stale", id);
+        }
+    });
+}
+
+// ── Page-boundary conditions ────────────────────────────────────────────────
+
+#[test]
+fn test_index_page_exactly_full_then_overflow() {
+    let (env, _client, _artist, _, _token_id, contract_id, _collection_id) = setup();
+    // White-box storage test with per-op contract frames — the aggregate
+    // invariant sweep is not a real transaction, so lift the per-invocation
+    // network resource limits.
+    env.cost_estimate().disable_resource_limits();
+    let idx = IndexId::ListingOffers(999);
+
+    for i in 0..INDEX_PAGE_SIZE as u64 {
+        env.as_contract(&contract_id, || storage::index_append(&env, &idx, i));
+    }
+    env.as_contract(&contract_id, || {
+        assert_eq!(storage::index_len(&env, &idx), INDEX_PAGE_SIZE);
+        assert_eq!(
+            storage::index_load_page(&env, &idx, 0).len(),
+            INDEX_PAGE_SIZE,
+            "page 0 must be exactly full"
+        );
+        assert!(
+            !env.storage()
+                .persistent()
+                .has(&DataKey::IndexPage(idx.clone(), 1)),
+            "page 1 must not exist while page 0 is exactly full"
+        );
+    });
+
+    // The next append must open page 1 with a single element.
+    env.as_contract(&contract_id, || {
+        storage::index_append(&env, &idx, INDEX_PAGE_SIZE as u64)
+    });
+    env.as_contract(&contract_id, || {
+        assert_eq!(storage::index_len(&env, &idx), INDEX_PAGE_SIZE + 1);
+        assert_eq!(storage::index_load_page(&env, &idx, 1).len(), 1);
+        assert_eq!(
+            storage::index_get(&env, &idx, INDEX_PAGE_SIZE),
+            Some(INDEX_PAGE_SIZE as u64)
+        );
+    });
+}
+
+#[test]
+fn test_active_index_single_element_page_removal() {
+    // 101 elements: page 1 holds a single element; removing it must delete
+    // the page key.  Then removing an element from page 0 must swap the
+    // current last element into the vacated slot and fix its position key.
+    let (env, _client, _artist, _, _token_id, contract_id, _collection_id) = setup();
+    // White-box storage test with per-op contract frames — the aggregate
+    // invariant sweep is not a real transaction, so lift the per-invocation
+    // network resource limits.
+    env.cost_estimate().disable_resource_limits();
+    let mut mirror: soroban_sdk::Vec<u64> = soroban_sdk::Vec::new(&env);
+
+    for i in 0..(INDEX_PAGE_SIZE as u64 + 1) {
+        env.as_contract(&contract_id, || {
+            storage::add_to_active_listings(&env, i)
+        });
+        mirror.push_back(i);
+    }
+    assert_active_index_invariants(&env, &contract_id, &mirror);
+
+    // Remove the single element of page 1 (id 100, the last appended).
+    let last = INDEX_PAGE_SIZE as u64;
+    env.as_contract(&contract_id, || {
+        storage::remove_from_active_listings(&env, last)
+    });
+    mirror.remove(mirror.first_index_of(last).unwrap());
+    env.as_contract(&contract_id, || {
+        assert!(
+            !env.storage()
+                .persistent()
+                .has(&DataKey::IndexPage(IndexId::ActiveListings, 1)),
+            "emptied page 1 must be deleted"
+        );
+    });
+    assert_active_index_invariants(&env, &contract_id, &mirror);
+
+    // Remove an element from the middle of page 0 — the last element (99)
+    // must be swapped into its slot.
+    env.as_contract(&contract_id, || {
+        storage::remove_from_active_listings(&env, 50)
+    });
+    mirror.remove(mirror.first_index_of(50u64).unwrap());
+    env.as_contract(&contract_id, || {
+        assert_eq!(
+            storage::index_get(&env, &IndexId::ActiveListings, 50),
+            Some(99u64),
+            "last element must be swapped into the vacated slot"
+        );
+    });
+    assert_active_index_invariants(&env, &contract_id, &mirror);
+}
+
+#[test]
+fn test_active_index_empty_and_absent_removal() {
+    let (env, client, _artist, _, _token_id, contract_id, _collection_id) = setup();
+
+    // Empty index: reads are empty, out-of-range access is None, removal of
+    // an absent id is a no-op.
+    assert!(client.get_active_listings(&10u32, &0u32).is_empty());
+    assert_eq!(client.get_active_listings_count(), 0u32);
+    env.as_contract(&contract_id, || {
+        assert_eq!(storage::index_get(&env, &IndexId::ActiveListings, 0), None);
+        storage::remove_from_active_listings(&env, 42); // must not panic
+        assert_eq!(storage::index_len(&env, &IndexId::ActiveListings), 0);
+    });
+
+    // Fill and fully drain: all keys must be gone at the end.
+    let mut mirror: soroban_sdk::Vec<u64> = soroban_sdk::Vec::new(&env);
+    for i in 0..5u64 {
+        env.as_contract(&contract_id, || storage::add_to_active_listings(&env, i));
+        mirror.push_back(i);
+    }
+    for i in 0..5u64 {
+        env.as_contract(&contract_id, || {
+            storage::remove_from_active_listings(&env, i)
+        });
+        mirror.remove(mirror.first_index_of(i).unwrap());
+        assert_active_index_invariants(&env, &contract_id, &mirror);
+    }
+    env.as_contract(&contract_id, || {
+        assert!(!env
+            .storage()
+            .persistent()
+            .has(&DataKey::IndexPage(IndexId::ActiveListings, 0)));
+        assert!(!env
+            .storage()
+            .persistent()
+            .has(&DataKey::IndexLen(IndexId::ActiveListings)));
+    });
+}
+
+// ── Property-style loop test over hundreds of ids ───────────────────────────
+
+#[test]
+fn test_active_index_property_loop_insert_remove() {
+    let (env, _client, _artist, _, _token_id, contract_id, _collection_id) = setup();
+    // White-box storage test with per-op contract frames — the aggregate
+    // invariant sweep is not a real transaction, so lift the per-invocation
+    // network resource limits.
+    env.cost_estimate().disable_resource_limits();
+    let mut mirror: soroban_sdk::Vec<u64> = soroban_sdk::Vec::new(&env);
+
+    // After every operation: O(1) length + membership checks on the touched
+    // id.  Every 16th operation (and at the end of each phase): the full
+    // structural sweep over pages, position keys and set equality.
+    let mut ops = 0u32;
+    let mut check = |env: &Env, mirror: &soroban_sdk::Vec<u64>, touched: u64, present: bool| {
+        env.as_contract(&contract_id, || {
+            let idx = IndexId::ActiveListings;
+            assert_eq!(storage::index_len(env, &idx), mirror.len());
+            let has_pos = env
+                .storage()
+                .persistent()
+                .has(&DataKey::ActiveListingPos(touched));
+            assert_eq!(has_pos, present, "position key wrong for id {}", touched);
+            if present {
+                let pos = env
+                    .storage()
+                    .persistent()
+                    .get::<DataKey, u32>(&DataKey::ActiveListingPos(touched))
+                    .unwrap();
+                assert_eq!(storage::index_get(env, &idx, pos), Some(touched));
+            }
+        });
+        ops += 1;
+        if ops % 16 == 0 {
+            assert_active_index_invariants(env, &contract_id, mirror);
+        }
+    };
+
+    // Insert 230 ids — crosses two page boundaries.
+    for i in 0..230u64 {
+        let id = 1_000 + i;
+        env.as_contract(&contract_id, || storage::add_to_active_listings(&env, id));
+        mirror.push_back(id);
+        check(&env, &mirror, id, true);
+    }
+    assert_active_index_invariants(&env, &contract_id, &mirror);
+
+    // Remove every third id (scattered positions: front, middle, boundaries).
+    let mut i = 0u64;
+    while i < 230 {
+        let id = 1_000 + i;
+        env.as_contract(&contract_id, || {
+            storage::remove_from_active_listings(&env, id)
+        });
+        mirror.remove(mirror.first_index_of(id).unwrap());
+        check(&env, &mirror, id, false);
+        i += 3;
+    }
+    assert_active_index_invariants(&env, &contract_id, &mirror);
+
+    // Remove the remainder in reverse insertion order until empty.
+    let mut j = 229i64;
+    while j >= 0 {
+        let id = 1_000 + j as u64;
+        if mirror.first_index_of(id).is_some() {
+            env.as_contract(&contract_id, || {
+                storage::remove_from_active_listings(&env, id)
+            });
+            mirror.remove(mirror.first_index_of(id).unwrap());
+            check(&env, &mirror, id, false);
+        }
+        j -= 1;
+    }
+    assert!(mirror.is_empty());
+    assert_active_index_invariants(&env, &contract_id, &mirror);
+}
+
+// ── Pending-offer counter: O(1) cap enforcement ─────────────────────────────
+
+#[test]
+fn test_offer_cap_counts_only_pending_after_49_terminal_offers() {
+    // 49 offers reach a terminal state (rejected) — none of them may count
+    // toward the cap.  A full set of MAX_OFFERS_PER_LISTING (50) new pending
+    // offers must then be accepted, and the 51st pending offer must fail,
+    // proving the cap tracks the pending counter and not the offer history.
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    let listing_id = create_test_listing(&env, &client, &artist, &token_id);
+
+    for _ in 0..49u32 {
+        let offer_id = client.make_offer(&buyer, &listing_id, &1_000_i128, &token_id, &None);
+        client.reject_offer(&artist, &offer_id);
+    }
+    assert_eq!(client.get_pending_offer_count(&listing_id), 0u32);
+
+    for _ in 0..50u32 {
+        client.make_offer(&buyer, &listing_id, &1_000_i128, &token_id, &None);
+    }
+    assert_eq!(client.get_pending_offer_count(&listing_id), 50u32);
+    // Full history retained: 49 terminal + 50 pending.
+    assert_eq!(client.get_listing_offers(&listing_id).len(), 99u32);
+
+    // 51st pending offer exceeds the cap.
+    let res = client.try_make_offer(&buyer, &listing_id, &1_000_i128, &token_id, &None);
+    assert!(res.is_err(), "51st pending offer must hit OfferLimitReached");
+}
+
+#[test]
+fn test_pending_counter_decrements_on_every_terminal_transition() {
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    let buyer2 = Address::generate(&env);
+    StellarAssetClient::new(&env, &token_id).mint(&buyer2, &100_000_000_000_i128);
+
+    let listing_id = create_test_listing(&env, &client, &artist, &token_id);
+
+    // withdraw
+    let o1 = client.make_offer(&buyer, &listing_id, &1_000_i128, &token_id, &None);
+    assert_eq!(client.get_pending_offer_count(&listing_id), 1u32);
+    client.withdraw_offer(&buyer, &o1);
+    assert_eq!(client.get_pending_offer_count(&listing_id), 0u32);
+
+    // reject
+    let o2 = client.make_offer(&buyer, &listing_id, &1_000_i128, &token_id, &None);
+    client.reject_offer(&artist, &o2);
+    assert_eq!(client.get_pending_offer_count(&listing_id), 0u32);
+
+    // reclaim (expired offer)
+    let now = env.ledger().timestamp();
+    let o3 = client.make_offer(&buyer, &listing_id, &1_000_i128, &token_id, &Some(now + 100));
+    assert_eq!(client.get_pending_offer_count(&listing_id), 1u32);
+    env.ledger().set_timestamp(now + 101);
+    client.reclaim_offer(&o3);
+    assert_eq!(client.get_pending_offer_count(&listing_id), 0u32);
+
+    // accept: the accepted offer AND all pending siblings leave the counter
+    let _o4 = client.make_offer(&buyer, &listing_id, &1_000_i128, &token_id, &None);
+    let o5 = client.make_offer(&buyer2, &listing_id, &2_000_i128, &token_id, &None);
+    assert_eq!(client.get_pending_offer_count(&listing_id), 2u32);
+    client.accept_offer(&artist, &o5);
+    assert_eq!(client.get_pending_offer_count(&listing_id), 0u32);
+}
+
+#[test]
+fn test_pending_counter_cleared_by_buy_and_cancel() {
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    let buyer2 = Address::generate(&env);
+    StellarAssetClient::new(&env, &token_id).mint(&buyer2, &100_000_000_000_i128);
+
+    // buy_artwork auto-rejects pending offers and clears the counter.
+    let l1 = create_test_listing(&env, &client, &artist, &token_id);
+    client.make_offer(&buyer2, &l1, &1_000_i128, &token_id, &None);
+    assert_eq!(client.get_pending_offer_count(&l1), 1u32);
+    client.buy_artwork(&buyer, &l1);
+    assert_eq!(client.get_pending_offer_count(&l1), 0u32);
+
+    // cancel_listing refunds pending offers and clears the counter.
+    let l2 = client.create_listing(
+        &artist,
+        &1_000_000_i128,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &2u64,
+        &valid_recipients(&env, &artist),
+        &None::<u64>,
+    );
+    client.make_offer(&buyer2, &l2, &1_000_i128, &token_id, &None);
+    let before = TokenClient::new(&env, &token_id).balance(&buyer2);
+    client.cancel_listing(&artist, &l2);
+    assert_eq!(client.get_pending_offer_count(&l2), 0u32);
+    assert_eq!(TokenClient::new(&env, &token_id).balance(&buyer2), before + 1_000);
+}
+
+// ── Batched, resumable cancel_artist_listings ───────────────────────────────
+
+#[test]
+fn test_cancel_artist_listings_batched_resumable() {
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    let admin = Address::generate(&env);
+    client.set_admin(&admin);
+    client.add_token_to_whitelist(&token_id);
+
+    let ids = create_n_listings(&env, &client, &artist, &token_id, &collection_id, 7);
+    // Pending offer on the first listing — must be refunded during the sweep.
+    let offer_amount = 5_000_i128;
+    let offer_id = client.make_offer(&buyer, &ids.get(0).unwrap(), &offer_amount, &token_id, &None);
+    let buyer_before = TokenClient::new(&env, &token_id).balance(&buyer);
+
+    client.revoke_artist(&artist);
+
+    // max_items = 0 reports the remaining count without processing anything.
+    assert_eq!(client.cancel_artist_listings(&admin, &artist, &0u32), 7u64);
+    assert_eq!(
+        client.get_listing(&ids.get(0).unwrap()).status,
+        ListingStatus::Active
+    );
+
+    // Three batched calls: 7 -> 4 -> 1 -> 0 remaining.
+    assert_eq!(client.cancel_artist_listings(&admin, &artist, &3u32), 4u64);
+    assert_eq!(
+        client.get_listing(&ids.get(2).unwrap()).status,
+        ListingStatus::Cancelled
+    );
+    assert_eq!(
+        client.get_listing(&ids.get(3).unwrap()).status,
+        ListingStatus::Active,
+        "listings beyond the batch must be untouched"
+    );
+    assert_eq!(client.cancel_artist_listings(&admin, &artist, &3u32), 1u64);
+    assert_eq!(client.cancel_artist_listings(&admin, &artist, &3u32), 0u64);
+
+    for i in 0..ids.len() {
+        assert_eq!(
+            client.get_listing(&ids.get(i).unwrap()).status,
+            ListingStatus::Cancelled
+        );
+    }
+    assert_eq!(client.get_active_listings_count(), 0u32);
+
+    // Refund-then-cancel semantics preserved.
+    assert_eq!(client.get_offer(&offer_id).status, OfferStatus::Rejected);
+    assert_eq!(
+        TokenClient::new(&env, &token_id).balance(&buyer),
+        buyer_before + offer_amount
+    );
+
+    // Completed sweep: a further call is a no-op returning 0.
+    assert_eq!(client.cancel_artist_listings(&admin, &artist, &3u32), 0u64);
+}
+
+// ── Pagination across page boundaries (client-level regression) ─────────────
+
+#[test]
+fn test_active_listings_pagination_across_page_boundary() {
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    // 120 active listings span two pages (INDEX_PAGE_SIZE = 100).
+    create_n_listings(&env, &client, &artist, &token_id, &collection_id, 120);
+    assert_eq!(client.get_active_listings_count(), 120u32);
+
+    // Window fully inside page 1.
+    let tail = client.get_active_listings(&30u32, &100u32);
+    assert_eq!(tail.len(), 20u32);
+    assert_eq!(tail.get(0).unwrap(), 101u64);
+
+    // Window straddling the page boundary.
+    let cross = client.get_active_listings_page(&95u32, &10u32);
+    assert_eq!(cross.len(), 10u32);
+    for k in 0..10u32 {
+        assert_eq!(cross.get(k).unwrap(), 96u64 + k as u64);
+    }
+
+    // Resolved-listing pagination across the boundary.
+    let (page, next) = client.get_listings_paginated(&99u32, &2u32);
+    assert_eq!(page.len(), 2u32);
+    assert_eq!(page.get(0).unwrap().listing_id, 100u64);
+    assert_eq!(page.get(1).unwrap().listing_id, 101u64);
+    assert_eq!(next, 101u32);
+
+    // Edge cases: offset past end, zero limit, start beyond count.
+    assert!(client.get_active_listings(&10u32, &120u32).is_empty());
+    assert!(client.get_active_listings(&0u32, &0u32).is_empty());
+    let (empty, cursor) = client.get_listings_paginated(&500u32, &10u32);
+    assert!(empty.is_empty());
+    assert_eq!(cursor, 500u32);
+}
+
+// ── 1.1.0 migration: legacy monolithic Vec indexes → pages ──────────────────
+
+use crate::types::{Auction, Listing, Offer};
+
+/// Populate the pre-1.1.0 (legacy) storage shape directly: entity records via
+/// the unchanged CRUD helpers plus monolithic `Vec<u64>` index entries under
+/// the legacy DataKeys.  3 listings (1 sold), 3 offers (1 terminal), 1 auction.
+fn setup_legacy_v1_fixture(
+    env: &Env,
+    contract_id: &Address,
+    artist: &Address,
+    buyer: &Address,
+    token_id: &Address,
+    collection_id: &Address,
+) {
+    env.as_contract(contract_id, || {
+        let recipients = valid_recipients(env, artist);
+        for lid in 1u64..=3 {
+            let status = if lid == 2 {
+                ListingStatus::Sold
+            } else {
+                ListingStatus::Active
+            };
+            storage::save_listing(
+                env,
+                &Listing {
+                    listing_id: lid,
+                    artist: artist.clone(),
+                    price: 1_000_000 * lid as i128,
+                    currency: symbol_short!("XLM"),
+                    token: token_id.clone(),
+                    collection: collection_id.clone(),
+                    token_id: lid,
+                    recipients: recipients.clone(),
+                    status,
+                    owner: None,
+                    created_at: 0,
+                    protocol_fee_bps: 0,
+                    expires_at: None,
+                },
+            );
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::ListingCount, &3u64);
+
+        for (oid, lid, status) in [
+            (1u64, 1u64, OfferStatus::Pending),
+            (2u64, 1u64, OfferStatus::Rejected),
+            (3u64, 3u64, OfferStatus::Pending),
+        ] {
+            storage::save_offer(
+                env,
+                &Offer {
+                    offer_id: oid,
+                    listing_id: lid,
+                    offerer: buyer.clone(),
+                    amount: 1_000,
+                    token: token_id.clone(),
+                    status,
+                    created_at: 0,
+                    expires_at: None,
+                },
+            );
+        }
+        env.storage().persistent().set(&DataKey::OfferCount, &3u64);
+
+        storage::save_auction(
+            env,
+            &Auction {
+                auction_id: 1,
+                creator: artist.clone(),
+                token: token_id.clone(),
+                collection: collection_id.clone(),
+                token_id: 9,
+                reserve_price: 1_000_000,
+                highest_bid: 0,
+                highest_bidder: None,
+                end_time: 10_000,
+                status: AuctionStatus::Active,
+                recipients: valid_recipients(env, artist),
+                min_increment: 1,
+                extension_window: 600,
+                extension_trigger: 0,
+                protocol_fee_bps: 0,
+            },
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::AuctionCount, &1u64);
+
+        // Legacy monolithic index entries exactly as pre-1.1.0 code wrote them.
+        env.storage()
+            .persistent()
+            .set(&DataKey::ArtistListings(artist.clone()), &vec![env, 1u64, 2u64, 3u64]);
+        env.storage()
+            .persistent()
+            .set(&DataKey::ActiveListings, &vec![env, 1u64, 3u64]);
+        env.storage()
+            .persistent()
+            .set(&DataKey::ListingOffers(1), &vec![env, 1u64, 2u64]);
+        env.storage()
+            .persistent()
+            .set(&DataKey::ListingOffers(3), &vec![env, 3u64]);
+        env.storage()
+            .persistent()
+            .set(&DataKey::OffererOffers(buyer.clone()), &vec![env, 1u64, 2u64, 3u64]);
+        env.storage()
+            .persistent()
+            .set(&DataKey::ArtistAuctions(artist.clone()), &vec![env, 1u64]);
+    });
+}
+
+/// Shared assertions: after migration every read surface must return exactly
+/// what the legacy fixture contained, pending counters must be rebuilt, and
+/// the legacy keys must be gone.
+fn assert_v1_fixture_migrated(
+    env: &Env,
+    client: &MarketplaceContractClient,
+    contract_id: &Address,
+    artist: &Address,
+    buyer: &Address,
+) {
+    assert_eq!(client.get_artist_listings(artist), vec![env, 1u64, 2u64, 3u64]);
+    assert_eq!(client.get_active_listings(&10u32, &0u32), vec![env, 1u64, 3u64]);
+    assert_eq!(client.get_active_listings_count(), 2u32);
+    assert_eq!(client.get_listing_offers(&1u64), vec![env, 1u64, 2u64]);
+    assert_eq!(client.get_listing_offers(&3u64), vec![env, 3u64]);
+    assert_eq!(client.get_offerer_offers(buyer), vec![env, 1u64, 2u64, 3u64]);
+    assert_eq!(client.get_artist_auctions(artist), vec![env, 1u64]);
+
+    // Pending counters rebuilt from offer statuses (offer 2 is terminal).
+    assert_eq!(client.get_pending_offer_count(&1u64), 1u32);
+    assert_eq!(client.get_pending_offer_count(&3u64), 1u32);
+
+    // get_offers_by_listing resolves through the paged index.
+    let offers = client.get_offers_by_listing(&1u64);
+    assert_eq!(offers.len(), 2u32);
+    assert_eq!(offers.get(0).unwrap().offer_id, 1u64);
+    assert_eq!(offers.get(1).unwrap().status, OfferStatus::Rejected);
+
+    env.as_contract(contract_id, || {
+        // Legacy keys consumed.
+        assert!(!env.storage().persistent().has(&DataKey::ActiveListings));
+        assert!(!env
+            .storage()
+            .persistent()
+            .has(&DataKey::ArtistListings(artist.clone())));
+        assert!(!env
+            .storage()
+            .persistent()
+            .has(&DataKey::ArtistAuctions(artist.clone())));
+        assert!(!env.storage().persistent().has(&DataKey::ListingOffers(1)));
+        assert!(!env.storage().persistent().has(&DataKey::ListingOffers(3)));
+        assert!(!env
+            .storage()
+            .persistent()
+            .has(&DataKey::OffererOffers(buyer.clone())));
+        // Active-listing position keys rebuilt for O(1) removal.
+        for lid in [1u64, 3u64] {
+            assert!(env
+                .storage()
+                .persistent()
+                .has(&DataKey::ActiveListingPos(lid)));
+        }
+    });
+}
+
+#[test]
+fn test_migrate_transforms_legacy_v1_data_and_is_idempotent() {
+    let (env, client, artist, buyer, token_id, contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    setup_legacy_v1_fixture(&env, &contract_id, &artist, &buyer, &token_id, &collection_id);
+
+    client.migrate(&artist);
+    assert_v1_fixture_migrated(&env, &client, &contract_id, &artist, &buyer);
+
+    // Idempotency: the second call must revert with AlreadyMigrated (#37).
+    let second = client.try_migrate(&artist);
+    assert!(second.is_err(), "second migrate must revert AlreadyMigrated");
+
+    // The migrated indexes are live: normal operation continues on pages.
+    client.add_token_to_whitelist(&token_id);
+    client.buy_artwork(&buyer, &1u64);
+    assert_eq!(client.get_active_listings(&10u32, &0u32), vec![&env, 3u64]);
+    assert_eq!(client.get_pending_offer_count(&1u64), 0u32);
+}
+
+#[test]
+fn test_migrate_step_bounded_and_resumable() {
+    let (env, client, artist, buyer, token_id, contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    setup_legacy_v1_fixture(&env, &contract_id, &artist, &buyer, &token_id, &collection_id);
+
+    // 8 migration units: 3 listings + 1 auction + 3 offers + 1 active index.
+    let mut remaining = client.migrate_step(&artist, &1u32);
+    assert_eq!(remaining, 7u64);
+    let mut steps = 1u32;
+    while remaining > 0 {
+        let next = client.migrate_step(&artist, &2u32);
+        assert!(next < remaining, "remaining must strictly decrease");
+        remaining = next;
+        steps += 1;
+        assert!(steps < 20, "migration must terminate");
+    }
+
+    assert_v1_fixture_migrated(&env, &client, &contract_id, &artist, &buyer);
+
+    // Marker recorded on completion: both entry points now revert.
+    assert!(client.try_migrate_step(&artist, &1u32).is_err());
+    assert!(client.try_migrate(&artist).is_err());
+}
+
+#[test]
+fn test_migrate_fresh_deploy_records_marker_only() {
+    let (env, client, artist, _, _token_id, contract_id, _collection_id) = setup();
+    client.set_admin(&artist);
+
+    // No legacy data: migrate must still complete and record the marker.
+    client.migrate(&artist);
+    env.as_contract(&contract_id, || {
+        let version = soroban_sdk::String::from_str(&env, "1.1.0");
+        assert!(storage::is_migration_done(&env, &version));
+    });
+    assert!(client.try_migrate(&artist).is_err());
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #5)")]
+fn test_migrate_rejects_non_admin() {
+    let (env, client, artist, buyer, _token_id, _contract_id, _collection_id) = setup();
+    client.set_admin(&artist);
+    client.migrate(&buyer);
 }
