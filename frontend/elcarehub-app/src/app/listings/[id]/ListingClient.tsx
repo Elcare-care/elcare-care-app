@@ -1,10 +1,10 @@
 // ─────────────────────────────────────────────────────────────
-// app/listings/[id]/page.tsx — Premium NFT listing detail page
+// app/listings/[id]/ListingClient.tsx — Premium NFT listing detail page
 // ─────────────────────────────────────────────────────────────
 
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import Image from "next/image";
 import {
@@ -13,8 +13,6 @@ import {
     Auction,
     getListing,
     getAuction,
-    ListingStatus,
-    AuctionStatus
 } from "@/lib/contract";
 import { fetchMetadata, cidToGatewayUrl, ArtworkMetadata } from "@/lib/ipfs";
 import { useWalletContext } from "@/context/WalletContext";
@@ -23,7 +21,11 @@ import { usePlaceBid } from "@/hooks/usePlaceBid";
 import { useListingOffers, useMakeOffer } from "@/hooks/useOffers";
 import { useListingActivity } from "@/hooks/useUserActivity";
 import { useListingHistory } from "@/hooks/useListingHistory";
+import { getListingPriceHistory, PriceHistoryPoint } from "@/lib/indexer";
 import { ProvenanceTimeline } from "@/components/ProvenanceTimeline";
+import { OfferPanel } from "@/components/OfferPanel";
+import { PriceHistoryChart } from "@/components/PriceHistoryChart";
+import { SocialShare } from "@/components/SocialShare";
 import { GuardButton } from "@/components/WalletGuard";
 import {
     ArrowLeft,
@@ -39,14 +41,35 @@ import {
     CheckCircle2,
     AlertCircle,
     TrendingUp,
-    Share2,
-    Copy,
-    Check,
 } from "lucide-react";
 
 interface ListingClientProps {
     id: string;
 }
+
+// ── usePriceHistory inline hook ────────────────────────────────────────────────
+
+function usePriceHistory(listingId: number | null) {
+    const [points, setPoints] = useState<PriceHistoryPoint[]>([]);
+    const [isLoading, setIsLoading] = useState(false);
+    const [error, setError] = useState<string | null>(null);
+
+    useEffect(() => {
+        if (listingId === null) return;
+        let cancelled = false;
+        setIsLoading(true);
+        setError(null);
+        getListingPriceHistory(listingId)
+            .then((data) => { if (!cancelled) setPoints(data); })
+            .catch((e) => { if (!cancelled) setError(e instanceof Error ? e.message : "Failed to load price history"); })
+            .finally(() => { if (!cancelled) setIsLoading(false); });
+        return () => { cancelled = true; };
+    }, [listingId]);
+
+    return { points, isLoading, error };
+}
+
+// ── Main component ─────────────────────────────────────────────────────────────
 
 export default function ListingDetailPage({ id }: ListingClientProps) {
     const router = useRouter();
@@ -60,21 +83,40 @@ export default function ListingDetailPage({ id }: ListingClientProps) {
     const [error, setError] = useState<string | null>(null);
     const [activeTab, setActiveTab] = useState<'details' | 'history' | 'offers'>('details');
 
-    // Share button — momentary "Copied!" feedback
-    const [shareCopied, setShareCopied] = useState(false);
-
     // Hooks
     const { buy, isBuying, error: buyError } = useBuyArtwork(publicKey);
     const { bid, isBidding, error: bidError } = usePlaceBid(publicKey);
     const { offers, isLoading: isLoadingOffers, refresh: refreshOffers } = useListingOffers(id ? Number(id) : null);
-    // Keep useListingActivity call for existing mocks/consumers; history is now handled by useListingHistory
+    // Kept for existing consumers / mocks
     useListingActivity(id ? Number(id) : null);
-    const { events: historyEvents, isLoading: isLoadingHistory, isLoadingMore, error: historyError, hasMore, loadMore } = useListingHistory(id ? Number(id) : null);
+    const {
+        events: historyEvents,
+        isLoading: isLoadingHistory,
+        isLoadingMore,
+        error: historyError,
+        hasMore,
+        loadMore,
+    } = useListingHistory(id ? Number(id) : null);
 
-    // Make Offer Hook and States
+    // Price history (for sparkline chart)
+    const listingIdNum = id ? Number(id) : null;
+    const { points: pricePoints, isLoading: isPriceLoading, error: priceError } = usePriceHistory(listingIdNum);
+
+    // Make Offer Hook
     const { make: makeOffer, isOffering, error: offerError } = useMakeOffer(publicKey);
-    const [offerAmount, setOfferAmount] = useState("");
-    const [offerSuccess, setOfferSuccess] = useState(false);
+
+    const handleMakeOffer = useCallback(
+        async (amount: number, tokenAddress: string, _expiryTs?: number): Promise<boolean> => {
+            if (!listing) return false;
+            const ok = await makeOffer(listing.listing_id, amount, tokenAddress);
+            if (ok) refreshOffers();
+            return ok;
+        },
+        [listing, makeOffer, refreshOffers]
+    );
+
+    // Bid state
+    const [bidAmount, setBidAmount] = useState("");
 
     useEffect(() => {
         const loadData = async () => {
@@ -82,37 +124,20 @@ export default function ListingDetailPage({ id }: ListingClientProps) {
             setIsLoading(true);
             setError(null);
             try {
-                // Try fetching as listing first
                 let l: Listing | null = null;
                 let a: Auction | null = null;
 
-                try {
-                    l = await getListing(Number(id));
-                    setListing(l);
-                } catch (e) {
-                    // Might be an auction only or not found
-                }
+                try { l = await getListing(Number(id)); setListing(l); } catch {}
+                try { a = await getAuction(Number(id)); setAuction(a); } catch {}
 
-                try {
-                    a = await getAuction(Number(id));
-                    setAuction(a);
-                } catch (e) {
-                    // Might be a listing only
-                }
-
-                if (!l && !a) {
-                    throw new Error("Artwork not found");
-                }
+                if (!l && !a) throw new Error("Artwork not found");
 
                 const cid = l?.metadata_cid || a?.metadata_cid;
                 if (cid) {
                     try {
                         const m = await fetchMetadata(cid);
                         setMetadata(m);
-                    } catch (e) {
-                        // Metadata is off-chain (IPFS) and may be slow or unavailable.
-                        // The on-chain listing still exists, so render it without metadata.
-                    }
+                    } catch {}
                 }
             } catch (err: any) {
                 setError(err.message || "Failed to load artwork details");
@@ -127,13 +152,11 @@ export default function ListingDetailPage({ id }: ListingClientProps) {
         if (!listing) return;
         const success = await buy(listing.listing_id);
         if (success) {
-            // Reload
             const updated = await getListing(listing.listing_id);
             setListing(updated);
         }
     };
 
-    const [bidAmount, setBidAmount] = useState("");
     const handleBid = async () => {
         if (!auction || !bidAmount) return;
         const success = await bid(auction.auction_id, Number(bidAmount));
@@ -144,35 +167,8 @@ export default function ListingDetailPage({ id }: ListingClientProps) {
         }
     };
 
-    const handleMakeOffer = async () => {
-        if (!listing || !offerAmount) return;
-        const success = await makeOffer(listing.listing_id, Number(offerAmount), listing.token);
-        if (success) {
-            setOfferSuccess(true);
-            setOfferAmount("");
-            refreshOffers();
-            setTimeout(() => setOfferSuccess(false), 3000);
-        }
-    };
-
-    const handleShare = async () => {
-        const url = typeof window !== "undefined" ? window.location.href : "";
-        try {
-            await navigator.clipboard.writeText(url);
-            setShareCopied(true);
-            setTimeout(() => setShareCopied(false), 2000);
-        } catch {
-            // Fallback: open native share sheet if clipboard is unavailable
-            if (typeof navigator.share === "function") {
-                navigator.share({ title: metadata?.title ?? `Listing #${id}`, url }).catch(() => {});
-            }
-        }
-    };
-
     const handleProvenance = () => {
-        // Switch to the history tab so the user sees the on-chain activity feed
         setActiveTab("history");
-        // Scroll the tab panel into view on mobile
         document.getElementById("listing-tabs")?.scrollIntoView({ behavior: "smooth" });
     };
 
@@ -209,18 +205,25 @@ export default function ListingDetailPage({ id }: ListingClientProps) {
     const status = listing?.status || auction?.status;
     const isActive = status === "Active";
 
-    // Formatted price
-    const priceDisplay = listing ? stroopsToXlm(listing.price) : auction ? stroopsToXlm(auction.highest_bid || auction.reserve_price) : "0";
+    const priceDisplay = listing
+        ? stroopsToXlm(listing.price)
+        : auction
+        ? stroopsToXlm(auction.highest_bid || auction.reserve_price)
+        : "0";
 
-    // Royalty info (now handled by the collection contract)
-    const royaltyBps = 0;
     const royaltyPercent = "0.0";
+
+    // Listing URL for sharing
+    const listingUrl =
+        typeof window !== "undefined"
+            ? window.location.href
+            : `https://elcarehub.art/listings/${id}`;
 
     return (
         <div className="min-h-screen bg-midnight-950 text-white pb-20 pt-24 px-4 sm:px-6 lg:px-8">
 
             <div className="grid gap-12 lg:grid-cols-2 lg:items-start">
-                {/* LEFT COLUMN: Media & Description */}
+                {/* LEFT COLUMN: Media, Tabs & Description */}
                 <div className="space-y-8 animate-fade-in-left">
                     {/* Main Artwork Frame */}
                     <div className="relative aspect-square overflow-hidden rounded-[2.5rem] bg-midnight-900 border border-white/5 shadow-2xl group">
@@ -240,11 +243,12 @@ export default function ListingDetailPage({ id }: ListingClientProps) {
                             </div>
                         )}
 
-                        {/* Status Floating Badge */}
-                        <div className={`absolute top-6 right-6 px-4 py-1.5 rounded-full text-xs font-bold tracking-widest uppercase backdrop-blur-md shadow-xl border ${status === "Active" ? "bg-mint-500/20 text-mint-400 border-mint-500/30" :
+                        {/* Status Badge */}
+                        <div className={`absolute top-6 right-6 px-4 py-1.5 rounded-full text-xs font-bold tracking-widest uppercase backdrop-blur-md shadow-xl border ${
+                            status === "Active" ? "bg-mint-500/20 text-mint-400 border-mint-500/30" :
                             status === "Sold" || status === "Finalized" ? "bg-brand-500/20 text-brand-400 border-brand-500/30" :
-                                "bg-terracotta-500/20 text-terracotta-400 border-terracotta-500/30"
-                            }`}>
+                            "bg-terracotta-500/20 text-terracotta-400 border-terracotta-500/30"
+                        }`}>
                             {status}
                         </div>
 
@@ -261,8 +265,10 @@ export default function ListingDetailPage({ id }: ListingClientProps) {
                                 <button
                                     key={tab}
                                     onClick={() => setActiveTab(tab)}
-                                    className={`pb-4 text-sm font-bold uppercase tracking-wider transition-all relative ${activeTab === tab ? "text-brand-400" : "text-white/40 hover:text-white"
-                                        }`}
+                                    data-testid={`tab-${tab}`}
+                                    className={`pb-4 text-sm font-bold uppercase tracking-wider transition-all relative ${
+                                        activeTab === tab ? "text-brand-400" : "text-white/40 hover:text-white"
+                                    }`}
                                 >
                                     {tab}
                                     {activeTab === tab && (
@@ -272,6 +278,7 @@ export default function ListingDetailPage({ id }: ListingClientProps) {
                             ))}
                         </div>
 
+                        {/* ── Details tab ─────────────────────────────────── */}
                         {activeTab === 'details' && (
                             <div className="space-y-6 animate-fade-in">
                                 <p className="text-white/70 leading-relaxed text-lg italic">
@@ -329,9 +336,18 @@ export default function ListingDetailPage({ id }: ListingClientProps) {
                                         </div>
                                     </div>
                                 </div>
+
+                                {/* Price History Chart */}
+                                <PriceHistoryChart
+                                    points={pricePoints}
+                                    isLoading={isPriceLoading}
+                                    error={priceError}
+                                    className="mt-6"
+                                />
                             </div>
                         )}
 
+                        {/* ── History tab ─────────────────────────────────── */}
                         {activeTab === 'history' && (
                             <div className="animate-fade-in max-h-[28rem] overflow-y-auto pr-2 custom-scrollbar">
                                 <ProvenanceTimeline
@@ -345,35 +361,22 @@ export default function ListingDetailPage({ id }: ListingClientProps) {
                             </div>
                         )}
 
+                        {/* ── Offers tab ───────────────────────────────────── */}
                         {activeTab === 'offers' && (
-                            <div className="space-y-4 animate-fade-in max-h-80 overflow-y-auto pr-4 custom-scrollbar">
-                                {offers.length > 0 ? (
-                                    offers.map((offer) => (
-                                        <div key={offer.offer_id} className="p-4 rounded-2xl bg-white/5 border border-white/5 flex items-center justify-between group hover:bg-white/10 transition-all">
-                                            <div className="flex items-center gap-4">
-                                                <div className="w-10 h-10 rounded-xl bg-brand-500/10 flex items-center justify-center text-brand-400 font-bold">
-                                                    {offer.offerer.slice(0, 1)}
-                                                </div>
-                                                <div>
-                                                    <p className="text-xs font-mono text-white/60 mb-1">{offer.offerer.slice(0, 12)}…</p>
-                                                    <div className="flex items-center gap-2 text-brand-400 font-bold">
-                                                        {stroopsToXlm(offer.amount)} XLM
-                                                    </div>
-                                                </div>
-                                            </div>
-                                            {offer.status === 'Pending' && (
-                                                <div className="px-3 py-1 rounded-full bg-mint-500/10 text-mint-400 text-[10px] font-bold uppercase tracking-widest border border-mint-500/20">
-                                                    Active
-                                                </div>
-                                            )}
-                                        </div>
-                                    ))
-                                ) : (
-                                    <div className="py-10 text-center text-white/30">
-                                        <TrendingUp size={40} className="mx-auto mb-4 opacity-20" />
-                                        <p className="italic">No active offers yet</p>
-                                    </div>
-                                )}
+                            <div className="animate-fade-in">
+                                <OfferPanel
+                                    listingId={Number(id)}
+                                    listingToken={listing?.token ?? ""}
+                                    isOwner={isOwn}
+                                    offers={offers}
+                                    isLoadingOffers={isLoadingOffers}
+                                    onRefreshOffers={refreshOffers}
+                                    onMakeOffer={handleMakeOffer}
+                                    isMakingOffer={isOffering}
+                                    makeOfferError={offerError}
+                                    isActive={isActive}
+                                    ownerPublicKey={publicKey}
+                                />
                             </div>
                         )}
                     </div>
@@ -382,7 +385,7 @@ export default function ListingDetailPage({ id }: ListingClientProps) {
                 {/* RIGHT COLUMN: Action Panel */}
                 <div className="space-y-8 animate-fade-in-right sticky top-28">
                     <div className="p-6 md:p-10 rounded-[3rem] bg-gradient-to-br from-white/10 to-white/5 border border-white/10 backdrop-blur-md shadow-2xl relative overflow-hidden">
-                        {/* Background design element */}
+                        {/* Background glows */}
                         <div className="absolute -top-10 -right-10 w-40 h-40 bg-brand-500/10 blur-3xl rounded-full" />
                         <div className="absolute -bottom-10 -left-10 w-40 h-40 bg-terracotta-500/10 blur-3xl rounded-full" />
 
@@ -477,41 +480,21 @@ export default function ListingDetailPage({ id }: ListingClientProps) {
                                     </div>
                                 )}
 
-                                {isActive && !isOwn && (
-                                    <div className="space-y-4">
-                                        <div className="flex flex-col sm:flex-row gap-4">
-                                            <input
-                                                type="number"
-                                                placeholder="Offer amount (XLM)..."
-                                                value={offerAmount}
-                                                onChange={(e) => {
-                                                    setOfferAmount(e.target.value);
-                                                    setOfferSuccess(false);
-                                                }}
-                                                className="w-full sm:flex-1 rounded-2xl bg-white/5 border border-white/10 px-6 py-4 sm:py-0 text-white text-lg font-bold focus:outline-none focus:border-brand-500 transition-all"
-                                            />
-                                            <GuardButton
-                                                onAction={handleMakeOffer}
-                                                disabled={isOffering || !offerAmount}
-                                                actionName="To make an offer"
-                                                className="w-full sm:w-auto rounded-2xl bg-brand-500 text-white px-8 py-5 text-sm uppercase font-black hover:bg-brand-600 transition-all active:scale-95 disabled:opacity-50"
-                                            >
-                                                {isOffering ? "Offering..." : "Make Offer"}
-                                            </GuardButton>
-                                        </div>
-                                        {offerSuccess && (
-                                            <div className="p-3 rounded-xl bg-mint-500/10 border border-mint-500/20 text-mint-400 text-xs flex items-center gap-2">
-                                                <CheckCircle2 size={16} />
-                                                Offer placed successfully!
-                                            </div>
-                                        )}
-                                        {offerError && (
-                                            <div className="p-3 rounded-xl bg-terracotta-500/10 border border-terracotta-500/20 text-terracotta-400 text-xs flex items-center gap-2">
-                                                <AlertCircle size={16} />
-                                                {offerError}
-                                            </div>
-                                        )}
-                                    </div>
+                                {/* Offer Panel (below buy button, listing only) */}
+                                {listing && isActive && (
+                                    <OfferPanel
+                                        listingId={Number(id)}
+                                        listingToken={listing.token}
+                                        isOwner={isOwn}
+                                        offers={offers}
+                                        isLoadingOffers={isLoadingOffers}
+                                        onRefreshOffers={refreshOffers}
+                                        onMakeOffer={handleMakeOffer}
+                                        isMakingOffer={isOffering}
+                                        makeOfferError={offerError}
+                                        isActive={isActive}
+                                        ownerPublicKey={publicKey}
+                                    />
                                 )}
 
                                 {isOwn && (
@@ -526,7 +509,7 @@ export default function ListingDetailPage({ id }: ListingClientProps) {
                                 {(status === "Sold" || status === "Finalized") && (
                                     <div className="p-6 rounded-2xl bg-white/5 border border-white/10 text-center">
                                         <p className="text-white/40 font-bold italic">
-                                            This asset has been privateley collected.
+                                            This asset has been privately collected.
                                         </p>
                                     </div>
                                 )}
@@ -538,24 +521,23 @@ export default function ListingDetailPage({ id }: ListingClientProps) {
                                     </div>
                                 )}
 
-                                {/* Secondary Actions */}
+                                {/* Secondary Actions: Share + Provenance */}
                                 <div className="flex gap-3 pt-6">
-                                    <button
-                                        onClick={handleShare}
-                                        title="Copy link to clipboard"
-                                        className="flex-1 h-12 rounded-xl bg-white/5 hover:bg-white/10 transition-all border border-white/5 flex items-center justify-center gap-2 text-xs font-bold text-white/60"
-                                    >
-                                        {shareCopied
-                                            ? <><Check size={14} className="text-mint-400" /><span className="text-mint-400">Copied!</span></>
-                                            : <><Share2 size={14} /> Share</>
-                                        }
-                                    </button>
+                                    {/* Social share buttons */}
+                                    <SocialShare
+                                        title={metadata?.title ?? `Listing #${id}`}
+                                        price={`${priceDisplay} XLM`}
+                                        url={listingUrl}
+                                        className="flex-1"
+                                    />
                                     <button
                                         onClick={handleProvenance}
                                         title="View on-chain provenance history"
-                                        className="flex-1 h-12 rounded-xl bg-white/5 hover:bg-white/10 transition-all border border-white/5 flex items-center justify-center gap-2 text-xs font-bold text-white/60"
+                                        data-testid="provenance-btn"
+                                        className="h-11 px-4 rounded-xl bg-white/5 hover:bg-white/10 transition-all border border-white/10 flex items-center gap-2 text-xs font-bold text-white/60"
                                     >
-                                        <ExternalLink size={14} /> Provenance
+                                        <History size={14} />
+                                        <span className="hidden sm:inline">Provenance</span>
                                     </button>
                                 </div>
                             </div>
