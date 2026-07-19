@@ -111,6 +111,7 @@ router.get('/events', (req: Request, res: Response) => {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no'); // prevent nginx from buffering SSE chunks
   res.flushHeaders();
 
   const lastEventId = req.headers['last-event-id'];
@@ -486,6 +487,7 @@ router.get('/events', (req: Request, res: Response) => {
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no'); // prevent nginx from buffering SSE chunks
     res.setHeader('Access-Control-Allow-Origin', '*');
 
     // Setup heartbeat

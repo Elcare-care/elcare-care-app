@@ -127,9 +127,59 @@ npm run backfill -- --start=123456 --end=124999 --rpc=https://your-archival-rpc
 | `STELLAR_HORIZON_URL` | ⬜ | `https://horizon-testnet.stellar.org` | Horizon REST API |
 | `PORT` | ⬜ | `4000` | HTTP server port |
 | `POLL_INTERVAL_MS` | ⬜ | `5000` | Polling interval in milliseconds |
-| `CORS_ORIGIN` | ⬜ | — | Comma-separated allowed origins (production) |
+| `CORS_ORIGIN` | ⬜ | — | Comma-separated list of allowed origins (see CORS section) |
 
-> In development (`NODE_ENV !== production`), all CORS origins are allowed.
+---
+
+## CORS Configuration
+
+The indexer uses a dynamic origin whitelist with per-origin credential support and preflight caching.
+
+### How it works
+
+- **Empty / unset `CORS_ORIGIN`** (development): every origin is reflected — no restrictions. Convenient for `localhost` and tool-based testing.
+- **Non-empty `CORS_ORIGIN`** (staging / production): only origins in the list receive `Access-Control-Allow-Origin`. Requests from any other origin get no CORS headers and are blocked by the browser.
+
+Allowed requests always include `Access-Control-Allow-Credentials: true` (required for `X-API-Key` headers) and `Access-Control-Max-Age: 86400` (preflight cached for 24 hours).
+
+### Environment examples
+
+**Local development** — allow everything:
+```env
+# leave CORS_ORIGIN unset or empty
+CORS_ORIGIN=
+```
+
+**Staging** — single frontend origin:
+```env
+CORS_ORIGIN=https://staging.elcarehub.xyz
+```
+
+**Production** — multiple origins (frontend + registered integrators):
+```env
+CORS_ORIGIN=https://app.elcarehub.xyz,https://partner.example.com,https://dashboard.example.com
+```
+
+### SSE (`/events`)
+
+The SSE endpoint adds `X-Accel-Buffering: no` so nginx reverse proxies forward chunks immediately rather than buffering the full response body.
+
+### Debug endpoint
+
+In non-production environments a `GET /cors-test` endpoint is available. It echoes the request origin, whether it was allowed, and the current whitelist — useful for verifying browser or curl config without reading server logs:
+
+```bash
+curl -H "Origin: http://localhost:3000" http://localhost:4000/cors-test
+```
+
+```json
+{
+  "origin": "http://localhost:3000",
+  "allowed": true,
+  "whitelist": [],
+  "mode": "development (all origins)"
+}
+```
 
 ---
 

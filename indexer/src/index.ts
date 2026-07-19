@@ -11,6 +11,7 @@ import { metricsMiddleware, handleMetrics } from './metrics.js';
 import { errorHandler } from './api/errors.js';
 import { startReconciler } from './reconciler.js';
 import { validateRequiredEnv, loadKeeperConfig } from './config.js';
+import { parseCorsOrigins, buildCorsOptions } from './cors.js';
 import { startKeeper } from './keeper/index.js';
 import { startGapRepairWorker } from './gap-repair.js';
 import { logger } from './logger.js';
@@ -40,12 +41,12 @@ try {
 const app = express();
 const PORT = process.env.PORT || 4000;
 
-app.use(cors({
-    origin: process.env.NODE_ENV === 'production'
-        ? (process.env.CORS_ORIGIN || '').split(',').map(o => o.trim()).filter(Boolean)
-        : true,
-    credentials: true,
-}));
+// ── CORS ──────────────────────────────────────────────────────────────────────
+// Parse the whitelist once at startup. An empty list = dev mode (all origins).
+const corsOrigins = parseCorsOrigins(process.env.CORS_ORIGIN);
+app.use(cors(buildCorsOptions(corsOrigins)));
+// Handle OPTIONS preflight explicitly — Express 5 requires a valid route pattern.
+app.options(/.*/, cors(buildCorsOptions(corsOrigins)));
 app.use(compression());
 app.use(express.json());
 
@@ -76,6 +77,30 @@ app.use(errorHandler);
 app.get('/health', (req: express.Request, res: express.Response) => {
     res.json({ status: 'ok' });
 });
+
+// ── Dev-only CORS debug endpoint ──────────────────────────────────────────────
+// Echo the request origin, relevant headers, and the CORS decision so developers
+// can verify their browser / curl config without reading server logs.
+// Stripped in production — never exposed to end users.
+if (process.env.NODE_ENV !== 'production') {
+    app.get('/cors-test', (req: express.Request, res: express.Response) => {
+        const origin = req.headers.origin ?? null;
+        const allowed = corsOrigins.length === 0
+            ? true
+            : origin !== null && corsOrigins.includes(origin);
+
+        res.json({
+            origin,
+            allowed,
+            whitelist: corsOrigins,
+            mode: corsOrigins.length === 0 ? 'development (all origins)' : 'production (whitelist)',
+            headers: {
+                'access-control-allow-origin': res.getHeader('access-control-allow-origin') ?? null,
+                'access-control-allow-credentials': res.getHeader('access-control-allow-credentials') ?? null,
+            },
+        });
+    });
+}
 
 // Readiness probe — returns 503 until the indexer has processed at least one ledger,
 // or if the indexer has stalled (no progress for STALL_THRESHOLD_MS).
