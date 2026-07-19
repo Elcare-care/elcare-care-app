@@ -62,8 +62,25 @@ pub enum MarketplaceError {
     OfferExpired = 34,
     /// A new offer would exceed MAX_OFFERS_PER_LISTING active (Pending) offers
     /// for this listing.  A cap bounds per-listing storage growth and keeps the
-    /// auto-reject sweep (ISSUE-031) economically viable.
+    /// auto-reject sweep economically viable.
     OfferLimitReached = 35,
+    /// `create_listing` or `create_auction` was called but the marketplace could
+    /// not verify that the caller owns `token_id` on the given collection contract.
+    /// The call is rejected before any escrow is attempted.
+    NotTokenOwner = 36,
+    /// A token is already held in escrow for an active listing or auction on this
+    /// marketplace.  The same `(collection, token_id)` pair cannot be listed or
+    /// auctioned simultaneously — it must be released first via cancel/expire.
+    TokenAlreadyEscrowed = 37,
+    /// The buyer must not be the listing artist (original creator) or the current
+    /// NFT owner.
+    SelfPurchaseNotAllowed = 38,
+    /// Arithmetic overflow detected during price or fee computation.
+    ArithmeticOverflow = 39,
+    /// The price falls outside the admin-configured `[min_price, max_price]` bounds.
+    PriceOutOfBounds = 40,
+    /// `migrate` was called for a version that has already been applied.
+    AlreadyMigrated = 41,
 }
 
 #[contracttype]
@@ -75,16 +92,13 @@ pub enum ListingStatus {
 }
 
 /// Discriminant carried in the ListingCancelledEvent to indicate why a listing
-/// was cancelled. This improves provenance display and analytics for indexers.
+/// was cancelled.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum CancelReason {
-    /// The listing owner (artist) explicitly cancelled the listing
     Owner = 1,
-    /// The listing expired (time-based expiry, if implemented)
     Expired = 2,
-    /// Admin revoked the artist's permission, causing automatic cancellation
     AdminRevoked = 3,
 }
 
@@ -93,8 +107,6 @@ pub enum CancelReason {
 pub struct Recipient {
     pub address: Address,
     /// Share expressed in basis points (0 – 10 000).
-    /// The sum of all recipient `percentage` values plus the protocol fee bps
-    /// must not exceed 10 000 (100 %).
     pub percentage: u32,
 }
 
@@ -112,15 +124,7 @@ pub struct Listing {
     pub status: ListingStatus,
     pub owner: Option<Address>,
     pub created_at: u32,
-    /// Protocol fee in basis points (0-10000) snapshotted at listing creation.
-    /// This ensures the fee applied at purchase matches what was displayed when
-    /// the listing was created, regardless of subsequent admin fee changes.
     pub protocol_fee_bps: u32,
-    /// Optional expiry as a Unix ledger timestamp (seconds since epoch).
-    /// When `Some(t)` and `env.ledger().timestamp() >= t`, the listing is
-    /// considered expired and cannot be purchased.  `None` means no expiry
-    /// (the listing lives until cancelled or sold).  Listings created before
-    /// this field was introduced will deserialise as `None` automatically.
     pub expires_at: Option<u64>,
 }
 
@@ -146,36 +150,17 @@ pub struct Auction {
     pub end_time: u64,
     pub status: AuctionStatus,
     pub recipients: soroban_sdk::Vec<Recipient>,
-    /// Minimum amount by which a new bid must exceed the current highest bid,
-    /// snapshotted from the global setting at auction creation. The first bid is
-    /// instead gated by `reserve_price`.
     pub min_increment: i128,
-    /// How many seconds to extend the auction when a qualifying late bid arrives.
-    /// Snapshotted from the global setting at auction creation time.
     pub extension_window: u64,
-    /// If `end_time - now < extension_trigger` seconds at bid time, the auction
-    /// end is extended by `extension_window`. Snapshotted at creation time.
     pub extension_trigger: u64,
-    /// Protocol fee in basis points snapshotted from the global setting at
-    /// auction creation time. This ensures settlement math is fixed when the
-    /// auction is created, giving bidders and the creator certainty about the
-    /// net payout — consistent with how listings behave.
     pub protocol_fee_bps: u32,
 }
 
-/// A single entry in the per-auction bounded bid history.
-///
-/// The history is capped to `BID_HISTORY_CAP` entries (see `contract.rs`).
-/// When the cap is reached the oldest entry is evicted so only the most
-/// recent N bids are ever persisted.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BidRecord {
-    /// The account that placed this bid.
     pub bidder: Address,
-    /// The bid amount (in the auction's payment token stroops).
     pub amount: i128,
-    /// The ledger sequence number at which this bid was recorded.
     pub ledger: u32,
 }
 
@@ -198,8 +183,5 @@ pub struct Offer {
     pub token: Address,
     pub status: OfferStatus,
     pub created_at: u32,
-    /// Optional expiry (Unix timestamp, seconds). When `Some(t)` and the
-    /// ledger timestamp >= t: `accept_offer` reverts, anyone may call
-    /// `reclaim_offer` to refund the offerer.  `None` = no expiry.
     pub expires_at: Option<u64>,
 }

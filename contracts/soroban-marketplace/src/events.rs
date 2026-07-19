@@ -2,7 +2,6 @@
 
 use soroban_sdk::{contracttype, symbol_short, Address, Env, Symbol};
 
-// Versioned event topics as Symbol constants
 pub const LISTING_CREATED: Symbol = symbol_short!("lst_crtd");
 pub const ARTWORK_SOLD: Symbol = symbol_short!("art_sold");
 pub const LISTING_CANCELLED: Symbol = symbol_short!("lst_cncl");
@@ -27,9 +26,9 @@ pub const AUCTION_EXTENDED: Symbol = symbol_short!("auc_ext");
 pub const AUCTION_CANCELLED: Symbol = symbol_short!("auc_cncl");
 pub const PROTOCOL_FEE_COLLECTED: Symbol = symbol_short!("fee_cltd");
 pub const OFFER_RECLAIMED: Symbol = symbol_short!("ofr_rclm");
+pub const NFT_ESCROWED: Symbol = symbol_short!("nft_escw");
+pub const NFT_RELEASED: Symbol = symbol_short!("nft_rels");
 
-// Event data structs
-// Event data structs
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ListingCreatedEvent {
@@ -57,9 +56,7 @@ pub struct ArtworkSoldEvent {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ListingCancelledEvent {
     pub listing_id: u64,
-    /// The actor that triggered the cancellation (may be the artist, admin, or contract).
     pub cancelled_by: Address,
-    /// Discriminant indicating the reason for cancellation (Owner, Expired, AdminRevoked).
     pub reason: crate::types::CancelReason,
     pub ledger_sequence: u32,
 }
@@ -75,7 +72,6 @@ pub struct ListingUpdatedEvent {
     pub ledger_sequence: u32,
 }
 
-// Add more event structs as needed for other actions
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AuctionCreatedEvent {
@@ -110,35 +106,30 @@ impl ListingCreatedEvent {
         env.events().publish((LISTING_CREATED,), self);
     }
 }
-
 impl ArtworkSoldEvent {
     #[allow(deprecated)]
     pub fn publish(self, env: &Env) {
         env.events().publish((ARTWORK_SOLD,), self);
     }
 }
-
 impl ListingCancelledEvent {
     #[allow(deprecated)]
     pub fn publish(self, env: &Env) {
         env.events().publish((LISTING_CANCELLED,), self);
     }
 }
-
 impl AuctionCreatedEvent {
     #[allow(deprecated)]
     pub fn publish(self, env: &Env) {
         env.events().publish((AUCTION_CREATED,), self);
     }
 }
-
 impl BidPlacedEvent {
     #[allow(deprecated)]
     pub fn publish(self, env: &Env) {
         env.events().publish((BID_PLACED,), self);
     }
 }
-
 impl AuctionFinalizedEvent {
     #[allow(deprecated)]
     pub fn publish(self, env: &Env) {
@@ -146,15 +137,12 @@ impl AuctionFinalizedEvent {
     }
 }
 
-/// Emitted when a qualifying late bid triggers the anti-sniping extension rule.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AuctionExtendedEvent {
     pub auction_id: u64,
-    /// The new end time after the extension has been applied.
     pub new_end_time: u64,
 }
-
 impl AuctionExtendedEvent {
     #[allow(deprecated)]
     pub fn publish(self, env: &Env) {
@@ -162,14 +150,12 @@ impl AuctionExtendedEvent {
     }
 }
 
-/// Emitted when a creator cancels an auction that has received no bids.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AuctionCancelledEvent {
     pub auction_id: u64,
     pub cancelled_by: Address,
 }
-
 impl AuctionCancelledEvent {
     #[allow(deprecated)]
     pub fn publish(self, env: &Env) {
@@ -184,9 +170,6 @@ impl ListingUpdatedEvent {
     }
 }
 
-/// Emitted when a seller updates the price of an active listing in-place via
-/// `update_listing_price`.  Both the old and new price are recorded so that
-/// indexers can reconstruct the full price history of every listing.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ListingPriceUpdatedEvent {
@@ -195,17 +178,6 @@ pub struct ListingPriceUpdatedEvent {
     pub new_price: i128,
     pub updated_by: Address,
 }
-
-/// Emitted when anyone calls `expire_listing` on a genuinely expired listing,
-/// transitioning it from Active → Expired/Cancelled.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ListingExpiredEvent {
-    pub listing_id: u64,
-    pub expired_at: u64,
-    pub ledger_sequence: u32,
-}
-
 impl ListingPriceUpdatedEvent {
     #[allow(deprecated)]
     pub fn publish(self, env: &Env) {
@@ -213,6 +185,13 @@ impl ListingPriceUpdatedEvent {
     }
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ListingExpiredEvent {
+    pub listing_id: u64,
+    pub expired_at: u64,
+    pub ledger_sequence: u32,
+}
 impl ListingExpiredEvent {
     #[allow(deprecated)]
     pub fn publish(self, env: &Env) {
@@ -229,7 +208,6 @@ pub struct OfferMadeEvent {
     pub amount: i128,
     pub token: Address,
 }
-
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OfferAcceptedEvent {
@@ -238,7 +216,6 @@ pub struct OfferAcceptedEvent {
     pub offerer: Address,
     pub amount: i128,
 }
-
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OfferRejectedEvent {
@@ -246,7 +223,6 @@ pub struct OfferRejectedEvent {
     pub listing_id: u64,
     pub offerer: Address,
 }
-
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OfferWithdrawnEvent {
@@ -261,21 +237,18 @@ impl OfferMadeEvent {
         env.events().publish((OFFER_MADE,), self);
     }
 }
-
 impl OfferAcceptedEvent {
     #[allow(deprecated)]
     pub fn publish(self, env: &Env) {
         env.events().publish((OFFER_ACCEPTED,), self);
     }
 }
-
 impl OfferRejectedEvent {
     #[allow(deprecated)]
     pub fn publish(self, env: &Env) {
         env.events().publish((OFFER_REJECTED,), self);
     }
 }
-
 impl OfferWithdrawnEvent {
     #[allow(deprecated)]
     pub fn publish(self, env: &Env) {
@@ -288,20 +261,17 @@ impl OfferWithdrawnEvent {
 pub struct ArtistRevokedEvent {
     pub artist: Address,
 }
-
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ArtistReinstatedEvent {
     pub artist: Address,
 }
-
 impl ArtistRevokedEvent {
     #[allow(deprecated)]
     pub fn publish(self, env: &Env) {
         env.events().publish((ARTIST_REVOKED,), self);
     }
 }
-
 impl ArtistReinstatedEvent {
     #[allow(deprecated)]
     pub fn publish(self, env: &Env) {
@@ -315,21 +285,18 @@ pub struct AdminTransferProposedEvent {
     pub current_admin: Address,
     pub proposed_admin: Address,
 }
-
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdminTransferredEvent {
     pub old_admin: Address,
     pub new_admin: Address,
 }
-
 impl AdminTransferProposedEvent {
     #[allow(deprecated)]
     pub fn publish(self, env: &Env) {
         env.events().publish((ADMIN_TRANSFER_PROPOSED,), self);
     }
 }
-
 impl AdminTransferredEvent {
     #[allow(deprecated)]
     pub fn publish(self, env: &Env) {
@@ -337,38 +304,20 @@ impl AdminTransferredEvent {
     }
 }
 
-// ── Protocol Fee Event ────────────────────────────────────────────────────────
-//
-// Emitted from every settlement path (buy_artwork, finalize_auction,
-// accept_offer) so the treasury's revenue is independently observable
-// on-chain without requiring indexer inference.
-
-/// Emitted once per settlement with the exact protocol-fee amount transferred
-/// to the treasury.  Carries enough context to identify the originating trade
-/// and reconcile treasury balances in real time.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProtocolFeeCollectedEvent {
-    /// ID of the listing (for buy_artwork / accept_offer) or auction
-    /// (for finalize_auction) that generated the fee.
     pub listing_id: u64,
-    /// Raw token amount transferred to the treasury.  Zero when no treasury is
-    /// configured or when the computed fee rounds down to zero.
     pub amount: i128,
-    /// The payment token from which the fee was deducted.
     pub token: Address,
-    /// The treasury address that received the fee.
     pub treasury: Address,
 }
-
 impl ProtocolFeeCollectedEvent {
     #[allow(deprecated)]
     pub fn publish(self, env: &Env) {
         env.events().publish((PROTOCOL_FEE_COLLECTED,), self);
     }
 }
-
-// End of events
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -378,10 +327,49 @@ pub struct OfferReclaimedEvent {
     pub offerer: Address,
     pub amount: i128,
 }
-
 impl OfferReclaimedEvent {
     #[allow(deprecated)]
     pub fn publish(self, env: &Env) {
         env.events().publish((OFFER_RECLAIMED,), self);
+    }
+}
+
+// ── NFT Escrow Events ─────────────────────────────────────────────────────────
+
+/// Emitted when an NFT is pulled into marketplace custody on create_listing /
+/// create_auction.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NftEscrowedEvent {
+    /// The listing_id or auction_id for which the token is held.
+    pub id: u64,
+    pub collection: Address,
+    pub token_id: u64,
+    pub seller: Address,
+    pub ledger_sequence: u32,
+}
+impl NftEscrowedEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events().publish((NFT_ESCROWED,), self);
+    }
+}
+
+/// Emitted when an escrowed NFT is released — to a buyer/winner on settlement,
+/// or back to the seller/creator on cancellation / expiry / no-bid finalize.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NftReleasedEvent {
+    /// The listing_id or auction_id that was holding the token.
+    pub id: u64,
+    pub collection: Address,
+    pub token_id: u64,
+    pub recipient: Address,
+    pub ledger_sequence: u32,
+}
+impl NftReleasedEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events().publish((NFT_RELEASED,), self);
     }
 }
