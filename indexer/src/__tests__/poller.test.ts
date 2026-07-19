@@ -7,9 +7,11 @@ vi.mock('dotenv', () => ({ default: { config: vi.fn() } }));
 
 const mockTx = vi.hoisted(() => ({
   marketplaceEvent: {
-    deleteMany: vi.fn().mockResolvedValue({}),
-    findMany: vi.fn().mockResolvedValue([]),
-    createMany: vi.fn().mockResolvedValue({}),
+    deleteMany:  vi.fn().mockResolvedValue({}),
+    findMany:    vi.fn().mockResolvedValue([]),
+    findUnique:  vi.fn().mockResolvedValue(null),   // null = not found = new event
+    create:      vi.fn().mockResolvedValue({}),
+    createMany:  vi.fn().mockResolvedValue({}),
   },
   listing: {
     deleteMany: vi.fn().mockResolvedValue({}),
@@ -60,24 +62,30 @@ const mockPrisma = vi.hoisted(() => ({
     update: vi.fn().mockResolvedValue({}),
     upsert: vi.fn().mockResolvedValue({ id: 1, lastLedger: 0, lastLedgerHash: null }),
   },
+  trackedContract: {
+    upsert: vi.fn().mockResolvedValue({ id: 1, contractId: 'CTEST', active: true }),
+    findMany: vi.fn().mockResolvedValue([
+      { id: 1, contractId: 'CTEST', type: 'marketplace', label: 'marketplace', lastLedger: 0, lastLedgerHash: null, active: true },
+    ]),
+    findUnique: vi.fn().mockResolvedValue(
+      { id: 1, contractId: 'CTEST', type: 'marketplace', label: 'marketplace', lastLedger: 0, lastLedgerHash: null, active: true }
+    ),
+    update: vi.fn().mockResolvedValue({}),
+  },
+  ledgerGap: {
+    upsert: vi.fn().mockResolvedValue({}),
+    findMany: vi.fn().mockResolvedValue([]),
+  },
   $transaction: vi.fn((fn: (tx: typeof mockTx) => Promise<void>) => fn(mockTx)),
 }));
 
 vi.mock('../db', () => ({ default: mockPrisma }));
 vi.mock('../metrics.js', () => ({
   latestLedgerProcessedGauge: { set: vi.fn() },
-  networkLatestLedgerGauge: { set: vi.fn() },
-  syncLatencyGauge: { set: vi.fn() },
-  stalledGauge: { set: vi.fn() },
-  decodeErrorsCounter: { inc: vi.fn() },
-  eventDecodeErrorsCounter: { inc: vi.fn() },
-  rpcRetryExhaustedCounter: { inc: vi.fn() },
-}));
-
-// Prevent real IPFS gateway calls in unit tests
-vi.mock('../ipfs-cache.js', () => ({
-  enqueueIpfsFetch: vi.fn().mockResolvedValue(undefined),
-  processIpfsQueue: vi.fn().mockResolvedValue(0),
+  networkLatestLedgerGauge:   { set: vi.fn() },
+  syncLatencyGauge:           { set: vi.fn() },
+  decodeErrorsCounter:        { inc: vi.fn() },
+  duplicateEventsCounter:     { inc: vi.fn() },
 }));
 
 // Stellar SDK mocks for offline unit testing
@@ -535,7 +543,8 @@ describe('validateHashContinuity', () => {
 
 describe('startPolling', () => {
   it('throws an error if both CONTRACT_ID and LAUNCHPAD_CONTRACT_ID are empty', async () => {
-    await expect(startPolling()).rejects.toThrow('At least one of MARKETPLACE_CONTRACT_ID or LAUNCHPAD_CONTRACT_ID must be set');
+    mockPrisma.trackedContract.findMany.mockResolvedValueOnce([]);
+    await expect(startPolling()).rejects.toThrow('No active tracked contracts');
   });
 });
 
@@ -615,21 +624,19 @@ describe('startPolling — window floor reset', () => {
 
   it('fetches events from windowFloor when syncState.lastLedger is too old', async () => {
     // Network is at ledger 20000; MAX_LEDGER_WINDOW is 17000 → windowFloor = 3000
-    // syncState.lastLedger = 100 → startLedger would be 101, which is < 3000
+    // contract.lastLedger = 100 → startLedger would be 101, which is < 3000
     const networkLatest = 20_000;
     const expectedWindowFloor = networkLatest - 17_000; // 3000
 
-    mockPrisma.syncState.upsert.mockResolvedValueOnce({
-      id: 1,
-      lastLedger: 100,
-      lastLedgerHash: null,
-    });
-    // After the window-floor persist, update returns the new state
-    mockPrisma.syncState.update.mockResolvedValue({
-      id: 1,
-      lastLedger: expectedWindowFloor - 1,
-      lastLedgerHash: null,
-    });
+    // Per-contract seed returns a contract with lastLedger=100 (too old)
+    mockPrisma.trackedContract.upsert.mockResolvedValue({});
+    mockPrisma.trackedContract.findMany.mockResolvedValue([
+      { id: 1, contractId: 'CTEST', type: 'marketplace', label: 'marketplace', lastLedger: 100, lastLedgerHash: null, active: true },
+    ]);
+    mockPrisma.trackedContract.findUnique.mockResolvedValue(
+      { id: 1, contractId: 'CTEST', type: 'marketplace', label: 'marketplace', lastLedger: 100, lastLedgerHash: null, active: true }
+    );
+    mockPrisma.trackedContract.update.mockResolvedValue({});
 
     // Reload the module so CONTRACT_ID picks up MARKETPLACE_CONTRACT_ID = 'CTEST'
     vi.resetModules();
@@ -648,27 +655,18 @@ describe('startPolling — window floor reset', () => {
         return Promise.resolve({ events: [], latestLedger: networkLatest });
       });
 
-    // Start the loop in the background; it runs indefinitely — we wait for
-    // the first-iteration DB side-effects instead of trying to stop the loop.
+    // Start the loop in the background; it runs indefinitely
     freshStart().catch(() => {});
 
-    // Wait for the window-floor DB persist to appear
+    // Wait for the window-floor trackedContract.update persist to appear
     await vi.waitFor(() => {
-      expect(mockPrisma.syncState.update).toHaveBeenCalledWith(
+      expect(mockPrisma.trackedContract.update).toHaveBeenCalledWith(
         expect.objectContaining({
           data: expect.objectContaining({ lastLedger: expectedWindowFloor - 1, lastLedgerHash: null }),
         })
       );
     }, { timeout: 3000 });
 
-    // The upsert pattern must be used (not findUnique + create)
-    expect(mockPrisma.syncState.upsert).toHaveBeenCalledWith(
-      expect.objectContaining({
-        where: { id: 1 },
-        create: expect.objectContaining({ id: 1, lastLedger: 0 }),
-        update: {},
-      })
-    );
     expect(mockPrisma.syncState.findUnique).not.toHaveBeenCalled();
     expect(mockPrisma.syncState.create).not.toHaveBeenCalled();
     // The poller must have requested events starting at the window floor
@@ -692,16 +690,15 @@ describe('startPolling — hash fetch failure', () => {
     const networkLatest = 60;
     const priorHash = 'prev_hash';
 
-    mockPrisma.syncState.upsert.mockResolvedValueOnce({
-      id: 1,
-      lastLedger: 50,
-      lastLedgerHash: priorHash,
-    });
-    mockPrisma.syncState.update.mockResolvedValue({
-      id: 1,
-      lastLedger: networkLatest,
-      lastLedgerHash: priorHash,
-    });
+    // Contract starts at lastLedger=50 with a known hash
+    mockPrisma.trackedContract.upsert.mockResolvedValue({});
+    mockPrisma.trackedContract.findMany.mockResolvedValue([
+      { id: 1, contractId: 'CTEST', type: 'marketplace', label: 'marketplace', lastLedger: 50, lastLedgerHash: priorHash, active: true },
+    ]);
+    mockPrisma.trackedContract.findUnique.mockResolvedValue(
+      { id: 1, contractId: 'CTEST', type: 'marketplace', label: 'marketplace', lastLedger: 50, lastLedgerHash: priorHash, active: true }
+    );
+    mockPrisma.trackedContract.update.mockResolvedValue({});
 
     vi.resetModules();
     const { startPolling: freshStart } = await import('../poller');
@@ -713,9 +710,11 @@ describe('startPolling — hash fetch failure', () => {
       .mockResolvedValue({ events: [], latestLedger: networkLatest } as any);
     vi.spyOn(sdkMod.rpc.Server.prototype, 'getLedgers')
       .mockImplementation(({ startLedger }: { startLedger: number }) => {
+        // hash continuity check succeeds for ledger 50
         if (startLedger === 50) {
           return Promise.resolve({ ledgers: [{ hash: priorHash, sequence: 50 }] });
         }
+        // hash fetch for the advance-to ledger fails
         if (startLedger === networkLatest) {
           return Promise.reject(new Error('network error'));
         }
@@ -724,18 +723,20 @@ describe('startPolling — hash fetch failure', () => {
 
     freshStart().catch(() => {});
 
+    // The trackedContract.update should be called with only lastLedger (no lastLedgerHash)
+    // when the hash fetch fails — this preserves the previous hash checkpoint
     await vi.waitFor(() => {
-      expect(mockPrisma.syncState.update).toHaveBeenCalledWith(
+      expect(mockPrisma.trackedContract.update).toHaveBeenCalledWith(
         expect.objectContaining({
-          data: { lastLedger: networkLatest },
+          data: expect.objectContaining({ lastLedger: networkLatest }),
         })
       );
     }, { timeout: 3000 });
 
-    const hashAdvanceUpdate = mockPrisma.syncState.update.mock.calls.find(
-      ([arg]) => arg.data?.lastLedger === networkLatest
+    const advanceUpdate = mockPrisma.trackedContract.update.mock.calls.find(
+      ([arg]: [any]) => arg.data?.lastLedger === networkLatest
     );
-    expect(hashAdvanceUpdate?.[0].data).not.toHaveProperty('lastLedgerHash');
+    expect(advanceUpdate?.[0].data).not.toHaveProperty('lastLedgerHash');
   }, 8000);
 });
 
@@ -744,64 +745,63 @@ describe('startPolling — hash fetch failure', () => {
 describe('applyDecodedEvents — idempotency (double-process produces no duplicates)', () => {
   beforeEach(() => vi.clearAllMocks());
 
+  const makeEvt = (eventType: string, listingId: bigint, idx = 0) => ({
+    eventType,
+    listingId,
+    actor: 'GA',
+    ledgerSequence: 100,
+    data: { artist: 'GA', collection: 'C', token_id: 1 },
+    eventHash: `hash-${eventType}-${listingId}-${idx}`,
+    contractId: 'CTEST',
+    txHash: 'tx1',
+    eventIndex: idx,
+  });
+
   it('inserts events on the first call', async () => {
     const events = [
-      { eventType: 'LISTING_CREATED', listingId: 1n, actor: 'GA', ledgerSequence: 100, data: { artist: 'GA', collection: 'C', token_id: 1 } },
-      { eventType: 'ARTWORK_SOLD',    listingId: 2n, actor: 'GB', ledgerSequence: 100, data: { buyer: 'GB' } },
+      makeEvt('LISTING_CREATED', 1n, 0),
+      makeEvt('ARTWORK_SOLD',    2n, 1),
     ];
 
-    // First call: no existing events
-    mockTx.marketplaceEvent.findMany.mockResolvedValueOnce([]);
+    // findUnique returns null → events are new
+    mockTx.marketplaceEvent.findUnique.mockResolvedValue(null);
 
     const inserted = await applyDecodedEvents(events, mockTx);
 
     expect(inserted).toHaveLength(2);
-    expect(mockTx.marketplaceEvent.createMany).toHaveBeenCalledOnce();
-    expect(mockTx.marketplaceEvent.createMany).toHaveBeenCalledWith(
-      expect.objectContaining({ skipDuplicates: true })
-    );
+    expect(mockTx.marketplaceEvent.create).toHaveBeenCalledTimes(2);
   });
 
   it('produces no inserts when the same ledger is processed a second time', async () => {
     const events = [
-      { eventType: 'LISTING_CREATED', listingId: 1n, actor: 'GA', ledgerSequence: 100, data: { artist: 'GA', collection: 'C', token_id: 1 } },
-      { eventType: 'ARTWORK_SOLD',    listingId: 2n, actor: 'GB', ledgerSequence: 100, data: { buyer: 'GB' } },
+      makeEvt('LISTING_CREATED', 1n, 0),
+      makeEvt('ARTWORK_SOLD',    2n, 1),
     ];
 
-    // Second call: DB already has both events (simulating re-process after restart)
-    mockTx.marketplaceEvent.findMany.mockResolvedValueOnce([
-      { listingId: 1n, eventType: 'LISTING_CREATED', ledgerSequence: 100 },
-      { listingId: 2n, eventType: 'ARTWORK_SOLD',    ledgerSequence: 100 },
-    ]);
+    // findUnique returns a row → both events already exist
+    mockTx.marketplaceEvent.findUnique.mockResolvedValue({ id: 99 });
 
     const inserted = await applyDecodedEvents(events, mockTx);
 
     expect(inserted).toHaveLength(0);
-    // createMany must NOT be called (or be called with empty data)
-    const createManyCalls = mockTx.marketplaceEvent.createMany.mock.calls;
-    for (const [arg] of createManyCalls) {
-      expect(arg.data).toHaveLength(0);
-    }
+    expect(mockTx.marketplaceEvent.create).not.toHaveBeenCalled();
   });
 
   it('only inserts truly new events when a ledger is partially re-processed', async () => {
     const events = [
-      { eventType: 'LISTING_CREATED', listingId: 1n, actor: 'GA', ledgerSequence: 100, data: {} },
-      { eventType: 'ARTWORK_SOLD',    listingId: 2n, actor: 'GB', ledgerSequence: 100, data: {} },
+      makeEvt('LISTING_CREATED', 1n, 0),
+      makeEvt('ARTWORK_SOLD',    2n, 1),
     ];
 
-    // Only the first event already exists
-    mockTx.marketplaceEvent.findMany.mockResolvedValueOnce([
-      { listingId: 1n, eventType: 'LISTING_CREATED', ledgerSequence: 100 },
-    ]);
+    // First event exists, second does not
+    mockTx.marketplaceEvent.findUnique
+      .mockResolvedValueOnce({ id: 99 })   // LISTING_CREATED → duplicate
+      .mockResolvedValueOnce(null);         // ARTWORK_SOLD    → new
 
     const inserted = await applyDecodedEvents(events, mockTx);
 
     expect(inserted).toHaveLength(1);
     expect(inserted[0].eventType).toBe('ARTWORK_SOLD');
-    expect(mockTx.marketplaceEvent.createMany).toHaveBeenCalledOnce();
-    const [createArg] = mockTx.marketplaceEvent.createMany.mock.calls[0];
-    expect(createArg.data).toHaveLength(1);
-    expect(createArg.skipDuplicates).toBe(true);
+    expect(mockTx.marketplaceEvent.create).toHaveBeenCalledTimes(1);
   });
 });

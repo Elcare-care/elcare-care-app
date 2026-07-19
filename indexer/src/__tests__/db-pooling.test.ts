@@ -1,7 +1,7 @@
 /**
  * Tests for database connection pooling and timeout configuration
  */
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { vi } from 'vitest';
 
 describe('Database pooling configuration', () => {
   const originalEnv = process.env;

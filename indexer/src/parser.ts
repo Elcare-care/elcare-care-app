@@ -1,5 +1,5 @@
-import { xdr, scValToNative } from '@stellar/stellar-sdk';
-import { SCHEMA_REGISTRY, decodeWithSchema, type DecodeResult } from './event-schemas.js';
+import { xdr, Address, scValToNative } from '@stellar/stellar-sdk';
+import { createHash } from 'crypto';
 
 export interface DecodedEvent {
   eventType: string;
@@ -7,6 +7,26 @@ export interface DecodedEvent {
   actor: string;
   ledgerSequence: number;
   data: any;
+  // Idempotency fields — populated by event-sync, used as upsert key
+  eventHash: string;
+  contractId: string;
+  txHash: string;
+  eventIndex: number;
+}
+
+/**
+ * Computes a globally unique, stable identity for an on-chain event.
+ * SHA256(contractId + ledgerSequence + txHash + eventIndex)
+ */
+export function computeEventHash(
+  contractId: string,
+  ledgerSequence: number,
+  txHash: string,
+  eventIndex: number
+): string {
+  return createHash('sha256')
+    .update(`${contractId}:${ledgerSequence}:${txHash}:${eventIndex}`)
+    .digest('hex');
 }
 
 /** Re-exported for callers that want to inspect decode failures directly. */
@@ -83,7 +103,10 @@ function resolveEventType(topics: string[]): string | null {
 export function parseMarketplaceEvent(
   topics: string[],
   valueXdr: string,
-  ledger: number
+  ledger: number,
+  contractId: string = '',
+  txHash: string = '',
+  eventIndex: number = 0
 ): DecodedEvent | null {
   const type = resolveEventType(topics);
   if (!type) return null;
@@ -144,6 +167,10 @@ export function parseMarketplaceEvent(
     actor,
     ledgerSequence: ledger,
     data: convertBigInts(nativeData),
+    eventHash: computeEventHash(contractId, ledger, txHash, eventIndex),
+    contractId,
+    txHash,
+    eventIndex,
   };
 }
 
