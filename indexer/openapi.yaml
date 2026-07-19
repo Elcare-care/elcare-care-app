@@ -155,11 +155,19 @@ paths:
             type: string
       responses:
         '200':
-          description: Auction details
+          description: Auction details with bid history
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Auction'
+                allOf:
+                  - $ref: '#/components/schemas/Auction'
+                  - type: object
+                    properties:
+                      bids:
+                        type: array
+                        description: Bid history, newest first
+                        items:
+                          $ref: '#/components/schemas/Bid'
         '404':
           description: Auction not found
 
@@ -528,6 +536,23 @@ components:
         updatedAtLedger:
           type: integer
 
+    Bid:
+      type: object
+      properties:
+        id:
+          type: integer
+        auctionId:
+          type: string
+        bidder:
+          type: string
+        amount:
+          type: string
+        ledgerSequence:
+          type: integer
+        createdAt:
+          type: string
+          format: date-time
+
     Offer:
       type: object
       properties:
@@ -541,7 +566,7 @@ components:
           type: string
         status:
           type: string
-          enum: [Pending, Accepted, Rejected, Withdrawn]
+          enum: [Pending, Accepted, Rejected, Withdrawn, Reclaimed]
         updatedAtLedger:
           type: integer
 

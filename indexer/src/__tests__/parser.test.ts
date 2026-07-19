@@ -16,7 +16,7 @@ vi.mock('@stellar/stellar-sdk', () => ({
   scValToNative: mockScValToNative,
 }));
 
-import { parseMarketplaceEvent, DecodedEvent } from '../parser';
+import { parseMarketplaceEvent, KNOWN_EVENT_TYPES, DecodedEvent } from '../parser';
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -25,7 +25,7 @@ import { parseMarketplaceEvent, DecodedEvent } from '../parser';
  * - topicSymbol: the symbol the XDR topic decodes to (e.g. 'lst_crtd')
  * - valueData:   the plain object returned by scValToNative for the value XDR
  */
-function setupMocks(topicSymbol: string, valueData: Record<string, any>) {
+function setupMocks(topicSymbol: string, valueData: any) {
   // First scValToNative call → topic symbol
   // Second scValToNative call → event value data
   mockScValToNative
@@ -41,19 +41,37 @@ describe('parseMarketplaceEvent — topic mapping', () => {
     mockFromXDR.mockReturnValue({});
   });
 
+  // All 24 marketplace symbols from contracts/soroban-marketplace/src/events.rs
+  // plus the 4 launchpad deploy symbols. This table pins symbol → type.
   const cases: [string, string][] = [
     ['lst_crtd', 'LISTING_CREATED'],
     ['art_sold', 'ARTWORK_SOLD'],
     ['lst_cncl', 'LISTING_CANCELLED'],
     ['lst_updt', 'LISTING_UPDATED'],
+    ['lst_pru', 'LISTING_PRICE_UPDATED'],
+    ['lst_expd', 'LISTING_EXPIRED'],
     ['bid_plcd', 'BID_PLACED'],
     ['auc_rslv', 'AUCTION_RESOLVED'],
     ['auc_cncl', 'AUCTION_CANCELLED'],
+    ['auc_ext', 'AUCTION_EXTENDED'],
     ['ofr_made', 'OFFER_MADE'],
     ['ofr_accp', 'OFFER_ACCEPTED'],
     ['ofr_rjct', 'OFFER_REJECTED'],
     ['ofr_wdrn', 'OFFER_WITHDRAWN'],
+    ['ofr_rclm', 'OFFER_RECLAIMED'],
+    ['roy_paid', 'ROYALTY_PAID'],
+    ['fee_cltd', 'PROTOCOL_FEE_COLLECTED'],
+    ['adm_prop', 'ADMIN_TRANSFER_PROPOSED'],
+    ['adm_xfrd', 'ADMIN_TRANSFERRED'],
+    ['art_rvkd', 'ARTIST_REVOKED'],
+    ['art_rnst', 'ARTIST_REINSTATED'],
+    ['ctr_psd', 'CONTRACT_PAUSED'],
+    ['ctr_unpsd', 'CONTRACT_UNPAUSED'],
     ['auc_crtd', 'AUCTION_CREATED'],
+    ['dep_n721', 'DEPLOY_NORMAL_721'],
+    ['dep_n1155', 'DEPLOY_NORMAL_1155'],
+    ['dep_l721', 'DEPLOY_LAZY_721'],
+    ['dep_l1155', 'DEPLOY_LAZY_1155'],
   ];
 
   for (const [symbol, expectedType] of cases) {
@@ -66,6 +84,12 @@ describe('parseMarketplaceEvent — topic mapping', () => {
       expect(result!.eventType).toBe(expectedType);
     });
   }
+
+  it('covers every known event type exactly once (no unmapped topics)', () => {
+    const expectedTypes = cases.map(([, type]) => type).sort();
+    expect([...KNOWN_EVENT_TYPES].sort()).toEqual(expectedTypes);
+    expect(KNOWN_EVENT_TYPES).toHaveLength(28);
+  });
 
   it('returns null for an unknown topic symbol', () => {
     setupMocks('unknown_sym', {});
@@ -541,5 +565,263 @@ describe('parseMarketplaceEvent — deploy event fixtures', () => {
     setupMocks('dep_n721', ['GCREATOR', 'CCONTRACT']);
     const r = parseMarketplaceEvent(['t'], 'v', 1)!;
     expect(r.listingId).toBeNull();
+  });
+});
+
+// ── newly mapped topic fixtures (#191) — payloads per events.rs structs ──────
+
+describe('parseMarketplaceEvent — LISTING_PRICE_UPDATED fixture', () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+    mockFromXDR.mockReturnValue({});
+  });
+
+  it('extracts updated_by as actor and serialises old/new price', () => {
+    setupMocks('lst_pru', {
+      listing_id: 4n,
+      old_price: 10_000_000n,
+      new_price: 12_000_000n,
+      updated_by: 'GSELLER',
+    });
+
+    const r = parseMarketplaceEvent(['t'], 'v', 900)!;
+    expect(r.eventType).toBe('LISTING_PRICE_UPDATED');
+    expect(r.listingId).toBe(4n);
+    expect(r.actor).toBe('GSELLER');
+    expect(r.data.old_price).toBe('10000000');
+    expect(r.data.new_price).toBe('12000000');
+  });
+});
+
+describe('parseMarketplaceEvent — LISTING_EXPIRED fixture', () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+    mockFromXDR.mockReturnValue({});
+  });
+
+  it('maps listing_id and serialises expired_at', () => {
+    setupMocks('lst_expd', {
+      listing_id: 6n,
+      expired_at: 1_800_000_000n,
+      ledger_sequence: 901,
+    });
+
+    const r = parseMarketplaceEvent(['t'], 'v', 901)!;
+    expect(r.eventType).toBe('LISTING_EXPIRED');
+    expect(r.listingId).toBe(6n);
+    expect(r.actor).toBe('');   // expire_listing is permissionless
+    expect(r.data.expired_at).toBe('1800000000');
+  });
+});
+
+describe('parseMarketplaceEvent — AUCTION_EXTENDED fixture', () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+    mockFromXDR.mockReturnValue({});
+  });
+
+  it('maps auction_id to listingId and serialises new_end_time', () => {
+    setupMocks('auc_ext', {
+      auction_id: 11n,
+      new_end_time: 1_800_000_600n,
+    });
+
+    const r = parseMarketplaceEvent(['t'], 'v', 902)!;
+    expect(r.eventType).toBe('AUCTION_EXTENDED');
+    expect(r.listingId).toBe(11n);
+    expect(r.data.new_end_time).toBe('1800000600');
+  });
+});
+
+describe('parseMarketplaceEvent — OFFER_RECLAIMED fixture', () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+    mockFromXDR.mockReturnValue({});
+  });
+
+  it('extracts offerer as actor and serialises offer_id and amount', () => {
+    setupMocks('ofr_rclm', {
+      offer_id: 9n,
+      listing_id: 42n,
+      offerer: 'GOFFERER',
+      amount: 30_000_000n,
+    });
+
+    const r = parseMarketplaceEvent(['t'], 'v', 903)!;
+    expect(r.eventType).toBe('OFFER_RECLAIMED');
+    expect(r.listingId).toBe(42n);
+    expect(r.actor).toBe('GOFFERER');
+    expect(r.data.offer_id).toBe('9');
+    expect(r.data.amount).toBe('30000000');
+  });
+});
+
+describe('parseMarketplaceEvent — PROTOCOL_FEE_COLLECTED fixture', () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+    mockFromXDR.mockReturnValue({});
+  });
+
+  it('maps listing_id and serialises amount, token and treasury', () => {
+    setupMocks('fee_cltd', {
+      listing_id: 42n,
+      amount: 250_000n,
+      token: 'CTOKEN',
+      treasury: 'GTREASURY',
+    });
+
+    const r = parseMarketplaceEvent(['t'], 'v', 904)!;
+    expect(r.eventType).toBe('PROTOCOL_FEE_COLLECTED');
+    expect(r.listingId).toBe(42n);
+    expect(r.data.amount).toBe('250000');
+    expect(r.data.token).toBe('CTOKEN');
+    expect(r.data.treasury).toBe('GTREASURY');
+  });
+});
+
+describe('parseMarketplaceEvent — admin & moderation fixtures', () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+    mockFromXDR.mockReturnValue({});
+  });
+
+  it('ADMIN_TRANSFER_PROPOSED: current_admin is the actor', () => {
+    setupMocks('adm_prop', {
+      current_admin: 'GADMIN_OLD',
+      proposed_admin: 'GADMIN_NEW',
+    });
+
+    const r = parseMarketplaceEvent(['t'], 'v', 905)!;
+    expect(r.eventType).toBe('ADMIN_TRANSFER_PROPOSED');
+    expect(r.listingId).toBeNull();
+    expect(r.actor).toBe('GADMIN_OLD');
+  });
+
+  it('ADMIN_TRANSFERRED: new_admin (the accepting admin) is the actor', () => {
+    setupMocks('adm_xfrd', {
+      old_admin: 'GADMIN_OLD',
+      new_admin: 'GADMIN_NEW',
+    });
+
+    const r = parseMarketplaceEvent(['t'], 'v', 906)!;
+    expect(r.eventType).toBe('ADMIN_TRANSFERRED');
+    expect(r.actor).toBe('GADMIN_NEW');
+  });
+
+  it('ARTIST_REVOKED: artist is the recorded actor', () => {
+    setupMocks('art_rvkd', { artist: 'GARTIST' });
+    const r = parseMarketplaceEvent(['t'], 'v', 907)!;
+    expect(r.eventType).toBe('ARTIST_REVOKED');
+    expect(r.actor).toBe('GARTIST');
+    expect(r.listingId).toBeNull();
+  });
+
+  it('ARTIST_REINSTATED: artist is the recorded actor', () => {
+    setupMocks('art_rnst', { artist: 'GARTIST' });
+    const r = parseMarketplaceEvent(['t'], 'v', 908)!;
+    expect(r.eventType).toBe('ARTIST_REINSTATED');
+    expect(r.actor).toBe('GARTIST');
+  });
+
+  it('CONTRACT_PAUSED: tolerates a unit (void) payload without crashing', () => {
+    setupMocks('ctr_psd', undefined as any);
+    const r = parseMarketplaceEvent(['t'], 'v', 909)!;
+    expect(r.eventType).toBe('CONTRACT_PAUSED');
+    expect(r.listingId).toBeNull();
+    expect(r.actor).toBe('');
+  });
+
+  it('CONTRACT_UNPAUSED: tolerates a bare address payload without crashing', () => {
+    setupMocks('ctr_unpsd', 'GADMIN');
+    const r = parseMarketplaceEvent(['t'], 'v', 910)!;
+    expect(r.eventType).toBe('CONTRACT_UNPAUSED');
+    expect(r.listingId).toBeNull();
+    expect(r.actor).toBe('');
+  });
+
+  it('ROYALTY_PAID: passes payload through and maps listing_id when present', () => {
+    setupMocks('roy_paid', {
+      listing_id: 42n,
+      amount: 1_000n,
+      recipient: 'GRECIP',
+    });
+
+    const r = parseMarketplaceEvent(['t'], 'v', 911)!;
+    expect(r.eventType).toBe('ROYALTY_PAID');
+    expect(r.listingId).toBe(42n);
+    expect(r.data.amount).toBe('1000');
+  });
+
+  it('LISTING_CANCELLED: cancelled_by is the recorded actor when present', () => {
+    setupMocks('lst_cncl', {
+      listing_id: 3n,
+      cancelled_by: 'GADMIN',
+      reason: 3,
+    });
+
+    const r = parseMarketplaceEvent(['t'], 'v', 912)!;
+    expect(r.actor).toBe('GADMIN');
+  });
+});
+
+// ── malformed payloads must throw so the caller can count decode errors ──────
+
+describe('parseMarketplaceEvent — malformed payloads', () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+    mockFromXDR.mockReturnValue({});
+  });
+
+  it('propagates value-XDR decode failures (caller increments decodeErrorsCounter)', () => {
+    // Topic decodes fine; the value XDR is corrupt
+    mockScValToNative.mockReturnValueOnce('lst_pru');
+    mockFromXDR
+      .mockReturnValueOnce({})
+      .mockImplementationOnce(() => { throw new Error('corrupt value XDR'); });
+
+    expect(() => parseMarketplaceEvent(['t'], 'corrupt', 1)).toThrow('corrupt value XDR');
+  });
+
+  it('throws on a numeric-string payload where a struct was expected (BigInt coercion)', () => {
+    // listing_id present but not coercible → BigInt throws → caller counts it
+    setupMocks('lst_pru', { listing_id: 'not-a-number' });
+    expect(() => parseMarketplaceEvent(['t'], 'v', 1)).toThrow();
+  });
+
+  it('does not throw for new topics when payload is an unexpected primitive', () => {
+    for (const symbol of ['lst_expd', 'auc_ext', 'ofr_rclm', 'fee_cltd', 'roy_paid']) {
+      setupMocks(symbol, 'unexpected-primitive' as any);
+      const r = parseMarketplaceEvent(['t'], 'v', 1)!;
+      expect(r).not.toBeNull();
+      expect(r.listingId).toBeNull();
+      expect(r.actor).toBe('');
+    }
+  });
+});
+
+// ── identity & ordering passthrough (#191) ───────────────────────────────────
+
+describe('parseMarketplaceEvent — eventId and ordering fields', () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+    mockFromXDR.mockReturnValue({});
+  });
+
+  it('carries eventId, txHash, txIndex and eventIndex through to the decoded event', () => {
+    setupMocks('lst_crtd', { listing_id: 1n, artist: 'GA' });
+
+    const r = parseMarketplaceEvent(['t'], 'v', 100, 'CONTRACT', 'txabc', 3, '429496729600-0000000003', 7)!;
+    expect(r.eventId).toBe('429496729600-0000000003');
+    expect(r.txHash).toBe('txabc');
+    expect(r.txIndex).toBe(7);
+    expect(r.eventIndex).toBe(3);
+  });
+
+  it('falls back to eventHash as eventId when the RPC id is absent', () => {
+    setupMocks('lst_crtd', { listing_id: 1n, artist: 'GA' });
+
+    const r = parseMarketplaceEvent(['t'], 'v', 100, 'CONTRACT', 'txabc', 3)!;
+    expect(r.eventId).toBe(r.eventHash);
+    expect(r.eventId).toHaveLength(64);
   });
 });

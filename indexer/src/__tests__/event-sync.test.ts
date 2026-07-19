@@ -25,7 +25,13 @@ vi.mock('../retry.js', () => ({
   withRetry: vi.fn((fn: () => Promise<unknown>) => fn()),
 }));
 
-import { collectMarketplaceEvents, MAX_LEDGER_WINDOW, EVENT_PAGE_LIMIT } from '../event-sync';
+import {
+  collectMarketplaceEvents,
+  extractEventOrdering,
+  sortDecodedEvents,
+  MAX_LEDGER_WINDOW,
+  EVENT_PAGE_LIMIT,
+} from '../event-sync';
 
 describe('collectMarketplaceEvents', () => {
   it('follows pagination tokens until the page is exhausted', async () => {
@@ -235,5 +241,111 @@ describe('collectMarketplaceEvents — malformed event isolation', () => {
     expect(events).toHaveLength(1);
     expect(events[0].eventType).toBe('GOOD');
     expect(mockDecodeErrorsCounter.inc).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ── Issue #191: intra-ledger ordering ────────────────────────────────────────
+
+describe('extractEventOrdering', () => {
+  it('decodes txIndex from the TOID and eventIndex from the suffix', () => {
+    // TOID = (ledger << 32) | (txApplicationOrder << 12) | opIndex
+    // ledger 100, tx order 7: (100n << 32n) | (7n << 12n) = 429496758272
+    const toid = ((100n << 32n) | (7n << 12n)).toString();
+    const ordering = extractEventOrdering({ id: `${toid}-0000000003` } as any, 99);
+    expect(ordering).toEqual({ txIndex: 7, eventIndex: 3 });
+  });
+
+  it('falls back to (0, array position) when the id is missing', () => {
+    expect(extractEventOrdering({} as any, 5)).toEqual({ txIndex: 0, eventIndex: 5 });
+  });
+
+  it('falls back to (0, array position) when the id is unparseable', () => {
+    expect(extractEventOrdering({ id: 'garbage' } as any, 2)).toEqual({ txIndex: 0, eventIndex: 2 });
+    expect(extractEventOrdering({ id: 'not-numeric-id' } as any, 4)).toEqual({ txIndex: 0, eventIndex: 4 });
+  });
+});
+
+describe('sortDecodedEvents', () => {
+  const ev = (ledgerSequence: number, txIndex: number, eventIndex: number) =>
+    ({ ledgerSequence, txIndex, eventIndex });
+
+  it('sorts by (ledger, txIndex, eventIndex)', () => {
+    const shuffled = [ev(2, 0, 0), ev(1, 5, 1), ev(1, 5, 0), ev(1, 2, 9)];
+    expect(sortDecodedEvents(shuffled)).toEqual([
+      ev(1, 2, 9), ev(1, 5, 0), ev(1, 5, 1), ev(2, 0, 0),
+    ]);
+  });
+
+  it('does not mutate the input array', () => {
+    const input = [ev(2, 0, 0), ev(1, 0, 0)];
+    const copy = [...input];
+    sortDecodedEvents(input);
+    expect(input).toEqual(copy);
+  });
+
+  it('treats missing ordering fields as zero', () => {
+    const sorted = sortDecodedEvents([
+      { ledgerSequence: 1, txIndex: 1, eventIndex: 0 },
+      { ledgerSequence: 1 } as any,
+    ]);
+    expect(sorted[0]).toEqual({ ledgerSequence: 1 });
+  });
+});
+
+describe('collectMarketplaceEvents — identity & ordering passthrough', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it('passes the RPC event id, txHash and derived ordering to the parser', async () => {
+    const { parseMarketplaceEvent } = await import('../parser.js');
+    const mockParse = parseMarketplaceEvent as ReturnType<typeof vi.fn>;
+
+    const toid = ((50n << 32n) | (3n << 12n)).toString();
+    const getEvents = vi.fn().mockResolvedValue({
+      events: [{
+        topic: ['E'],
+        value: 'v',
+        ledger: 50,
+        contractId: 'CONTRACT',
+        txHash: 'txhash-1',
+        id: `${toid}-0000000002`,
+      }],
+      paginationToken: null,
+    });
+
+    await collectMarketplaceEvents({ getEvents } as any, ['C1'], 1, 100);
+
+    expect(mockParse).toHaveBeenCalledWith(
+      ['E'], 'v', 50, 'CONTRACT', 'txhash-1',
+      2,                       // eventIndex from the id suffix
+      `${toid}-0000000002`,    // eventId = the raw RPC id
+      3                        // txIndex from the TOID
+    );
+  });
+
+  it('returns the batch sorted by (ledger, txIndex, eventIndex)', async () => {
+    const { parseMarketplaceEvent } = await import('../parser.js');
+    const mockParse = parseMarketplaceEvent as ReturnType<typeof vi.fn>;
+    mockParse.mockImplementation(
+      (_t: string[], _v: string, ledger: number, _c: string, _h: string, eventIndex: number, eventId: string, txIndex: number) =>
+        ({ eventType: 'E', listingId: null, actor: '', data: {}, ledgerSequence: ledger, eventIndex, eventId, txIndex })
+    );
+
+    const toid = (ledger: bigint, tx: bigint) => ((ledger << 32n) | (tx << 12n)).toString();
+    const getEvents = vi.fn().mockResolvedValue({
+      events: [
+        { topic: ['E'], value: 'v', ledger: 60, id: `${toid(60n, 9n)}-0000000000` },
+        { topic: ['E'], value: 'v', ledger: 50, id: `${toid(50n, 4n)}-0000000001` },
+        { topic: ['E'], value: 'v', ledger: 50, id: `${toid(50n, 4n)}-0000000000` },
+      ],
+      paginationToken: null,
+    });
+
+    const events = await collectMarketplaceEvents({ getEvents } as any, ['C1'], 1, 100);
+
+    expect(events.map((e) => [e.ledgerSequence, (e as any).txIndex, (e as any).eventIndex])).toEqual([
+      [50, 4, 0],
+      [50, 4, 1],
+      [60, 9, 0],
+    ]);
   });
 });

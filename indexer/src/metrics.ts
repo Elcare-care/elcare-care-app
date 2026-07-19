@@ -37,6 +37,12 @@ export const duplicateEventsCounter = new client.Counter({
   help: 'Total number of duplicate on-chain events skipped during idempotent processing',
 });
 
+/** 1 when the poller has made no progress for STALL_THRESHOLD_MS, 0 otherwise. */
+export const stalledGauge = new client.Gauge({
+  name: 'indexer_stalled',
+  help: '1 when the indexer has not advanced within the stall threshold, 0 otherwise',
+});
+
 export const httpRequestDurationMicroseconds = new client.Histogram({
   name: 'http_request_duration_seconds',
   help: 'Duration of HTTP requests in seconds',

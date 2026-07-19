@@ -29,6 +29,7 @@ enum OfferStatus {
   Accepted
   Rejected
   Withdrawn
+  Reclaimed
 }
 
 model SyncState {
@@ -117,12 +118,46 @@ model MarketplaceEvent {
   ledgerSequence  Int
   ledgerTimestamp DateTime @default(now())
   eventHash       String   @unique @default("")  // SHA256(contractId:ledger:txHash:eventIndex)
+  eventId         String   @unique               // RPC-provided globally unique event id (eventHash surrogate for legacy rows)
+  txHash          String   @default("")
+  txIndex         Int      @default(0)           // transaction application order within the ledger
+  eventIndex      Int      @default(0)           // event position within the transaction
   @@index([actor])
   @@index([eventType])
   @@index([listingId])
   @@index([ledgerSequence])
   @@index([listingId, ledgerSequence])
-  @@unique([listingId, eventType, ledgerSequence])
+  @@index([ledgerSequence, txIndex, eventIndex])
+}
+
+// Full price-change history for listings, one row per lst_pru event.
+// eventId ties each row to its originating MarketplaceEvent for replay idempotency.
+model PriceHistory {
+  id             Int      @id @default(autoincrement())
+  listingId      BigInt
+  oldPrice       Decimal  @db.Decimal(32, 7)
+  newPrice       Decimal  @db.Decimal(32, 7)
+  updatedBy      String
+  ledgerSequence Int
+  eventId        String   @unique
+  createdAt      DateTime @default(now())
+  @@index([listingId])
+  @@index([listingId, ledgerSequence])
+}
+
+// Protocol fee revenue, one row per fee_cltd event emitted on settlement.
+model ProtocolFee {
+  id             Int      @id @default(autoincrement())
+  listingId      BigInt
+  amount         Decimal  @db.Decimal(32, 7)
+  token          String
+  treasury       String
+  ledgerSequence Int
+  eventId        String   @unique
+  createdAt      DateTime @default(now())
+  @@index([listingId])
+  @@index([treasury])
+  @@index([ledgerSequence])
 }
 
 model Collection {

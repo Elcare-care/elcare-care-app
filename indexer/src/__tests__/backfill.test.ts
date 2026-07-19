@@ -3,19 +3,35 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 vi.mock('dotenv', () => ({ default: { config: vi.fn() } }));
 
 // ── Mock Prisma ───────────────────────────────────────────────────────────────
-const mockPrisma = vi.hoisted(() => ({
-  $transaction: vi.fn((fn: (tx: any) => Promise<any>) => fn(mockTx)),
-}));
-
 const mockTx = vi.hoisted(() => ({
   syncState: {
     upsert: vi.fn().mockResolvedValue({ id: 1, lastLedger: 0 }),
+  },
+  backfillJob: {
+    update: vi.fn().mockResolvedValue({}),
   },
   marketplaceEvent: {
     findMany: vi.fn().mockResolvedValue([]),
     createMany: vi.fn().mockResolvedValue({}),
   },
 }));
+
+const mockPrisma = vi.hoisted(() => {
+  let nextJobId = 1;
+  return {
+    backfillJob: {
+      create: vi.fn(async ({ data }: { data: any }) => ({ id: nextJobId++, ...data })),
+      update: vi.fn().mockResolvedValue({}),
+      findUnique: vi.fn().mockResolvedValue(null),
+    },
+    syncState: {
+      findUnique: vi.fn().mockResolvedValue({ id: 1, lastLedger: 0 }),
+    },
+    // pg_try_advisory_lock — always acquired in unit tests
+    $queryRaw: vi.fn().mockResolvedValue([{ acquired: true }]),
+    $transaction: vi.fn((fn: (tx: any) => Promise<any>) => fn(mockTx)),
+  };
+});
 
 vi.mock('../db', () => ({ default: mockPrisma }));
 
@@ -26,6 +42,11 @@ vi.mock('../metrics.js', () => ({
   latestLedgerProcessedGauge: { set: vi.fn() },
   networkLatestLedgerGauge: { set: vi.fn() },
   syncLatencyGauge: { set: vi.fn() },
+  backfillJobsTotal: { inc: vi.fn() },
+  backfillDurationSeconds: { startTimer: vi.fn(() => vi.fn()) },
+  backfillBatchLedgers: { observe: vi.fn() },
+  backfillBatchInserted: { observe: vi.fn() },
+  backfillLockContentions: { inc: vi.fn() },
 }));
 
 vi.mock('../retry.js', () => ({
@@ -101,7 +122,7 @@ describe('runBackfill — range validation', () => {
   it('throws when endLedger exceeds the chain tip', async () => {
     // Chain tip = 1000 from the mock getLatestLedger
     process.argv = ['node', 'backfill.ts', '--start=100', '--end=9999'];
-    await expect(runBackfill()).rejects.toThrow(/exceeds the current chain tip/);
+    await expect(runBackfill()).rejects.toThrow(/exceeds chain tip/);
   });
 
   it('completes successfully for a valid small range', async () => {
@@ -114,15 +135,16 @@ describe('runBackfill — range validation', () => {
   });
 
   it('logs progress at each batch boundary', async () => {
-    const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    // logger emits JSON lines via process.stdout.write
+    const stdoutSpy = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
     process.argv = ['node', 'backfill.ts', '--start=100', '--end=200'];
     await runBackfill();
 
-    const progressCalls = consoleSpy.mock.calls.filter(
-      ([msg]) => typeof msg === 'object' && (msg as any).msg?.includes('progress')
+    const progressLines = stdoutSpy.mock.calls.filter(
+      ([line]) => typeof line === 'string' && line.includes('backfill: progress')
     );
-    expect(progressCalls.length).toBeGreaterThanOrEqual(1);
-    consoleSpy.mockRestore();
+    expect(progressLines.length).toBeGreaterThanOrEqual(1);
+    stdoutSpy.mockRestore();
   });
 
   it('re-running the same range is safe (idempotent) — no duplicate inserts', async () => {

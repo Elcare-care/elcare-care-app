@@ -9,9 +9,10 @@ import {
   gapsCreatedTotal,
   openGapsGauge,
   openGapLedgersTotalGauge,
+  duplicateEventsCounter,
 } from './metrics.js';
 import { recordProgress } from './stall.js';
-import { collectMarketplaceEvents, MAX_LEDGER_WINDOW } from './event-sync.js';
+import { collectMarketplaceEvents, sortDecodedEvents, MAX_LEDGER_WINDOW } from './event-sync.js';
 import { withRetry } from './retry.js';
 import { logger } from './logger.js';
 import redis from './redis.js';
@@ -154,6 +155,17 @@ export async function revertLedgers(safeAtLedger: number): Promise<void> {
   await prisma.$transaction(async (tx) => {
     // Remove events that occurred after the safe checkpoint
     await tx.marketplaceEvent.deleteMany({
+      where: { ledgerSequence: { gt: safeAtLedger } },
+    });
+
+    // Remove per-event history rows written past the safe checkpoint
+    await tx.bid.deleteMany({
+      where: { ledgerSequence: { gt: safeAtLedger } },
+    });
+    await tx.priceHistory.deleteMany({
+      where: { ledgerSequence: { gt: safeAtLedger } },
+    });
+    await tx.protocolFee.deleteMany({
       where: { ledgerSequence: { gt: safeAtLedger } },
     });
 
@@ -405,43 +417,80 @@ async function fetchAuctionFromChain(_auctionId: bigint): Promise<any | null> {
   return null;
 }
 
+/** Resolves the globally unique identity of a decoded event (RPC id preferred). */
+function resolveEventId(event: any): string {
+  return event.eventId || event.eventHash || '';
+}
+
 export async function applyDecodedEvents(decodedEvents: any[], tx: any) {
   if (decodedEvents.length === 0) return [];
 
-  const toInsert: any[] = [];
+  // Deterministic application order: (ledgerSequence, txIndex, eventIndex).
+  // State reducers below are last-write-wins, so out-of-order application
+  // within a batch would corrupt state (e.g. an earlier BID_PLACED overwriting
+  // a later one).
+  const sorted = sortDecodedEvents(decodedEvents);
 
-  for (const event of decodedEvents) {
-    const eventHash: string = event.eventHash ?? '';
+  const rows = sorted.map((event) => ({
+    eventId: resolveEventId(event),
+    listingId: event.listingId ?? null,
+    eventType: event.eventType,
+    actor: event.actor,
+    data: event.data,
+    ledgerSequence: event.ledgerSequence,
+    eventHash: event.eventHash ?? '',
+    txHash: event.txHash ?? '',
+    txIndex: event.txIndex ?? 0,
+    eventIndex: event.eventIndex ?? 0,
+  }));
 
-    // Upsert on eventHash — the unique identity of this on-chain event.
-    // On conflict (duplicate) the update is a no-op; we detect it by checking
-    // whether the row's id changed (Prisma returns the upserted row).
-    const existing = eventHash
-      ? await tx.marketplaceEvent.findUnique({ where: { eventHash }, select: { id: true } })
-      : null;
+  // Determine which events are already stored so reducers and SSE only run
+  // for genuinely new events (a full-batch replay must be a no-op). This
+  // lookup is NOT the duplicate-prevention mechanism — the unique constraints
+  // enforced by createMany({ skipDuplicates }) below are, so a concurrent
+  // writer racing between these two statements can never double-insert.
+  const known = await tx.marketplaceEvent.findMany({
+    where: {
+      OR: [
+        { eventId: { in: rows.map((r) => r.eventId) } },
+        { eventHash: { in: rows.map((r) => r.eventHash).filter(Boolean) } },
+      ],
+    },
+    select: { eventId: true, eventHash: true },
+  });
+  const knownIds = new Set<string>();
+  for (const r of known as Array<{ eventId: string; eventHash: string }>) {
+    if (r.eventId) knownIds.add(r.eventId);
+    if (r.eventHash) knownIds.add(r.eventHash);
+  }
 
-    if (existing) {
-      duplicateEventsCounter.inc();
-      logger.debug('[Dedup] Skipping duplicate event', {
-        eventHash,
-        eventType: event.eventType,
-        ledger: event.ledgerSequence,
-      });
-      continue;
-    }
-
-    await tx.marketplaceEvent.create({
-      data: {
-        listingId: event.listingId ?? null,
-        eventType: event.eventType,
-        actor: event.actor,
-        data: event.data,
-        ledgerSequence: event.ledgerSequence,
-        eventHash,
-      },
+  const newRows = rows.filter((r) => !knownIds.has(r.eventId) && !knownIds.has(r.eventHash));
+  const preKnownDuplicates = rows.length - newRows.length;
+  if (preKnownDuplicates > 0) {
+    duplicateEventsCounter.inc(preKnownDuplicates);
+    logger.debug('[Dedup] Skipping already-stored events', {
+      count: preKnownDuplicates,
     });
+  }
 
-    toInsert.push(event);
+  if (newRows.length === 0) return [];
+
+  const created = await tx.marketplaceEvent.createMany({
+    data: newRows,
+    skipDuplicates: true,
+  });
+  // Rows skipped here were inserted concurrently by another writer between the
+  // findMany above and this insert.
+  const racedDuplicates = newRows.length - (created?.count ?? newRows.length);
+  if (racedDuplicates > 0) duplicateEventsCounter.inc(racedDuplicates);
+
+  const newIds = new Set(newRows.map((r) => r.eventId));
+  const toInsert = sorted.filter((event) => newIds.has(resolveEventId(event)));
+
+  // Apply state reducers in batch order. Reducers are themselves guarded
+  // against regressions (updatedAtLedger / monotonic comparisons) so a raced
+  // or replayed event cannot move state backwards.
+  for (const event of toInsert) {
     await processEvent(event, tx, true);
   }
 
@@ -462,6 +511,10 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
         ledgerSequence,
         data,
         eventHash: event.eventHash ?? '',
+        eventId: resolveEventId(event),
+        txHash: event.txHash ?? '',
+        txIndex: event.txIndex ?? 0,
+        eventIndex: event.eventIndex ?? 0,
       },
     });
   }
@@ -496,7 +549,13 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
     return;
   }
 
-  // Update Listing state based on event type
+  // Update Listing state based on event type.
+  //
+  // Order-safety: every mutation of existing state carries a
+  // `updatedAtLedger: { lte: ledgerSequence }` guard (or a monotonic value
+  // guard for bids) so that replaying or reordering events can never move
+  // state backwards. A `count === 0` therefore means "not found OR stale
+  // event" — both are safe to skip.
   if (!listingId) return;
 
   switch (eventType) {
@@ -505,21 +564,24 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
       if (chainListing && !chainListing.artist) {
         chainListing = null;
       }
-      
+
       const artist = chainListing ? chainListing.artist.toString() : data.artist;
       const price = chainListing ? chainListing.price.toString() : data.price;
       const currency = chainListing ? chainListing.currency.toString() : data.currency;
       const collection = chainListing ? chainListing.collection.toString() : data.collection;
       const nftTokenId = chainListing ? BigInt(chainListing.token_id) : BigInt(data.token_id);
       const token = chainListing ? chainListing.token.toString() : (data.token || '');
-      
-      const recipients = chainListing 
+
+      const recipients = chainListing
         ? chainListing.recipients.map((r: any) => ({
             address: r.address.toString(),
             percentage: Number(r.percentage)
           }))
         : [];
 
+      // Ensure the row exists, then apply data only if this event is not
+      // stale — a late-arriving LISTING_CREATED must not reset a listing
+      // that has since been sold or cancelled back to Active.
       await db.listing.upsert({
         where: { listingId },
         create: {
@@ -536,7 +598,11 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
           createdAtLedger: ledgerSequence,
           updatedAtLedger: ledgerSequence,
         },
-        update: {
+        update: {},
+      });
+      await db.listing.updateMany({
+        where: { listingId, updatedAtLedger: { lte: ledgerSequence } },
+        data: {
           artist,
           price,
           collection,
@@ -544,14 +610,14 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
           status: 'Active' as const,
           recipients,
           updatedAtLedger: ledgerSequence,
-        }
+        },
       });
       break;
     }
 
     case 'LISTING_UPDATED': {
       const { count } = await db.listing.updateMany({
-        where: { listingId },
+        where: { listingId, updatedAtLedger: { lte: ledgerSequence } },
         data: {
           price: data.new_price,
           collection: data.collection,
@@ -559,35 +625,88 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
           updatedAtLedger: ledgerSequence,
         },
       });
-      if (count === 0) logger.warn('LISTING_UPDATED: listing not found', { listingId: listingId?.toString(), ledger: ledgerSequence });
+      if (count === 0) logger.warn('LISTING_UPDATED: listing not found or event stale', { listingId: listingId?.toString(), ledger: ledgerSequence });
+      break;
+    }
+
+    case 'LISTING_PRICE_UPDATED': {
+      const { count } = await db.listing.updateMany({
+        where: { listingId, updatedAtLedger: { lte: ledgerSequence } },
+        data: {
+          price: data.new_price,
+          updatedAtLedger: ledgerSequence,
+        },
+      });
+      if (count === 0) logger.warn('LISTING_PRICE_UPDATED: listing not found or event stale', { listingId: listingId?.toString(), ledger: ledgerSequence });
+      // Price history accumulates regardless of listing state; the unique
+      // eventId + skipDuplicates makes replays a no-op.
+      await db.priceHistory.createMany({
+        data: [{
+          listingId,
+          oldPrice: data.old_price,
+          newPrice: data.new_price,
+          updatedBy: data.updated_by || actor,
+          ledgerSequence,
+          eventId: resolveEventId(event),
+        }],
+        skipDuplicates: true,
+      });
       break;
     }
 
     case 'ARTWORK_SOLD': {
       const { count } = await db.listing.updateMany({
-        where: { listingId },
+        where: { listingId, updatedAtLedger: { lte: ledgerSequence } },
         data: {
           status: 'Sold' as const,
           owner: data.buyer,
           updatedAtLedger: ledgerSequence,
         },
       });
-      if (count === 0) logger.error('ARTWORK_SOLD: listing not found — sale not recorded', { listingId: listingId?.toString(), ledger: ledgerSequence });
+      if (count === 0) logger.error('ARTWORK_SOLD: listing not found or event stale — sale not recorded', { listingId: listingId?.toString(), ledger: ledgerSequence });
       break;
     }
 
     case 'LISTING_CANCELLED': {
       const { count } = await db.listing.updateMany({
-        where: { listingId },
+        where: { listingId, updatedAtLedger: { lte: ledgerSequence } },
         data: {
           status: 'Cancelled' as const,
           updatedAtLedger: ledgerSequence,
         },
       });
-      if (count === 0) logger.warn('LISTING_CANCELLED: listing not found', { listingId: listingId?.toString(), ledger: ledgerSequence });
+      if (count === 0) logger.warn('LISTING_CANCELLED: listing not found or event stale', { listingId: listingId?.toString(), ledger: ledgerSequence });
       break;
     }
-    
+
+    // Contract semantics: expiry transitions the listing to Cancelled.
+    case 'LISTING_EXPIRED': {
+      const { count } = await db.listing.updateMany({
+        where: { listingId, updatedAtLedger: { lte: ledgerSequence } },
+        data: {
+          status: 'Cancelled' as const,
+          updatedAtLedger: ledgerSequence,
+        },
+      });
+      if (count === 0) logger.warn('LISTING_EXPIRED: listing not found or event stale', { listingId: listingId?.toString(), ledger: ledgerSequence });
+      break;
+    }
+
+    case 'PROTOCOL_FEE_COLLECTED': {
+      await db.protocolFee.createMany({
+        data: [{
+          listingId,
+          amount: data.amount,
+          token: data.token,
+          treasury: data.treasury,
+          ledgerSequence,
+          eventId: resolveEventId(event),
+        }],
+        skipDuplicates: true,
+      });
+      break;
+    }
+
     case 'AUCTION_CREATED': {
       let chainAuction = await fetchAuctionFromChain(listingId);
       if (chainAuction && !chainAuction.creator) {
@@ -624,7 +743,11 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
           createdAtLedger: ledgerSequence,
           updatedAtLedger: ledgerSequence,
         },
-        update: {
+        update: {},
+      });
+      await db.auction.updateMany({
+        where: { auctionId: listingId, updatedAtLedger: { lte: ledgerSequence } },
+        data: {
           creator,
           collection,
           nftTokenId,
@@ -634,27 +757,60 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
           status: 'Active' as const,
           recipients,
           updatedAtLedger: ledgerSequence,
-        }
+        },
       });
       break;
     }
 
     case 'BID_PLACED': {
+      // Bid history — one row per (auction, ledger, bidder); replays hit the
+      // unique constraint and become a no-op update.
+      await db.bid.upsert({
+        where: {
+          auctionId_ledgerSequence_bidder: {
+            auctionId: listingId,
+            ledgerSequence,
+            bidder: data.bidder,
+          },
+        },
+        create: {
+          auctionId: listingId,
+          bidder: data.bidder,
+          amount: data.bid_amount,
+          ledgerSequence,
+        },
+        update: { amount: data.bid_amount },
+      });
+
+      // Monotonic guard: bids strictly increase on-chain, so an out-of-order
+      // or replayed BID_PLACED can never lower the recorded highest bid.
       const { count } = await db.auction.updateMany({
-        where: { auctionId: listingId },
+        where: { auctionId: listingId, highestBid: { lt: data.bid_amount } },
         data: {
           highestBid: data.bid_amount,
           highestBidder: data.bidder,
           updatedAtLedger: ledgerSequence,
         }
       });
-      if (count === 0) logger.warn('BID_PLACED: auction not found', { auctionId: listingId?.toString(), ledger: ledgerSequence });
+      if (count === 0) logger.warn('BID_PLACED: auction not found or bid not higher than recorded', { auctionId: listingId?.toString(), ledger: ledgerSequence });
+      break;
+    }
+
+    case 'AUCTION_EXTENDED': {
+      const { count } = await db.auction.updateMany({
+        where: { auctionId: listingId, updatedAtLedger: { lte: ledgerSequence } },
+        data: {
+          endTime: BigInt(data.new_end_time || 0),
+          updatedAtLedger: ledgerSequence,
+        },
+      });
+      if (count === 0) logger.warn('AUCTION_EXTENDED: auction not found or event stale', { auctionId: listingId?.toString(), ledger: ledgerSequence });
       break;
     }
 
     case 'AUCTION_RESOLVED': {
       const { count } = await db.auction.updateMany({
-        where: { auctionId: listingId },
+        where: { auctionId: listingId, updatedAtLedger: { lte: ledgerSequence } },
         data: {
           status: 'Finalized' as const,
           highestBid: data.amount,
@@ -662,19 +818,19 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
           updatedAtLedger: ledgerSequence,
         }
       });
-      if (count === 0) logger.error('AUCTION_RESOLVED: auction not found — resolution not recorded', { auctionId: listingId?.toString(), ledger: ledgerSequence });
+      if (count === 0) logger.error('AUCTION_RESOLVED: auction not found or event stale — resolution not recorded', { auctionId: listingId?.toString(), ledger: ledgerSequence });
       break;
     }
 
     case 'AUCTION_CANCELLED': {
       const { count } = await db.auction.updateMany({
-        where: { auctionId: listingId },
+        where: { auctionId: listingId, updatedAtLedger: { lte: ledgerSequence } },
         data: {
           status: 'Cancelled' as const,
           updatedAtLedger: ledgerSequence,
         },
       });
-      if (count === 0) logger.warn('AUCTION_CANCELLED: auction not found', { auctionId: listingId?.toString(), ledger: ledgerSequence });
+      if (count === 0) logger.warn('AUCTION_CANCELLED: auction not found or event stale', { auctionId: listingId?.toString(), ledger: ledgerSequence });
       break;
     }
 
@@ -691,41 +847,46 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
           createdAtLedger: ledgerSequence,
           updatedAtLedger: ledgerSequence,
         },
-        update: {
+        update: {},
+      });
+      // Guarded so a stale OFFER_MADE cannot reset a terminal offer state.
+      await db.offer.updateMany({
+        where: { offerId: BigInt(data.offer_id), updatedAtLedger: { lte: ledgerSequence } },
+        data: {
           listingId: BigInt(data.listing_id),
           offerer: data.offerer,
           amount: data.amount,
           token: data.token,
           status: 'Pending' as const,
           updatedAtLedger: ledgerSequence,
-        }
+        },
       });
       break;
     }
 
     case 'OFFER_ACCEPTED': {
-      await db.offer.update({
-        where: { offerId: BigInt(data.offer_id) },
+      await db.offer.updateMany({
+        where: { offerId: BigInt(data.offer_id), updatedAtLedger: { lte: ledgerSequence } },
         data: {
           status: 'Accepted' as const,
           updatedAtLedger: ledgerSequence,
         }
       });
       const { count: listingCount } = await db.listing.updateMany({
-        where: { listingId: BigInt(data.listing_id) },
+        where: { listingId: BigInt(data.listing_id), updatedAtLedger: { lte: ledgerSequence } },
         data: {
           status: 'Sold' as const,
           owner: data.offerer,
           updatedAtLedger: ledgerSequence,
         }
       });
-      if (listingCount === 0) logger.error('OFFER_ACCEPTED: listing not found — offer accepted but listing not updated', { listingId: data.listing_id?.toString(), offerId: data.offer_id?.toString(), ledger: ledgerSequence });
+      if (listingCount === 0) logger.error('OFFER_ACCEPTED: listing not found or event stale — offer accepted but listing not updated', { listingId: data.listing_id?.toString(), offerId: data.offer_id?.toString(), ledger: ledgerSequence });
       break;
     }
 
     case 'OFFER_REJECTED': {
-      await db.offer.update({
-        where: { offerId: BigInt(data.offer_id) },
+      await db.offer.updateMany({
+        where: { offerId: BigInt(data.offer_id), updatedAtLedger: { lte: ledgerSequence } },
         data: {
           status: 'Rejected' as const,
           updatedAtLedger: ledgerSequence,
@@ -735,8 +896,8 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
     }
 
     case 'OFFER_WITHDRAWN': {
-      await db.offer.update({
-        where: { offerId: BigInt(data.offer_id) },
+      await db.offer.updateMany({
+        where: { offerId: BigInt(data.offer_id), updatedAtLedger: { lte: ledgerSequence } },
         data: {
           status: 'Withdrawn' as const,
           updatedAtLedger: ledgerSequence,
@@ -744,6 +905,22 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
       });
       break;
     }
+
+    // Terminal state: the offerer reclaimed escrowed funds after expiry.
+    case 'OFFER_RECLAIMED': {
+      await db.offer.updateMany({
+        where: { offerId: BigInt(data.offer_id), updatedAtLedger: { lte: ledgerSequence } },
+        data: {
+          status: 'Reclaimed' as const,
+          updatedAtLedger: ledgerSequence,
+        }
+      });
+      break;
+    }
+
+    // ROYALTY_PAID, ADMIN_TRANSFER_PROPOSED, ADMIN_TRANSFERRED,
+    // ARTIST_REVOKED, ARTIST_REINSTATED, CONTRACT_PAUSED, CONTRACT_UNPAUSED:
+    // persisted to MarketplaceEvent (with actor) above; no state reduction.
   }
 
   // Broadcast to any connected SSE clients after the DB write is complete.

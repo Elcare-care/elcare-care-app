@@ -27,6 +27,8 @@ import {
 // ── SSE registry ───────────────────────────────────────────────────────────────
 
 const SSE_BUFFER_SIZE = 200;
+const MAX_SSE_CONNECTIONS = parseInt(process.env.MAX_SSE_CONNECTIONS || '100', 10);
+const SSE_HEARTBEAT_MS = parseInt(process.env.SSE_HEARTBEAT_MS || '30000', 10);
 
 interface SSEEvent {
   id: number;
@@ -76,6 +78,28 @@ export function closeSSEClients(): void {
         try { client.end(); } catch { /* ignore */ }
     }
     sseClients.clear();
+}
+
+// Per-client heartbeat timers so idle proxies don't drop the connection.
+const sseHeartbeats: Map<Response, ReturnType<typeof setInterval>> = new Map();
+
+function setupSSEHeartbeat(res: Response): void {
+  const timer = setInterval(() => {
+    try {
+      res.write(`: heartbeat\n\n`);
+    } catch {
+      cleanupSSEClient(res);
+    }
+  }, SSE_HEARTBEAT_MS);
+  sseHeartbeats.set(res, timer);
+  sseClients.set(res, 0);
+}
+
+function cleanupSSEClient(res: Response): void {
+  const timer = sseHeartbeats.get(res);
+  if (timer) clearInterval(timer);
+  sseHeartbeats.delete(res);
+  sseClients.delete(res);
 }
 
 const router = Router();
@@ -251,7 +275,12 @@ router.get('/auctions/:id', async (req: Request, res: Response, next: NextFuncti
       where: { auctionId: BigInt(id) },
     });
     if (!result) return next(notFound('Auction not found'));
-    res.json(serialize(result));
+
+    const bids = await prisma.bid.findMany({
+      where: { auctionId: BigInt(id) },
+      orderBy: [{ ledgerSequence: 'desc' }, { id: 'desc' }],
+    });
+    res.json(serialize({ ...result, bids }));
   } catch (err) {
     next(internalError('Failed to fetch auction'));
   }
@@ -682,7 +711,7 @@ router.get('/sync/gaps', validateQuery(syncGapsQuerySchema), async (req: Request
 // ── GET /sync/gaps/:id ────────────────────────────────────────────────────────
 
 router.get('/sync/gaps/:id', async (req: Request, res: Response, next: NextFunction) => {
-  const id = parseInt(req.params.id, 10);
+  const id = parseInt(String(req.params.id), 10);
   if (isNaN(id)) return next(badRequest('Gap ID must be an integer'));
   try {
     const gap = await prisma.ledgerGap.findUnique({
@@ -719,7 +748,7 @@ router.get('/sync/jobs', async (req: Request, res: Response, next: NextFunction)
 // ── GET /sync/jobs/:id ────────────────────────────────────────────────────────
 
 router.get('/sync/jobs/:id', async (req: Request, res: Response, next: NextFunction) => {
-  const id = parseInt(req.params.id, 10);
+  const id = parseInt(String(req.params.id), 10);
   if (isNaN(id)) return next(badRequest('Job ID must be an integer'));
   try {
     const job = await prisma.backfillJob.findUnique({ where: { id } });

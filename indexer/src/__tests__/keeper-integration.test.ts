@@ -16,7 +16,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { Keypair } from '@stellar/stellar-sdk';
+import { Keypair, SorobanDataBuilder, xdr as SdkXdr } from '@stellar/stellar-sdk';
 
 // ── Mock metrics (no prom-client needed) ──────────────────────────────────────
 vi.mock('../metrics.js', () => ({
@@ -36,7 +36,7 @@ vi.mock('../metrics.js', () => ({
 }));
 
 // ── Mock Prisma ───────────────────────────────────────────────────────────────
-const mockDb = {
+const mockDb = vi.hoisted(() => ({
   keeperAction: {
     findUnique: vi.fn(),
     findMany:   vi.fn(),
@@ -54,7 +54,7 @@ const mockDb = {
   offer: {
     findMany: vi.fn(),
   },
-};
+}));
 vi.mock('../db.js', () => ({ default: mockDb }));
 
 // ── Mock @stellar/stellar-sdk (rpc.Server only) ────────────────────────────
@@ -63,19 +63,23 @@ vi.mock('../db.js', () => ({ default: mockDb }));
 
 import { rpc as realRpc } from '@stellar/stellar-sdk';
 
-const mockSimulate = vi.fn();
-const mockSend     = vi.fn();
-const mockGetTx    = vi.fn();
-const mockGetAcct  = vi.fn();
-const mockGetLatest = vi.fn();
+const { mockSimulate, mockSend, mockGetTx, mockGetAcct, mockGetLatest, MockServer } = vi.hoisted(() => {
+  const mockSimulate  = vi.fn();
+  const mockSend      = vi.fn();
+  const mockGetTx     = vi.fn();
+  const mockGetAcct   = vi.fn();
+  const mockGetLatest = vi.fn();
 
-class MockServer {
-  simulateTransaction = mockSimulate;
-  sendTransaction     = mockSend;
-  getTransaction      = mockGetTx;
-  getAccount          = mockGetAcct;
-  getLatestLedger     = mockGetLatest;
-}
+  class MockServer {
+    simulateTransaction = mockSimulate;
+    sendTransaction     = mockSend;
+    getTransaction      = mockGetTx;
+    getAccount          = mockGetAcct;
+    getLatestLedger     = mockGetLatest;
+  }
+
+  return { mockSimulate, mockSend, mockGetTx, mockGetAcct, mockGetLatest, MockServer };
+});
 
 vi.mock('@stellar/stellar-sdk', async (importOriginal) => {
   const original = await importOriginal<typeof import('@stellar/stellar-sdk')>();
@@ -101,7 +105,7 @@ import type { KeeperCandidate } from '../keeper/types.js';
 function testCfg(overrides: Record<string, unknown> = {}) {
   return {
     KEEPER_ENABLED:                true,
-    KEEPER_SECRET:                 'SAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA3',
+    KEEPER_SECRET:                 TEST_SECRET,
     KEEPER_DRY_RUN:                false,
     KEEPER_INTERVAL_MS:            60_000,
     KEEPER_MAX_ACTIONS_PER_CYCLE:  20,
@@ -117,8 +121,8 @@ function testCfg(overrides: Record<string, unknown> = {}) {
 }
 
 // A deterministic test keypair (not funded, just for XDR construction)
-const TEST_SECRET = 'SAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA3';
-const keypair = Keypair.fromSecret(TEST_SECRET);
+const keypair = Keypair.fromRawEd25519Seed(Buffer.alloc(32, 7));
+const TEST_SECRET = keypair.secret();
 
 const CONTRACT_ID      = 'CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM';
 const NETWORK_PASS     = 'Test SDF Network ; September 2015';
@@ -127,16 +131,18 @@ function makeServer() {
   return new (rpc.Server as unknown as typeof MockServer)('http://localhost') as unknown as rpc.Server;
 }
 
-/** Minimal stub for a successful simulate response. */
+/**
+ * Minimal raw simulate-success response. transactionData and the result XDR
+ * must be genuinely parseable — assembleTransaction decodes both.
+ */
 function successSimResponse() {
   return {
     id: '1',
     latestLedger: 100,
     minResourceFee: '1000',
-    results: [{ auth: [], xdr: 'AAAAAA==' }],
-    transactionData: 'AAAAAA==',
-    // assembleTransaction needs this shape
-    result: { retval: { switch: () => ({ name: 'scvVoid' }) } },
+    events: [],
+    results: [{ auth: [], xdr: SdkXdr.ScVal.scvVoid().toXDR('base64') }],
+    transactionData: new SorobanDataBuilder().build().toXDR('base64'),
   };
 }
 

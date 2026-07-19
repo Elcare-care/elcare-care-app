@@ -15,6 +15,15 @@ const mockPrisma: any = vi.hoisted(() => {
     collection: {
       deleteMany: vi.fn().mockResolvedValue({ count: 1 }),
     },
+    bid: {
+      deleteMany: vi.fn().mockResolvedValue({ count: 1 }),
+    },
+    priceHistory: {
+      deleteMany: vi.fn().mockResolvedValue({ count: 1 }),
+    },
+    protocolFee: {
+      deleteMany: vi.fn().mockResolvedValue({ count: 1 }),
+    },
   };
   mPrisma.$transaction = vi.fn((callback: (tx: typeof mPrisma) => Promise<void>) => callback(mPrisma));
   return mPrisma;
@@ -79,6 +88,16 @@ describe('Chain Re-organization Rollback', () => {
     expect(mockPrisma.collection.deleteMany).toHaveBeenCalledWith({
       where: { deployedAtLedger: { gt: 100 } },
     });
+  });
+
+  it('deletes bid, price-history and protocol-fee rows written after the safe ledger', async () => {
+    await revertLedgers(100);
+
+    for (const model of [mockPrisma.bid, mockPrisma.priceHistory, mockPrisma.protocolFee]) {
+      expect(model.deleteMany).toHaveBeenCalledWith({
+        where: { ledgerSequence: { gt: 100 } },
+      });
+    }
   });
 
   it('resets SyncState to the safe ledger with null hash', async () => {
