@@ -1,6 +1,7 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import prisma from '../db.js';
 import redis from '../redis.js';
+import { Prisma } from '@prisma/client';
 import { cacheMiddleware } from './cache-middleware.js';
 import { etagMiddleware } from './etag-middleware.js';
 import { strictRateLimiter } from './rate-limit-middleware.js';
@@ -187,7 +188,13 @@ router.get('/listings/:id', async (req: Request, res: Response, next: NextFuncti
       where: { listingId: BigInt(id as string) },
     });
     if (!listing) return next(notFound('Listing not found'));
-    return res.json(serialize(listing));
+
+    // Attach cached IPFS metadata when available, or null if still pending.
+    const ipfsMetadata = listing.token
+      ? await prisma.ipfsMetadata.findUnique({ where: { cid: listing.token } }).catch(() => null)
+      : null;
+
+    return res.json(serialize({ ...listing, ipfsMetadata: ipfsMetadata ?? null }));
   } catch (err) {
     next(internalError('Failed to fetch listing details'));
   }
@@ -218,6 +225,67 @@ router.get('/listings/:id/history', async (req: Request, res: Response, next: Ne
     res.json({ events: serialize(results), total });
   } catch (err) {
     next(internalError('Failed to fetch listing history'));
+  }
+});
+
+// ── GET /ipfs/:cid ────────────────────────────────────────────────────────────
+//
+// Serves cached IPFS metadata for a given CID.  If the metadata is not yet
+// cached, fetches it on-demand (populating the cache), enqueues a background
+// refresh job, and returns the result.  Returns 404 when the content cannot be
+// fetched from any gateway.
+
+router.get('/ipfs/:cid', cacheMiddleware(300), async (req: Request, res: Response, next: NextFunction) => {
+  const cid = req.params.cid as string;
+  if (!cid || !/^[a-zA-Z0-9]+$/.test(cid)) {
+    return next(badRequest('Invalid CID format'));
+  }
+
+  try {
+    // 1. Serve from cache if available
+    const cached = await prisma.ipfsMetadata.findUnique({ where: { cid } });
+    if (cached) {
+      return res.json(serialize(cached));
+    }
+
+    // 2. On-demand fetch and cache (for direct /ipfs/:cid requests)
+    let raw: ReturnType<typeof Object.create>;
+    try {
+      raw = await fetchIpfsMetadata(cid);
+    } catch {
+      return next(notFound('IPFS content not available'));
+    }
+
+    const stored = await prisma.ipfsMetadata.upsert({
+      where: { cid },
+      create: {
+        cid,
+        title: typeof raw.title === 'string' ? raw.title : undefined,
+        description: typeof raw.description === 'string' ? raw.description : undefined,
+        imageUrl: typeof raw.image === 'string'
+          ? raw.image
+          : typeof raw.imageUrl === 'string' ? raw.imageUrl : undefined,
+        attributes: raw.attributes != null ? (raw.attributes as Prisma.InputJsonValue) : Prisma.JsonNull,
+        raw: raw as Prisma.InputJsonValue,
+      },
+      update: {
+        title: typeof raw.title === 'string' ? raw.title : undefined,
+        description: typeof raw.description === 'string' ? raw.description : undefined,
+        imageUrl: typeof raw.image === 'string'
+          ? raw.image
+          : typeof raw.imageUrl === 'string' ? raw.imageUrl : undefined,
+        attributes: raw.attributes != null ? (raw.attributes as Prisma.InputJsonValue) : Prisma.JsonNull,
+        fetchedAt: new Date(),
+        raw: raw as Prisma.InputJsonValue,
+      },
+    });
+
+    // 3. Ensure a queue entry exists for future refreshes (fire-and-forget)
+    enqueueIpfsFetch(cid).catch(() => { /* ignore */ });
+
+    return res.json(serialize(stored));
+  } catch (err) {
+    next(internalError('Failed to fetch IPFS metadata'));
   }
 });
 

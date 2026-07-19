@@ -5,8 +5,8 @@ import compression from 'compression';
 import dotenv from 'dotenv';
 import routes, { closeSSEClients } from './api/routes.js';
 import { startPolling, registerShutdownHook } from './poller.js';
-import { rateLimiter } from './api/rate-limit-middleware.js';
-import { metricsMiddleware, handleMetrics } from './metrics.js';
+import { rateLimiter, globalRateLimiter } from './api/rate-limit-middleware.js';
+import { metricsMiddleware, handleMetrics, requestLogger } from './metrics.js';
 import { errorHandler } from './api/errors.js';
 import { startReconciler } from './reconciler.js';
 import { validateRequiredEnv, loadKeeperConfig } from './config.js';
@@ -50,7 +50,7 @@ app.use(globalRateLimiter);
 app.use(requestLogger);
 app.use(metricsMiddleware);
 
-// Expose /metrics for Prometheus scrapers (bypass rate limit via skip in globalRateLimiter)
+// Expose /metrics for Prometheus scrapers
 app.get('/metrics', handleMetrics);
 
 // Apply standard rate limiting for fallback
@@ -62,16 +62,15 @@ app.use('/', docsRouter);
 // API Routes
 app.use('/', routes);
 
-// Sentry error handler must be registered before the custom error handler so
-// that it receives the error object before it is serialised into an HTTP response.
+// Sentry error handler must be registered before the custom error handler
 Sentry.setupExpressErrorHandler(app);
 
 // Central error handler — must be registered after all routes
 app.use(errorHandler);
 
 // Health check
-app.get('/health', (req: express.Request, res: express.Response) => {
-    res.json({ status: 'ok' });
+app.get('/health', (_req: express.Request, res: express.Response) => {
+  res.json({ status: 'ok' });
 });
 
 // ── Dev-only CORS debug endpoint ──────────────────────────────────────────────
@@ -177,6 +176,6 @@ const httpServer = app.listen(PORT, () => {
 
 // Register HTTP server and SSE cleanup so gracefulShutdown() in poller closes them too.
 registerShutdownHook(() => new Promise<void>((resolve) => {
-    closeSSEClients();
-    httpServer.close(() => resolve());
+  closeSSEClients();
+  httpServer.close(() => resolve());
 }));

@@ -635,6 +635,16 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
           updatedAtLedger: ledgerSequence,
         }
       });
+
+      // Enqueue a background IPFS metadata fetch using the token CID.
+      // Fire-and-forget — a fetch failure must never crash the indexing path.
+      if (token) {
+        enqueueIpfsFetch(token).catch((err) => {
+          logger.warn('[processEvent] Failed to enqueue IPFS fetch', {
+            listingId: listingId?.toString(), token, err: err instanceof Error ? err.message : String(err),
+          });
+        });
+      }
       break;
     }
 

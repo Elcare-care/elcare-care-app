@@ -5,6 +5,8 @@ const mockRpcRetryExhaustedCounter = vi.hoisted(() => ({ inc: vi.fn() }));
 vi.mock('../metrics.js', () => ({
   rpcRetryExhaustedCounter: mockRpcRetryExhaustedCounter,
   decodeErrorsCounter: { inc: vi.fn() },
+  eventDecodeErrorsCounter: { inc: vi.fn() },
+  stalledGauge: { set: vi.fn() },
   latestLedgerProcessedGauge: { set: vi.fn() },
   networkLatestLedgerGauge: { set: vi.fn() },
   syncLatencyGauge: { set: vi.fn() },
