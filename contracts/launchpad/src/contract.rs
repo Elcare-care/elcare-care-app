@@ -213,6 +213,22 @@ impl Launchpad {
             return Err(Error::InvalidFeeBps);
         }
 
+        let (receiver, fee) = storage::get_platform_fee(&env);
+        if fee > 0 {
+            soroban_sdk::token::TokenClient::new(&env, &currency).transfer(
+                &creator,
+                &receiver,
+                &(fee as i128),
+            );
+            events::publish_deployment_fee_collected(
+                &env,
+                &creator,
+                &receiver,
+                fee as i128,
+                &currency,
+            );
+        }
+
         let wasm = storage::get_wasm_normal_721(&env).ok_or(Error::WasmHashNotSet)?;
         collect_deploy_fee(&env, &creator, &currency);
 
@@ -262,6 +278,22 @@ impl Launchpad {
 
         if platform_fee_bps > MAX_FEE_BPS {
             return Err(Error::InvalidFeeBps);
+        }
+
+        let (receiver, fee) = storage::get_platform_fee(&env);
+        if fee > 0 {
+            soroban_sdk::token::TokenClient::new(&env, &currency).transfer(
+                &creator,
+                &receiver,
+                &(fee as i128),
+            );
+            events::publish_deployment_fee_collected(
+                &env,
+                &creator,
+                &receiver,
+                fee as i128,
+                &currency,
+            );
         }
 
         let wasm = storage::get_wasm_normal_1155(&env).ok_or(Error::WasmHashNotSet)?;
@@ -320,6 +352,22 @@ impl Launchpad {
             return Err(Error::InvalidFeeBps);
         }
 
+        let (platform_fee_receiver, fee) = storage::get_platform_fee(&env);
+        if fee > 0 {
+            soroban_sdk::token::TokenClient::new(&env, &currency).transfer(
+                &creator,
+                &platform_fee_receiver,
+                &(fee as i128),
+            );
+            events::publish_deployment_fee_collected(
+                &env,
+                &creator,
+                &receiver,
+                fee as i128,
+                &currency,
+            );
+        }
+
         let wasm = storage::get_wasm_lazy_721(&env).ok_or(Error::WasmHashNotSet)?;
         let platform_fee_receiver = collect_deploy_fee(&env, &creator, &currency);
 
@@ -373,6 +421,22 @@ impl Launchpad {
 
         if platform_fee_bps > MAX_FEE_BPS {
             return Err(Error::InvalidFeeBps);
+        }
+
+        let (platform_fee_receiver, fee) = storage::get_platform_fee(&env);
+        if fee > 0 {
+            soroban_sdk::token::TokenClient::new(&env, &currency).transfer(
+                &creator,
+                &platform_fee_receiver,
+                &(fee as i128),
+            );
+            events::publish_deployment_fee_collected(
+                &env,
+                &creator,
+                &receiver,
+                fee as i128,
+                &currency,
+            );
         }
 
         let wasm = storage::get_wasm_lazy_1155(&env).ok_or(Error::WasmHashNotSet)?;

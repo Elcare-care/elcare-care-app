@@ -2,8 +2,11 @@ import { Router, Request, Response, NextFunction } from 'express';
 import prisma from '../db.js';
 import redis from '../redis.js';
 import { cacheMiddleware } from './cache-middleware.js';
+import { etagMiddleware } from './etag-middleware.js';
 import { strictRateLimiter } from './rate-limit-middleware.js';
 import { badRequest, notFound, internalError } from './errors.js';
+import { applyDecodedEvents } from '../poller.js';
+import { collectMarketplaceEvents } from '../event-sync.js';
 import {
   validateQuery,
   listingsQuerySchema,
@@ -12,7 +15,14 @@ import {
   walletActivityQuerySchema,
   collectionsQuerySchema,
   statsQuerySchema,
+  syncGapsQuerySchema,
 } from './query-schemas.js';
+import {
+  getOverviewStats,
+  getDailyStats,
+  getTopCollections,
+  getTopArtists,
+} from '../stats.js';
 
 // ── SSE registry ───────────────────────────────────────────────────────────────
 
@@ -40,8 +50,7 @@ export function _resetSseState() {
   sseClients.clear();
 }
 
-// SSE clients registry
-const sseClients: Response[] = [];
+// SSE clients registry — keyed by Response, value is last-seen event ID
 
 export function emitSSEEvent(event: any) {
   const id = nextSseId();
@@ -63,10 +72,10 @@ export function emitSSEEvent(event: any) {
 }
 
 export function closeSSEClients(): void {
-    for (const client of sseClients) {
+    for (const [client] of sseClients) {
         try { client.end(); } catch { /* ignore */ }
     }
-    sseClients.length = 0;
+    sseClients.clear();
 }
 
 const router = Router();
@@ -102,6 +111,7 @@ router.get('/events', (req: Request, res: Response) => {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no'); // prevent nginx from buffering SSE chunks
   res.flushHeaders();
 
   const lastEventId = req.headers['last-event-id'];
@@ -190,12 +200,22 @@ router.get('/listings/:id/history', async (req: Request, res: Response, next: Ne
   if (!/^\d+$/.test(id)) {
     return next(badRequest('Invalid ID format'));
   }
+
+  const limit  = Math.min(parseInt(String(req.query.limit  ?? '100'), 10) || 100, 500);
+  const offset = Math.min(parseInt(String(req.query.offset ?? '0'),   10) || 0,   10000);
+
   try {
-    const results = await prisma.marketplaceEvent.findMany({
-      where: { listingId: BigInt(id) },
-      orderBy: { ledgerSequence: 'asc' },
-    });
-    res.json(serialize(results));
+    const where = { listingId: BigInt(id) };
+    const [results, total] = await Promise.all([
+      prisma.marketplaceEvent.findMany({
+        where,
+        orderBy: { ledgerSequence: 'asc' },
+        take: limit,
+        skip: offset,
+      }),
+      prisma.marketplaceEvent.count({ where }),
+    ]);
+    res.json({ events: serialize(results), total });
   } catch (err) {
     next(internalError('Failed to fetch listing history'));
   }
@@ -467,6 +487,7 @@ router.get('/events', (req: Request, res: Response) => {
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no'); // prevent nginx from buffering SSE chunks
     res.setHeader('Access-Control-Allow-Origin', '*');
 
     // Setup heartbeat
@@ -562,6 +583,229 @@ router.get('/artists/:address/metrics', cacheMiddleware(60), async (req: Request
     });
   } catch (err) {
     next(internalError('Failed to fetch artist metrics'));
+  }
+});
+
+// ── GET /keeper/status ────────────────────────────────────────────────────────
+//
+// Returns the keeper's current operational state:
+//   - whether it is running and in dry-run mode
+//   - aggregate counts by KeeperActionStatus
+//   - the most recent 20 actions (for quick operator triage)
+//   - stats from the last completed cycle
+
+router.get('/keeper/status', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    // Lazy-import to avoid a hard dependency when the keeper is disabled.
+    const { getLastCycleStats, isKeeperRunning } = await import('../keeper/index.js');
+    const { getActionSummary, getRecentActions } = await import('../keeper/idempotency.js');
+
+    const [summary, recent, lastCycle] = await Promise.all([
+      getActionSummary(),
+      getRecentActions(20),
+      Promise.resolve(getLastCycleStats()),
+    ]);
+
+    const payload = {
+      running:       isKeeperRunning(),
+      dryRun:        process.env.KEEPER_DRY_RUN !== 'false',
+      enabled:       process.env.KEEPER_ENABLED === 'true',
+      actionCounts:  summary,
+      lastCycle: lastCycle
+        ? {
+            startedAt:            lastCycle.startedAt,
+            completedAt:          lastCycle.completedAt,
+            candidatesDiscovered: lastCycle.candidatesDiscovered,
+            actionsAttempted:     lastCycle.actionsAttempted,
+            actionsSucceeded:     lastCycle.actionsSucceeded,
+            actionsFailed:        lastCycle.actionsFailed,
+            actionsSkipped:       lastCycle.actionsSkipped,
+            feesSpentStroops:     lastCycle.feesSpentStroops.toString(),
+            budgetExhausted:      lastCycle.budgetExhausted,
+            dryRun:               lastCycle.dryRun,
+          }
+        : null,
+      recentActions: serialize(recent),
+    };
+
+    res.json(payload);
+  } catch (err) {
+    next(internalError('Failed to fetch keeper status'));
+  }
+});
+
+// ── GET /sync/gaps ────────────────────────────────────────────────────────────
+//
+// Returns ledger gaps with optional filtering by status/source.
+// Also includes a summary of open gaps and total missing ledgers.
+
+router.get('/sync/gaps', validateQuery(syncGapsQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
+  const { status, source, limit, offset } = (req as any).validatedQuery;
+  try {
+    const where: any = {};
+    if (status) where.status = status;
+    if (source) where.source = source;
+
+    const take = limit ?? 50;
+    const skip = offset ?? 0;
+
+    const [gaps, total, openSummary] = await Promise.all([
+      prisma.ledgerGap.findMany({
+        where,
+        orderBy: { createdAt: 'asc' },
+        take,
+        skip,
+        include: { repairJob: { select: { id: true, status: true, checkpointLedger: true, totalInserted: true } } },
+      }),
+      prisma.ledgerGap.count({ where }),
+      prisma.ledgerGap.findMany({
+        where: { status: 'Open' },
+        select: { fromLedger: true, toLedger: true },
+      }),
+    ]);
+
+    const openLedgers = openSummary.reduce(
+      (acc, g) => acc + (g.toLedger - g.fromLedger + 1), 0,
+    );
+
+    res.json({
+      summary: {
+        openGaps:    openSummary.length,
+        openLedgers,
+      },
+      total,
+      gaps: serialize(gaps),
+    });
+  } catch (err) {
+    next(internalError('Failed to fetch sync gaps'));
+  }
+});
+
+// ── GET /sync/gaps/:id ────────────────────────────────────────────────────────
+
+router.get('/sync/gaps/:id', async (req: Request, res: Response, next: NextFunction) => {
+  const id = parseInt(req.params.id, 10);
+  if (isNaN(id)) return next(badRequest('Gap ID must be an integer'));
+  try {
+    const gap = await prisma.ledgerGap.findUnique({
+      where: { id },
+      include: { repairJob: true },
+    });
+    if (!gap) return next(notFound('Gap not found'));
+    res.json(serialize(gap));
+  } catch (err) {
+    next(internalError('Failed to fetch gap'));
+  }
+});
+
+// ── GET /sync/jobs ────────────────────────────────────────────────────────────
+//
+// BackfillJob listing for operator visibility.
+
+router.get('/sync/jobs', async (req: Request, res: Response, next: NextFunction) => {
+  const status = req.query.status as string | undefined;
+  try {
+    const where: any = {};
+    if (status) where.status = status;
+    const jobs = await prisma.backfillJob.findMany({
+      where,
+      orderBy: { createdAt: 'desc' },
+      take: 100,
+    });
+    res.json(serialize(jobs));
+  } catch (err) {
+    next(internalError('Failed to fetch backfill jobs'));
+  }
+});
+
+// ── GET /sync/jobs/:id ────────────────────────────────────────────────────────
+
+router.get('/sync/jobs/:id', async (req: Request, res: Response, next: NextFunction) => {
+  const id = parseInt(req.params.id, 10);
+  if (isNaN(id)) return next(badRequest('Job ID must be an integer'));
+  try {
+    const job = await prisma.backfillJob.findUnique({ where: { id } });
+    if (!job) return next(notFound('BackfillJob not found'));
+    res.json(serialize(job));
+  } catch (err) {
+    next(internalError('Failed to fetch backfill job'));
+  }
+});
+
+// ── GET /admin/contracts ──────────────────────────────────────────────────────
+//
+// List all tracked contracts with their current sync status.
+
+router.get('/admin/contracts', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const contracts = await prisma.trackedContract.findMany({
+      orderBy: { createdAt: 'asc' },
+    });
+    res.json(serialize(contracts));
+  } catch (err) {
+    next(internalError('Failed to fetch tracked contracts'));
+  }
+});
+
+// ── POST /admin/contracts ─────────────────────────────────────────────────────
+//
+// Add a new contract to track. Body: { contractId, type, label?, startLedger? }
+
+router.post('/admin/contracts', async (req: Request, res: Response, next: NextFunction) => {
+  const { contractId, type, label = '', startLedger = 0 } = req.body ?? {};
+
+  if (!contractId || typeof contractId !== 'string' || contractId.trim() === '') {
+    return next(badRequest('contractId is required'));
+  }
+  if (type !== 'marketplace' && type !== 'launchpad') {
+    return next(badRequest('type must be "marketplace" or "launchpad"'));
+  }
+  if (!Number.isInteger(startLedger) || startLedger < 0) {
+    return next(badRequest('startLedger must be a non-negative integer'));
+  }
+
+  try {
+    const contract = await prisma.trackedContract.upsert({
+      where: { contractId: contractId.trim() },
+      create: {
+        contractId: contractId.trim(),
+        type,
+        label: String(label),
+        startLedger,
+        lastLedger: startLedger,
+        active: true,
+      },
+      update: {
+        type,
+        label: String(label),
+        active: true,
+      },
+    });
+    res.status(201).json(serialize(contract));
+  } catch (err) {
+    next(internalError('Failed to add tracked contract'));
+  }
+});
+
+// ── DELETE /admin/contracts/:id ───────────────────────────────────────────────
+//
+// Deactivate a tracked contract. The polling loop will stop on the next tick.
+
+router.delete('/admin/contracts/:id', async (req: Request, res: Response, next: NextFunction) => {
+  const id = parseInt(req.params.id, 10);
+  if (isNaN(id)) return next(badRequest('Contract ID must be an integer'));
+
+  try {
+    const existing = await prisma.trackedContract.findUnique({ where: { id } });
+    if (!existing) return next(notFound('Tracked contract not found'));
+
+    const updated = await prisma.trackedContract.update({
+      where: { id },
+      data: { active: false },
+    });
+    res.json(serialize(updated));
+  } catch (err) {
+    next(internalError('Failed to deactivate tracked contract'));
   }
 });
 
