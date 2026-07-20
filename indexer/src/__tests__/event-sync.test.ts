@@ -35,6 +35,9 @@ vi.mock('../parser.js', () => ({
 
 vi.mock('../retry.js', () => ({
   withRetry: vi.fn((fn: () => Promise<unknown>) => fn()),
+  withRpcRetry: vi.fn((fn: () => Promise<unknown>) => fn()),
+  withDbRetry: vi.fn((fn: () => Promise<unknown>) => fn()),
+  withIpfsRetry: vi.fn((fn: () => Promise<unknown>) => fn()),
 }));
 
 import { collectMarketplaceEvents, MAX_LEDGER_WINDOW, EVENT_PAGE_LIMIT } from '../event-sync';

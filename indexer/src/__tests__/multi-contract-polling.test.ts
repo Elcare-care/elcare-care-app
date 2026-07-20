@@ -90,6 +90,9 @@ vi.mock('../logger.js', () => ({
 vi.mock('../redis.js', () => ({ default: { get: vi.fn(), set: vi.fn(), disconnect: vi.fn() } }));
 vi.mock('../retry.js', () => ({
   withRetry: vi.fn((fn: () => any) => fn()),
+  withRpcRetry: vi.fn((fn: () => any) => fn()),
+  withDbRetry: vi.fn((fn: () => any) => fn()),
+  withIpfsRetry: vi.fn((fn: () => any) => fn()),
 }));
 
 vi.mock('@stellar/stellar-sdk', () => ({
