@@ -31,6 +31,9 @@ vi.mock('../redis.js', () => ({
 
 vi.mock('../retry.js', () => ({
   withRetry: vi.fn((fn: () => Promise<unknown>) => fn()),
+  withRpcRetry: vi.fn((fn: () => Promise<unknown>) => fn()),
+  withDbRetry: vi.fn((fn: () => Promise<unknown>) => fn()),
+  withIpfsRetry: vi.fn((fn: () => Promise<unknown>) => fn()),
 }));
 
 vi.mock('@stellar/stellar-sdk', () => ({

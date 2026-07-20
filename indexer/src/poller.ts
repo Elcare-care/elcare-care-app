@@ -13,7 +13,7 @@ import {
 } from './metrics.js';
 import { recordProgress } from './stall.js';
 import { collectMarketplaceEvents, MAX_LEDGER_WINDOW } from './event-sync.js';
-import { withRetry } from './retry.js';
+import { withRpcRetry } from './retry.js';
 import { logger } from './logger.js';
 import redis from './redis.js';
 import { loadConfig, parseTrackedContracts } from './config.js';
@@ -323,7 +323,7 @@ async function pollContract(
         }
       }
 
-      const networkLatestLedger: number = await withRetry(
+      const networkLatestLedger: number = await withRpcRetry(
         () => server.getLatestLedger().then((r) => r.sequence),
         { operation: 'getLatestLedger', maxAttempts: 5, baseDelayMs: 1_000 }
       );
