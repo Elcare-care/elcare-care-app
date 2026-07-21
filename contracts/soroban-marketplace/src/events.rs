@@ -1,33 +1,32 @@
 // events.rs — Defines all contract event schemas for ELCARE-HUB Marketplace
 
-use soroban_sdk::{contracttype, symbol_short, Address, Env, Symbol};
+use soroban_sdk::{contracttype, Address, Env, Symbol};
 
-pub const LISTING_CREATED: Symbol = symbol_short!("lst_crtd");
-pub const ARTWORK_SOLD: Symbol = symbol_short!("art_sold");
-pub const LISTING_CANCELLED: Symbol = symbol_short!("lst_cncl");
-pub const LISTING_UPDATED: Symbol = symbol_short!("lst_updt");
-pub const BID_PLACED: Symbol = symbol_short!("bid_plcd");
-pub const AUCTION_RESOLVED: Symbol = symbol_short!("auc_rslv");
-pub const AUCTION_CREATED: Symbol = symbol_short!("auc_crtd");
-pub const OFFER_MADE: Symbol = symbol_short!("ofr_made");
-pub const OFFER_ACCEPTED: Symbol = symbol_short!("ofr_accp");
-pub const OFFER_REJECTED: Symbol = symbol_short!("ofr_rjct");
-pub const OFFER_WITHDRAWN: Symbol = symbol_short!("ofr_wdrn");
-pub const ROYALTY_PAID: Symbol = symbol_short!("roy_paid");
-pub const ADMIN_TRANSFER_PROPOSED: Symbol = symbol_short!("adm_prop");
-pub const ADMIN_TRANSFERRED: Symbol = symbol_short!("adm_xfrd");
-pub const ARTIST_REVOKED: Symbol = symbol_short!("art_rvkd");
-pub const ARTIST_REINSTATED: Symbol = symbol_short!("art_rnst");
-pub const CONTRACT_PAUSED: Symbol = symbol_short!("ctr_psd");
-pub const CONTRACT_UNPAUSED: Symbol = symbol_short!("ctr_unpsd");
-pub const LISTING_PRICE_UPDATED: Symbol = symbol_short!("lst_pru");
-pub const LISTING_EXPIRED: Symbol = symbol_short!("lst_expd");
-pub const AUCTION_EXTENDED: Symbol = symbol_short!("auc_ext");
-pub const AUCTION_CANCELLED: Symbol = symbol_short!("auc_cncl");
-pub const PROTOCOL_FEE_COLLECTED: Symbol = symbol_short!("fee_cltd");
-pub const OFFER_RECLAIMED: Symbol = symbol_short!("ofr_rclm");
-pub const NFT_ESCROWED: Symbol = symbol_short!("nft_escw");
-pub const NFT_RELEASED: Symbol = symbol_short!("nft_rels");
+// Versioned event topics as string constants
+pub const LISTING_CREATED: &str = "listing_created";
+pub const ARTWORK_SOLD: &str = "artwork_sold";
+pub const LISTING_CANCELLED: &str = "listing_cancelled";
+pub const LISTING_UPDATED: &str = "listing_updated";
+pub const BID_PLACED: &str = "bid_placed";
+pub const AUCTION_RESOLVED: &str = "auction_resolved";
+pub const AUCTION_CREATED: &str = "auction_created";
+pub const OFFER_MADE: &str = "offer_made";
+pub const OFFER_ACCEPTED: &str = "offer_accepted";
+pub const OFFER_REJECTED: &str = "offer_rejected";
+pub const OFFER_WITHDRAWN: &str = "offer_withdrawn";
+pub const ROYALTY_PAID: &str = "royalty_paid";
+pub const ADMIN_TRANSFER_PROPOSED: &str = "admin_transfer_proposed";
+pub const ADMIN_TRANSFERRED: &str = "admin_transferred";
+pub const ARTIST_REVOKED: &str = "artist_revoked";
+pub const ARTIST_REINSTATED: &str = "artist_reinstated";
+pub const CONTRACT_PAUSED: &str = "contract_paused";
+pub const CONTRACT_UNPAUSED: &str = "contract_unpaused";
+pub const LISTING_PRICE_UPDATED: &str = "listing_price_updated";
+pub const LISTING_EXPIRED: &str = "listing_expired";
+pub const AUCTION_EXTENDED: &str = "auction_extended";
+pub const AUCTION_CANCELLED: &str = "auction_cancelled";
+pub const PROTOCOL_FEE_COLLECTED: &str = "protocol_fee_collected";
+pub const OFFER_RECLAIMED: &str = "offer_reclaimed";
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -103,37 +102,37 @@ pub struct AuctionFinalizedEvent {
 impl ListingCreatedEvent {
     #[allow(deprecated)]
     pub fn publish(self, env: &Env) {
-        env.events().publish((LISTING_CREATED,), self);
+        env.events().publish((soroban_sdk::Symbol::new(env, LISTING_CREATED),), self);
     }
 }
 impl ArtworkSoldEvent {
     #[allow(deprecated)]
     pub fn publish(self, env: &Env) {
-        env.events().publish((ARTWORK_SOLD,), self);
+        env.events().publish((soroban_sdk::Symbol::new(env, ARTWORK_SOLD),), self);
     }
 }
 impl ListingCancelledEvent {
     #[allow(deprecated)]
     pub fn publish(self, env: &Env) {
-        env.events().publish((LISTING_CANCELLED,), self);
+        env.events().publish((soroban_sdk::Symbol::new(env, LISTING_CANCELLED),), self);
     }
 }
 impl AuctionCreatedEvent {
     #[allow(deprecated)]
     pub fn publish(self, env: &Env) {
-        env.events().publish((AUCTION_CREATED,), self);
+        env.events().publish((soroban_sdk::Symbol::new(env, AUCTION_CREATED),), self);
     }
 }
 impl BidPlacedEvent {
     #[allow(deprecated)]
     pub fn publish(self, env: &Env) {
-        env.events().publish((BID_PLACED,), self);
+        env.events().publish((soroban_sdk::Symbol::new(env, BID_PLACED),), self);
     }
 }
 impl AuctionFinalizedEvent {
     #[allow(deprecated)]
     pub fn publish(self, env: &Env) {
-        env.events().publish((AUCTION_RESOLVED,), self);
+        env.events().publish((soroban_sdk::Symbol::new(env, AUCTION_RESOLVED),), self);
     }
 }
 
@@ -146,7 +145,7 @@ pub struct AuctionExtendedEvent {
 impl AuctionExtendedEvent {
     #[allow(deprecated)]
     pub fn publish(self, env: &Env) {
-        env.events().publish((AUCTION_EXTENDED,), self);
+        env.events().publish((soroban_sdk::Symbol::new(env, AUCTION_EXTENDED),), self);
     }
 }
 
@@ -159,14 +158,14 @@ pub struct AuctionCancelledEvent {
 impl AuctionCancelledEvent {
     #[allow(deprecated)]
     pub fn publish(self, env: &Env) {
-        env.events().publish((AUCTION_CANCELLED,), self);
+        env.events().publish((soroban_sdk::Symbol::new(env, AUCTION_CANCELLED),), self);
     }
 }
 
 impl ListingUpdatedEvent {
     #[allow(deprecated)]
     pub fn publish(self, env: &Env) {
-        env.events().publish((LISTING_UPDATED,), self);
+        env.events().publish((soroban_sdk::Symbol::new(env, LISTING_UPDATED),), self);
     }
 }
 
@@ -192,10 +191,18 @@ pub struct ListingExpiredEvent {
     pub expired_at: u64,
     pub ledger_sequence: u32,
 }
+
+impl ListingPriceUpdatedEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events().publish((soroban_sdk::Symbol::new(env, LISTING_PRICE_UPDATED),), self);
+    }
+}
+
 impl ListingExpiredEvent {
     #[allow(deprecated)]
     pub fn publish(self, env: &Env) {
-        env.events().publish((LISTING_EXPIRED,), self);
+        env.events().publish((soroban_sdk::Symbol::new(env, LISTING_EXPIRED),), self);
     }
 }
 
@@ -234,25 +241,25 @@ pub struct OfferWithdrawnEvent {
 impl OfferMadeEvent {
     #[allow(deprecated)]
     pub fn publish(self, env: &Env) {
-        env.events().publish((OFFER_MADE,), self);
+        env.events().publish((soroban_sdk::Symbol::new(env, OFFER_MADE),), self);
     }
 }
 impl OfferAcceptedEvent {
     #[allow(deprecated)]
     pub fn publish(self, env: &Env) {
-        env.events().publish((OFFER_ACCEPTED,), self);
+        env.events().publish((soroban_sdk::Symbol::new(env, OFFER_ACCEPTED),), self);
     }
 }
 impl OfferRejectedEvent {
     #[allow(deprecated)]
     pub fn publish(self, env: &Env) {
-        env.events().publish((OFFER_REJECTED,), self);
+        env.events().publish((soroban_sdk::Symbol::new(env, OFFER_REJECTED),), self);
     }
 }
 impl OfferWithdrawnEvent {
     #[allow(deprecated)]
     pub fn publish(self, env: &Env) {
-        env.events().publish((OFFER_WITHDRAWN,), self);
+        env.events().publish((soroban_sdk::Symbol::new(env, OFFER_WITHDRAWN),), self);
     }
 }
 
@@ -269,13 +276,13 @@ pub struct ArtistReinstatedEvent {
 impl ArtistRevokedEvent {
     #[allow(deprecated)]
     pub fn publish(self, env: &Env) {
-        env.events().publish((ARTIST_REVOKED,), self);
+        env.events().publish((soroban_sdk::Symbol::new(env, ARTIST_REVOKED),), self);
     }
 }
 impl ArtistReinstatedEvent {
     #[allow(deprecated)]
     pub fn publish(self, env: &Env) {
-        env.events().publish((ARTIST_REINSTATED,), self);
+        env.events().publish((soroban_sdk::Symbol::new(env, ARTIST_REINSTATED),), self);
     }
 }
 
@@ -294,13 +301,13 @@ pub struct AdminTransferredEvent {
 impl AdminTransferProposedEvent {
     #[allow(deprecated)]
     pub fn publish(self, env: &Env) {
-        env.events().publish((ADMIN_TRANSFER_PROPOSED,), self);
+        env.events().publish((soroban_sdk::Symbol::new(env, ADMIN_TRANSFER_PROPOSED),), self);
     }
 }
 impl AdminTransferredEvent {
     #[allow(deprecated)]
     pub fn publish(self, env: &Env) {
-        env.events().publish((ADMIN_TRANSFERRED,), self);
+        env.events().publish((soroban_sdk::Symbol::new(env, ADMIN_TRANSFERRED),), self);
     }
 }
 
@@ -315,7 +322,7 @@ pub struct ProtocolFeeCollectedEvent {
 impl ProtocolFeeCollectedEvent {
     #[allow(deprecated)]
     pub fn publish(self, env: &Env) {
-        env.events().publish((PROTOCOL_FEE_COLLECTED,), self);
+        env.events().publish((soroban_sdk::Symbol::new(env, PROTOCOL_FEE_COLLECTED),), self);
     }
 }
 
@@ -330,7 +337,7 @@ pub struct OfferReclaimedEvent {
 impl OfferReclaimedEvent {
     #[allow(deprecated)]
     pub fn publish(self, env: &Env) {
-        env.events().publish((OFFER_RECLAIMED,), self);
+        env.events().publish((soroban_sdk::Symbol::new(env, OFFER_RECLAIMED),), self);
     }
 }
 

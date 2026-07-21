@@ -49,6 +49,31 @@ vi.mock('../logger.js', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
 
+// ── Mock retry ────────────────────────────────────────────────────────────────
+// Replace withIpfsRetry with a thin shim that honours maxAttempts and retryable
+// but uses zero delay so tests run fast and circuit-breaker state never leaks.
+
+vi.mock('../retry.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../retry.js')>();
+  return {
+    ...actual,
+    withIpfsRetry: async <T>(fn: () => Promise<T>, overrides?: Partial<typeof actual.IPFS_RETRY_CONFIG>): Promise<T> => {
+      const maxAttempts = overrides?.maxAttempts ?? actual.IPFS_RETRY_CONFIG.maxAttempts ?? 3;
+      const retryable   = overrides?.retryable   ?? (() => true);
+      let lastErr: unknown;
+      for (let attempt = 1; attempt <= maxAttempts!; attempt++) {
+        try {
+          return await fn();
+        } catch (err) {
+          lastErr = err;
+          if (!retryable!(err)) throw err;
+        }
+      }
+      throw lastErr;
+    },
+  };
+});
+
 import {
   enqueueIpfsFetch,
   fetchIpfsMetadata,

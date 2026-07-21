@@ -1,7 +1,7 @@
 import { rpc } from '@stellar/stellar-sdk';
 import { parseMarketplaceEvent, SchemaDecodeError, type DecodedEvent } from './parser.js';
 import { decodeErrorsCounter, eventDecodeErrorsCounter } from './metrics.js';
-import { withRetry } from './retry.js';
+import { withRpcRetry } from './retry.js';
 
 export const MAX_LEDGER_WINDOW = 17_000;
 export const EVENT_PAGE_LIMIT = 100;
@@ -73,7 +73,7 @@ export async function collectMarketplaceEvents(
     let paginationToken: string | null = null;
 
     do {
-      const response: any = await withRetry(
+      const response: any = await withRpcRetry(
         () => server.getEvents({
           startLedger: windowStart,
           endLedger: windowEnd,

@@ -20,6 +20,7 @@ import axios, { AxiosError } from 'axios';
 import prisma from './db.js';
 import { logger } from './logger.js';
 import { Prisma } from '@prisma/client';
+import { withIpfsRetry } from './retry.js';
 
 // ── Configuration ─────────────────────────────────────────────────────────────
 
@@ -97,36 +98,44 @@ function backoffMs(attempt: number): number {
  * Attempts to fetch metadata for `cid` using the primary gateway first,
  * then the fallback.  Returns the parsed metadata on success.
  * Throws if all attempts on both gateways are exhausted.
+ *
+ * Per-gateway retry semantics:
+ *  - Retry on ANY error except HTTP 404 (content definitively absent on this gateway).
+ *  - 504/503/429 and network errors are also retried (default IPFS_RETRY_CONFIG).
+ *  - 404 on a gateway stops retrying that gateway and moves to the next.
  */
 export async function fetchIpfsMetadata(cid: string): Promise<IpfsArtworkMetadata> {
   const gateways = [
-    { name: 'primary', url: gatewayUrl(PRIMARY_GATEWAY, cid), maxAttempts: MAX_PRIMARY_ATTEMPTS },
+    { name: 'primary',  url: gatewayUrl(PRIMARY_GATEWAY, cid),  maxAttempts: MAX_PRIMARY_ATTEMPTS },
     { name: 'fallback', url: gatewayUrl(FALLBACK_GATEWAY, cid), maxAttempts: MAX_FALLBACK_ATTEMPTS },
   ];
 
   let lastError: unknown;
 
   for (const gw of gateways) {
-    for (let attempt = 1; attempt <= gw.maxAttempts; attempt++) {
-      try {
-        const data = await fetchFromGateway(gw.url);
-        logger.info('[IpfsCache] Fetched metadata', { cid, gateway: gw.name, attempt });
-        return data;
-      } catch (err) {
-        lastError = err;
-        const status = (err as AxiosError)?.response?.status;
-        logger.warn('[IpfsCache] Fetch attempt failed', {
-          cid, gateway: gw.name, attempt, status,
-          error: err instanceof Error ? err.message : String(err),
-        });
-
-        // Don't retry on 404 — the content doesn't exist on this gateway
-        if (status === 404) break;
-
-        if (attempt < gw.maxAttempts) {
-          await new Promise((r) => setTimeout(r, backoffMs(attempt)));
-        }
-      }
+    try {
+      const data = await withIpfsRetry(
+        () => fetchFromGateway(gw.url),
+        {
+          maxAttempts: gw.maxAttempts,
+          operation: `ipfs-${gw.name}`,
+          // Retry everything except 404 — content definitively absent on this gateway
+          retryable: (err: unknown) => {
+            const status = (err as AxiosError)?.response?.status;
+            return status !== 404;
+          },
+        },
+      );
+      logger.info('[IpfsCache] Fetched metadata', { cid, gateway: gw.name });
+      return data;
+    } catch (err) {
+      lastError = err;
+      const status = (err as AxiosError)?.response?.status;
+      logger.warn('[IpfsCache] Gateway exhausted', {
+        cid, gateway: gw.name, status,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      // Any error (including 404) moves on to the fallback gateway
     }
   }
 

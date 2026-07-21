@@ -32,6 +32,9 @@ vi.mock('../metrics.js', () => ({
 
 vi.mock('../retry.js', () => ({
   withRetry: vi.fn((fn: () => Promise<unknown>) => fn()),
+  withRpcRetry: vi.fn((fn: () => Promise<unknown>) => fn()),
+  withDbRetry: vi.fn((fn: () => Promise<unknown>) => fn()),
+  withIpfsRetry: vi.fn((fn: () => Promise<unknown>) => fn()),
 }));
 
 // ── Mock Stellar SDK ──────────────────────────────────────────────────────────
