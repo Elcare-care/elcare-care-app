@@ -290,6 +290,9 @@ jobs:
       - name: Run Build
         run: npm run build
         working-directory: indexer
+      - name: Check Event Catalog
+        run: npx vitest src/__tests__/event-catalog.test.ts --run
+        working-directory: indexer
       - name: Run Tests
         run: npm run test
         working-directory: indexer
