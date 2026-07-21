@@ -1,12 +1,13 @@
 #![no_std]
 #![allow(clippy::too_many_arguments, deprecated)]
-pub mod events;
 // ------------------------------------------------------------
 // lib.rs — Soroban Marketplace contract root
 // ------------------------------------------------------------
 
+pub mod events;
 mod contract;
-mod storage;
+pub mod escrow;
+pub mod storage;
 mod types;
 
 #[cfg(test)]
@@ -17,6 +18,5 @@ pub use types::{
     BidRecord, CancelReason, Listing, ListingStatus, MarketplaceError, Offer, OfferStatus,
 };
 
-// Re-export the generated client so test.rs can use MarketplaceContractClient.
 #[cfg(any(test, feature = "testutils"))]
 pub use contract::MarketplaceContractClient;
