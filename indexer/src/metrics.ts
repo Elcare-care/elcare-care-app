@@ -37,6 +37,50 @@ export const duplicateEventsCounter = new client.Counter({
   help: 'Total number of duplicate on-chain events skipped during idempotent processing',
 });
 
+// ── Realtime SSE metrics (#192) ───────────────────────────────────────────────
+
+/** Number of SSE clients currently connected to this instance. */
+export const sseConnectedClientsGauge = new client.Gauge({
+  name: 'sse_connected_clients',
+  help: 'Number of SSE clients currently connected to this API instance',
+});
+
+/** Frames successfully written to client sockets. */
+export const sseEventsDeliveredTotal = new client.Counter({
+  name: 'sse_events_delivered_total',
+  help: 'Total SSE event frames written to client connections',
+});
+
+/** Frames dropped due to slow-client backpressure (bounded send queues). */
+export const sseEventsDroppedTotal = new client.Counter({
+  name: 'sse_events_dropped_total',
+  help: 'Total SSE event frames dropped because a slow client exceeded its send-queue cap',
+});
+
+/** Resume requests carrying a Last-Event-ID (header or query param). */
+export const sseReplayRequestsTotal = new client.Counter({
+  name: 'sse_replay_requests_total',
+  help: 'Total SSE connections that requested replay via Last-Event-ID',
+});
+
+/** Failed XADD/PUBLISH attempts (client falls back to local delivery). */
+export const sseRedisPublishFailuresTotal = new client.Counter({
+  name: 'sse_redis_publish_failures_total',
+  help: 'Total events that failed to publish to Redis and used the local fallback',
+});
+
+/** Events delivered via the degraded single-process path (Redis unavailable). */
+export const sseDegradedFallbackTotal = new client.Counter({
+  name: 'sse_degraded_fallback_total',
+  help: 'Total events delivered through the in-memory fallback while Redis was unavailable',
+});
+
+/** Successful subscriber re-attachments after a pub/sub connection loss. */
+export const sseSubscriberReconnectsTotal = new client.Counter({
+  name: 'sse_subscriber_reconnects_total',
+  help: 'Total pub/sub subscriber reconnections after connection loss',
+});
+
 export const httpRequestDurationMicroseconds = new client.Histogram({
   name: 'http_request_duration_seconds',
   help: 'Duration of HTTP requests in seconds',

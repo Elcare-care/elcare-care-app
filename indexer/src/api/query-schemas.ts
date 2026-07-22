@@ -53,6 +53,21 @@ export const statsQuerySchema = z.object({
   to:    z.string().optional(),
 });
 
+export const eventsQuerySchema = z.object({
+  types: z
+    .string()
+    .regex(/^[A-Za-z0-9_]+(,[A-Za-z0-9_]+)*$/, 'types must be a comma-separated list of event type names')
+    .optional(),
+  listingId: z
+    .string()
+    .regex(/^\d+$/, 'listingId must be a non-negative integer')
+    .optional(),
+  lastEventId: z
+    .string()
+    .regex(/^\d+(-\d+)?$/, 'lastEventId must be an SSE event id')
+    .optional(),
+});
+
 export const syncGapsQuerySchema = z.object({
   status: z.enum(['Open', 'Repairing', 'Repaired', 'Failed']).optional(),
   source: z.enum(['rpc_window_skip', 'reorg', 'manual']).optional(),

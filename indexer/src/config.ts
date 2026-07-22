@@ -46,6 +46,29 @@ export function loadConfig() {
 
 export type Config = ReturnType<typeof loadConfig>;
 
+// ── Realtime SSE configuration (#192) ────────────────────────────────────────
+
+export function loadRealtimeConfig() {
+  return {
+    /** Hard cap on concurrent SSE connections per API instance. */
+    sseMaxConnections: parsePositiveInt('SSE_MAX_CONNECTIONS', process.env.SSE_MAX_CONNECTIONS, 100),
+    /** Interval between `: heartbeat` comment frames. */
+    sseHeartbeatMs: parsePositiveInt('SSE_HEARTBEAT_MS', process.env.SSE_HEARTBEAT_MS, 30_000),
+    /**
+     * XADD MAXLEN~ cap on the Redis Stream — the durable replay horizon.
+     * Clients resuming from an id older than the retained window receive
+     * only what the stream still holds.
+     */
+    sseStreamMaxLen: parsePositiveInt('SSE_STREAM_MAXLEN', process.env.SSE_STREAM_MAXLEN, 1000),
+    /** Per-client send-queue cap; overflow drops the oldest frames. */
+    sseClientQueueMax: parsePositiveInt('SSE_CLIENT_QUEUE_MAX', process.env.SSE_CLIENT_QUEUE_MAX, 100),
+    /** Degraded-mode in-memory ring size (single-process fallback). */
+    sseLocalBufferSize: parsePositiveInt('SSE_LOCAL_BUFFER_SIZE', process.env.SSE_LOCAL_BUFFER_SIZE, 200),
+  };
+}
+
+export type RealtimeConfig = ReturnType<typeof loadRealtimeConfig>;
+
 // ── Keeper configuration ─────────────────────────────────────────────────────
 //
 // All keeper env vars are optional at process start so that the main indexer

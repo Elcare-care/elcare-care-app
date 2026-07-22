@@ -16,6 +16,7 @@ import {
   collectionsQuerySchema,
   statsQuerySchema,
   syncGapsQuerySchema,
+  eventsQuerySchema,
 } from './query-schemas.js';
 import {
   getOverviewStats,
@@ -24,59 +25,19 @@ import {
   getTopArtists,
 } from '../stats.js';
 
-// ── SSE registry ───────────────────────────────────────────────────────────────
+// ── SSE realtime fan-out (#192) ───────────────────────────────────────────────
+//
+// Delivery lives in src/realtime/ (Redis Stream + pub/sub, degraded in-memory
+// fallback). These re-exports keep the historical call sites (poller.ts,
+// index.ts) and test helpers working unchanged.
 
-const SSE_BUFFER_SIZE = 200;
+import { hub, emitSSEEvent, closeSSEClients, ensureRealtimeStarted } from '../realtime/index.js';
+export { emitSSEEvent, closeSSEClients };
 
-interface SSEEvent {
-  id: number;
-  data: string;
-}
-
-let sseEventCounter = 0;
-const sseBuffer: SSEEvent[] = [];
-const sseClients: Map<Response, number> = new Map();
-
-function nextSseId(): number {
-  return ++sseEventCounter;
-}
-
-// Exposed for testing only
-export function _getSseBuffer() { return sseBuffer; }
-export function _getSseEventCounter() { return sseEventCounter; }
-export function _resetSseState() {
-  sseEventCounter = 0;
-  sseBuffer.length = 0;
-  sseClients.clear();
-}
-
-// SSE clients registry — keyed by Response, value is last-seen event ID
-
-export function emitSSEEvent(event: any) {
-  const id = nextSseId();
-  const dataStr = JSON.stringify(event, (_k, v) => typeof v === 'bigint' ? v.toString() : v);
-  const payload: SSEEvent = { id, data: dataStr };
-
-  sseBuffer.push(payload);
-  if (sseBuffer.length > SSE_BUFFER_SIZE) sseBuffer.shift();
-
-  const frame = `id: ${id}\ndata: ${dataStr}\n\n`;
-  for (const [client] of sseClients) {
-    try {
-      client.write(frame);
-      sseClients.set(client, id);
-    } catch {
-      sseClients.delete(client);
-    }
-  }
-}
-
-export function closeSSEClients(): void {
-    for (const [client] of sseClients) {
-        try { client.end(); } catch { /* ignore */ }
-    }
-    sseClients.clear();
-}
+// Exposed for testing only — mirror the legacy in-memory helper contract.
+export function _getSseBuffer() { return hub._localBuffer(); }
+export function _getSseEventCounter() { return hub._localCounter(); }
+export function _resetSseState() { hub._reset(); }
 
 const router = Router();
 
@@ -107,29 +68,42 @@ const serialize = (obj: any) =>
 
 // ── GET /events (SSE) ─────────────────────────────────────────────────────────
 
-router.get('/events', (req: Request, res: Response) => {
+router.get('/events', validateQuery(eventsQuerySchema), async (req: Request, res: Response) => {
+  ensureRealtimeStarted();
+
+  if (hub.atCapacity) {
+    return res.status(503).json({ error: 'Too many SSE connections' });
+  }
+
+  const { types, listingId, lastEventId: lastEventIdParam } = (req as any).validatedQuery as {
+    types?: string;
+    listingId?: string;
+    lastEventId?: string;
+  };
+
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
   res.flushHeaders();
 
-  const lastEventId = req.headers['last-event-id'];
-  const resumeFrom = lastEventId ? parseInt(String(lastEventId), 10) : null;
+  // Standard Last-Event-ID header wins; ?lastEventId= is the fallback for
+  // clients that cannot set headers (e.g. native EventSource polyfills).
+  const headerId = req.headers['last-event-id'];
+  const lastEventId =
+    (typeof headerId === 'string' && headerId.length > 0 ? headerId : null) ??
+    lastEventIdParam ??
+    null;
 
-  sseClients.set(res, resumeFrom ?? sseEventCounter);
+  const filter = {
+    ...(types ? { types: new Set(types.split(',')) } : {}),
+    ...(listingId !== undefined ? { listingId } : {}),
+  };
 
-  if (resumeFrom !== null && !isNaN(resumeFrom)) {
-    const missed = sseBuffer.filter(e => e.id > resumeFrom);
-    for (const ev of missed) {
-      try {
-        res.write(`id: ${ev.id}\ndata: ${ev.data}\n\n`);
-      } catch {
-        break;
-      }
-    }
-  }
-
-  req.on('close', () => sseClients.delete(res));
+  // Registers the client, replays the missed window when lastEventId is
+  // given (Redis Stream when available, in-memory ring in degraded mode),
+  // then tails live events. Detach on disconnect is wired inside.
+  await hub.attachClient(res, { filter, lastEventId });
 });
 
 // ── GET /listings ─────────────────────────────────────────────────────────────
@@ -473,35 +447,6 @@ router.get('/stats', validateQuery(statsQuerySchema), async (req: Request, res: 
   } catch (err) {
     next(internalError('Failed to fetch stats'));
   }
-});
-
-// GET /events — Server-Sent Events stream with keep-alive heartbeats
-router.get('/events', (req: Request, res: Response) => {
-    // Check connection limit
-    if (sseClients.size >= MAX_SSE_CONNECTIONS) {
-        return res.status(503).json({ error: 'Too many SSE connections' });
-    }
-
-    // Setup SSE headers
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Connection', 'keep-alive');
-    res.setHeader('Access-Control-Allow-Origin', '*');
-
-    // Setup heartbeat
-    setupSSEHeartbeat(res);
-
-    // Send initial connection message
-    res.write(`data: ${JSON.stringify({ type: 'CONNECTED' })}\n\n`);
-
-    // Cleanup on disconnect
-    res.on('close', () => {
-        cleanupSSEClient(res);
-    });
-
-    res.on('error', () => {
-        cleanupSSEClient(res);
-    });
 });
 
 // ── GET /artists/:address/metrics ─────────────────────────────────────────────

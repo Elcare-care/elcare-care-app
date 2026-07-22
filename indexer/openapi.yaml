@@ -117,6 +117,63 @@ paths:
                 items:
                   $ref: '#/components/schemas/MarketplaceEvent'
 
+  /events:
+    get:
+      summary: Realtime marketplace event stream (Server-Sent Events)
+      description: |
+        Streams marketplace events as `text/event-stream` frames. Each frame
+        carries an `id:` line usable for resumption. Reconnect with the
+        standard `Last-Event-ID` header (or `?lastEventId=`) to replay missed
+        events from the durable Redis Stream before switching to live tail.
+
+        The replay horizon is bounded by the stream cap (SSE_STREAM_MAXLEN,
+        default 1000 events); older events cannot be replayed. When Redis is
+        unavailable the server degrades to in-process delivery and emits a
+        `: resume-not-durable` comment line — ids remain monotonic but replay
+        does not survive a restart.
+
+        Comment frames (`: heartbeat`) are emitted periodically to keep
+        intermediaries from closing idle connections.
+      tags: [Events]
+      parameters:
+        - name: Last-Event-ID
+          in: header
+          required: false
+          schema:
+            type: string
+          description: Resume position — the last event id the client received
+        - name: lastEventId
+          in: query
+          required: false
+          schema:
+            type: string
+            pattern: '^\d+(-\d+)?$'
+          description: Fallback resume position for clients that cannot set headers
+        - name: types
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Comma-separated event type filter (e.g. BID_PLACED,ARTWORK_SOLD)
+        - name: listingId
+          in: query
+          required: false
+          schema:
+            type: string
+            pattern: '^\d+$'
+          description: Only stream events for this listing/auction id
+      responses:
+        '200':
+          description: SSE stream of marketplace events
+          content:
+            text/event-stream:
+              schema:
+                type: string
+        '400':
+          description: Invalid filter or resume parameter
+        '503':
+          description: Connection cap reached (SSE_MAX_CONNECTIONS)
+
   /auctions:
     get:
       summary: Get all auctions
