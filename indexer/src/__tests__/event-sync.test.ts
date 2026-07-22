@@ -1,11 +1,14 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 const mockDecodeErrorsCounter = vi.hoisted(() => ({ inc: vi.fn() }));
+const mockEventDecodeErrorsCounter = vi.hoisted(() => ({ inc: vi.fn() }));
 const mockRpcRetryExhaustedCounter = vi.hoisted(() => ({ inc: vi.fn() }));
 
 vi.mock('../metrics.js', () => ({
   decodeErrorsCounter: mockDecodeErrorsCounter,
+  eventDecodeErrorsCounter: mockEventDecodeErrorsCounter,
   rpcRetryExhaustedCounter: mockRpcRetryExhaustedCounter,
+  stalledGauge: { set: vi.fn() },
   latestLedgerProcessedGauge: { set: vi.fn() },
   networkLatestLedgerGauge: { set: vi.fn() },
   syncLatencyGauge: { set: vi.fn() },
@@ -19,10 +22,22 @@ vi.mock('../parser.js', () => ({
     ledgerSequence: ledger,
     data: { ledger },
   })),
+  // Export SchemaDecodeError so event-sync.ts can use instanceof checks
+  SchemaDecodeError: class SchemaDecodeError extends Error {
+    eventType: string;
+    constructor(eventType: string, reason: string) {
+      super(`[SchemaDecodeError] ${eventType}: ${reason}`);
+      this.name = 'SchemaDecodeError';
+      this.eventType = eventType;
+    }
+  },
 }));
 
 vi.mock('../retry.js', () => ({
   withRetry: vi.fn((fn: () => Promise<unknown>) => fn()),
+  withRpcRetry: vi.fn((fn: () => Promise<unknown>) => fn()),
+  withDbRetry: vi.fn((fn: () => Promise<unknown>) => fn()),
+  withIpfsRetry: vi.fn((fn: () => Promise<unknown>) => fn()),
 }));
 
 import {

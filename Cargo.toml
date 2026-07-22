@@ -9,6 +9,17 @@ members = [
 ]
 resolver = "2"
 
+# Force ed25519-dalek to v2.x across the whole workspace.
+# soroban-env-host 25.0.1 declares ed25519-dalek = ">=2.0.0" which resolves to
+# v3 on crates.io, but v3 changed the rand_core::CryptoRng trait bound in a way
+# that breaks soroban-env-host's testutils compilation. Pinning to "=2.2.0"
+# keeps everything on the v2 ABI that soroban-env-host 25.x was tested with.
+[workspace.dependencies]
+ed25519-dalek = "=2.2.0"
+
+[patch.crates-io]
+soroban-env-host = { path = "patches/soroban-env-host-25.0.1" }
+
 [profile.release]
 opt-level = "z"
 overflow-checks = true
@@ -23,3 +34,8 @@ lto = true
 inherits = "release"
 debug-assertions = true
 
+# soroban-env-host v25.0.1 declares ed25519-dalek ">=2.0.0" but its source
+# code uses the v2 API. Force the entire workspace to resolve only v2.2.0 by
+# listing it as a workspace dependency (member crates inherit via dep spec).
+[workspace.dependencies]
+ed25519-dalek = "=2.2.0"

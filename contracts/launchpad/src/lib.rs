@@ -10,7 +10,7 @@ mod types;
 mod test;
 
 pub use contract::Launchpad;
-pub use types::{CollectionKind, CollectionRecord, DataKey, Error};
+pub use types::{CollectionKind, CollectionRecord, DataKey, Error, WasmHashes};
 
 #[cfg(any(test, feature = "testutils"))]
 pub use contract::LaunchpadClient;

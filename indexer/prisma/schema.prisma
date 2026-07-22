@@ -39,6 +39,28 @@ model SyncState {
   updatedAt        DateTime @updatedAt
 }
 
+// ── Dynamic contract registry ─────────────────────────────────────────────────
+//
+// Each row represents one Soroban contract being tracked by the indexer.
+// type: "marketplace" | "launchpad"
+// lastLedger/lastLedgerHash track per-contract sync progress independently.
+
+model TrackedContract {
+  id               Int      @id @default(autoincrement())
+  contractId       String   @unique
+  type             String   // "marketplace" | "launchpad"
+  label            String   @default("")
+  startLedger      Int      @default(0)
+  lastLedger       Int      @default(0)
+  lastLedgerHash   String?
+  active           Boolean  @default(true)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  @@index([active])
+  @@index([type])
+}
+
 model Listing {
   listingId       BigInt        @id
   artist          String

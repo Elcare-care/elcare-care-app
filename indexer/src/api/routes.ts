@@ -1,6 +1,7 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import prisma from '../db.js';
 import redis from '../redis.js';
+import { Prisma } from '@prisma/client';
 import { cacheMiddleware } from './cache-middleware.js';
 import { etagMiddleware } from './etag-middleware.js';
 import { strictRateLimiter } from './rate-limit-middleware.js';
@@ -135,6 +136,7 @@ router.get('/events', (req: Request, res: Response) => {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no'); // prevent nginx from buffering SSE chunks
   res.flushHeaders();
 
   const lastEventId = req.headers['last-event-id'];
@@ -210,7 +212,13 @@ router.get('/listings/:id', async (req: Request, res: Response, next: NextFuncti
       where: { listingId: BigInt(id as string) },
     });
     if (!listing) return next(notFound('Listing not found'));
-    return res.json(serialize(listing));
+
+    // Attach cached IPFS metadata when available, or null if still pending.
+    const ipfsMetadata = listing.token
+      ? await prisma.ipfsMetadata.findUnique({ where: { cid: listing.token } }).catch(() => null)
+      : null;
+
+    return res.json(serialize({ ...listing, ipfsMetadata: ipfsMetadata ?? null }));
   } catch (err) {
     next(internalError('Failed to fetch listing details'));
   }
@@ -241,6 +249,67 @@ router.get('/listings/:id/history', async (req: Request, res: Response, next: Ne
     res.json({ events: serialize(results), total });
   } catch (err) {
     next(internalError('Failed to fetch listing history'));
+  }
+});
+
+// ── GET /ipfs/:cid ────────────────────────────────────────────────────────────
+//
+// Serves cached IPFS metadata for a given CID.  If the metadata is not yet
+// cached, fetches it on-demand (populating the cache), enqueues a background
+// refresh job, and returns the result.  Returns 404 when the content cannot be
+// fetched from any gateway.
+
+router.get('/ipfs/:cid', cacheMiddleware(300), async (req: Request, res: Response, next: NextFunction) => {
+  const cid = req.params.cid as string;
+  if (!cid || !/^[a-zA-Z0-9]+$/.test(cid)) {
+    return next(badRequest('Invalid CID format'));
+  }
+
+  try {
+    // 1. Serve from cache if available
+    const cached = await prisma.ipfsMetadata.findUnique({ where: { cid } });
+    if (cached) {
+      return res.json(serialize(cached));
+    }
+
+    // 2. On-demand fetch and cache (for direct /ipfs/:cid requests)
+    let raw: ReturnType<typeof Object.create>;
+    try {
+      raw = await fetchIpfsMetadata(cid);
+    } catch {
+      return next(notFound('IPFS content not available'));
+    }
+
+    const stored = await prisma.ipfsMetadata.upsert({
+      where: { cid },
+      create: {
+        cid,
+        title: typeof raw.title === 'string' ? raw.title : undefined,
+        description: typeof raw.description === 'string' ? raw.description : undefined,
+        imageUrl: typeof raw.image === 'string'
+          ? raw.image
+          : typeof raw.imageUrl === 'string' ? raw.imageUrl : undefined,
+        attributes: raw.attributes != null ? (raw.attributes as Prisma.InputJsonValue) : Prisma.JsonNull,
+        raw: raw as Prisma.InputJsonValue,
+      },
+      update: {
+        title: typeof raw.title === 'string' ? raw.title : undefined,
+        description: typeof raw.description === 'string' ? raw.description : undefined,
+        imageUrl: typeof raw.image === 'string'
+          ? raw.image
+          : typeof raw.imageUrl === 'string' ? raw.imageUrl : undefined,
+        attributes: raw.attributes != null ? (raw.attributes as Prisma.InputJsonValue) : Prisma.JsonNull,
+        fetchedAt: new Date(),
+        raw: raw as Prisma.InputJsonValue,
+      },
+    });
+
+    // 3. Ensure a queue entry exists for future refreshes (fire-and-forget)
+    enqueueIpfsFetch(cid).catch(() => { /* ignore */ });
+
+    return res.json(serialize(stored));
+  } catch (err) {
+    next(internalError('Failed to fetch IPFS metadata'));
   }
 });
 
@@ -515,6 +584,7 @@ router.get('/events', (req: Request, res: Response) => {
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no'); // prevent nginx from buffering SSE chunks
     res.setHeader('Access-Control-Allow-Origin', '*');
 
     // Setup heartbeat
@@ -756,6 +826,83 @@ router.get('/sync/jobs/:id', async (req: Request, res: Response, next: NextFunct
     res.json(serialize(job));
   } catch (err) {
     next(internalError('Failed to fetch backfill job'));
+  }
+});
+
+// ── GET /admin/contracts ──────────────────────────────────────────────────────
+//
+// List all tracked contracts with their current sync status.
+
+router.get('/admin/contracts', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const contracts = await prisma.trackedContract.findMany({
+      orderBy: { createdAt: 'asc' },
+    });
+    res.json(serialize(contracts));
+  } catch (err) {
+    next(internalError('Failed to fetch tracked contracts'));
+  }
+});
+
+// ── POST /admin/contracts ─────────────────────────────────────────────────────
+//
+// Add a new contract to track. Body: { contractId, type, label?, startLedger? }
+
+router.post('/admin/contracts', async (req: Request, res: Response, next: NextFunction) => {
+  const { contractId, type, label = '', startLedger = 0 } = req.body ?? {};
+
+  if (!contractId || typeof contractId !== 'string' || contractId.trim() === '') {
+    return next(badRequest('contractId is required'));
+  }
+  if (type !== 'marketplace' && type !== 'launchpad') {
+    return next(badRequest('type must be "marketplace" or "launchpad"'));
+  }
+  if (!Number.isInteger(startLedger) || startLedger < 0) {
+    return next(badRequest('startLedger must be a non-negative integer'));
+  }
+
+  try {
+    const contract = await prisma.trackedContract.upsert({
+      where: { contractId: contractId.trim() },
+      create: {
+        contractId: contractId.trim(),
+        type,
+        label: String(label),
+        startLedger,
+        lastLedger: startLedger,
+        active: true,
+      },
+      update: {
+        type,
+        label: String(label),
+        active: true,
+      },
+    });
+    res.status(201).json(serialize(contract));
+  } catch (err) {
+    next(internalError('Failed to add tracked contract'));
+  }
+});
+
+// ── DELETE /admin/contracts/:id ───────────────────────────────────────────────
+//
+// Deactivate a tracked contract. The polling loop will stop on the next tick.
+
+router.delete('/admin/contracts/:id', async (req: Request, res: Response, next: NextFunction) => {
+  const id = parseInt(req.params.id, 10);
+  if (isNaN(id)) return next(badRequest('Contract ID must be an integer'));
+
+  try {
+    const existing = await prisma.trackedContract.findUnique({ where: { id } });
+    if (!existing) return next(notFound('Tracked contract not found'));
+
+    const updated = await prisma.trackedContract.update({
+      where: { id },
+      data: { active: false },
+    });
+    res.json(serialize(updated));
+  } catch (err) {
+    next(internalError('Failed to deactivate tracked contract'));
   }
 });
 

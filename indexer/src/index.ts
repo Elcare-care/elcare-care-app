@@ -16,23 +16,18 @@ import { isStalled } from './stall.js';
 import { errorHandler } from './api/errors.js';
 import { startReconciler } from './reconciler.js';
 import { validateRequiredEnv, loadKeeperConfig } from './config.js';
+import { parseCorsOrigins, buildCorsOptions } from './cors.js';
 import { startKeeper } from './keeper/index.js';
 import { startGapRepairWorker } from './gap-repair.js';
 import { logger } from './logger.js';
 import prisma from './db.js';
+import docsRouter from './api/docs-router.js';
 
 dotenv.config();
 
 // Initialise Sentry before the Express app is constructed so it can instrument
 // framework integrations automatically. No-op when SENTRY_DSN is not set.
 initSentry();
-
-// Load OpenAPI spec
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-const openapiPath = path.join(__dirname, '..', 'openapi.yaml');
-const openapiFile = fs.readFileSync(openapiPath, 'utf8');
-const swaggerDoc = yaml.parse(openapiFile);
 
 // Fail fast — refuse to start if any required environment variable is missing.
 try {
@@ -45,12 +40,12 @@ try {
 const app = express();
 const PORT = process.env.PORT || 4000;
 
-app.use(cors({
-    origin: process.env.NODE_ENV === 'production'
-        ? (process.env.CORS_ORIGIN || '').split(',').map(o => o.trim()).filter(Boolean)
-        : true,
-    credentials: true,
-}));
+// ── CORS ──────────────────────────────────────────────────────────────────────
+// Parse the whitelist once at startup. An empty list = dev mode (all origins).
+const corsOrigins = parseCorsOrigins(process.env.CORS_ORIGIN);
+app.use(cors(buildCorsOptions(corsOrigins)));
+// Handle OPTIONS preflight explicitly — Express 5 requires a valid route pattern.
+app.options(/.*/, cors(buildCorsOptions(corsOrigins)));
 app.use(compression());
 app.use(express.json());
 
@@ -61,7 +56,7 @@ app.use(globalRateLimiter);
 app.use(requestLogger);
 app.use(metricsMiddleware);
 
-// Expose /metrics for Prometheus scrapers (bypass rate limit via skip in globalRateLimiter)
+// Expose /metrics for Prometheus scrapers
 app.get('/metrics', handleMetrics);
 
 // Apply standard rate limiting for fallback
@@ -76,17 +71,40 @@ app.get('/openapi.yaml', (req: express.Request, res: express.Response) => {
 // API Routes
 app.use('/', routes);
 
-// Sentry error handler must be registered before the custom error handler so
-// that it receives the error object before it is serialised into an HTTP response.
+// Sentry error handler must be registered before the custom error handler
 Sentry.setupExpressErrorHandler(app);
 
 // Central error handler — must be registered after all routes
 app.use(errorHandler);
 
 // Health check
-app.get('/health', (req: express.Request, res: express.Response) => {
-    res.json({ status: 'ok' });
+app.get('/health', (_req: express.Request, res: express.Response) => {
+  res.json({ status: 'ok' });
 });
+
+// ── Dev-only CORS debug endpoint ──────────────────────────────────────────────
+// Echo the request origin, relevant headers, and the CORS decision so developers
+// can verify their browser / curl config without reading server logs.
+// Stripped in production — never exposed to end users.
+if (process.env.NODE_ENV !== 'production') {
+    app.get('/cors-test', (req: express.Request, res: express.Response) => {
+        const origin = req.headers.origin ?? null;
+        const allowed = corsOrigins.length === 0
+            ? true
+            : origin !== null && corsOrigins.includes(origin);
+
+        res.json({
+            origin,
+            allowed,
+            whitelist: corsOrigins,
+            mode: corsOrigins.length === 0 ? 'development (all origins)' : 'production (whitelist)',
+            headers: {
+                'access-control-allow-origin': res.getHeader('access-control-allow-origin') ?? null,
+                'access-control-allow-credentials': res.getHeader('access-control-allow-credentials') ?? null,
+            },
+        });
+    });
+}
 
 // Readiness probe — returns 503 until the indexer has processed at least one ledger,
 // or if the indexer has stalled (no progress for STALL_THRESHOLD_MS).
@@ -99,14 +117,27 @@ app.get('/readyz', async (req: express.Request, res: express.Response) => {
 
     let lastLedger = 0;
     try {
+        const contracts = await prisma.trackedContract.findMany({
+            where: { active: true },
+            select: { contractId: true, lastLedger: true, label: true },
+        });
+        const ready = contracts.length > 0 && contracts.some((c) => c.lastLedger > 0);
+        if (ready) {
+            return res.json({
+                status: 'ready',
+                contracts: contracts.map((c) => ({ contractId: c.contractId, label: c.label, lastLedger: c.lastLedger })),
+            });
+        }
+        return res.status(503).json({ status: 'not_ready', reason: 'No ledgers indexed yet' });
+    } catch {
+        // Fall back to legacy SyncState check
         const state = await prisma.syncState.findUnique({ where: { id: 1 } });
         if (!state || state.lastLedger === 0) {
             reasons.push('No ledgers indexed yet');
         } else {
             lastLedger = state.lastLedger;
         }
-    } catch (err) {
-        reasons.push('Failed to check sync state');
+        return res.status(503).json({ status: 'not_ready', reason: 'No ledgers indexed yet' });
     }
 
     if (reasons.length > 0) {
@@ -165,6 +196,6 @@ const httpServer = app.listen(PORT, () => {
 
 // Register HTTP server and SSE cleanup so gracefulShutdown() in poller closes them too.
 registerShutdownHook(() => new Promise<void>((resolve) => {
-    closeSSEClients();
-    httpServer.close(() => resolve());
+  closeSSEClients();
+  httpServer.close(() => resolve());
 }));

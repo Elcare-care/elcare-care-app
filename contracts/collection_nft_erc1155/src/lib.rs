@@ -551,7 +551,7 @@ impl NormalNFT1155 {
 
             let creator: Address = env.storage().instance().get(&DataKey::Creator).unwrap();
             env.events().publish(
-                (symbol_short!("mint"), creator, to.clone()),
+                (symbol_short!("mint"), creator.clone(), to.clone()),
                 (token_id, amount),
             );
         }

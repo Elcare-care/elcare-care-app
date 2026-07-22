@@ -1,7 +1,7 @@
 import { rpc } from '@stellar/stellar-sdk';
-import { parseMarketplaceEvent, type DecodedEvent } from './parser.js';
-import { decodeErrorsCounter } from './metrics.js';
-import { withRetry } from './retry.js';
+import { parseMarketplaceEvent, SchemaDecodeError, type DecodedEvent } from './parser.js';
+import { decodeErrorsCounter, eventDecodeErrorsCounter } from './metrics.js';
+import { withRpcRetry } from './retry.js';
 
 export const MAX_LEDGER_WINDOW = 17_000;
 export const EVENT_PAGE_LIMIT = 100;
@@ -113,7 +113,7 @@ export async function collectMarketplaceEvents(
     let paginationToken: string | null = null;
 
     do {
-      const response: any = await withRetry(
+      const response: any = await withRpcRetry(
         () => server.getEvents({
           startLedger: windowStart,
           endLedger: windowEnd,
@@ -129,12 +129,23 @@ export async function collectMarketplaceEvents(
           const decoded = decodeRpcEvent(event, idx);
           if (decoded) decodedEvents.push(decoded);
         } catch (err) {
+          // Always increment the legacy unlabeled counter for backward compat.
           decodeErrorsCounter.inc();
-          console.error({
+
+          // Increment the per-event-type labeled counter when the schema decoder
+          // identifies the event type before failing; fall back to 'unknown'.
+          const eventType =
+            err instanceof SchemaDecodeError ? err.eventType : 'unknown';
+          eventDecodeErrorsCounter.inc({ event_type: eventType });
+
+          // Log at warn level with the raw event for post-mortem; never crash the batch.
+          console.warn({
             msg: '[EventSync] Failed to decode event — skipping',
             ledger: (event as RpcEvent).ledger,
             eventIndex: idx,
+            eventType,
             error: err instanceof Error ? err.message : String(err),
+            rawTopic: (event as RpcEvent).topic,
           });
         }
       }

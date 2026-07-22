@@ -39,6 +39,8 @@ vi.mock('../db', () => ({ default: mockPrisma }));
 vi.mock('../metrics.js', () => ({
   rpcRetryExhaustedCounter: { inc: vi.fn() },
   decodeErrorsCounter: { inc: vi.fn() },
+  eventDecodeErrorsCounter: { inc: vi.fn() },
+  stalledGauge: { set: vi.fn() },
   latestLedgerProcessedGauge: { set: vi.fn() },
   networkLatestLedgerGauge: { set: vi.fn() },
   syncLatencyGauge: { set: vi.fn() },
@@ -51,6 +53,9 @@ vi.mock('../metrics.js', () => ({
 
 vi.mock('../retry.js', () => ({
   withRetry: vi.fn((fn: () => Promise<unknown>) => fn()),
+  withRpcRetry: vi.fn((fn: () => Promise<unknown>) => fn()),
+  withDbRetry: vi.fn((fn: () => Promise<unknown>) => fn()),
+  withIpfsRetry: vi.fn((fn: () => Promise<unknown>) => fn()),
 }));
 
 // ── Mock Stellar SDK ──────────────────────────────────────────────────────────

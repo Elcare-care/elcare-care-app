@@ -741,6 +741,58 @@ export function subscribeToMarketplaceEvents(
   };
 }
 
+// ─────────────────────────────────────────────────────────────
+// Price history — sparkline data for a listing
+// ─────────────────────────────────────────────────────────────
+
+export interface PriceHistoryPoint {
+  /** Unix timestamp (ms) */
+  timestamp: number;
+  /** Price as a string (in stroops or XLM — caller formats) */
+  price: string;
+}
+
+/**
+ * Fetches price-change history for a specific listing.
+ * Endpoint: GET /listings/:id/price-history
+ */
+export async function getListingPriceHistory(
+  listingId: number
+): Promise<PriceHistoryPoint[]> {
+  if (!Number.isFinite(listingId)) return [];
+  try {
+    const raw = await fetchWithRetry<unknown>(
+      `/listings/${listingId}/price-history`
+    );
+    if (!Array.isArray(raw)) return [];
+    return raw
+      .filter(
+        (item): item is Record<string, unknown> =>
+          item !== null && typeof item === "object"
+      )
+      .map((item) => ({
+        timestamp:
+          typeof item.timestamp === "number"
+            ? item.timestamp
+            : typeof item.ledgerTimestamp === "string"
+            ? new Date(item.ledgerTimestamp).getTime()
+            : Date.now(),
+        price:
+          item.price != null
+            ? String(item.price)
+            : item.new_price != null
+            ? String(item.new_price)
+            : "0",
+      }));
+  } catch (e) {
+    console.warn(
+      "[indexer] getListingPriceHistory:",
+      e instanceof Error ? e.message : e
+    );
+    return [];
+  }
+}
+
 /**
  * Fetches launch metrics (mints, volume, conversion) for an artist.
  */

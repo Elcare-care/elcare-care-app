@@ -4,6 +4,7 @@ export default defineConfig({
   test: {
     environment: "node",
     globals: true,
+    // Unit tests only — integration tests run via vitest.integration.config.mts
     include: ["src/__tests__/**/*.test.ts"],
     // Integration tests need live Postgres/Redis and run via
     // vitest.integration.config.mts in their own CI job.

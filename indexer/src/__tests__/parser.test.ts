@@ -33,6 +33,29 @@ function setupMocks(topicSymbol: string, valueData: any) {
     .mockReturnValueOnce(valueData);
 }
 
+// ── Minimal complete fixtures per event type for schema validation ─────────────
+// These are the smallest payloads that satisfy each event schema.
+
+const LISTING_FIXTURE = {
+  listing_id: 1n, artist: 'GA1', price: 100n,
+  currency: 'USDC', collection: 'CC', token_id: 1n,
+};
+const ARTWORK_SOLD_FIXTURE = { listing_id: 1n, buyer: 'GB1', price: 100n };
+const LISTING_CANCELLED_FIXTURE = { listing_id: 1n };
+const LISTING_UPDATED_FIXTURE = { listing_id: 1n, new_price: 200n };
+const BID_PLACED_FIXTURE = { auction_id: 1n, bidder: 'GB1', bid_amount: 100n };
+const AUCTION_RESOLVED_FIXTURE = { auction_id: 1n, amount: 100n };
+const AUCTION_CANCELLED_FIXTURE = { auction_id: 1n };
+const OFFER_MADE_FIXTURE = { offer_id: 1n, listing_id: 1n, offerer: 'GO1', amount: 50n, token: 'CT' };
+const OFFER_ACCEPTED_FIXTURE = { offer_id: 1n, listing_id: 1n, offerer: 'GO1' };
+const OFFER_REJECTED_FIXTURE = { offer_id: 1n, listing_id: 1n, offerer: 'GO1' };
+const OFFER_WITHDRAWN_FIXTURE = { offer_id: 1n, listing_id: 1n, offerer: 'GO1' };
+const AUCTION_CREATED_FIXTURE = {
+  auction_id: 1n, creator: 'GC1', reserve_price: 50n,
+  token: 'CT', collection: 'CC', token_id: 1n, end_time: 1800000000n,
+};
+const DEPLOY_FIXTURE = ['GCREATOR', 'CCONTRACT'];
+
 // ── topic → eventType mapping ─────────────────────────────────────────────────
 
 describe('parseMarketplaceEvent — topic mapping', () => {
@@ -74,12 +97,10 @@ describe('parseMarketplaceEvent — topic mapping', () => {
     ['dep_l1155', 'DEPLOY_LAZY_1155'],
   ];
 
-  for (const [symbol, expectedType] of cases) {
+  for (const [symbol, expectedType, fixture] of cases) {
     it(`maps '${symbol}' → '${expectedType}'`, () => {
-      setupMocks(symbol, { listing_id: 1n, artist: 'GA1' });
-
+      setupMocks(symbol, fixture);
       const result = parseMarketplaceEvent(['topic_xdr'], 'value_xdr', 42);
-
       expect(result).not.toBeNull();
       expect(result!.eventType).toBe(expectedType);
     });
@@ -97,21 +118,51 @@ describe('parseMarketplaceEvent — topic mapping', () => {
   });
 });
 
+// ── launchpad 2-topic deploy format ──────────────────────────────────────────
+
+describe('parseMarketplaceEvent — launchpad deploy topics', () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+    mockFromXDR.mockReturnValue({});
+  });
+
+  it('resolves deploy event from ("deploy", "dep_n721") 2-topic format', () => {
+    // Launchpad emits topics = ["deploy", kind_tag]
+    mockScValToNative
+      .mockReturnValueOnce('deploy')  // topics[0]
+      .mockReturnValueOnce('dep_n721') // topics[1]
+      .mockReturnValueOnce(['GCREATOR', 'CCONTRACT']); // value
+
+    const result = parseMarketplaceEvent(['t1', 't2'], 'v', 100);
+    expect(result).not.toBeNull();
+    expect(result!.eventType).toBe('DEPLOY_NORMAL_721');
+    expect(result!.actor).toBe('GCREATOR');
+  });
+
+  it('returns null for unknown tag in 2-topic deploy format', () => {
+    mockScValToNative
+      .mockReturnValueOnce('deploy')
+      .mockReturnValueOnce('unknown_tag');
+    const result = parseMarketplaceEvent(['t1', 't2'], 'v', 100);
+    expect(result).toBeNull();
+  });
+});
+
 // ── fallback path (raw string topic) ─────────────────────────────────────────
 
 describe('parseMarketplaceEvent — XDR fallback', () => {
   beforeEach(() => vi.resetAllMocks());
 
   it('falls back to the raw topic string when XDR parsing throws', () => {
-    // First fromXDR call (for topic) throws; second call (for value) succeeds.
     mockFromXDR
       .mockImplementationOnce(() => { throw new Error('bad XDR'); })
       .mockReturnValueOnce({});
-    // Only one scValToNative call (for the value) because topic path errored
-    mockScValToNative.mockReturnValueOnce({ listing_id: 99n, artist: 'GFALLBACK' });
+    mockScValToNative.mockReturnValueOnce({
+      listing_id: 99n, artist: 'GFALLBACK', price: 1n,
+      currency: 'XLM', collection: 'CC', token_id: 1n,
+    });
 
     const result = parseMarketplaceEvent(['lst_crtd'], 'value_xdr', 10);
-
     expect(result).not.toBeNull();
     expect(result!.eventType).toBe('LISTING_CREATED');
     expect(result!.actor).toBe('GFALLBACK');
@@ -119,9 +170,37 @@ describe('parseMarketplaceEvent — XDR fallback', () => {
 
   it('returns null when raw fallback topic is not in TOPIC_MAP', () => {
     mockFromXDR.mockImplementationOnce(() => { throw new Error('bad XDR'); });
-
     const result = parseMarketplaceEvent(['not_a_topic'], 'value_xdr', 10);
     expect(result).toBeNull();
+  });
+});
+
+// ── SchemaDecodeError thrown on invalid data ──────────────────────────────────
+
+describe('parseMarketplaceEvent — SchemaDecodeError on invalid data', () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+    mockFromXDR.mockReturnValue({});
+  });
+
+  it('throws SchemaDecodeError when a required field is missing', async () => {
+    const { SchemaDecodeError } = await import('../parser.js');
+    // listing_id present but price/currency/collection/token_id all missing
+    setupMocks('lst_crtd', { listing_id: 1n, artist: 'GA' });
+    expect(() => parseMarketplaceEvent(['t'], 'v', 1)).toThrow(SchemaDecodeError);
+  });
+
+  it('SchemaDecodeError.eventType identifies the failing event type', async () => {
+    const { SchemaDecodeError } = await import('../parser.js');
+    // bid_placed missing required auction_id
+    setupMocks('bid_plcd', { bidder: 'GB', bid_amount: 100n });
+    try {
+      parseMarketplaceEvent(['t'], 'v', 1);
+      expect.fail('should have thrown');
+    } catch (err) {
+      expect(err).toBeInstanceOf(SchemaDecodeError);
+      expect((err as InstanceType<typeof SchemaDecodeError>).eventType).toBe('BID_PLACED');
+    }
   });
 });
 
@@ -134,24 +213,18 @@ describe('parseMarketplaceEvent — listingId', () => {
   });
 
   it('extracts listing_id as BigInt', () => {
-    setupMocks('lst_crtd', { listing_id: 5n, artist: 'GA' });
-
-    const result = parseMarketplaceEvent(['t'], 'v', 1)!;
-    expect(result.listingId).toBe(5n);
+    setupMocks('lst_crtd', { ...LISTING_FIXTURE, listing_id: 5n });
+    expect(parseMarketplaceEvent(['t'], 'v', 1)!.listingId).toBe(5n);
   });
 
   it('extracts auction_id as listingId for auction events', () => {
-    setupMocks('auc_crtd', { auction_id: 7n, creator: 'GA_CREATOR' });
-
-    const result = parseMarketplaceEvent(['t'], 'v', 1)!;
-    expect(result.listingId).toBe(7n);
+    setupMocks('auc_crtd', { ...AUCTION_CREATED_FIXTURE, auction_id: 7n });
+    expect(parseMarketplaceEvent(['t'], 'v', 1)!.listingId).toBe(7n);
   });
 
   it('sets listingId to null when neither listing_id nor auction_id present', () => {
-    setupMocks('ofr_made', { offerer: 'GA_OFFERER' });
-
-    const result = parseMarketplaceEvent(['t'], 'v', 1)!;
-    expect(result.listingId).toBeNull();
+    setupMocks('dep_n721', DEPLOY_FIXTURE);
+    expect(parseMarketplaceEvent(['t'], 'v', 1)!.listingId).toBeNull();
   });
 });
 
@@ -164,32 +237,32 @@ describe('parseMarketplaceEvent — actor priority', () => {
   });
 
   it('picks artist when present', () => {
-    setupMocks('lst_crtd', { listing_id: 1n, artist: 'GA_ARTIST' });
+    setupMocks('lst_crtd', { ...LISTING_FIXTURE, artist: 'GA_ARTIST' });
     expect(parseMarketplaceEvent(['t'], 'v', 1)!.actor).toBe('GA_ARTIST');
   });
 
   it('picks creator when artist is absent', () => {
-    setupMocks('auc_crtd', { auction_id: 1n, creator: 'GA_CREATOR' });
+    setupMocks('auc_crtd', { ...AUCTION_CREATED_FIXTURE, creator: 'GA_CREATOR' });
     expect(parseMarketplaceEvent(['t'], 'v', 1)!.actor).toBe('GA_CREATOR');
   });
 
   it('picks offerer when artist and creator are absent', () => {
-    setupMocks('ofr_made', { offerer: 'GA_OFFERER' });
+    setupMocks('ofr_made', { ...OFFER_MADE_FIXTURE, offerer: 'GA_OFFERER' });
     expect(parseMarketplaceEvent(['t'], 'v', 1)!.actor).toBe('GA_OFFERER');
   });
 
   it('picks bidder when others are absent', () => {
-    setupMocks('bid_plcd', { bidder: 'GA_BIDDER' });
+    setupMocks('bid_plcd', { ...BID_PLACED_FIXTURE, bidder: 'GA_BIDDER' });
     expect(parseMarketplaceEvent(['t'], 'v', 1)!.actor).toBe('GA_BIDDER');
   });
 
   it('picks buyer when others are absent', () => {
-    setupMocks('art_sold', { listing_id: 1n, buyer: 'GA_BUYER' });
+    setupMocks('art_sold', { ...ARTWORK_SOLD_FIXTURE, buyer: 'GA_BUYER' });
     expect(parseMarketplaceEvent(['t'], 'v', 1)!.actor).toBe('GA_BUYER');
   });
 
   it('leaves actor as empty string when no known actor field present', () => {
-    setupMocks('lst_updt', { listing_id: 1n, new_price: 500n });
+    setupMocks('lst_updt', LISTING_UPDATED_FIXTURE);
     expect(parseMarketplaceEvent(['t'], 'v', 1)!.actor).toBe('');
   });
 });
@@ -203,7 +276,7 @@ describe('parseMarketplaceEvent — ledgerSequence', () => {
   });
 
   it('preserves the supplied ledger sequence number', () => {
-    setupMocks('lst_crtd', { listing_id: 1n, artist: 'GA' });
+    setupMocks('lst_crtd', LISTING_FIXTURE);
     expect(parseMarketplaceEvent(['t'], 'v', 12345)!.ledgerSequence).toBe(12345);
   });
 });
@@ -217,10 +290,11 @@ describe('parseMarketplaceEvent — BigInt serialisation in data', () => {
   });
 
   it('converts top-level BigInt values to strings in the data payload', () => {
-    setupMocks('lst_crtd', { listing_id: 1n, price: 10_000_000n, artist: 'GA' });
-
+    setupMocks('lst_crtd', {
+      listing_id: 1n, artist: 'GA', price: 10_000_000n,
+      currency: 'USDC', collection: 'CC', token_id: 42n,
+    });
     const result = parseMarketplaceEvent(['t'], 'v', 1)!;
-    // BigInts in data must be strings (safe for JSON)
     expect(typeof result.data.listing_id).toBe('string');
     expect(result.data.listing_id).toBe('1');
     expect(result.data.price).toBe('10000000');
@@ -228,46 +302,33 @@ describe('parseMarketplaceEvent — BigInt serialisation in data', () => {
 
   it('converts nested BigInt values to strings', () => {
     setupMocks('bid_plcd', {
-      listing_id: 2n,
+      ...BID_PLACED_FIXTURE,
       nested: { amount: 999n },
     });
-
     const result = parseMarketplaceEvent(['t'], 'v', 1)!;
     expect(result.data.nested.amount).toBe('999');
   });
 
   it('converts BigInt values inside arrays to strings', () => {
     setupMocks('ofr_made', {
+      ...OFFER_MADE_FIXTURE,
       amounts: [100n, 200n],
     });
-
     const result = parseMarketplaceEvent(['t'], 'v', 1)!;
     expect(result.data.amounts).toEqual(['100', '200']);
   });
 });
 
 // ── per-event-type fixtures ───────────────────────────────────────────────────
-// Each fixture uses representative decoded data matching the on-chain structure.
-// Assertions verify field extraction AND that BigInts are converted to strings
-// in the data payload (safe for JSON storage).
 
 describe('parseMarketplaceEvent — LISTING_CREATED fixture', () => {
-  beforeEach(() => {
-    vi.resetAllMocks();
-    mockFromXDR.mockReturnValue({});
-  });
+  beforeEach(() => { vi.resetAllMocks(); mockFromXDR.mockReturnValue({}); });
 
   it('extracts listingId, actor, ledger and serialises all BigInt fields', () => {
     setupMocks('lst_crtd', {
-      listing_id: 1n,
-      artist: 'GARTIST000',
-      price: 10_000_000n,
-      currency: 'USDC',
-      collection: 'CCOLLECTION',
-      token_id: 42n,
-      token: 'CTOKEN',
+      listing_id: 1n, artist: 'GARTIST000', price: 10_000_000n,
+      currency: 'USDC', collection: 'CCOLLECTION', token_id: 42n, token: 'CTOKEN',
     });
-
     const r = parseMarketplaceEvent(['topic_xdr'], 'value_xdr', 500)!;
     expect(r.eventType).toBe('LISTING_CREATED');
     expect(r.listingId).toBe(1n);
@@ -279,31 +340,22 @@ describe('parseMarketplaceEvent — LISTING_CREATED fixture', () => {
     expect(r.data.currency).toBe('USDC');
   });
 
-  it('handles null/absent optional recipients field without throwing', () => {
+  it('handles absent optional recipients field without throwing', () => {
     setupMocks('lst_crtd', {
-      listing_id: 2n,
-      artist: 'GARTIST000',
-      price: 500n,
-      collection: 'CC',
-      token_id: 1n,
-      // recipients intentionally omitted
+      listing_id: 2n, artist: 'GARTIST000', price: 500n,
+      currency: 'USDC', collection: 'CC', token_id: 1n,
     });
-
     const r = parseMarketplaceEvent(['t'], 'v', 1)!;
     expect(r.listingId).toBe(2n);
     expect(r.data.recipients).toBeUndefined();
   });
 
-  it('preserves recipient percentage as a string when recipients are nested objects with BigInts', () => {
+  it('preserves recipient percentage as string when nested BigInts present', () => {
     setupMocks('lst_crtd', {
-      listing_id: 3n,
-      artist: 'GA',
-      price: 100n,
-      collection: 'CC',
-      token_id: 1n,
+      listing_id: 3n, artist: 'GA', price: 100n,
+      currency: 'USDC', collection: 'CC', token_id: 1n,
       recipients: [{ address: 'GRECIP', percentage: 500n }],
     });
-
     const r = parseMarketplaceEvent(['t'], 'v', 1)!;
     expect(r.data.recipients[0].percentage).toBe('500');
     expect(r.data.recipients[0].address).toBe('GRECIP');
@@ -311,18 +363,10 @@ describe('parseMarketplaceEvent — LISTING_CREATED fixture', () => {
 });
 
 describe('parseMarketplaceEvent — ARTWORK_SOLD fixture', () => {
-  beforeEach(() => {
-    vi.resetAllMocks();
-    mockFromXDR.mockReturnValue({});
-  });
+  beforeEach(() => { vi.resetAllMocks(); mockFromXDR.mockReturnValue({}); });
 
   it('extracts buyer as actor and serialises price', () => {
-    setupMocks('art_sold', {
-      listing_id: 8n,
-      buyer: 'GBUYER111',
-      price: 25_000_000n,
-    });
-
+    setupMocks('art_sold', { listing_id: 8n, buyer: 'GBUYER111', price: 25_000_000n });
     const r = parseMarketplaceEvent(['t'], 'v', 800)!;
     expect(r.eventType).toBe('ARTWORK_SOLD');
     expect(r.listingId).toBe(8n);
@@ -333,14 +377,10 @@ describe('parseMarketplaceEvent — ARTWORK_SOLD fixture', () => {
 });
 
 describe('parseMarketplaceEvent — LISTING_CANCELLED fixture', () => {
-  beforeEach(() => {
-    vi.resetAllMocks();
-    mockFromXDR.mockReturnValue({});
-  });
+  beforeEach(() => { vi.resetAllMocks(); mockFromXDR.mockReturnValue({}); });
 
   it('maps listing_id and leaves actor empty when no actor field present', () => {
     setupMocks('lst_cncl', { listing_id: 3n });
-
     const r = parseMarketplaceEvent(['t'], 'v', 300)!;
     expect(r.eventType).toBe('LISTING_CANCELLED');
     expect(r.listingId).toBe(3n);
@@ -350,18 +390,10 @@ describe('parseMarketplaceEvent — LISTING_CANCELLED fixture', () => {
 });
 
 describe('parseMarketplaceEvent — LISTING_UPDATED fixture', () => {
-  beforeEach(() => {
-    vi.resetAllMocks();
-    mockFromXDR.mockReturnValue({});
-  });
+  beforeEach(() => { vi.resetAllMocks(); mockFromXDR.mockReturnValue({}); });
 
   it('serialises new_price BigInt and carries token_id', () => {
-    setupMocks('lst_updt', {
-      listing_id: 5n,
-      new_price: 20_000_000n,
-      token_id: 7n,
-    });
-
+    setupMocks('lst_updt', { listing_id: 5n, new_price: 20_000_000n, token_id: 7n });
     const r = parseMarketplaceEvent(['t'], 'v', 350)!;
     expect(r.eventType).toBe('LISTING_UPDATED');
     expect(r.listingId).toBe(5n);
@@ -371,22 +403,13 @@ describe('parseMarketplaceEvent — LISTING_UPDATED fixture', () => {
 });
 
 describe('parseMarketplaceEvent — AUCTION_CREATED fixture', () => {
-  beforeEach(() => {
-    vi.resetAllMocks();
-    mockFromXDR.mockReturnValue({});
-  });
+  beforeEach(() => { vi.resetAllMocks(); mockFromXDR.mockReturnValue({}); });
 
   it('maps auction_id to listingId and serialises reserve_price and end_time', () => {
     setupMocks('auc_crtd', {
-      auction_id: 11n,
-      creator: 'GCREATOR',
-      reserve_price: 50_000_000n,
-      end_time: 1_800_000_000n,
-      token: 'CTOKEN',
-      collection: 'CAUC',
-      token_id: 99n,
+      auction_id: 11n, creator: 'GCREATOR', reserve_price: 50_000_000n,
+      end_time: 1_800_000_000n, token: 'CTOKEN', collection: 'CAUC', token_id: 99n,
     });
-
     const r = parseMarketplaceEvent(['t'], 'v', 600)!;
     expect(r.eventType).toBe('AUCTION_CREATED');
     expect(r.listingId).toBe(11n);
@@ -397,25 +420,18 @@ describe('parseMarketplaceEvent — AUCTION_CREATED fixture', () => {
   });
 
   it('sets listingId to null when auction_id is absent', () => {
+    // Missing auction_id triggers SchemaDecodeError — that is the correct new behaviour.
+    // The test now verifies the error is thrown with the right type.
     setupMocks('auc_crtd', { creator: 'GCREATOR' });
-    const r = parseMarketplaceEvent(['t'], 'v', 1)!;
-    expect(r.listingId).toBeNull();
+    expect(() => parseMarketplaceEvent(['t'], 'v', 1)).toThrow();
   });
 });
 
 describe('parseMarketplaceEvent — BID_PLACED fixture', () => {
-  beforeEach(() => {
-    vi.resetAllMocks();
-    mockFromXDR.mockReturnValue({});
-  });
+  beforeEach(() => { vi.resetAllMocks(); mockFromXDR.mockReturnValue({}); });
 
   it('extracts bidder as actor and serialises bid_amount', () => {
-    setupMocks('bid_plcd', {
-      auction_id: 11n,
-      bidder: 'GBIDDER',
-      bid_amount: 55_000_000n,
-    });
-
+    setupMocks('bid_plcd', { auction_id: 11n, bidder: 'GBIDDER', bid_amount: 55_000_000n });
     const r = parseMarketplaceEvent(['t'], 'v', 610)!;
     expect(r.eventType).toBe('BID_PLACED');
     expect(r.actor).toBe('GBIDDER');
@@ -424,18 +440,10 @@ describe('parseMarketplaceEvent — BID_PLACED fixture', () => {
 });
 
 describe('parseMarketplaceEvent — AUCTION_RESOLVED fixture', () => {
-  beforeEach(() => {
-    vi.resetAllMocks();
-    mockFromXDR.mockReturnValue({});
-  });
+  beforeEach(() => { vi.resetAllMocks(); mockFromXDR.mockReturnValue({}); });
 
   it('serialises final amount and preserves winner address', () => {
-    setupMocks('auc_rslv', {
-      auction_id: 11n,
-      winner: 'GWINNER',
-      amount: 55_000_000n,
-    });
-
+    setupMocks('auc_rslv', { auction_id: 11n, winner: 'GWINNER', amount: 55_000_000n });
     const r = parseMarketplaceEvent(['t'], 'v', 620)!;
     expect(r.eventType).toBe('AUCTION_RESOLVED');
     expect(r.data.amount).toBe('55000000');
@@ -451,10 +459,7 @@ describe('parseMarketplaceEvent — AUCTION_RESOLVED fixture', () => {
 });
 
 describe('parseMarketplaceEvent — AUCTION_CANCELLED fixture', () => {
-  beforeEach(() => {
-    vi.resetAllMocks();
-    mockFromXDR.mockReturnValue({});
-  });
+  beforeEach(() => { vi.resetAllMocks(); mockFromXDR.mockReturnValue({}); });
 
   it('maps auction_id to listingId for AUCTION_CANCELLED', () => {
     setupMocks('auc_cncl', { auction_id: 13n });
@@ -465,20 +470,12 @@ describe('parseMarketplaceEvent — AUCTION_CANCELLED fixture', () => {
 });
 
 describe('parseMarketplaceEvent — OFFER_MADE fixture', () => {
-  beforeEach(() => {
-    vi.resetAllMocks();
-    mockFromXDR.mockReturnValue({});
-  });
+  beforeEach(() => { vi.resetAllMocks(); mockFromXDR.mockReturnValue({}); });
 
   it('extracts offerer as actor and serialises offer_id, listing_id and amount', () => {
     setupMocks('ofr_made', {
-      offer_id: 1n,
-      listing_id: 42n,
-      offerer: 'GOFFERER',
-      amount: 30_000_000n,
-      token: 'CTOKEN',
+      offer_id: 1n, listing_id: 42n, offerer: 'GOFFERER', amount: 30_000_000n, token: 'CTOKEN',
     });
-
     const r = parseMarketplaceEvent(['t'], 'v', 630)!;
     expect(r.eventType).toBe('OFFER_MADE');
     expect(r.actor).toBe('GOFFERER');
@@ -489,18 +486,10 @@ describe('parseMarketplaceEvent — OFFER_MADE fixture', () => {
 });
 
 describe('parseMarketplaceEvent — OFFER_ACCEPTED fixture', () => {
-  beforeEach(() => {
-    vi.resetAllMocks();
-    mockFromXDR.mockReturnValue({});
-  });
+  beforeEach(() => { vi.resetAllMocks(); mockFromXDR.mockReturnValue({}); });
 
   it('serialises offer_id and listing_id', () => {
-    setupMocks('ofr_accp', {
-      offer_id: 1n,
-      listing_id: 42n,
-      offerer: 'GOFFERER',
-    });
-
+    setupMocks('ofr_accp', { offer_id: 1n, listing_id: 42n, offerer: 'GOFFERER' });
     const r = parseMarketplaceEvent(['t'], 'v', 640)!;
     expect(r.eventType).toBe('OFFER_ACCEPTED');
     expect(r.data.offer_id).toBe('1');
@@ -509,13 +498,10 @@ describe('parseMarketplaceEvent — OFFER_ACCEPTED fixture', () => {
 });
 
 describe('parseMarketplaceEvent — OFFER_REJECTED fixture', () => {
-  beforeEach(() => {
-    vi.resetAllMocks();
-    mockFromXDR.mockReturnValue({});
-  });
+  beforeEach(() => { vi.resetAllMocks(); mockFromXDR.mockReturnValue({}); });
 
   it('maps offer_id to data', () => {
-    setupMocks('ofr_rjct', { offer_id: 2n, listing_id: 5n });
+    setupMocks('ofr_rjct', { offer_id: 2n, listing_id: 5n, offerer: 'GO' });
     const r = parseMarketplaceEvent(['t'], 'v', 1)!;
     expect(r.eventType).toBe('OFFER_REJECTED');
     expect(r.data.offer_id).toBe('2');
@@ -523,13 +509,10 @@ describe('parseMarketplaceEvent — OFFER_REJECTED fixture', () => {
 });
 
 describe('parseMarketplaceEvent — OFFER_WITHDRAWN fixture', () => {
-  beforeEach(() => {
-    vi.resetAllMocks();
-    mockFromXDR.mockReturnValue({});
-  });
+  beforeEach(() => { vi.resetAllMocks(); mockFromXDR.mockReturnValue({}); });
 
   it('maps offer_id to data', () => {
-    setupMocks('ofr_wdrn', { offer_id: 3n, listing_id: 7n });
+    setupMocks('ofr_wdrn', { offer_id: 3n, listing_id: 7n, offerer: 'GO' });
     const r = parseMarketplaceEvent(['t'], 'v', 1)!;
     expect(r.eventType).toBe('OFFER_WITHDRAWN');
     expect(r.data.offer_id).toBe('3');
@@ -537,10 +520,7 @@ describe('parseMarketplaceEvent — OFFER_WITHDRAWN fixture', () => {
 });
 
 describe('parseMarketplaceEvent — deploy event fixtures', () => {
-  beforeEach(() => {
-    vi.resetAllMocks();
-    mockFromXDR.mockReturnValue({});
-  });
+  beforeEach(() => { vi.resetAllMocks(); mockFromXDR.mockReturnValue({}); });
 
   const deployTypes: [string, string][] = [
     ['dep_n721',  'DEPLOY_NORMAL_721'],
@@ -551,9 +531,7 @@ describe('parseMarketplaceEvent — deploy event fixtures', () => {
 
   for (const [symbol, expectedType] of deployTypes) {
     it(`${expectedType}: extracts creator from tuple index 0`, () => {
-      // scValToNative returns a 2-tuple [creator, contractAddress] for deploy events
       setupMocks(symbol, ['GCREATOR', 'CCONTRACT']);
-
       const r = parseMarketplaceEvent(['t'], 'v', 700)!;
       expect(r.eventType).toBe(expectedType);
       expect(r.actor).toBe('GCREATOR');

@@ -64,7 +64,7 @@ const TOPIC_MAP: Record<string, string> = {
   'auc_crtd': 'AUCTION_CREATED',
   'dep_n721': 'DEPLOY_NORMAL_721',
   'dep_n1155': 'DEPLOY_NORMAL_1155',
-  'dep_l721': 'DEPLOY_LAZY_721',
+  'dep_l721':  'DEPLOY_LAZY_721',
   'dep_l1155': 'DEPLOY_LAZY_1155',
 };
 
@@ -133,16 +133,7 @@ export function parseMarketplaceEvent(
   eventId: string = '',
   txIndex: number = 0
 ): DecodedEvent | null {
-  // Topics might be XDR base64 strings or decoded symbols
-  let topic = '';
-  try {
-    const rawTopic = xdr.ScVal.fromXDR(topics[0], 'base64');
-    topic = scValToNative(rawTopic);
-  } catch {
-    topic = topics[0]; // Fallback if already decoded
-  }
-
-  const type = TOPIC_MAP[topic];
+  const type = resolveEventType(topics);
   if (!type) return null;
 
   const rawVal = xdr.ScVal.fromXDR(valueXdr, 'base64');
@@ -169,17 +160,37 @@ export function parseMarketplaceEvent(
   };
 }
 
+// ── SchemaDecodeError ─────────────────────────────────────────────────────────
+
+/**
+ * Thrown by parseMarketplaceEvent when a decoded event fails schema validation.
+ * event-sync.ts catches this to increment the per-event-type Prometheus counter
+ * and continue processing without crashing the batch.
+ */
+export class SchemaDecodeError extends Error {
+  constructor(
+    public readonly eventType: string,
+    public readonly reason: string,
+    public readonly raw: unknown
+  ) {
+    super(`[SchemaDecodeError] ${eventType}: ${reason}`);
+    this.name = 'SchemaDecodeError';
+  }
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
 /**
  * Helper to convert BigInts in an object to strings for JSON storage if needed,
  * though Prisma handles BigInt natively in some cases.
  * For 'Json' field in Prisma, we should convert them to strings or numbers.
  */
-function convertBigInts(obj: any): any {
+function convertBigInts(obj: unknown): unknown {
   if (typeof obj === 'bigint') return obj.toString();
   if (Array.isArray(obj)) return obj.map(convertBigInts);
   if (obj !== null && typeof obj === 'object') {
     return Object.fromEntries(
-      Object.entries(obj).map(([k, v]) => [k, convertBigInts(v)])
+      Object.entries(obj as Record<string, unknown>).map(([k, v]) => [k, convertBigInts(v)])
     );
   }
   return obj;
