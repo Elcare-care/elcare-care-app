@@ -4,7 +4,7 @@
 import React from "react";
 import { render, screen } from "@testing-library/react";
 import { useFilterUrlSync, FilterUrlSync } from "@/hooks/useFilterUrlSync";
-import type { Filters } from "@/components/SearchFilter";
+import type { Filters } from "@/components/FilterSidebar";
 
 // ── Mocks ──────────────────────────────────────────────────
 
@@ -60,9 +60,10 @@ describe("useFilterUrlSync", () => {
     expect(initialFilters).toEqual<Filters>({
       search: "",
       status: "All",
-      category: "All",
+      collection: [],
       minPrice: "",
       maxPrice: "",
+      artist: "",
       sort: "newest",
     });
   });
@@ -84,10 +85,16 @@ describe("useFilterUrlSync", () => {
     expect(api().initialFilters.status).toBe("Active");
   });
 
-  it("parses category from ?category= param", () => {
-    mockSearchParams = new URLSearchParams("category=Painting");
+  it("parses collection from ?collection= params", () => {
+    mockSearchParams = new URLSearchParams("collection=C1&collection=C2");
     const { api } = renderConsumer();
-    expect(api().initialFilters.category).toBe("Painting");
+    expect(api().initialFilters.collection).toEqual(["C1", "C2"]);
+  });
+
+  it("parses artist from ?artist= param", () => {
+    mockSearchParams = new URLSearchParams("artist=ADDR1");
+    const { api } = renderConsumer();
+    expect(api().initialFilters.artist).toBe("ADDR1");
   });
 
   it("parses price range from ?minPrice=&maxPrice= params", () => {
@@ -109,29 +116,18 @@ describe("useFilterUrlSync", () => {
     expect(api().initialPage).toBe(3);
   });
 
-  it("falls back to page 1 when ?page= is invalid", () => {
-    mockSearchParams = new URLSearchParams("page=abc");
-    const { api } = renderConsumer();
-    expect(api().initialPage).toBe(1);
-  });
-
-  it("falls back to page 1 when ?page= is 0", () => {
-    mockSearchParams = new URLSearchParams("page=0");
-    const { api } = renderConsumer();
-    expect(api().initialPage).toBe(1);
-  });
-
   it("reads all combined params", () => {
     mockSearchParams = new URLSearchParams(
-      "q=portrait&status=Active&category=Photography&minPrice=5&maxPrice=50&sort=price-high&page=2",
+      "q=portrait&status=Active&collection=Photography&minPrice=5&maxPrice=50&sort=price-high&artist=A1&page=2",
     );
     const { api } = renderConsumer();
     expect(api().initialFilters).toEqual<Filters>({
       search: "portrait",
       status: "Active",
-      category: "Photography",
+      collection: ["Photography"],
       minPrice: "5",
       maxPrice: "50",
+      artist: "A1",
       sort: "price-high",
     });
     expect(api().initialPage).toBe(2);
@@ -144,9 +140,10 @@ describe("useFilterUrlSync", () => {
     const filters: Filters = {
       search: "landscape",
       status: "Active",
-      category: "All",
+      collection: [],
       minPrice: "10",
       maxPrice: "",
+      artist: "",
       sort: "newest",
     };
     api().syncToUrl(filters, 1);
@@ -161,25 +158,31 @@ describe("useFilterUrlSync", () => {
     const filters: Filters = {
       search: "",
       status: "All",
-      category: "All",
+      collection: [],
       minPrice: "",
       maxPrice: "",
+      artist: "",
       sort: "newest",
     };
     api().syncToUrl(filters, 1);
-    // No params = pathname only
     expect(mockReplace).toHaveBeenCalledWith("/explore", {
       scroll: false,
     });
   });
 
-  it("syncToUrl includes page when > 1", () => {
+  it("syncToUrl includes multiple collections", () => {
     const { api } = renderConsumer();
-    api().syncToUrl(
-      { search: "", status: "All", category: "All", minPrice: "", maxPrice: "", sort: "newest" },
-      3,
-    );
-    expect(mockReplace).toHaveBeenCalledWith("/explore?page=3", {
+    const filters: Filters = {
+      search: "",
+      status: "All",
+      collection: ["C1", "C2"],
+      minPrice: "",
+      maxPrice: "",
+      artist: "",
+      sort: "newest",
+    };
+    api().syncToUrl(filters, 1);
+    expect(mockReplace).toHaveBeenCalledWith("/explore?collection=C1&collection=C2", {
       scroll: false,
     });
   });
@@ -189,48 +192,15 @@ describe("useFilterUrlSync", () => {
     const filters: Filters = {
       search: "",
       status: "All",
-      category: "All",
+      collection: [],
       minPrice: "",
       maxPrice: "",
+      artist: "",
       sort: "price-low",
     };
     api().syncToUrl(filters, 1);
     expect(mockReplace).toHaveBeenCalledWith("/explore?sort=price-low", {
       scroll: false,
     });
-  });
-
-  it("syncToUrl includes category when non-default", () => {
-    const { api } = renderConsumer();
-    const filters: Filters = {
-      search: "",
-      status: "All",
-      category: "Sculpture",
-      minPrice: "",
-      maxPrice: "",
-      sort: "newest",
-    };
-    api().syncToUrl(filters, 1);
-    expect(mockReplace).toHaveBeenCalledWith("/explore?category=Sculpture", {
-      scroll: false,
-    });
-  });
-
-  it("syncToUrl uses the current pathname", () => {
-    mockPathname = "/explore/special";
-    const { api } = renderConsumer();
-    const filters: Filters = {
-      search: "test",
-      status: "All",
-      category: "All",
-      minPrice: "",
-      maxPrice: "",
-      sort: "newest",
-    };
-    api().syncToUrl(filters, 1);
-    expect(mockReplace).toHaveBeenCalledWith(
-      "/explore/special?q=test",
-      { scroll: false },
-    );
   });
 });

@@ -399,6 +399,8 @@ export async function getListingHistory(
 
 /**
  * Deployed collections from the indexer (Supplementary to on-chain `all_collections` when the indexer is synced).
+ */
+export async function getCollections(
   filter: CollectionFilter = {}
 ): Promise<{ collections: IndexerCollectionRow[]; total: number }> {
   const params = new URLSearchParams();
@@ -465,6 +467,9 @@ export async function fetchListings(options: {
   minPrice?: string;
   maxPrice?: string;
   search?: string;
+  collection?: string[];
+  artist?: string;
+  sort?: string;
 } = {}): Promise<{ listings: any[]; total?: number }> {
   const params = new URLSearchParams();
   if (options.status) params.set('status', options.status);
@@ -473,6 +478,11 @@ export async function fetchListings(options: {
   if (options.minPrice) params.set('minPrice', options.minPrice);
   if (options.maxPrice) params.set('maxPrice', options.maxPrice);
   if (options.search) params.set('search', options.search);
+  if (options.artist) params.set('artist', options.artist);
+  if (options.sort) params.set('sort', options.sort);
+  if (options.collection && options.collection.length > 0) {
+    options.collection.forEach(c => params.append('collection', c));
+  }
   const q = params.toString();
 
   const raw = await fetchWithRetry<unknown>(`/listings${q ? `?${q}` : ''}`);
