@@ -17,6 +17,7 @@ import { withRpcRetry } from './retry.js';
 import { logger } from './logger.js';
 import redis from './redis.js';
 import { loadConfig, parseTrackedContracts } from './config.js';
+import { enqueueIpfsFetch } from './ipfs-cache.js';
 
 dotenv.config();
 

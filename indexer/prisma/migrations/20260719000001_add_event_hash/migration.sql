@@ -1,6 +1,9 @@
 -- Add eventHash column to MarketplaceEvent for idempotent event processing.
 -- The column is nullable initially so the backfill can run before we enforce NOT NULL.
 
+-- pgcrypto is required for digest() / encode() below.
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
 ALTER TABLE "MarketplaceEvent" ADD COLUMN IF NOT EXISTS "eventHash" TEXT;
 
 -- Backfill existing rows with a deterministic hash derived from available columns.

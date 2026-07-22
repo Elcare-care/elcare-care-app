@@ -1,5 +1,6 @@
 import { xdr, Address, scValToNative } from '@stellar/stellar-sdk';
 import { createHash } from 'crypto';
+import { SCHEMA_REGISTRY, decodeWithSchema, type DecodeResult } from './event-schemas.js';
 
 export interface DecodedEvent {
   eventType: string;
