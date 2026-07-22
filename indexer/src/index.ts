@@ -3,10 +3,16 @@ import express from 'express';
 import cors from 'cors';
 import compression from 'compression';
 import dotenv from 'dotenv';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import yaml from 'yaml';
+import swaggerUi from 'swagger-ui-express';
 import routes, { closeSSEClients } from './api/routes.js';
 import { startPolling, registerShutdownHook } from './poller.js';
 import { rateLimiter, globalRateLimiter } from './api/rate-limit-middleware.js';
 import { metricsMiddleware, handleMetrics, requestLogger } from './metrics.js';
+import { isStalled } from './stall.js';
 import { errorHandler } from './api/errors.js';
 import { startReconciler } from './reconciler.js';
 import { validateRequiredEnv, loadKeeperConfig } from './config.js';
@@ -56,8 +62,11 @@ app.get('/metrics', handleMetrics);
 // Apply standard rate limiting for fallback
 app.use(rateLimiter);
 
-// OpenAPI spec + Swagger UI (no rate-limit — static/read-only)
-app.use('/', docsRouter);
+// Swagger UI + raw OpenAPI spec
+app.use('/docs', swaggerUi.serve, swaggerUi.setup(swaggerDoc));
+app.get('/openapi.yaml', (req: express.Request, res: express.Response) => {
+    res.type('text/yaml').send(openapiFile);
+});
 
 // API Routes
 app.use('/', routes);
@@ -100,10 +109,13 @@ if (process.env.NODE_ENV !== 'production') {
 // Readiness probe — returns 503 until the indexer has processed at least one ledger,
 // or if the indexer has stalled (no progress for STALL_THRESHOLD_MS).
 app.get('/readyz', async (req: express.Request, res: express.Response) => {
+    const reasons: string[] = [];
+
     if (isStalled()) {
-        return res.status(503).json({ status: 'stalled', reason: 'Indexer not advancing' });
+        reasons.push('Indexer not advancing');
     }
 
+    let lastLedger = 0;
     try {
         const contracts = await prisma.trackedContract.findMany({
             where: { active: true },
@@ -120,11 +132,19 @@ app.get('/readyz', async (req: express.Request, res: express.Response) => {
     } catch {
         // Fall back to legacy SyncState check
         const state = await prisma.syncState.findUnique({ where: { id: 1 } });
-        if (state && state.lastLedger > 0) {
-            return res.json({ status: 'ready', lastLedger: state.lastLedger });
+        if (!state || state.lastLedger === 0) {
+            reasons.push('No ledgers indexed yet');
+        } else {
+            lastLedger = state.lastLedger;
         }
         return res.status(503).json({ status: 'not_ready', reason: 'No ledgers indexed yet' });
     }
+
+    if (reasons.length > 0) {
+        return res.status(503).json({ status: 'not_ready', reasons });
+    }
+
+    res.json({ status: 'ready', lastLedger });
 });
 
 // Start the server

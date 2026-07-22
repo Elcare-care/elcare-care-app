@@ -40,8 +40,25 @@ vi.mock('../metrics.js', () => ({
   keeperFeeBumpsTotal:          { inc: vi.fn() },
 }));
 
+// ── Stellar SDK mock — gap-repair drives runBackfill without an injected
+// rpcServer, so the module-level `new rpc.Server(...)` must be a stub. ────────
+vi.mock('@stellar/stellar-sdk', () => ({
+  rpc: {
+    Server: class {
+      getLatestLedger() { return Promise.resolve({ sequence: 100_000 }); }
+      getLedgers() { return Promise.resolve({ ledgers: [{ hash: 'deadbeef' }] }); }
+      getEvents() { return Promise.resolve({ events: [], paginationToken: null }); }
+    },
+  },
+}));
+
+// ── Retry mock — single attempt, no back-off delays ──────────────────────────
+vi.mock('../retry.js', () => ({
+  withRetry: vi.fn((fn: () => Promise<unknown>) => fn()),
+}));
+
 // ── Prisma mock ───────────────────────────────────────────────────────────────
-const mockDb = {
+const mockDb = vi.hoisted(() => ({
   backfillJob: {
     create:     vi.fn(),
     findUnique: vi.fn(),
@@ -64,22 +81,24 @@ const mockDb = {
   },
   $queryRaw:    vi.fn(),
   $transaction: vi.fn(),
-};
+}));
 vi.mock('../db.js', () => ({ default: mockDb }));
 
 // ── Mock collectMarketplaceEvents ─────────────────────────────────────────────
-const mockCollect = vi.fn().mockResolvedValue([]);
+const mockCollect = vi.hoisted(() => vi.fn().mockResolvedValue([]));
 vi.mock('../event-sync.js', () => ({
   collectMarketplaceEvents: mockCollect,
   MAX_LEDGER_WINDOW: 17_280,
 }));
 
 // ── Mock poller helpers ───────────────────────────────────────────────────────
-const mockApply = vi.fn().mockResolvedValue([]);
-const mockBuild = vi.fn((l: number, h: string | null) => ({
-  lastLedger: l, ...(h ? { lastLedgerHash: h } : {}),
+const { mockApply, mockBuild, mockPersistGap } = vi.hoisted(() => ({
+  mockApply: vi.fn().mockResolvedValue([]),
+  mockBuild: vi.fn((l: number, h: string | null) => ({
+    lastLedger: l, ...(h ? { lastLedgerHash: h } : {}),
+  })),
+  mockPersistGap: vi.fn().mockResolvedValue(undefined),
 }));
-const mockPersistGap = vi.fn().mockResolvedValue(undefined);
 
 vi.mock('../poller.js', () => ({
   applyDecodedEvents:       mockApply,
@@ -113,6 +132,8 @@ function mockRpcServer() {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  process.env.MARKETPLACE_CONTRACT_ID = 'CTEST';
+  process.env.STELLAR_RPC_URL = 'https://rpc.test';
   // Default: advisory lock succeeds
   mockDb.$queryRaw.mockResolvedValue([{ acquired: true }]);
   // Default: syncState cursor at 0 (fresh DB)

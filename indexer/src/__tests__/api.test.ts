@@ -18,6 +18,13 @@ const mockPrisma = vi.hoisted(() => ({
   collection: {
     findMany: vi.fn(),
   },
+  auction: {
+    findMany: vi.fn(),
+    findUnique: vi.fn(),
+  },
+  bid: {
+    findMany: vi.fn(),
+  },
 }));
 
 const mockRedis = vi.hoisted(() => ({
@@ -66,6 +73,71 @@ const sampleEvent = {
   ledgerSequence: 100,
   ledgerTimestamp: new Date('2024-01-01T00:00:00Z'),
 };
+
+// ── GET /auctions/:id — bid history (#191) ───────────────────────────────────
+
+describe('GET /auctions/:id', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  const sampleAuction = {
+    auctionId: BigInt(11),
+    creator: 'GCREATOR',
+    collection: 'CAUC',
+    nftTokenId: BigInt(99),
+    token: 'CTOKEN',
+    reservePrice: '50000000.0000000',
+    highestBid: '65000000.0000000',
+    highestBidder: 'GBIDDER2',
+    endTime: BigInt(1800000000),
+    status: 'Active',
+    createdAtLedger: 600,
+    updatedAtLedger: 612,
+  };
+
+  it('returns the auction with its accumulated bid history, newest first', async () => {
+    mockPrisma.auction.findUnique.mockResolvedValue(sampleAuction);
+    mockPrisma.bid.findMany.mockResolvedValue([
+      { id: 2, auctionId: BigInt(11), bidder: 'GBIDDER2', amount: '65000000.0000000', ledgerSequence: 612 },
+      { id: 1, auctionId: BigInt(11), bidder: 'GBIDDER1', amount: '55000000.0000000', ledgerSequence: 610 },
+    ]);
+
+    const res = await request(app).get('/auctions/11');
+
+    expect(res.status).toBe(200);
+    expect(res.body.auctionId).toBe('11');
+    expect(res.body.bids).toHaveLength(2);
+    expect(res.body.bids[0].bidder).toBe('GBIDDER2');
+    expect(res.body.bids[1].bidder).toBe('GBIDDER1');
+    expect(mockPrisma.bid.findMany).toHaveBeenCalledWith({
+      where: { auctionId: BigInt(11) },
+      orderBy: [{ ledgerSequence: 'desc' }, { id: 'desc' }],
+    });
+  });
+
+  it('returns an empty bids array for an auction without bids', async () => {
+    mockPrisma.auction.findUnique.mockResolvedValue(sampleAuction);
+    mockPrisma.bid.findMany.mockResolvedValue([]);
+
+    const res = await request(app).get('/auctions/11');
+
+    expect(res.status).toBe(200);
+    expect(res.body.bids).toEqual([]);
+  });
+
+  it('returns 404 without querying bids when the auction does not exist', async () => {
+    mockPrisma.auction.findUnique.mockResolvedValue(null);
+
+    const res = await request(app).get('/auctions/999');
+
+    expect(res.status).toBe(404);
+    expect(mockPrisma.bid.findMany).not.toHaveBeenCalled();
+  });
+
+  it('rejects a non-numeric id with 400', async () => {
+    const res = await request(app).get('/auctions/not-a-number');
+    expect(res.status).toBe(400);
+  });
+});
 
 // ── GET /listings ─────────────────────────────────────────────────────────────
 

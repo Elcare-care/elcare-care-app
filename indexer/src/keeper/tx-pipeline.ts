@@ -26,7 +26,6 @@ import {
   Keypair,
   Account,
   nativeToScVal,
-  assembleTransaction,
   Transaction,
   FeeBumpTransaction,
 } from '@stellar/stellar-sdk';
@@ -159,7 +158,7 @@ export async function executeTransaction(
       networkPassphrase,
     })
       .addOperation(contract.call(method, ...args))
-      .setTimeout(cfg.KEEPER_SUBMIT_TIMEOUT_MS / 1000)
+      .setTimeout(Math.max(1, Math.ceil(cfg.KEEPER_SUBMIT_TIMEOUT_MS / 1000)))
       .build();
 
     // ── Simulate to obtain resource footprint ─────────────────────────────────
@@ -190,7 +189,7 @@ export async function executeTransaction(
       return { kind: 'transient_failure', error: new Error(errMsg) };
     }
 
-    assembledTx = assembleTransaction(builtTx, sim as rpc.Api.SimulateTransactionSuccessResponse).build();
+    assembledTx = rpc.assembleTransaction(builtTx, sim as rpc.Api.SimulateTransactionSuccessResponse).build();
     baseFeeStroops = Number((sim as rpc.Api.SimulateTransactionSuccessResponse).minResourceFee ?? BASE_FEE);
     break; // successful build
   }

@@ -240,7 +240,7 @@ export type KeeperConfig = z.infer<typeof keeperEnvSchema>;
 export function loadKeeperConfig(): KeeperConfig {
   const result = keeperEnvSchema.safeParse(process.env);
   if (!result.success) {
-    const messages = result.error.errors.map((e) => `  ${e.path.join('.')}: ${e.message}`).join('\n');
+    const messages = result.error.issues.map((e) => `  ${e.path.join('.')}: ${e.message}`).join('\n');
     throw new Error(`[keeper] Invalid configuration:\n${messages}`);
   }
 
