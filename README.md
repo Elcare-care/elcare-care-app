@@ -35,6 +35,7 @@ Every piece is verified on-chain — ensuring provenance and empowering artists 
 - [Overview](#overview)
 - [Key Features](#key-features)
 - [Architecture](#architecture)
+- [Architecture & Debugging Guides](#architecture--debugging-guides)
 - [Repository Structure](#repository-structure)
 - [Quick Start](#quick-start)
 - [API Reference](#api-reference)
@@ -134,6 +135,24 @@ The platform celebrates African heritage — from Benin bronze sculptures to Tin
            │   Pinata   │  IPFS — artwork images + NFT metadata JSON
            └────────────┘
 ```
+
+
+---
+
+## Architecture & Debugging Guides
+
+For detailed architectural walk-throughs, component boundaries, and step-by-step decision trees when troubleshooting issues, refer to our focused guides:
+
+| Guide | Description |
+|---|---|
+| 🏗️ **[Local Architecture](docs/guides/local-architecture.md)** | Full-stack local setup, service communication, and diagnostic flow |
+| 🦀 **[Contract Testing](docs/guides/contract-testing.md)** | Building WASM, executing Rust unit tests, and debugging contract errors |
+| 🔄 **[Indexer Ingestion](docs/guides/indexer-ingestion.md)** | RPC polling, re-org detection, stall recovery, and ledger gap backfilling |
+| 🏷️ **[Event Parsing](docs/guides/event-parsing.md)** | Soroban XDR event decoding, Zod schemas, and topic resolution |
+| 💻 **[Frontend Transaction Debugging](docs/guides/frontend-transaction-debugging.md)** | Wallet connection, transaction lifecycle, error mapping, and E2E testing |
+| 🚀 **[Deployment](docs/guides/deployment.md)** | Contract deployment, indexer containers, readiness probes, and Next.js builds |
+| 🗄️ **[Database Migrations](docs/guides/database-migrations.md)** | Prisma ORM schema updates, rollback resolution, and zero-downtime rules |
+| 🛡️ **[Security Triage](docs/guides/security-triage.md)** | Cargo Audit, npm Audit, Gitleaks, and Safe Redaction guidelines |
 
 ---
 
