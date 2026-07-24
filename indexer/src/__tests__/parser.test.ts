@@ -524,3 +524,42 @@ describe('parseMarketplaceEvent — deploy event fixtures', () => {
     expect(r.listingId).toBeNull();
   });
 });
+
+// ── Blocked-bidder events (Issue #199) ────────────────────────────────────────
+
+describe('parseMarketplaceEvent — AUCTION_BIDDER_BLOCKED / UNBLOCKED', () => {
+  beforeEach(() => { vi.resetAllMocks(); mockFromXDR.mockReturnValue({}); });
+
+  const BLOCKED_FIXTURE = { auction_id: 9n, bidder: 'GBIDDERADDRESS' };
+
+  it("maps 'auction_bidder_blocked' → 'AUCTION_BIDDER_BLOCKED'", () => {
+    setupMocks('auction_bidder_blocked', BLOCKED_FIXTURE);
+    const r = parseMarketplaceEvent(['t'], 'v', 500)!;
+    expect(r.eventType).toBe('AUCTION_BIDDER_BLOCKED');
+  });
+
+  it("maps 'auction_bidder_unblocked' → 'AUCTION_BIDDER_UNBLOCKED'", () => {
+    setupMocks('auction_bidder_unblocked', BLOCKED_FIXTURE);
+    const r = parseMarketplaceEvent(['t'], 'v', 501)!;
+    expect(r.eventType).toBe('AUCTION_BIDDER_UNBLOCKED');
+  });
+
+  it('extracts auction_id as listingId and bidder as actor', () => {
+    setupMocks('auction_bidder_blocked', BLOCKED_FIXTURE);
+    const r = parseMarketplaceEvent(['t'], 'v', 500)!;
+    expect(r.listingId).toBe(9n);
+    expect(r.actor).toBe('GBIDDERADDRESS');
+  });
+
+  it('persists the full bidder address in the data payload', () => {
+    setupMocks('auction_bidder_unblocked', BLOCKED_FIXTURE);
+    const r = parseMarketplaceEvent(['t'], 'v', 501)!;
+    expect(r.data.bidder).toBe('GBIDDERADDRESS');
+    expect(r.data.auction_id).toBe('9'); // BigInt serialised for the Json column
+  });
+
+  it('throws SchemaDecodeError when bidder is missing', () => {
+    setupMocks('auction_bidder_blocked', { auction_id: 9n });
+    expect(() => parseMarketplaceEvent(['t'], 'v', 1)).toThrow(/bidder/);
+  });
+});

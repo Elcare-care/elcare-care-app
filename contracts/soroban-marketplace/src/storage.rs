@@ -111,6 +111,11 @@ pub enum DataKey {
     /// listing or auction; a double-listing guard reads it and settlement /
     /// cancellation clears it.
     EscrowedToken(Address, u64),
+    /// Bounded (≤ MAX_BLOCKED_BIDDERS) list of addresses barred from bidding
+    /// on this auction (anti-shill-bidding registry, Issue #199).  Kept as a
+    /// separate per-auction key — not a field on `Auction` — so auctions that
+    /// never block anyone pay no extra storage.
+    AuctionBlockedBidders(u64),
 }
 
 /// Custody record for an NFT held by the marketplace, keyed by
@@ -785,6 +790,36 @@ pub fn load_auction_bids(env: &Env, auction_id: u64) -> soroban_sdk::Vec<BidReco
         bump_entry_ttl(env, &key);
     }
     value
+}
+
+// ── Blocked bidders (Issue #199) ─────────────────────────────
+
+pub fn load_blocked_bidders(env: &Env, auction_id: u64) -> Vec<Address> {
+    let key = DataKey::AuctionBlockedBidders(auction_id);
+    let value = env
+        .storage()
+        .persistent()
+        .get::<DataKey, Vec<Address>>(&key)
+        .unwrap_or_else(|| Vec::new(env));
+    if !value.is_empty() {
+        bump_entry_ttl(env, &key);
+    }
+    value
+}
+
+pub fn save_blocked_bidders(env: &Env, auction_id: u64, list: &Vec<Address>) {
+    let key = DataKey::AuctionBlockedBidders(auction_id);
+    if list.is_empty() {
+        // Drop the entry entirely so an emptied registry costs nothing.
+        env.storage().persistent().remove(&key);
+    } else {
+        env.storage().persistent().set(&key, list);
+        bump_entry_ttl(env, &key);
+    }
+}
+
+pub fn is_bidder_blocked(env: &Env, auction_id: u64, bidder: &Address) -> bool {
+    load_blocked_bidders(env, auction_id).contains(bidder)
 }
 
 pub fn set_paused(env: &Env, paused: bool) {

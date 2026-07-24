@@ -8451,3 +8451,219 @@ fn test_event_catalog_topics() {
     assert_eq!(crate::events::LISTING_CREATED, "listing_created");
     assert_eq!(crate::events::PROTOCOL_FEE_COLLECTED, "protocol_fee_collected");
 }
+
+// ════════════════════════════════════════════════════════════
+// SECTION 17: Blocked-bidder registry (Issue #199)
+// ════════════════════════════════════════════════════════════
+//
+// Acceptance criteria:
+//   1. A blocked bidder calling place_bid receives Unauthorized (#5).
+//   2. block_bidder / unblock_bidder are gated to the auction creator or admin.
+//   3. auction_bidder_blocked / auction_bidder_unblocked events are emitted.
+//   4. After unblock the bidder can bid normally again.
+//   5. The registry is capped at MAX_BLOCKED_BIDDERS (50) entries
+//      (BlockedListFull #45); blocking is idempotent.
+
+/// Fixture: a live auction by `artist` with a *distinct* admin, so the
+/// creator-path and admin-path authorization checks are genuinely different
+/// addresses.  Returns (env, client, creator, buyer, admin, token, auction_id).
+fn setup_blocked_bidder_auction() -> (
+    Env,
+    MarketplaceContractClient<'static>,
+    Address,
+    Address,
+    Address,
+    Address,
+    u64,
+) {
+    let (env, client, artist, buyer, token_id, _cid, collection_id) = setup();
+    let admin = Address::generate(&env);
+    client.set_admin(&admin);
+    client.add_token_to_whitelist(&token_id);
+    let auction_id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1_000_000_i128,
+        &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+    (env, client, artist, buyer, admin, token_id, auction_id)
+}
+
+#[test]
+fn test_blocked_bidder_cannot_bid() {
+    let (_env, client, artist, buyer, _admin, _t, auction_id) = setup_blocked_bidder_auction();
+
+    client.block_bidder(&artist, &auction_id, &buyer);
+
+    let result = client.try_place_bid(&buyer, &auction_id, &1_500_000_i128);
+    assert!(result.is_err(), "blocked bidder's bid must be rejected");
+    assert_eq!(
+        result.unwrap_err().unwrap(),
+        crate::types::MarketplaceError::Unauthorized.into(),
+        "blocked bidder must receive Unauthorized (#5)",
+    );
+}
+
+#[test]
+fn test_unblocked_bidder_can_bid_again() {
+    let (_env, client, artist, buyer, _admin, _t, auction_id) = setup_blocked_bidder_auction();
+
+    client.block_bidder(&artist, &auction_id, &buyer);
+    assert!(client.try_place_bid(&buyer, &auction_id, &1_500_000_i128).is_err());
+
+    client.unblock_bidder(&artist, &auction_id, &buyer);
+    client.place_bid(&buyer, &auction_id, &1_500_000_i128);
+
+    let auction = client.get_auction(&auction_id);
+    assert_eq!(auction.highest_bid, 1_500_000_i128);
+    assert_eq!(auction.highest_bidder, Some(buyer));
+}
+
+#[test]
+fn test_admin_can_block_and_unblock() {
+    let (_env, client, _artist, buyer, admin, _t, auction_id) = setup_blocked_bidder_auction();
+
+    // The contract admin — not the auction creator — manages the registry.
+    client.block_bidder(&admin, &auction_id, &buyer);
+    assert!(client.try_place_bid(&buyer, &auction_id, &1_500_000_i128).is_err());
+
+    client.unblock_bidder(&admin, &auction_id, &buyer);
+    client.place_bid(&buyer, &auction_id, &1_500_000_i128);
+    assert_eq!(client.get_auction(&auction_id).highest_bidder, Some(buyer));
+}
+
+#[test]
+fn test_stranger_cannot_manage_blocked_list() {
+    let (env, client, _artist, buyer, _admin, _t, auction_id) = setup_blocked_bidder_auction();
+
+    let stranger = Address::generate(&env);
+    let blocked = client.try_block_bidder(&stranger, &auction_id, &buyer);
+    assert_eq!(
+        blocked.unwrap_err().unwrap(),
+        crate::types::MarketplaceError::Unauthorized.into(),
+        "non-creator/non-admin must not block",
+    );
+    let unblocked = client.try_unblock_bidder(&stranger, &auction_id, &buyer);
+    assert_eq!(
+        unblocked.unwrap_err().unwrap(),
+        crate::types::MarketplaceError::Unauthorized.into(),
+        "non-creator/non-admin must not unblock",
+    );
+}
+
+#[test]
+fn test_block_bidder_emits_event() {
+    let (env, client, artist, buyer, _admin, _t, auction_id) = setup_blocked_bidder_auction();
+
+    client.block_bidder(&artist, &auction_id, &buyer);
+    assert!(
+        has_event_with_topic(&env.events().all(), "auction_bidder_blocked"),
+        "AuctionBidderBlockedEvent was not emitted",
+    );
+}
+
+#[test]
+fn test_unblock_bidder_emits_event() {
+    let (env, client, artist, buyer, _admin, _t, auction_id) = setup_blocked_bidder_auction();
+
+    client.block_bidder(&artist, &auction_id, &buyer);
+    client.unblock_bidder(&artist, &auction_id, &buyer);
+    assert!(
+        has_event_with_topic(&env.events().all(), "auction_bidder_unblocked"),
+        "AuctionBidderUnblockedEvent was not emitted",
+    );
+}
+
+#[test]
+fn test_block_bidder_is_idempotent() {
+    let (_env, client, artist, buyer, _admin, _t, auction_id) = setup_blocked_bidder_auction();
+
+    client.block_bidder(&artist, &auction_id, &buyer);
+    client.block_bidder(&artist, &auction_id, &buyer); // no-op, no panic
+    assert_eq!(client.get_blocked_bidders(&auction_id).len(), 1);
+}
+
+#[test]
+fn test_unblock_not_blocked_is_noop() {
+    let (env, client, artist, _buyer, _admin, _t, auction_id) = setup_blocked_bidder_auction();
+
+    let stranger = Address::generate(&env);
+    client.unblock_bidder(&artist, &auction_id, &stranger); // no-op, no panic
+    assert_eq!(client.get_blocked_bidders(&auction_id).len(), 0);
+    assert!(
+        !has_event_with_topic(&env.events().all(), "auction_bidder_unblocked"),
+        "no-op unblock must not emit an event",
+    );
+}
+
+#[test]
+fn test_get_blocked_bidders_view() {
+    let (env, client, artist, buyer, _admin, _t, auction_id) = setup_blocked_bidder_auction();
+
+    assert_eq!(client.get_blocked_bidders(&auction_id).len(), 0);
+    let other = Address::generate(&env);
+    client.block_bidder(&artist, &auction_id, &buyer);
+    client.block_bidder(&artist, &auction_id, &other);
+
+    let list = client.get_blocked_bidders(&auction_id);
+    assert_eq!(list.len(), 2);
+    assert!(list.contains(&buyer));
+    assert!(list.contains(&other));
+}
+
+#[test]
+fn test_blocked_list_cap_enforced() {
+    let (env, client, artist, _buyer, _admin, _t, auction_id) = setup_blocked_bidder_auction();
+
+    // Fill the registry to MAX_BLOCKED_BIDDERS (50) entries.
+    for _ in 0..50 {
+        client.block_bidder(&artist, &auction_id, &Address::generate(&env));
+    }
+    assert_eq!(client.get_blocked_bidders(&auction_id).len(), 50);
+
+    let result = client.try_block_bidder(&artist, &auction_id, &Address::generate(&env));
+    assert_eq!(
+        result.unwrap_err().unwrap(),
+        crate::types::MarketplaceError::BlockedListFull.into(),
+        "51st entry must revert with BlockedListFull (#45)",
+    );
+}
+
+#[test]
+fn test_block_bidder_unknown_auction() {
+    let (env, client, artist, _buyer, _admin, _t, _auction_id) = setup_blocked_bidder_auction();
+
+    let result = client.try_block_bidder(&artist, &999u64, &Address::generate(&env));
+    assert_eq!(
+        result.unwrap_err().unwrap(),
+        crate::types::MarketplaceError::AuctionNotFound.into(),
+    );
+}
+
+#[test]
+fn test_blocking_highest_bidder_is_not_retroactive() {
+    // Blocking bars future bids only: the already-escrowed highest bid stays
+    // live and is refunded through the normal outbid flow.
+    let (env, client, artist, buyer, _admin, token_id, auction_id) =
+        setup_blocked_bidder_auction();
+    let buyer2 = Address::generate(&env);
+    StellarAssetClient::new(&env, &token_id).mint(&buyer2, &100_000_000_000_i128);
+    let token = TokenClient::new(&env, &token_id);
+    let buyer_base = token.balance(&buyer);
+
+    client.place_bid(&buyer, &auction_id, &1_000_000_i128);
+    client.block_bidder(&artist, &auction_id, &buyer);
+
+    // Still the highest bidder — the escrowed bid was not evicted.
+    assert_eq!(client.get_auction(&auction_id).highest_bidder, Some(buyer.clone()));
+    // But any further bid from the blocked address is rejected.
+    assert!(client.try_place_bid(&buyer, &auction_id, &2_000_000_i128).is_err());
+
+    // A clean outbid refunds the blocked bidder in full, as usual.
+    client.place_bid(&buyer2, &auction_id, &2_000_000_i128);
+    assert_eq!(token.balance(&buyer), buyer_base, "outbid must refund the blocked bidder");
+    assert_eq!(client.get_auction(&auction_id).highest_bidder, Some(buyer2));
+}

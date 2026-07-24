@@ -60,6 +60,8 @@ const TOPIC_MAP: Record<string, string> = {
   'admin_proposal_cancelled':  'ADMIN_PROPOSAL_CANCELLED',
   'contract_paused':   'CONTRACT_PAUSED',
   'contract_unpaused': 'CONTRACT_UNPAUSED',
+  'auction_bidder_blocked':  'AUCTION_BIDDER_BLOCKED',
+  'auction_bidder_unblocked':  'AUCTION_BIDDER_UNBLOCKED',
   // Launchpad deploy events (topics[0] = "deploy", topics[1] = kind tag)
   'dep_n721':  'DEPLOY_NORMAL_721',
   'dep_n1155': 'DEPLOY_NORMAL_1155',

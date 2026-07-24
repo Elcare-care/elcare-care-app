@@ -30,6 +30,8 @@ pub const PROTOCOL_FEE_COLLECTED: &str = "protocol_fee_collected";
 pub const OFFER_RECLAIMED: &str = "offer_reclaimed";
 pub const NFT_ESCROWED: &str = "nft_escrowed";
 pub const NFT_RELEASED: &str = "nft_released";
+pub const AUCTION_BIDDER_BLOCKED: &str = "auction_bidder_blocked";
+pub const AUCTION_BIDDER_UNBLOCKED: &str = "auction_bidder_unblocked";
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -401,6 +403,48 @@ impl OfferReclaimedEvent {
     pub fn publish(self, env: &Env) {
         env.events().publish((soroban_sdk::Symbol::new(env, OFFER_RECLAIMED),), self);
     }
+}
+
+// ── Blocked-bidder Events (Issue #199) ────────────────────────────────────────
+
+/// Emitted when the auction creator or admin adds an address to the auction's
+/// blocked-bidder registry.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuctionBidderBlockedEvent {
+    pub auction_id: u64,
+    pub bidder: Address,
+}
+impl AuctionBidderBlockedEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events().publish((soroban_sdk::Symbol::new(env, AUCTION_BIDDER_BLOCKED),), self);
+    }
+}
+
+/// Emitted when a previously-blocked address is removed from the auction's
+/// blocked-bidder registry.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuctionBidderUnblockedEvent {
+    pub auction_id: u64,
+    pub bidder: Address,
+}
+impl AuctionBidderUnblockedEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events().publish((soroban_sdk::Symbol::new(env, AUCTION_BIDDER_UNBLOCKED),), self);
+    }
+}
+
+/// Emit `auction_bidder_blocked` for a newly-registered blocked address.
+pub fn emit_bidder_blocked(env: &Env, auction_id: u64, bidder: Address) {
+    AuctionBidderBlockedEvent { auction_id, bidder }.publish(env);
+}
+
+/// Emit `auction_bidder_unblocked` once an address is removed from the registry.
+pub fn emit_bidder_unblocked(env: &Env, auction_id: u64, bidder: Address) {
+    AuctionBidderUnblockedEvent { auction_id, bidder }.publish(env);
 }
 
 // ── NFT Escrow Events ─────────────────────────────────────────────────────────

@@ -18,10 +18,11 @@ use crate::{
         get_listing_count, get_max_price_storage, get_migration_progress, get_min_price_storage,
         get_pending_admin_storage, increment_auction_count, increment_listing_count,
         increment_offer_count, index_append, index_len, is_artist_revoked_storage,
-        is_migration_done, load_auction, load_auction_bids, load_listing, load_listing_offers,
-        load_offer, load_offerer_offers, load_pending_offer_ids, pending_offer_count,
-        release_auction_lock, release_listing_lock, remove_artist_revocation_storage,
-        remove_from_active_listings, remove_pending_offer, save_auction, save_listing, save_offer,
+        is_bidder_blocked, is_migration_done, load_auction, load_auction_bids, load_blocked_bidders,
+        load_listing, load_listing_offers, load_offer, load_offerer_offers, load_pending_offer_ids,
+        pending_offer_count, release_auction_lock, release_listing_lock,
+        remove_artist_revocation_storage, remove_from_active_listings, remove_pending_offer,
+        save_auction, save_blocked_bidders, save_listing, save_offer,
         set_artist_cancel_cursor, set_artist_revocation_storage,
         set_auction_extension_trigger_storage, set_auction_extension_window_storage,
         set_max_price_storage, set_migration_done, set_migration_progress, set_min_price_storage,
@@ -71,6 +72,11 @@ const MAX_BATCH_CANCEL: u32 = 10;
 /// fallback.
 const BID_HISTORY_CAP: u32 = 20;
 const MAX_OFFERS_PER_LISTING: u32 = 50;
+
+/// Maximum number of addresses one auction's blocked-bidder registry can hold
+/// (Issue #199).  Bounds the per-auction `AuctionBlockedBidders` entry so the
+/// `place_bid` membership scan and the storage footprint stay small.
+const MAX_BLOCKED_BIDDERS: u32 = 50;
 
 #[contract]
 pub struct MarketplaceContract;
@@ -1010,6 +1016,11 @@ impl MarketplaceContract {
             panic_with_error!(&env, MarketplaceError::AuctionExpired);
         }
         if bidder == auction.creator { panic_with_error!(&env, MarketplaceError::SelfBidNotAllowed); }
+        // Anti-shill-bidding registry (Issue #199): addresses the creator or
+        // admin has blocked for this auction may not bid.
+        if is_bidder_blocked(&env, auction_id, &bidder) {
+            panic_with_error!(&env, MarketplaceError::Unauthorized);
+        }
         let required_min = if auction.highest_bid == 0 {
             auction.reserve_price
         } else {
@@ -1116,6 +1127,51 @@ impl MarketplaceContract {
         // Return NFT to creator
         escrow::release_nft(&env, &auction.collection, auction.token_id,
             &creator, env.ledger().sequence(), auction_id);
+    }
+
+    // ── Blocked bidders (Issue #199) ─────────────────────────
+    // Per-auction anti-shill-bidding registry.  The auction creator or the
+    // contract admin can bar specific addresses from bidding; `place_bid`
+    // rejects a blocked address with `Unauthorized`.  Blocking is not
+    // retroactive: an already-escrowed highest bid stays in place and is
+    // settled or refunded through the normal auction flow.
+
+    pub fn block_bidder(env: Env, caller: Address, auction_id: u64, bidder: Address) {
+        caller.require_auth();
+        let auction = load_auction(&env, auction_id)
+            .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::AuctionNotFound));
+        Self::require_creator_or_admin(&env, &caller, &auction.creator);
+        let mut list = load_blocked_bidders(&env, auction_id);
+        if list.contains(&bidder) {
+            return; // idempotent — no duplicate entry, no duplicate event
+        }
+        if list.len() >= MAX_BLOCKED_BIDDERS {
+            panic_with_error!(&env, MarketplaceError::BlockedListFull);
+        }
+        list.push_back(bidder.clone());
+        save_blocked_bidders(&env, auction_id, &list);
+        emit_bidder_blocked(&env, auction_id, bidder);
+    }
+
+    pub fn unblock_bidder(env: Env, caller: Address, auction_id: u64, bidder: Address) {
+        caller.require_auth();
+        let auction = load_auction(&env, auction_id)
+            .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::AuctionNotFound));
+        Self::require_creator_or_admin(&env, &caller, &auction.creator);
+        let list = load_blocked_bidders(&env, auction_id);
+        if let Some(pos) = list.first_index_of(&bidder) {
+            let mut updated = list;
+            updated.remove(pos);
+            save_blocked_bidders(&env, auction_id, &updated);
+            emit_bidder_unblocked(&env, auction_id, bidder);
+        }
+        // Not present → idempotent no-op, mirroring block_bidder.
+    }
+
+    pub fn get_blocked_bidders(env: Env, auction_id: u64) -> Vec<Address> {
+        load_auction(&env, auction_id)
+            .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::AuctionNotFound));
+        load_blocked_bidders(&env, auction_id)
     }
 
     // ── Offers ───────────────────────────────────────────────
@@ -1470,6 +1526,25 @@ impl MarketplaceContract {
         let admin = env.storage().persistent()
             .get::<_, Address>(&key).expect("admin not set");
         admin.require_auth();
+    }
+
+    /// Authorize `caller` (already `require_auth`ed) as either the auction's
+    /// creator or the contract admin — the two roles allowed to manage a
+    /// blocked-bidder registry (Issue #199).
+    fn require_creator_or_admin(env: &Env, caller: &Address, creator: &Address) {
+        if caller == creator {
+            return;
+        }
+        if let Some(admin) = env
+            .storage()
+            .persistent()
+            .get::<_, Address>(&DataKey::Admin)
+        {
+            if *caller == admin {
+                return;
+            }
+        }
+        panic_with_error!(env, MarketplaceError::Unauthorized);
     }
 
     fn require_price_in_bounds(env: &Env, price: i128) {

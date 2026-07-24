@@ -99,6 +99,10 @@ pub enum MarketplaceError {
     /// an `EscrowedToken` record — the token backs another active listing or
     /// auction (double-listing guard).
     TokenAlreadyEscrowed = 44,
+    /// `block_bidder` would grow the auction's blocked-bidder registry past
+    /// `MAX_BLOCKED_BIDDERS` (50) entries.  The cap bounds per-auction storage
+    /// growth; unblock an existing entry to free a slot.
+    BlockedListFull = 45,
 }
 
 #[contracttype]

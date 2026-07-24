@@ -629,6 +629,66 @@ export async function finalizeAuction(
 }
 
 /**
+ * block_bidder — Auction creator or admin bars an address from bidding on
+ * this auction (anti-shill-bidding registry, Issue #199).
+ */
+export async function blockBidder(
+  callerPublicKey: string,
+  auctionId: number,
+  bidderAddress: string
+): Promise<boolean> {
+  const args: xdr.ScVal[] = [
+    new Address(callerPublicKey).toScVal(),
+    nativeToScVal(BigInt(auctionId), { type: "u64" }),
+    new Address(bidderAddress).toScVal(),
+  ];
+
+  await invokeContract(callerPublicKey, "block_bidder", args);
+  return true;
+}
+
+/**
+ * unblock_bidder — Remove an address from the auction's blocked-bidder
+ * registry (Issue #199).
+ */
+export async function unblockBidder(
+  callerPublicKey: string,
+  auctionId: number,
+  bidderAddress: string
+): Promise<boolean> {
+  const args: xdr.ScVal[] = [
+    new Address(callerPublicKey).toScVal(),
+    nativeToScVal(BigInt(auctionId), { type: "u64" }),
+    new Address(bidderAddress).toScVal(),
+  ];
+
+  await invokeContract(callerPublicKey, "unblock_bidder", args);
+  return true;
+}
+
+/**
+ * get_blocked_bidders — Read the auction's current blocked-bidder registry
+ * (read-only, Issue #199).
+ */
+export async function getBlockedBidders(auctionId: number): Promise<string[]> {
+  const callerPublicKey = await getReadOnlyCallerPublicKey();
+
+  const args: xdr.ScVal[] = [
+    nativeToScVal(BigInt(auctionId), { type: "u64" }),
+  ];
+
+  const retVal = await invokeContract(
+    callerPublicKey,
+    "get_blocked_bidders",
+    args,
+    true
+  );
+
+  const addrs = scValToNative(retVal) as string[];
+  return addrs.map(String);
+}
+
+/**
  * get_auction — Fetch a single auction by ID (read-only).
  */
 export async function getAuction(auctionId: number): Promise<Auction> {
