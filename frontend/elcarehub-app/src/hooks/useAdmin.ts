@@ -16,7 +16,12 @@ import {
     isArtistRevoked,
     addTokenToWhitelist,
     removeTokenFromWhitelist,
-    getTokenWhitelist
+    getTokenWhitelist,
+    getPendingAdmin,
+    proposeAdmin,
+    acceptAdmin,
+    cancelAdminProposal,
+    type PendingAdminProposal
 } from "@/lib/contract";
 import { Horizon } from "@stellar/stellar-sdk";
 import { config } from "@/lib/config";
@@ -189,6 +194,85 @@ export function useTokenManagement(adminPublicKey: string | null) {
     };
 
     return { whitelistedTokens, whitelist, unwhitelist, isLoading, isProcessing, error, refresh };
+}
+
+/**
+ * Two-step admin key rotation (Issue #202).
+ *
+ * Loads the currently-pending proposal (if any) and exposes propose / accept /
+ * cancel actions.  The pending proposal is refreshed after every mutating call
+ * so the UI countdown and available actions stay in sync with chain state.
+ */
+export function useAdminTransfer(currentPublicKey: string | null) {
+    const [pending, setPending] = useState<PendingAdminProposal | null>(null);
+    const [isLoading, setIsLoading] = useState(false);
+    const [isProcessing, setIsProcessing] = useState(false);
+    const [error, setError] = useState<string | null>(null);
+
+    const refresh = useCallback(async () => {
+        setIsLoading(true);
+        try {
+            setPending(await getPendingAdmin());
+        } catch {
+            setPending(null);
+        } finally {
+            setIsLoading(false);
+        }
+    }, []);
+
+    useEffect(() => {
+        refresh();
+    }, [refresh]);
+
+    const propose = async (candidate: string) => {
+        if (!currentPublicKey) return false;
+        setIsProcessing(true);
+        setError(null);
+        try {
+            await proposeAdmin(currentPublicKey, candidate);
+            await refresh();
+            return true;
+        } catch (err: unknown) {
+            setError(err instanceof Error ? err.message : "Proposal failed");
+            return false;
+        } finally {
+            setIsProcessing(false);
+        }
+    };
+
+    const accept = async () => {
+        if (!currentPublicKey) return false;
+        setIsProcessing(true);
+        setError(null);
+        try {
+            await acceptAdmin(currentPublicKey);
+            await refresh();
+            return true;
+        } catch (err: unknown) {
+            setError(err instanceof Error ? err.message : "Accept failed");
+            return false;
+        } finally {
+            setIsProcessing(false);
+        }
+    };
+
+    const cancel = async () => {
+        if (!currentPublicKey) return false;
+        setIsProcessing(true);
+        setError(null);
+        try {
+            await cancelAdminProposal(currentPublicKey);
+            await refresh();
+            return true;
+        } catch (err: unknown) {
+            setError(err instanceof Error ? err.message : "Cancel failed");
+            return false;
+        } finally {
+            setIsProcessing(false);
+        }
+    };
+
+    return { pending, isLoading, isProcessing, error, refresh, propose, accept, cancel };
 }
 
 export function useAdminCheck(currentPublicKey: string | null) {

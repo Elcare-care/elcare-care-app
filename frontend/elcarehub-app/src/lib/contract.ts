@@ -864,3 +864,74 @@ export async function getAdmin(): Promise<string | null> {
     return null;
   }
 }
+
+// ── Admin key rotation (two-step propose → accept, Issue #202) ─────────────────
+
+/** A pending admin-rotation proposal read from `get_pending_admin`. */
+export interface PendingAdminProposal {
+  /** Address invited to become the new admin. */
+  candidate: string;
+  /** Absolute unix timestamp (seconds) after which the proposal can no longer be accepted. */
+  expiresAt: number;
+}
+
+/**
+ * transfer_admin — Step 1: the current admin proposes a new admin.
+ *
+ * The on-chain entry point is `transfer_admin(current_admin, new_admin)`; it
+ * stamps the proposal with a 7-day acceptance deadline.
+ */
+export async function proposeAdmin(
+  currentAdminPublicKey: string,
+  candidatePublicKey: string
+): Promise<boolean> {
+  const args: xdr.ScVal[] = [
+    new Address(currentAdminPublicKey).toScVal(),
+    new Address(candidatePublicKey).toScVal(),
+  ];
+  await invokeContract(currentAdminPublicKey, "transfer_admin", args);
+  return true;
+}
+
+/**
+ * accept_admin — Step 2: the proposed candidate accepts and becomes admin.
+ * Fails on-chain if the proposal has expired or the caller is not the candidate.
+ */
+export async function acceptAdmin(candidatePublicKey: string): Promise<boolean> {
+  const args: xdr.ScVal[] = [new Address(candidatePublicKey).toScVal()];
+  await invokeContract(candidatePublicKey, "accept_admin", args);
+  return true;
+}
+
+/**
+ * cancel_admin_proposal — the current admin cancels a still-pending proposal.
+ */
+export async function cancelAdminProposal(
+  currentAdminPublicKey: string
+): Promise<boolean> {
+  const args: xdr.ScVal[] = [new Address(currentAdminPublicKey).toScVal()];
+  await invokeContract(currentAdminPublicKey, "cancel_admin_proposal", args);
+  return true;
+}
+
+/**
+ * get_pending_admin — read the currently-pending admin proposal, or null.
+ * Returns `Option<PendingAdminProposal { candidate, expires_at }>`.
+ */
+export async function getPendingAdmin(): Promise<PendingAdminProposal | null> {
+  const callerPublicKey = await getReadOnlyCallerPublicKey();
+  try {
+    const retVal = await invokeContract(callerPublicKey, "get_pending_admin", [], true);
+    const native = scValToNative(retVal) as
+      | { candidate: unknown; expires_at: unknown }
+      | null
+      | undefined;
+    if (!native) return null;
+    return {
+      candidate: (native.candidate as Address).toString(),
+      expiresAt: Number(native.expires_at),
+    };
+  } catch {
+    return null;
+  }
+}
