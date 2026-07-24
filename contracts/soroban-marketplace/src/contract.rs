@@ -15,17 +15,15 @@ use crate::{
         get_active_listing_ids_range, get_artist_auction_ids,
         get_artist_cancel_cursor, get_artist_listing_ids, get_auction_count,
         get_auction_extension_trigger_storage, get_auction_extension_window_storage,
-        get_listing_count, get_max_price_storage, get_migration_progress, get_min_price_storage,
-        get_pending_admin_storage, increment_auction_count, increment_listing_count,
-        increment_offer_count, index_append, index_len, is_artist_revoked_storage,
-        is_migration_done, load_auction, load_auction_bids, load_listing, load_listing_offers,
-        load_offer, load_offerer_offers, load_pending_offer_ids, pending_offer_count,
-        release_auction_lock, release_listing_lock, remove_artist_revocation_storage,
-        remove_from_active_listings, remove_pending_offer, save_auction, save_listing, save_offer,
-        set_artist_cancel_cursor, set_artist_revocation_storage,
-        set_auction_extension_trigger_storage, set_auction_extension_window_storage,
-        set_max_price_storage, set_migration_done, set_migration_progress, set_min_price_storage,
-        set_pending_admin_storage, take_legacy_index_vec, DataKey, IndexId,
+        get_listing_count, get_max_price_storage, get_min_price_storage, get_pending_admin_storage,
+        increment_auction_count, increment_listing_count, increment_offer_count,
+        is_artist_revoked_storage, is_migration_done, load_auction, load_auction_bids,
+        load_listing, load_listing_offers, load_offer, load_offerer_offers, release_auction_lock,
+        release_listing_lock, remove_artist_revocation_storage, remove_from_active_listings,
+        save_auction, save_listing, save_listing_offers, save_offer, save_offerer_offers,
+        set_artist_revocation_storage, set_auction_extension_trigger_storage,
+        set_auction_extension_window_storage, set_max_price_storage, set_migration_done,
+        set_min_price_storage, set_pending_admin_storage, PendingAdminProposal,
     },
     types::{
         Auction, AuctionStatus, BidRecord, CancelReason, Listing, ListingStatus, MarketplaceError,
@@ -38,6 +36,15 @@ const CONTRACT_VERSION: &str = "1.1.0";
 const DEFAULT_MIN_BID_INCREMENT: i128 = 1;
 const DEFAULT_EXTENSION_WINDOW: u64 = 600;
 const DEFAULT_EXTENSION_TRIGGER: u64 = 0;
+
+/// Lifetime of a pending admin-rotation proposal, in seconds (7 days).
+///
+/// `transfer_admin` stamps each proposal with
+/// `expires_at = env.ledger().timestamp() + ADMIN_PROPOSAL_TTL`.  Once that
+/// deadline passes, `accept_admin` reverts with `AdminProposalExpired`, so a
+/// proposal that is never accepted or cancelled cannot leave the contract in a
+/// half-transferred governance state indefinitely.
+const ADMIN_PROPOSAL_TTL: u64 = 604_800; // 7 days
 
 /// Minimum auction duration in seconds (1 hour).
 ///
@@ -85,6 +92,10 @@ impl MarketplaceContract {
             .get::<_, Address>(&crate::storage::DataKey::Admin)
     }
 
+    /// Step 1 of the two-step admin rotation: the current admin proposes a
+    /// candidate.  The proposal is stamped with an `expires_at` deadline
+    /// (`now + ADMIN_PROPOSAL_TTL`); a second call overwrites any still-pending
+    /// proposal (and its deadline) with the new candidate.
     pub fn transfer_admin(env: Env, current_admin: Address, new_admin: Address) {
         current_admin.require_auth();
         let stored = Self::get_admin(env.clone())
@@ -92,16 +103,32 @@ impl MarketplaceContract {
         if current_admin != stored {
             panic_with_error!(&env, MarketplaceError::Unauthorized);
         }
-        set_pending_admin_storage(&env, &new_admin);
-        AdminTransferProposedEvent { current_admin, proposed_admin: new_admin }.publish(&env);
+        let expires_at = env.ledger().timestamp() + ADMIN_PROPOSAL_TTL;
+        set_pending_admin_storage(
+            &env,
+            &PendingAdminProposal {
+                candidate: new_admin.clone(),
+                expires_at,
+            },
+        );
+        emit_admin_proposed(&env, current_admin, new_admin, expires_at);
     }
 
+    /// Step 2 of the two-step admin rotation: the proposed candidate accepts.
+    ///
+    /// Reverts with `NoAdminProposalPending` if no proposal is active,
+    /// `Unauthorized` if the caller is not the proposed candidate, and
+    /// `AdminProposalExpired` if the proposal's `expires_at` deadline has
+    /// passed.
     pub fn accept_admin(env: Env, new_admin: Address) {
         new_admin.require_auth();
         let pending = get_pending_admin_storage(&env)
-            .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::Unauthorized));
-        if new_admin != pending {
+            .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::NoAdminProposalPending));
+        if new_admin != pending.candidate {
             panic_with_error!(&env, MarketplaceError::Unauthorized);
+        }
+        if env.ledger().timestamp() > pending.expires_at {
+            panic_with_error!(&env, MarketplaceError::AdminProposalExpired);
         }
         let old_admin = Self::get_admin(env.clone())
             .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::Unauthorized));
@@ -113,7 +140,29 @@ impl MarketplaceContract {
             crate::storage::LEDGER_TTL_BUMP,
         );
         clear_pending_admin_storage(&env);
-        AdminTransferredEvent { old_admin, new_admin }.publish(&env);
+        emit_admin_accepted(&env, old_admin, new_admin);
+    }
+
+    /// Cancel a still-pending admin proposal.  Callable only by the current
+    /// admin.  Reverts with `NoAdminProposalPending` when no proposal is
+    /// active, so cancelling is idempotent-by-error rather than silent.
+    pub fn cancel_admin_proposal(env: Env, current_admin: Address) {
+        current_admin.require_auth();
+        let stored = Self::get_admin(env.clone())
+            .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::Unauthorized));
+        if current_admin != stored {
+            panic_with_error!(&env, MarketplaceError::Unauthorized);
+        }
+        let pending = get_pending_admin_storage(&env)
+            .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::NoAdminProposalPending));
+        clear_pending_admin_storage(&env);
+        emit_admin_proposal_cancelled(&env, current_admin, pending.candidate);
+    }
+
+    /// View: the currently-pending admin proposal (candidate + `expires_at`),
+    /// or `None` when no rotation is in progress.
+    pub fn get_pending_admin(env: Env) -> Option<PendingAdminProposal> {
+        get_pending_admin_storage(&env)
     }
 
     // ── Versioning & Migration ───────────────────────────────

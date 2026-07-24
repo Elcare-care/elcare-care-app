@@ -13,6 +13,24 @@ const positiveInt = (max: number) =>
 
 const optionalString = z.string().optional();
 
+// ── Cursor pagination fields (shared across list endpoints) ───────────────────
+//
+// cursor_ledger    : ledgerSequence value to paginate from (exclusive boundary).
+// cursor_direction : "desc" (default, newest-first) | "asc" (oldest-first).
+//
+// When cursor_ledger is provided the endpoint uses:
+//   DESC → WHERE updatedAtLedger < cursor_ledger  (next older page)
+//   ASC  → WHERE updatedAtLedger > cursor_ledger  (next newer page)
+//
+// Responses include:
+//   X-Next-Cursor  : ledgerSequence of the last item returned, or "" when exhausted.
+//   X-Total-Count  : total matching rows (independent COUNT query).
+
+const cursorFields = {
+  cursor_ledger:    z.coerce.number().int().min(0).optional(),
+  cursor_direction: z.enum(['asc', 'desc']).optional().default('desc'),
+};
+
 // ── Per-endpoint schemas ──────────────────────────────────────────────────────
 
 export const listingsQuerySchema = z.object({
@@ -24,11 +42,15 @@ export const listingsQuerySchema = z.object({
   maxPrice: z.coerce.number().nonnegative().optional(),
   limit:    positiveInt(1000).optional(),
   offset:   positiveInt(10_000).optional(),
+  ...cursorFields,
 });
 
 export const auctionsQuerySchema = z.object({
   creator: optionalString,
   status:  optionalString,
+  limit:   positiveInt(1000).optional(),
+  offset:  positiveInt(10_000).optional(),
+  ...cursorFields,
 });
 
 export const offersQuerySchema = z.object({
@@ -36,21 +58,23 @@ export const offersQuerySchema = z.object({
     .string()
     .regex(/^\d+$/, 'listing_id must be a non-negative integer')
     .optional(),
-  // Terminal/pending statuses plus two derived filters:
-  //   'expired'   — still Pending but past its expires_at deadline
-  //   'reclaimed' — Withdrawn via an OFFER_RECLAIMED on-chain event
-  status: z
-    .enum(['Pending', 'Accepted', 'Rejected', 'Withdrawn', 'expired', 'reclaimed'])
-    .optional(),
+  limit:  positiveInt(1000).optional(),
+  offset: positiveInt(10_000).optional(),
+  ...cursorFields,
 });
 
 export const walletActivityQuerySchema = z.object({
-  limit: positiveInt(200).optional(),
+  limit:  positiveInt(200).optional(),
+  offset: positiveInt(10_000).optional(),
+  ...cursorFields,
 });
 
 export const collectionsQuerySchema = z.object({
   kind:    optionalString,
   creator: optionalString,
+  limit:   positiveInt(1000).optional(),
+  offset:  positiveInt(10_000).optional(),
+  ...cursorFields,
 });
 
 export const statsQuerySchema = z.object({

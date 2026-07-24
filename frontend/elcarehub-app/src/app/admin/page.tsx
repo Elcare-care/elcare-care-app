@@ -5,8 +5,9 @@
 "use client";
 
 import { useState, useCallback, useEffect } from "react";
+import { StrKey } from "@stellar/stellar-sdk";
 import { useWallet } from "@/hooks/useWallet";
-import { useAdminStats, useModeration, useTokenManagement, useAdminCheck } from "@/hooks/useAdmin";
+import { useAdminStats, useModeration, useTokenManagement, useAdminCheck, useAdminTransfer } from "@/hooks/useAdmin";
 import { useAdminSession } from "@/hooks/useAdminSession";
 import { AdminConfirmationModal } from "@/components/AdminConfirmationModal";
 import {
@@ -25,9 +26,36 @@ import {
     CheckCircle2,
     AlertCircle,
     KeyRound,
-    History
+    History,
+    ArrowRightLeft,
+    Clock,
+    X,
+    ChevronRight,
+    AlertTriangle
 } from "lucide-react";
 import { stroopsToXlm } from "@/lib/contract";
+
+// ── Admin key rotation helpers (Issue #202) ───────────────────────────────────
+
+/** True for a well-formed Stellar ed25519 public key (G...). */
+function isValidStellarAddress(addr: string): boolean {
+    try {
+        return StrKey.isValidEd25519PublicKey(addr.trim());
+    } catch {
+        return false;
+    }
+}
+
+/** Render seconds-remaining as "6d 23h 12m 04s"; "Expired" once elapsed. */
+function formatCountdown(secondsRemaining: number): string {
+    if (secondsRemaining <= 0) return "Expired";
+    const d = Math.floor(secondsRemaining / 86400);
+    const h = Math.floor((secondsRemaining % 86400) / 3600);
+    const m = Math.floor((secondsRemaining % 3600) / 60);
+    const s = Math.floor(secondsRemaining % 60);
+    const pad = (n: number) => String(n).padStart(2, "0");
+    return `${d}d ${pad(h)}h ${pad(m)}m ${pad(s)}s`;
+}
 
 export default function AdminPage() {
     const { publicKey } = useWallet();
@@ -45,6 +73,27 @@ export default function AdminPage() {
     } = useTokenManagement(publicKey);
 
     const { isAuthenticated, authenticate, logout, sessionExpiresIn } = useAdminSession();
+
+    // Admin key rotation (Issue #202)
+    const {
+        pending: pendingAdmin,
+        isProcessing: isRotating,
+        error: rotationError,
+        propose: proposeNewAdmin,
+        accept: acceptAdminTransfer,
+        cancel: cancelAdminTransfer,
+    } = useAdminTransfer(publicKey);
+
+    const [isWizardOpen, setIsWizardOpen] = useState(false);
+    // A once-per-second clock so the proposal countdown ticks live.
+    const [nowSeconds, setNowSeconds] = useState(() => Math.floor(Date.now() / 1000));
+    useEffect(() => {
+        const id = setInterval(() => setNowSeconds(Math.floor(Date.now() / 1000)), 1000);
+        return () => clearInterval(id);
+    }, []);
+    const secondsRemaining = pendingAdmin ? pendingAdmin.expiresAt - nowSeconds : 0;
+    const isConnectedWalletCandidate =
+        !!pendingAdmin && !!publicKey && pendingAdmin.candidate === publicKey;
 
     // Local state for moderation search
     const [artistSearch, setArtistSearch] = useState("");
@@ -155,6 +204,51 @@ export default function AdminPage() {
         return (
             <div className="flex h-[80vh] items-center justify-center">
                 <Loader2 className="h-10 w-10 animate-spin text-brand-500" />
+            </div>
+        );
+    }
+
+    // A non-admin wallet that is the pending candidate gets a focused Accept view
+    // instead of Access Denied, so it can complete the two-step rotation.
+    if (!isAdmin && isConnectedWalletCandidate && pendingAdmin) {
+        const expired = secondsRemaining <= 0;
+        return (
+            <div className="flex min-h-[80vh] flex-col items-center justify-center px-4 text-center">
+                <div className="mb-6 rounded-full bg-brand-100 p-6">
+                    <KeyRound className="h-12 w-12 text-brand-600" />
+                </div>
+                <h1 className="font-display text-4xl font-bold tracking-tight text-midnight-900 sm:text-5xl">
+                    Admin Transfer Pending
+                </h1>
+                <p className="mt-4 max-w-lg text-lg text-gray-600">
+                    The current administrator has proposed transferring admin authority to
+                    <span className="font-semibold text-midnight-900"> your connected wallet</span>.
+                    Accept to take over administration of the marketplace.
+                </p>
+
+                <div className={`mt-8 flex items-center gap-2 rounded-2xl px-5 py-3 text-sm font-semibold ${expired ? "bg-red-50 text-red-700" : "bg-brand-50 text-brand-700"}`}>
+                    <Clock className="h-4 w-4" />
+                    {expired
+                        ? "This proposal has expired and can no longer be accepted."
+                        : `Acceptance window closes in ${formatCountdown(secondsRemaining)}`}
+                </div>
+
+                {rotationError && (
+                    <div className="mt-4 flex items-center gap-2 rounded-xl bg-red-50 p-4 text-sm text-red-600 border border-red-100">
+                        <AlertCircle className="h-4 w-4" />
+                        {rotationError}
+                    </div>
+                )}
+
+                <button
+                    type="button"
+                    disabled={isRotating || expired}
+                    onClick={async () => { await acceptAdminTransfer(); }}
+                    className="mt-8 flex items-center gap-2 rounded-2xl bg-brand-600 px-8 py-4 text-lg font-bold text-white shadow-lg shadow-brand-200 transition-all hover:bg-brand-700 active:scale-95 disabled:opacity-50"
+                >
+                    {isRotating ? <Loader2 className="h-6 w-6 animate-spin" /> : <CheckCircle2 className="h-6 w-6" />}
+                    Accept Admin Transfer
+                </button>
             </div>
         );
     }
@@ -483,6 +577,85 @@ export default function AdminPage() {
                             )}
                         </div>
                     </section>
+
+                    {/* Admin Key Rotation Panel (Issue #202) */}
+                    <section className="lg:col-span-2 rounded-3xl bg-white p-8 shadow-sm border border-brand-100">
+                        <div className="mb-6 flex items-center gap-3">
+                            <div className="rounded-xl bg-red-100 p-2.5">
+                                <KeyRound className="h-6 w-6 text-red-600" />
+                            </div>
+                            <h2 className="font-display text-2xl font-bold text-midnight-950">Admin Key Rotation</h2>
+                        </div>
+
+                        {rotationError && (
+                            <div className="mb-6 flex items-center gap-2 rounded-xl bg-red-50 p-4 text-sm text-red-600 border border-red-100">
+                                <AlertCircle className="h-4 w-4" />
+                                {rotationError}
+                            </div>
+                        )}
+
+                        {pendingAdmin ? (
+                            <div className="rounded-2xl border border-amber-200 bg-amber-50/60 p-6">
+                                <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+                                    <div className="flex flex-col gap-2">
+                                        <span className="inline-flex w-fit items-center gap-1.5 rounded-full bg-amber-100 px-3 py-1 text-xs font-bold uppercase tracking-wider text-amber-700">
+                                            <ArrowRightLeft className="h-3 w-3" />
+                                            Transfer Pending
+                                        </span>
+                                        <div>
+                                            <span className="text-xs font-bold uppercase tracking-wider text-gray-400">Proposed New Admin</span>
+                                            <code className="mt-1 block break-all font-mono text-sm font-medium text-midnight-900">
+                                                {pendingAdmin.candidate}
+                                            </code>
+                                        </div>
+                                    </div>
+                                    <div className={`flex items-center gap-2 rounded-xl px-4 py-3 text-sm font-bold ${secondsRemaining <= 0 ? "bg-red-100 text-red-700" : "bg-white text-midnight-900 border border-amber-200"}`}>
+                                        <Clock className="h-4 w-4" />
+                                        <span className="font-mono">{formatCountdown(secondsRemaining)}</span>
+                                    </div>
+                                </div>
+
+                                <div className="mt-6 flex flex-wrap gap-3">
+                                    <button
+                                        type="button"
+                                        disabled={isRotating}
+                                        onClick={async () => { await cancelAdminTransfer(); }}
+                                        className="flex items-center gap-2 rounded-full bg-red-50 px-6 py-2.5 text-sm font-bold text-red-700 transition-all hover:bg-red-100 disabled:opacity-50 border border-red-100"
+                                    >
+                                        {isRotating ? <Loader2 className="h-4 w-4 animate-spin" /> : <X className="h-4 w-4" />}
+                                        Cancel Proposal
+                                    </button>
+
+                                    {isConnectedWalletCandidate && (
+                                        <button
+                                            type="button"
+                                            disabled={isRotating || secondsRemaining <= 0}
+                                            onClick={async () => { await acceptAdminTransfer(); }}
+                                            className="flex items-center gap-2 rounded-full bg-brand-600 px-6 py-2.5 text-sm font-bold text-white transition-all hover:bg-brand-700 disabled:opacity-50 shadow-md shadow-brand-200"
+                                        >
+                                            {isRotating ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />}
+                                            Accept Admin
+                                        </button>
+                                    )}
+                                </div>
+                            </div>
+                        ) : (
+                            <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+                                <p className="max-w-xl text-gray-600">
+                                    Transfer administrative control of the marketplace to a new wallet using a safe,
+                                    two-step process. The new admin has 7 days to accept before the proposal expires.
+                                </p>
+                                <button
+                                    type="button"
+                                    onClick={() => setIsWizardOpen(true)}
+                                    className="flex shrink-0 items-center gap-2 rounded-full bg-midnight-900 px-6 py-3 text-sm font-bold text-white transition-all hover:bg-midnight-800"
+                                >
+                                    <ArrowRightLeft className="h-4 w-4" />
+                                    Start Admin Transfer
+                                </button>
+                            </div>
+                        )}
+                    </section>
                 </div>
             </div >
 
@@ -496,7 +669,200 @@ export default function AdminPage() {
                 variant={confirmConfig.variant}
                 isProcessing={isModerating || isManagingTokens}
             />
+
+            <AdminTransferWizard
+                isOpen={isWizardOpen}
+                isProcessing={isRotating}
+                onClose={() => setIsWizardOpen(false)}
+                onSubmit={async (candidate) => {
+                    const ok = await proposeNewAdmin(candidate);
+                    if (ok) setIsWizardOpen(false);
+                    return ok;
+                }}
+            />
         </div >
+    );
+}
+
+// ── Admin Transfer Wizard (Issue #202) ────────────────────────────────────────
+
+/**
+ * Three-step modal that guides the current admin through proposing a new admin:
+ *   1. Enter the candidate Stellar address (validated).
+ *   2. Acknowledge the 7-day acceptance window and its implications.
+ *   3. Confirm and submit the `transfer_admin` (propose) transaction.
+ */
+function AdminTransferWizard({
+    isOpen,
+    isProcessing,
+    onClose,
+    onSubmit,
+}: {
+    isOpen: boolean;
+    isProcessing: boolean;
+    onClose: () => void;
+    onSubmit: (candidate: string) => Promise<boolean>;
+}) {
+    const [step, setStep] = useState<1 | 2 | 3>(1);
+    const [candidate, setCandidate] = useState("");
+
+    // Reset to a clean state whenever the modal is (re)opened.
+    useEffect(() => {
+        if (isOpen) {
+            setStep(1);
+            setCandidate("");
+        }
+    }, [isOpen]);
+
+    if (!isOpen) return null;
+
+    const trimmed = candidate.trim();
+    const isValid = isValidStellarAddress(trimmed);
+
+    return (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-midnight-950/50 p-4 backdrop-blur-sm">
+            <div className="w-full max-w-lg rounded-3xl bg-white p-8 shadow-2xl">
+                {/* Header */}
+                <div className="mb-6 flex items-center justify-between">
+                    <div className="flex items-center gap-3">
+                        <div className="rounded-xl bg-red-100 p-2.5">
+                            <KeyRound className="h-6 w-6 text-red-600" />
+                        </div>
+                        <h3 className="font-display text-2xl font-bold text-midnight-950">Transfer Admin</h3>
+                    </div>
+                    <button
+                        type="button"
+                        aria-label="Close"
+                        onClick={onClose}
+                        className="rounded-lg p-2 text-gray-400 transition-all hover:bg-gray-100 hover:text-gray-600"
+                    >
+                        <X className="h-5 w-5" />
+                    </button>
+                </div>
+
+                {/* Step indicator */}
+                <div className="mb-8 flex items-center gap-2">
+                    {[1, 2, 3].map((s) => (
+                        <div
+                            key={s}
+                            className={`h-1.5 flex-1 rounded-full transition-colors ${s <= step ? "bg-brand-500" : "bg-gray-200"}`}
+                        />
+                    ))}
+                </div>
+
+                {/* Step 1 — candidate address */}
+                {step === 1 && (
+                    <div>
+                        <label className="mb-2 block text-sm font-bold text-midnight-900">
+                            New Admin Stellar Address
+                        </label>
+                        <input
+                            type="text"
+                            autoFocus
+                            placeholder="G..."
+                            value={candidate}
+                            onChange={(e) => setCandidate(e.target.value)}
+                            className="w-full rounded-xl border border-gray-200 px-4 py-3 font-mono text-sm focus:border-brand-500 focus:outline-none focus:ring-1 focus:ring-brand-500"
+                        />
+                        {trimmed.length > 0 && !isValid && (
+                            <p className="mt-2 flex items-center gap-1.5 text-xs font-medium text-red-600">
+                                <AlertCircle className="h-3.5 w-3.5" />
+                                Not a valid Stellar public key (must start with G and be 56 characters).
+                            </p>
+                        )}
+                        {isValid && (
+                            <p className="mt-2 flex items-center gap-1.5 text-xs font-medium text-green-600">
+                                <CheckCircle2 className="h-3.5 w-3.5" />
+                                Valid Stellar address.
+                            </p>
+                        )}
+                        <div className="mt-8 flex justify-end">
+                            <button
+                                type="button"
+                                disabled={!isValid}
+                                onClick={() => setStep(2)}
+                                className="flex items-center gap-2 rounded-full bg-midnight-900 px-6 py-2.5 text-sm font-bold text-white transition-all hover:bg-midnight-800 disabled:opacity-40"
+                            >
+                                Continue
+                                <ChevronRight className="h-4 w-4" />
+                            </button>
+                        </div>
+                    </div>
+                )}
+
+                {/* Step 2 — warning */}
+                {step === 2 && (
+                    <div>
+                        <div className="rounded-2xl border border-amber-200 bg-amber-50 p-5">
+                            <div className="mb-3 flex items-center gap-2 text-amber-800">
+                                <AlertTriangle className="h-5 w-5" />
+                                <span className="font-bold">Please read carefully</span>
+                            </div>
+                            <ul className="space-y-2 text-sm text-amber-900">
+                                <li>• The proposed admin has <strong>7 days</strong> to accept before the proposal expires.</li>
+                                <li>• Until they accept, <strong>you remain the admin</strong> and can cancel the proposal at any time.</li>
+                                <li>• Once accepted, <strong>this wallet loses all admin rights</strong> and cannot reverse the transfer.</li>
+                                <li>• Ensure the address below is correct and that you control it or trust its owner.</li>
+                            </ul>
+                        </div>
+                        <div className="mt-4 rounded-xl bg-gray-50 p-4">
+                            <span className="text-xs font-bold uppercase tracking-wider text-gray-400">New Admin</span>
+                            <code className="mt-1 block break-all font-mono text-sm text-midnight-900">{trimmed}</code>
+                        </div>
+                        <div className="mt-8 flex justify-between">
+                            <button
+                                type="button"
+                                onClick={() => setStep(1)}
+                                className="rounded-full px-6 py-2.5 text-sm font-bold text-gray-500 transition-all hover:bg-gray-100"
+                            >
+                                Back
+                            </button>
+                            <button
+                                type="button"
+                                onClick={() => setStep(3)}
+                                className="flex items-center gap-2 rounded-full bg-midnight-900 px-6 py-2.5 text-sm font-bold text-white transition-all hover:bg-midnight-800"
+                            >
+                                I Understand
+                                <ChevronRight className="h-4 w-4" />
+                            </button>
+                        </div>
+                    </div>
+                )}
+
+                {/* Step 3 — confirm + submit */}
+                {step === 3 && (
+                    <div>
+                        <p className="text-gray-600">
+                            You are about to propose <span className="font-semibold text-midnight-900">a new marketplace administrator</span>.
+                            This submits an on-chain transaction from your wallet.
+                        </p>
+                        <div className="mt-4 rounded-xl bg-gray-50 p-4">
+                            <span className="text-xs font-bold uppercase tracking-wider text-gray-400">Proposing</span>
+                            <code className="mt-1 block break-all font-mono text-sm text-midnight-900">{trimmed}</code>
+                        </div>
+                        <div className="mt-8 flex justify-between">
+                            <button
+                                type="button"
+                                disabled={isProcessing}
+                                onClick={() => setStep(2)}
+                                className="rounded-full px-6 py-2.5 text-sm font-bold text-gray-500 transition-all hover:bg-gray-100 disabled:opacity-40"
+                            >
+                                Back
+                            </button>
+                            <button
+                                type="button"
+                                disabled={isProcessing || !isValid}
+                                onClick={async () => { await onSubmit(trimmed); }}
+                                className="flex items-center gap-2 rounded-full bg-brand-600 px-6 py-2.5 text-sm font-bold text-white transition-all hover:bg-brand-700 disabled:opacity-50 shadow-md shadow-brand-200"
+                            >
+                                {isProcessing ? <Loader2 className="h-4 w-4 animate-spin" /> : <ArrowRightLeft className="h-4 w-4" />}
+                                Submit Proposal
+                            </button>
+                        </div>
+                    </div>
+                )}
+            </div>
+        </div>
     );
 }
 

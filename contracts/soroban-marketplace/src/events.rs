@@ -17,6 +17,7 @@ pub const OFFER_WITHDRAWN: &str = "offer_withdrawn";
 pub const ROYALTY_PAID: &str = "royalty_paid";
 pub const ADMIN_TRANSFER_PROPOSED: &str = "admin_transfer_proposed";
 pub const ADMIN_TRANSFERRED: &str = "admin_transferred";
+pub const ADMIN_PROPOSAL_CANCELLED: &str = "admin_proposal_cancelled";
 pub const ARTIST_REVOKED: &str = "artist_revoked";
 pub const ARTIST_REINSTATED: &str = "artist_reinstated";
 pub const CONTRACT_PAUSED: &str = "contract_paused";
@@ -290,12 +291,24 @@ impl ArtistReinstatedEvent {
 pub struct AdminTransferProposedEvent {
     pub current_admin: Address,
     pub proposed_admin: Address,
+    /// Absolute ledger timestamp after which the proposal can no longer be
+    /// accepted.  Lets indexers/frontends render a countdown without a
+    /// separate view call.
+    pub expires_at: u64,
 }
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdminTransferredEvent {
     pub old_admin: Address,
     pub new_admin: Address,
+}
+/// Emitted when the current admin cancels a still-pending admin proposal via
+/// `cancel_admin_proposal` before it was accepted or expired.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminProposalCancelledEvent {
+    pub current_admin: Address,
+    pub cancelled_candidate: Address,
 }
 impl AdminTransferProposedEvent {
     #[allow(deprecated)]
@@ -308,6 +321,56 @@ impl AdminTransferredEvent {
     pub fn publish(self, env: &Env) {
         env.events().publish((soroban_sdk::Symbol::new(env, ADMIN_TRANSFERRED),), self);
     }
+}
+impl AdminProposalCancelledEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events().publish((soroban_sdk::Symbol::new(env, ADMIN_PROPOSAL_CANCELLED),), self);
+    }
+}
+
+// ── Admin-transfer event emitters ─────────────────────────────────────────────
+//
+// Thin constructors so the contract layer emits admin-rotation events through a
+// single, named entry point (Issue #202) instead of building event structs
+// inline at each call site.
+
+/// Emit `admin_transfer_proposed` for a newly-created rotation proposal.
+pub fn emit_admin_proposed(
+    env: &Env,
+    current_admin: Address,
+    proposed_admin: Address,
+    expires_at: u64,
+) {
+    AdminTransferProposedEvent {
+        current_admin,
+        proposed_admin,
+        expires_at,
+    }
+    .publish(env);
+}
+
+/// Emit `admin_transferred` once a proposal is accepted and authority moves.
+pub fn emit_admin_accepted(env: &Env, old_admin: Address, new_admin: Address) {
+    AdminTransferredEvent {
+        old_admin,
+        new_admin,
+    }
+    .publish(env);
+}
+
+/// Emit `admin_proposal_cancelled` when the current admin clears a pending
+/// proposal before acceptance/expiry.
+pub fn emit_admin_proposal_cancelled(
+    env: &Env,
+    current_admin: Address,
+    cancelled_candidate: Address,
+) {
+    AdminProposalCancelledEvent {
+        current_admin,
+        cancelled_candidate,
+    }
+    .publish(env);
 }
 
 #[contracttype]

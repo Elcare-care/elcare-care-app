@@ -180,11 +180,18 @@ export interface ArtistReinstatedData {
 export interface AdminTransferProposedData {
   current_admin: string;
   proposed_admin: string;
+  /** Absolute ledger timestamp after which the proposal can no longer be accepted. */
+  expires_at: bigint;
 }
 
 export interface AdminTransferredData {
   old_admin: string;
   new_admin: string;
+}
+
+export interface AdminProposalCancelledData {
+  current_admin: string;
+  cancelled_candidate: string;
 }
 
 export interface ContractPausedData {
@@ -421,6 +428,9 @@ export const ADMIN_TRANSFER_PROPOSED_SCHEMA: ContractEventSchema = {
   data: [
     { name: 'current_admin', type: 'string' },
     { name: 'proposed_admin', type: 'string' },
+    // Added by Issue #202: the proposal's acceptance deadline.
+    // `optional` so events emitted before the upgrade still decode.
+    { name: 'expires_at', type: 'bigint', optional: true },
   ],
 };
 
@@ -429,6 +439,14 @@ export const ADMIN_TRANSFERRED_SCHEMA: ContractEventSchema = {
   data: [
     { name: 'old_admin', type: 'string' },
     { name: 'new_admin', type: 'string' },
+  ],
+};
+
+export const ADMIN_PROPOSAL_CANCELLED_SCHEMA: ContractEventSchema = {
+  type: 'ADMIN_PROPOSAL_CANCELLED',
+  data: [
+    { name: 'current_admin', type: 'string' },
+    { name: 'cancelled_candidate', type: 'string' },
   ],
 };
 
@@ -480,6 +498,7 @@ export const SCHEMA_REGISTRY: Map<string, ContractEventSchema> = new Map([
   ['ARTIST_REINSTATED', ARTIST_REINSTATED_SCHEMA],
   ['ADMIN_TRANSFER_PROPOSED', ADMIN_TRANSFER_PROPOSED_SCHEMA],
   ['ADMIN_TRANSFERRED', ADMIN_TRANSFERRED_SCHEMA],
+  ['ADMIN_PROPOSAL_CANCELLED', ADMIN_PROPOSAL_CANCELLED_SCHEMA],
   ['CONTRACT_PAUSED', CONTRACT_PAUSED_SCHEMA],
   ['CONTRACT_UNPAUSED', CONTRACT_UNPAUSED_SCHEMA],
   // Deploy events share a common tuple structure; each variant is registered separately.

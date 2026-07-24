@@ -10,12 +10,21 @@ import {
   openGapsGauge,
   openGapLedgersTotalGauge,
   duplicateEventsCounter,
+  listingsCreatedTotal,
+  salesTotalCounter,
+  auctionFinalizationsTotal,
+  offersMadeTotal,
+  offersAcceptedTotal,
+  activeListingsGauge,
+  activeAuctionsGauge,
+  syncLagLedgersGauge,
+  eventProcessingDurationHistogram,
 } from './metrics.js';
 import { recordProgress } from './stall.js';
 import { collectMarketplaceEvents, MAX_LEDGER_WINDOW } from './event-sync.js';
 import { withRpcRetry } from './retry.js';
 import { logger } from './logger.js';
-import redis from './redis.js';
+import redis, { invalidatePattern, invalidateKey } from './redis.js';
 import { loadConfig, parseTrackedContracts } from './config.js';
 import { enqueueIpfsFetch } from './ipfs-cache.js';
 
@@ -539,8 +548,14 @@ export async function applyDecodedEvents(decodedEvents: any[], tx: any) {
 
 export async function processEvent(event: any, tx?: any, skipInsert = false) {
   const { eventType, listingId, actor, ledgerSequence, data } = event;
-
   const db = tx ?? prisma;
+
+  // ── Measure per-event-type processing time ────────────────────────────────
+  const eventStart = process.hrtime();
+  const recordEventDuration = () => {
+    const [s, ns] = process.hrtime(eventStart);
+    eventProcessingDurationHistogram.labels(eventType).observe(s + ns / 1e9);
+  };
 
   if (!skipInsert) {
     await db.marketplaceEvent.create({
@@ -582,63 +597,52 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
           deployedAtLedger: ledgerSequence,
         },
       });
+      // Invalidate collections cache
+      invalidatePattern('cache:*/collections*').catch(() => {});
     }
+    recordEventDuration();
     return;
   }
 
   // Update Listing state based on event type
-  if (!listingId) return;
+  if (!listingId) { recordEventDuration(); return; }
 
   switch (eventType) {
     case 'LISTING_CREATED': {
       let chainListing = await fetchListingFromChain(listingId);
-      if (chainListing && !chainListing.artist) {
-        chainListing = null;
-      }
-      
-      const artist = chainListing ? chainListing.artist.toString() : data.artist;
-      const price = chainListing ? chainListing.price.toString() : data.price;
-      const currency = chainListing ? chainListing.currency.toString() : data.currency;
-      const collection = chainListing ? chainListing.collection.toString() : data.collection;
-      const nftTokenId = chainListing ? BigInt(chainListing.token_id) : BigInt(data.token_id);
-      const token = chainListing ? chainListing.token.toString() : (data.token || '');
-      
-      const recipients = chainListing 
-        ? chainListing.recipients.map((r: any) => ({
-            address: r.address.toString(),
-            percentage: Number(r.percentage)
-          }))
+      if (chainListing && !chainListing.artist) chainListing = null;
+
+      const artist     = chainListing ? chainListing.artist.toString()      : data.artist;
+      const price      = chainListing ? chainListing.price.toString()       : data.price;
+      const currency   = chainListing ? chainListing.currency.toString()    : data.currency;
+      const collection = chainListing ? chainListing.collection.toString()  : data.collection;
+      const nftTokenId = chainListing ? BigInt(chainListing.token_id)       : BigInt(data.token_id);
+      const token      = chainListing ? chainListing.token.toString()       : (data.token || '');
+      const recipients = chainListing
+        ? chainListing.recipients.map((r: any) => ({ address: r.address.toString(), percentage: Number(r.percentage) }))
         : [];
 
       await db.listing.upsert({
         where: { listingId },
         create: {
-          listingId,
-          artist,
-          owner: null,
-          price,
-          currency,
-          collection,
-          nftTokenId,
-          token,
-          status: 'Active' as const,
-          recipients,
-          createdAtLedger: ledgerSequence,
-          updatedAtLedger: ledgerSequence,
+          listingId, artist, owner: null, price, currency, collection,
+          nftTokenId, token, status: 'Active' as const, recipients,
+          createdAtLedger: ledgerSequence, updatedAtLedger: ledgerSequence,
         },
         update: {
-          artist,
-          price,
-          collection,
-          nftTokenId,
-          status: 'Active' as const,
-          recipients,
-          updatedAtLedger: ledgerSequence,
-        }
+          artist, price, collection, nftTokenId,
+          status: 'Active' as const, recipients, updatedAtLedger: ledgerSequence,
+        },
       });
 
-      // Enqueue a background IPFS metadata fetch using the token CID.
-      // Fire-and-forget — a fetch failure must never crash the indexing path.
+      // ── Metrics & cache invalidation ──────────────────────────────────────
+      listingsCreatedTotal.labels(collection ?? 'unknown').inc();
+      invalidatePattern('cache:*/listings*').catch(() => {});
+      invalidateKey(`cache:/listings/${listingId.toString()}`).catch(() => {});
+      // Refresh active-listing gauge asynchronously (best-effort)
+      prisma.listing.count({ where: { status: 'Active' } })
+        .then((n) => activeListingsGauge.set(n)).catch(() => {});
+
       if (token) {
         enqueueIpfsFetch(token).catch((err) => {
           logger.warn('[processEvent] Failed to enqueue IPFS fetch', {
@@ -660,95 +664,88 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
         },
       });
       if (count === 0) logger.warn('LISTING_UPDATED: listing not found', { listingId: listingId?.toString(), ledger: ledgerSequence });
+      invalidatePattern('cache:*/listings*').catch(() => {});
+      invalidateKey(`cache:/listings/${listingId.toString()}`).catch(() => {});
+      break;
+    }
+
+    case 'LISTING_PRICE_UPDATED':
+    case 'LISTING_EXPIRED': {
+      invalidatePattern('cache:*/listings*').catch(() => {});
+      invalidateKey(`cache:/listings/${listingId.toString()}`).catch(() => {});
       break;
     }
 
     case 'ARTWORK_SOLD': {
       const { count } = await db.listing.updateMany({
         where: { listingId },
-        data: {
-          status: 'Sold' as const,
-          owner: data.buyer,
-          updatedAtLedger: ledgerSequence,
-        },
+        data: { status: 'Sold' as const, owner: data.buyer, updatedAtLedger: ledgerSequence },
       });
       if (count === 0) logger.error('ARTWORK_SOLD: listing not found — sale not recorded', { listingId: listingId?.toString(), ledger: ledgerSequence });
+
+      // ── Metrics & cache invalidation ──────────────────────────────────────
+      salesTotalCounter.labels(data.token ?? 'unknown').inc();
+      invalidatePattern('cache:*/listings*').catch(() => {});
+      invalidateKey(`cache:/listings/${listingId.toString()}`).catch(() => {});
+      prisma.listing.count({ where: { status: 'Active' } })
+        .then((n) => activeListingsGauge.set(n)).catch(() => {});
       break;
     }
 
     case 'LISTING_CANCELLED': {
       const { count } = await db.listing.updateMany({
         where: { listingId },
-        data: {
-          status: 'Cancelled' as const,
-          updatedAtLedger: ledgerSequence,
-        },
+        data: { status: 'Cancelled' as const, updatedAtLedger: ledgerSequence },
       });
       if (count === 0) logger.warn('LISTING_CANCELLED: listing not found', { listingId: listingId?.toString(), ledger: ledgerSequence });
+      invalidatePattern('cache:*/listings*').catch(() => {});
+      invalidateKey(`cache:/listings/${listingId.toString()}`).catch(() => {});
+      prisma.listing.count({ where: { status: 'Active' } })
+        .then((n) => activeListingsGauge.set(n)).catch(() => {});
       break;
     }
-    
+
     case 'AUCTION_CREATED': {
       let chainAuction = await fetchAuctionFromChain(listingId);
-      if (chainAuction && !chainAuction.creator) {
-        chainAuction = null;
-      }
-      
-      const creator = chainAuction ? chainAuction.creator.toString() : data.creator;
-      const reservePrice = chainAuction ? chainAuction.reserve_price.toString() : (data.reserve_price || '0');
-      const token = chainAuction ? chainAuction.token.toString() : (data.token || '');
-      const endTime = chainAuction ? BigInt(chainAuction.end_time) : BigInt(data.end_time || 0);
-      const collection = chainAuction ? chainAuction.collection.toString() : data.collection;
-      const nftTokenId = chainAuction ? BigInt(chainAuction.token_id) : BigInt(data.token_id || 0);
-      const recipients = chainAuction 
-        ? chainAuction.recipients.map((r: any) => ({
-            address: r.address.toString(),
-            percentage: Number(r.percentage)
-          }))
+      if (chainAuction && !chainAuction.creator) chainAuction = null;
+
+      const creator      = chainAuction ? chainAuction.creator.toString()         : data.creator;
+      const reservePrice = chainAuction ? chainAuction.reserve_price.toString()   : (data.reserve_price || '0');
+      const token        = chainAuction ? chainAuction.token.toString()           : (data.token || '');
+      const endTime      = chainAuction ? BigInt(chainAuction.end_time)           : BigInt(data.end_time || 0);
+      const collection   = chainAuction ? chainAuction.collection.toString()      : data.collection;
+      const nftTokenId   = chainAuction ? BigInt(chainAuction.token_id)           : BigInt(data.token_id || 0);
+      const recipients   = chainAuction
+        ? chainAuction.recipients.map((r: any) => ({ address: r.address.toString(), percentage: Number(r.percentage) }))
         : [];
 
       await db.auction.upsert({
         where: { auctionId: listingId },
         create: {
-          auctionId: listingId,
-          creator,
-          collection,
-          nftTokenId,
-          token,
-          reservePrice,
-          highestBid: '0',
-          highestBidder: null,
-          endTime,
-          status: 'Active' as const,
-          recipients,
-          createdAtLedger: ledgerSequence,
-          updatedAtLedger: ledgerSequence,
+          auctionId: listingId, creator, collection, nftTokenId, token, reservePrice,
+          highestBid: '0', highestBidder: null, endTime, status: 'Active' as const,
+          recipients, createdAtLedger: ledgerSequence, updatedAtLedger: ledgerSequence,
         },
         update: {
-          creator,
-          collection,
-          nftTokenId,
-          token,
-          reservePrice,
-          endTime,
-          status: 'Active' as const,
-          recipients,
-          updatedAtLedger: ledgerSequence,
-        }
+          creator, collection, nftTokenId, token, reservePrice, endTime,
+          status: 'Active' as const, recipients, updatedAtLedger: ledgerSequence,
+        },
       });
+
+      invalidatePattern('cache:*/auctions*').catch(() => {});
+      prisma.auction.count({ where: { status: 'Active' } })
+        .then((n) => activeAuctionsGauge.set(n)).catch(() => {});
       break;
     }
 
     case 'BID_PLACED': {
       const { count } = await db.auction.updateMany({
         where: { auctionId: listingId },
-        data: {
-          highestBid: data.bid_amount,
-          highestBidder: data.bidder,
-          updatedAtLedger: ledgerSequence,
-        }
+        data: { highestBid: data.bid_amount, highestBidder: data.bidder, updatedAtLedger: ledgerSequence },
       });
       if (count === 0) logger.warn('BID_PLACED: auction not found', { auctionId: listingId?.toString(), ledger: ledgerSequence });
+      invalidatePattern('cache:*/auctions*').catch(() => {});
+      invalidateKey(`cache:/auctions/${listingId.toString()}`).catch(() => {});
       break;
     }
 
@@ -760,21 +757,31 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
           highestBid: data.amount,
           highestBidder: data.winner || null,
           updatedAtLedger: ledgerSequence,
-        }
+        },
       });
       if (count === 0) logger.error('AUCTION_RESOLVED: auction not found — resolution not recorded', { auctionId: listingId?.toString(), ledger: ledgerSequence });
+
+      auctionFinalizationsTotal.inc();
+      invalidatePattern('cache:*/auctions*').catch(() => {});
+      invalidateKey(`cache:/auctions/${listingId.toString()}`).catch(() => {});
+      prisma.auction.count({ where: { status: 'Active' } })
+        .then((n) => activeAuctionsGauge.set(n)).catch(() => {});
       break;
     }
 
-    case 'AUCTION_CANCELLED': {
-      const { count } = await db.auction.updateMany({
-        where: { auctionId: listingId },
-        data: {
-          status: 'Cancelled' as const,
-          updatedAtLedger: ledgerSequence,
-        },
-      });
-      if (count === 0) logger.warn('AUCTION_CANCELLED: auction not found', { auctionId: listingId?.toString(), ledger: ledgerSequence });
+    case 'AUCTION_CANCELLED':
+    case 'AUCTION_EXTENDED': {
+      if (eventType === 'AUCTION_CANCELLED') {
+        const { count } = await db.auction.updateMany({
+          where: { auctionId: listingId },
+          data: { status: 'Cancelled' as const, updatedAtLedger: ledgerSequence },
+        });
+        if (count === 0) logger.warn('AUCTION_CANCELLED: auction not found', { auctionId: listingId?.toString(), ledger: ledgerSequence });
+        prisma.auction.count({ where: { status: 'Active' } })
+          .then((n) => activeAuctionsGauge.set(n)).catch(() => {});
+      }
+      invalidatePattern('cache:*/auctions*').catch(() => {});
+      invalidateKey(`cache:/auctions/${listingId.toString()}`).catch(() => {});
       break;
     }
 
@@ -801,50 +808,50 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
           status: 'Pending' as const,
           expiresAt: offerExpiresAt,
           updatedAtLedger: ledgerSequence,
-        }
+        },
       });
+      offersMadeTotal.inc();
+      invalidatePattern(`cache:*/offers*listing=${data.listing_id}*`).catch(() => {});
       break;
     }
 
     case 'OFFER_ACCEPTED': {
       await db.offer.update({
         where: { offerId: BigInt(data.offer_id) },
-        data: {
-          status: 'Accepted' as const,
-          updatedAtLedger: ledgerSequence,
-        }
+        data: { status: 'Accepted' as const, updatedAtLedger: ledgerSequence },
       });
       const { count: listingCount } = await db.listing.updateMany({
         where: { listingId: BigInt(data.listing_id) },
-        data: {
-          status: 'Sold' as const,
-          owner: data.offerer,
-          updatedAtLedger: ledgerSequence,
-        }
+        data: { status: 'Sold' as const, owner: data.offerer, updatedAtLedger: ledgerSequence },
       });
-      if (listingCount === 0) logger.error('OFFER_ACCEPTED: listing not found — offer accepted but listing not updated', { listingId: data.listing_id?.toString(), offerId: data.offer_id?.toString(), ledger: ledgerSequence });
+      if (listingCount === 0) logger.error('OFFER_ACCEPTED: listing not found', { listingId: data.listing_id?.toString(), offerId: data.offer_id?.toString(), ledger: ledgerSequence });
+
+      offersAcceptedTotal.inc();
+      salesTotalCounter.labels(data.token ?? 'unknown').inc();
+      invalidatePattern(`cache:*/offers*listing=${data.listing_id}*`).catch(() => {});
+      invalidatePattern('cache:*/listings*').catch(() => {});
+      invalidateKey(`cache:/listings/${data.listing_id?.toString()}`).catch(() => {});
+      prisma.listing.count({ where: { status: 'Active' } })
+        .then((n) => activeListingsGauge.set(n)).catch(() => {});
       break;
     }
 
     case 'OFFER_REJECTED': {
       await db.offer.update({
         where: { offerId: BigInt(data.offer_id) },
-        data: {
-          status: 'Rejected' as const,
-          updatedAtLedger: ledgerSequence,
-        }
+        data: { status: 'Rejected' as const, updatedAtLedger: ledgerSequence },
       });
+      invalidatePattern(`cache:*/offers*listing=${data.listing_id}*`).catch(() => {});
       break;
     }
 
-    case 'OFFER_WITHDRAWN': {
+    case 'OFFER_WITHDRAWN':
+    case 'OFFER_RECLAIMED': {
       await db.offer.update({
         where: { offerId: BigInt(data.offer_id) },
-        data: {
-          status: 'Withdrawn' as const,
-          updatedAtLedger: ledgerSequence,
-        }
+        data: { status: 'Withdrawn' as const, updatedAtLedger: ledgerSequence },
       });
+      invalidatePattern(`cache:*/offers*listing=${data.listing_id}*`).catch(() => {});
       break;
     }
 
@@ -865,6 +872,12 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
       break;
     }
   }
+
+  // ── Update sync lag gauge ─────────────────────────────────────────────────
+  // (best-effort, non-blocking)
+  syncLagLedgersGauge.set(Math.max(0, (networkLatestLedgerGauge as any)._getValue?.() ?? 0));
+
+  recordEventDuration();
 
   // Broadcast to any connected SSE clients after the DB write is complete.
   if (!tx) emitSSEEvent(event);

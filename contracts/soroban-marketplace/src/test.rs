@@ -1829,6 +1829,118 @@ fn test_transfer_admin_wrong_caller_panics() {
     client.transfer_admin(&impostor, &new_admin);
 }
 
+// ── Admin proposal timeout / cancel tests (Issue #202) ──────────
+
+#[test]
+fn test_admin_proposal_stores_candidate_and_expiry() {
+    let (env, client, admin, _, _token_id, _contract_id, _collection_id) = setup();
+    let candidate = Address::generate(&env);
+    client.set_admin(&admin);
+
+    let now = env.ledger().timestamp();
+    client.transfer_admin(&admin, &candidate);
+
+    let pending = client.get_pending_admin().expect("a proposal should be pending");
+    assert_eq!(pending.candidate, candidate);
+    // 7 days = 604_800 seconds (ADMIN_PROPOSAL_TTL).
+    assert_eq!(pending.expires_at, now + 604_800);
+}
+
+#[test]
+fn test_get_pending_admin_none_when_no_proposal() {
+    let (_env, client, admin, _, _token_id, _contract_id, _collection_id) = setup();
+    client.set_admin(&admin);
+    assert!(client.get_pending_admin().is_none());
+}
+
+#[test]
+fn test_accept_admin_after_expiry_fails() {
+    let (env, client, admin, _, _token_id, _contract_id, _collection_id) = setup();
+    let candidate = Address::generate(&env);
+    client.set_admin(&admin);
+    client.transfer_admin(&admin, &candidate);
+
+    // Advance the ledger clock 1 second past the 7-day acceptance window.
+    env.ledger().set_timestamp(env.ledger().timestamp() + 604_800 + 1);
+
+    let res = client.try_accept_admin(&candidate);
+    assert!(res.is_err(), "accept after expiry must revert (AdminProposalExpired)");
+    // Authority did not move, and the stale proposal is still on record.
+    assert_eq!(client.get_admin(), Some(admin));
+    assert!(client.get_pending_admin().is_some());
+}
+
+#[test]
+fn test_accept_admin_at_deadline_succeeds() {
+    let (env, client, admin, _, _token_id, _contract_id, _collection_id) = setup();
+    let candidate = Address::generate(&env);
+    client.set_admin(&admin);
+    client.transfer_admin(&admin, &candidate);
+
+    // Exactly at expires_at is still valid — expiry uses a strict `>` check.
+    env.ledger().set_timestamp(env.ledger().timestamp() + 604_800);
+    client.accept_admin(&candidate);
+
+    assert_eq!(client.get_admin(), Some(candidate));
+    assert!(client.get_pending_admin().is_none());
+}
+
+#[test]
+fn test_cancel_admin_proposal_clears_pending() {
+    let (env, client, admin, _, _token_id, _contract_id, _collection_id) = setup();
+    let candidate = Address::generate(&env);
+    client.set_admin(&admin);
+    client.transfer_admin(&admin, &candidate);
+    assert!(client.get_pending_admin().is_some());
+
+    client.cancel_admin_proposal(&admin);
+    assert!(client.get_pending_admin().is_none(), "cancel must clear the pending slot");
+
+    // With nothing pending, the former candidate can no longer accept.
+    assert!(client.try_accept_admin(&candidate).is_err());
+    assert_eq!(client.get_admin(), Some(admin));
+}
+
+#[test]
+#[should_panic]
+fn test_cancel_admin_proposal_not_admin_panics() {
+    let (env, client, admin, _, _token_id, _contract_id, _collection_id) = setup();
+    let candidate = Address::generate(&env);
+    let impostor = Address::generate(&env);
+    client.set_admin(&admin);
+    client.transfer_admin(&admin, &candidate);
+    // Only the current admin may cancel — impostor must panic Unauthorized.
+    client.cancel_admin_proposal(&impostor);
+}
+
+#[test]
+fn test_cancel_admin_proposal_when_none_pending_fails() {
+    let (_env, client, admin, _, _token_id, _contract_id, _collection_id) = setup();
+    client.set_admin(&admin);
+    // Nothing has been proposed — cancel must revert (NoAdminProposalPending).
+    assert!(client.try_cancel_admin_proposal(&admin).is_err());
+}
+
+#[test]
+fn test_double_propose_overwrites_candidate() {
+    let (env, client, admin, _, _token_id, _contract_id, _collection_id) = setup();
+    let first = Address::generate(&env);
+    let second = Address::generate(&env);
+    client.set_admin(&admin);
+
+    client.transfer_admin(&admin, &first);
+    client.transfer_admin(&admin, &second);
+
+    // Only the most recent candidate remains pending.
+    let pending = client.get_pending_admin().expect("a proposal should be pending");
+    assert_eq!(pending.candidate, second);
+
+    // The superseded candidate can no longer accept; the current one can.
+    assert!(client.try_accept_admin(&first).is_err());
+    client.accept_admin(&second);
+    assert_eq!(client.get_admin(), Some(second));
+}
+
 #[test]
 #[should_panic]
 fn test_accept_admin_wrong_caller_panics() {
