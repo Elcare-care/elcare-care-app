@@ -113,6 +113,8 @@ export interface OfferMadeData {
   offerer: string;
   amount: bigint;
   token: string;
+  /** Optional expiry (ledger timestamp); absent when the offer never expires. */
+  expires_at?: bigint;
 }
 
 export interface OfferAcceptedData {
@@ -343,6 +345,7 @@ export const OFFER_MADE_SCHEMA: ContractEventSchema = {
     { name: 'offerer', type: 'string' },
     { name: 'amount', type: 'bigint' },
     { name: 'token', type: 'string' },
+    { name: 'expires_at', type: 'bigint', optional: true },
   ],
 };
 

@@ -36,6 +36,12 @@ export const offersQuerySchema = z.object({
     .string()
     .regex(/^\d+$/, 'listing_id must be a non-negative integer')
     .optional(),
+  // Terminal/pending statuses plus two derived filters:
+  //   'expired'   — still Pending but past its expires_at deadline
+  //   'reclaimed' — Withdrawn via an OFFER_RECLAIMED on-chain event
+  status: z
+    .enum(['Pending', 'Accepted', 'Rejected', 'Withdrawn', 'expired', 'reclaimed'])
+    .optional(),
 });
 
 export const walletActivityQuerySchema = z.object({

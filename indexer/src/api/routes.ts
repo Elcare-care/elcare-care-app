@@ -329,11 +329,33 @@ router.get('/auctions/:id', async (req: Request, res: Response, next: NextFuncti
 // ── GET /offers ───────────────────────────────────────────────────────────────
 
 router.get('/offers', validateQuery(offersQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
-  const { listing_id } = (req as any).validatedQuery;
+  const { listing_id, status } = (req as any).validatedQuery;
   try {
     const where: any = {};
     if (listing_id) {
       where.listingId = BigInt(listing_id);
+    }
+
+    if (status === 'expired') {
+      // Still Pending on-chain but past its deadline — the offerer can reclaim.
+      where.status = 'Pending';
+      where.expiresAt = { not: null, lt: BigInt(Math.floor(Date.now() / 1000)) };
+    } else if (status === 'reclaimed') {
+      // Reclaimed offers share the Withdrawn status with manual withdrawals, so
+      // distinguish them by the presence of an OFFER_RECLAIMED event.
+      const reclaimedEvents = await prisma.marketplaceEvent.findMany({
+        where: { eventType: 'OFFER_RECLAIMED' },
+        select: { data: true },
+      });
+      const reclaimedIds = reclaimedEvents
+        .map((e) => {
+          const oid = (e.data as any)?.offer_id;
+          return oid != null ? BigInt(oid) : null;
+        })
+        .filter((v): v is bigint => v !== null);
+      where.offerId = { in: reclaimedIds };
+    } else if (status) {
+      where.status = status;
     }
 
     const results = await prisma.offer.findMany({

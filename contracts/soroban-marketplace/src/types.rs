@@ -77,6 +77,12 @@ pub enum MarketplaceError {
     PriceOutOfBounds = 39,
     /// A checked arithmetic operation overflowed while computing fee splits.
     ArithmeticOverflow = 40,
+    /// `escrow_nft` was called but `owner_of(token_id)` on the collection did
+    /// not match the declared seller — the caller does not own the token.
+    NotTokenOwner = 41,
+    /// `escrow_nft` was called for a `(collection, token_id)` that already has
+    /// an active escrow record — the token is already listed/auctioned.
+    TokenAlreadyEscrowed = 42,
 }
 
 #[contracttype]

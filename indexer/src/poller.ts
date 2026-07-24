@@ -779,6 +779,7 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
     }
 
     case 'OFFER_MADE': {
+      const offerExpiresAt = data.expires_at != null ? BigInt(data.expires_at) : null;
       await db.offer.upsert({
         where: { offerId: BigInt(data.offer_id) },
         create: {
@@ -788,6 +789,7 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
           amount: data.amount,
           token: data.token,
           status: 'Pending' as const,
+          expiresAt: offerExpiresAt,
           createdAtLedger: ledgerSequence,
           updatedAtLedger: ledgerSequence,
         },
@@ -797,6 +799,7 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
           amount: data.amount,
           token: data.token,
           status: 'Pending' as const,
+          expiresAt: offerExpiresAt,
           updatedAtLedger: ledgerSequence,
         }
       });
@@ -842,6 +845,23 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
           updatedAtLedger: ledgerSequence,
         }
       });
+      break;
+    }
+
+    // An expired offer reclaimed by (or on behalf of) its offerer: the contract
+    // refunds the escrow and moves the offer to its Withdrawn terminal state.
+    // Without this case an expired-then-reclaimed offer stays Pending in the DB
+    // forever, misleading artists into thinking it is still acceptable.  The
+    // refunded `amount` travels with the persisted MarketplaceEvent's data.
+    case 'OFFER_RECLAIMED': {
+      const { count } = await db.offer.updateMany({
+        where: { offerId: BigInt(data.offer_id) },
+        data: {
+          status: 'Withdrawn' as const,
+          updatedAtLedger: ledgerSequence,
+        }
+      });
+      if (count === 0) logger.warn('OFFER_RECLAIMED: offer not found', { offerId: data.offer_id?.toString(), ledger: ledgerSequence });
       break;
     }
   }

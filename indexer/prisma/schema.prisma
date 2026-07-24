@@ -110,6 +110,8 @@ model Offer {
   amount          Decimal     @db.Decimal(32, 7)
   token           String
   status          OfferStatus @default(Pending)
+  /// Optional expiry (ledger timestamp) after which the offer can be reclaimed. Null = never expires.
+  expiresAt       BigInt?
   createdAtLedger Int
   updatedAtLedger Int
   createdAt       DateTime    @default(now())

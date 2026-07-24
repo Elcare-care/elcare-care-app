@@ -27,6 +27,8 @@ pub const AUCTION_EXTENDED: &str = "auction_extended";
 pub const AUCTION_CANCELLED: &str = "auction_cancelled";
 pub const PROTOCOL_FEE_COLLECTED: &str = "protocol_fee_collected";
 pub const OFFER_RECLAIMED: &str = "offer_reclaimed";
+pub const NFT_ESCROWED: &str = "nft_escrowed";
+pub const NFT_RELEASED: &str = "nft_released";
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -192,13 +194,6 @@ pub struct ListingExpiredEvent {
     pub ledger_sequence: u32,
 }
 
-impl ListingPriceUpdatedEvent {
-    #[allow(deprecated)]
-    pub fn publish(self, env: &Env) {
-        env.events().publish((soroban_sdk::Symbol::new(env, LISTING_PRICE_UPDATED),), self);
-    }
-}
-
 impl ListingExpiredEvent {
     #[allow(deprecated)]
     pub fn publish(self, env: &Env) {
@@ -214,6 +209,10 @@ pub struct OfferMadeEvent {
     pub offerer: Address,
     pub amount: i128,
     pub token: Address,
+    /// Optional expiry (ledger timestamp) after which the offer can be
+    /// reclaimed; `None` when the offer never expires.  Emitted so the indexer
+    /// can surface countdown timers without a separate contract read.
+    pub expires_at: Option<u64>,
 }
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
