@@ -106,6 +106,23 @@ pub enum DataKey {
     ArtistCancelCursor(Address),
     /// Resumable progress of the versioned `migrate`/`migrate_step` operation.
     MigrationCursor(soroban_sdk::String),
+    /// Escrow record for a `(collection, token_id)` currently held in
+    /// marketplace custody.  Exists iff the token is escrowed for an active
+    /// listing or auction; a double-listing guard reads it and settlement /
+    /// cancellation clears it.
+    EscrowedToken(Address, u64),
+}
+
+/// Custody record for an NFT held by the marketplace, keyed by
+/// `DataKey::EscrowedToken(collection, token_id)`.  Written by `escrow_nft`
+/// and removed by `release_nft`.
+#[contracttype]
+#[derive(Clone)]
+pub struct EscrowRecord {
+    /// True if the token backs a fixed-price listing; false for an auction.
+    pub is_listing: bool,
+    /// The listing_id or auction_id the escrow is bound to.
+    pub id: u64,
 }
 
 pub const LEDGER_TTL_BUMP: u32 = 432_000;
@@ -520,6 +537,33 @@ pub fn clear_pending_offers(env: &Env, listing_id: u64) {
     env.storage()
         .persistent()
         .remove(&DataKey::ListingPendingOffers(listing_id));
+}
+
+// ── NFT escrow records ───────────────────────────────────────
+//
+// One persistent entry per `(collection, token_id)` in marketplace custody.
+// `escrow_nft` writes it (after a double-listing guard read); `release_nft`
+// removes it once the token leaves custody.
+
+pub fn get_escrow_record(env: &Env, collection: &Address, token_id: u64) -> Option<EscrowRecord> {
+    let key = DataKey::EscrowedToken(collection.clone(), token_id);
+    let res = env.storage().persistent().get::<DataKey, EscrowRecord>(&key);
+    if res.is_some() {
+        bump_entry_ttl(env, &key);
+    }
+    res
+}
+
+pub fn set_escrow_record(env: &Env, collection: &Address, token_id: u64, record: &EscrowRecord) {
+    let key = DataKey::EscrowedToken(collection.clone(), token_id);
+    env.storage().persistent().set(&key, record);
+    bump_entry_ttl(env, &key);
+}
+
+pub fn clear_escrow_record(env: &Env, collection: &Address, token_id: u64) {
+    env.storage()
+        .persistent()
+        .remove(&DataKey::EscrowedToken(collection.clone(), token_id));
 }
 
 // ── Batched cancel_artist_listings cursor ────────────────────

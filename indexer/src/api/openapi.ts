@@ -69,6 +69,7 @@ export const OfferSchema = registry.register(
     amount:          z.string().openapi({ example: '8.0000000', description: 'Offered amount as a decimal string' }),
     token:           z.string().openapi({ example: 'CABC...DEF', description: 'Payment token contract address' }),
     status:          z.enum(['Pending', 'Accepted', 'Rejected', 'Withdrawn']).openapi({ example: 'Pending' }),
+    expiresAt:       bigIntString.optional().openapi({ description: 'Ledger timestamp after which the offer can be reclaimed; absent when it never expires', example: '1735689600' }),
     createdAtLedger: z.number().int().openapi({ example: 50000000 }),
     updatedAtLedger: z.number().int().openapi({ example: 50000001 }),
     createdAt:       isoDateTime,

@@ -12,6 +12,7 @@ import {
   getArtistListings,
   getListing,
   withdrawOffer,
+  reclaimOffer,
   acceptOffer,
   rejectOffer,
   makeOffer,
@@ -184,6 +185,26 @@ export function useWithdrawOffer(publicKey: string | null) {
   );
 
   return { withdraw, isWithdrawing, error: null };
+}
+
+// ── useReclaimOffer ──────────────────────────────────────────
+
+export function useReclaimOffer(publicKey: string | null) {
+  const { run, isRunning: isReclaiming } = useTxToast();
+
+  const reclaim = useCallback(
+    async (offerId: number): Promise<boolean> => {
+      if (!publicKey) return false;
+      const result = await run(
+        () => reclaimOffer(publicKey, offerId),
+        { action: "Reclaim offer funds" }
+      );
+      return result !== null;
+    },
+    [publicKey, run]
+  );
+
+  return { reclaim, isReclaiming, error: null };
 }
 
 // ── useAcceptOffer ───────────────────────────────────────────

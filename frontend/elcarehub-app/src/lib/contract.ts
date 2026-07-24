@@ -450,12 +450,18 @@ export interface Offer {
   token: string;
   status: OfferStatus;
   created_at: number;
+  /** Unix seconds after which the offer expires and can be reclaimed. Absent when the offer never expires. */
+  expires_at?: number;
 }
 
 // ── Offer ScVal parsing ──────────────────────────────────────
 
 function parseOfferFromScVal(raw: unknown): Offer {
   const obj = scValToNative(raw as xdr.ScVal) as Record<string, unknown>;
+
+  const expiresAtRaw = obj["expires_at"];
+  const expires_at =
+    expiresAtRaw != null ? Number(expiresAtRaw) : undefined;
 
   return {
     offer_id: Number(obj["offer_id"]),
@@ -465,6 +471,7 @@ function parseOfferFromScVal(raw: unknown): Offer {
     token: (obj["token"] as Address).toString(),
     status: String(obj["status"]) as OfferStatus,
     created_at: Number(obj["created_at"]),
+    ...(expires_at !== undefined && { expires_at }),
   };
 }
 
@@ -490,6 +497,15 @@ export async function makeOffer(
 export async function withdrawOffer(offererPublicKey: string, offerId: number): Promise<boolean> {
   const args = [new Address(offererPublicKey).toScVal(), nativeToScVal(BigInt(offerId), { type: "u64" })];
   await invokeContract(offererPublicKey, "withdraw_offer", args);
+  return true;
+}
+
+// Reclaim the escrowed funds of an expired offer. The contract call is
+// permissionless (only the offer_id is passed); the refund always goes to the
+// original offerer. `signerPublicKey` is just the source account paying fees.
+export async function reclaimOffer(signerPublicKey: string, offerId: number): Promise<boolean> {
+  const args = [nativeToScVal(BigInt(offerId), { type: "u64" })];
+  await invokeContract(signerPublicKey, "reclaim_offer", args);
   return true;
 }
 

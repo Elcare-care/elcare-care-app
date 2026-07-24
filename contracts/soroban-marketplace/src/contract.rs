@@ -1,4 +1,4 @@
- go// contract.rs — ELCARE-HUB Marketplace contract implementation
+// contract.rs — ELCARE-HUB Marketplace contract implementation
 #[allow(unused_imports)]
 use soroban_sdk::{
     contract, contractimpl, log, panic_with_error, token::Client as TokenClient,
@@ -8,9 +8,12 @@ use crate::events::*;
 use crate::{
     escrow,
     storage::{
-        acquire_auction_lock, acquire_listing_lock, add_artist_auction_id, add_artist_listing_id,
-        add_to_active_listings, append_bid_record, clear_pending_admin_storage,
-        get_active_listing_ids, get_artist_auction_ids, get_artist_listing_ids, get_auction_count,
+        acquire_auction_lock, acquire_listing_lock, active_listings_len, add_artist_auction_id,
+        add_artist_listing_id, add_listing_offer_id, add_offerer_offer_id, add_pending_offer,
+        add_to_active_listings, append_bid_record, clear_artist_cancel_cursor,
+        clear_migration_progress, clear_pending_admin_storage, clear_pending_offers,
+        get_active_listing_ids_range, get_artist_auction_ids,
+        get_artist_cancel_cursor, get_artist_listing_ids, get_auction_count,
         get_auction_extension_trigger_storage, get_auction_extension_window_storage,
         get_listing_count, get_max_price_storage, get_min_price_storage, get_pending_admin_storage,
         increment_auction_count, increment_listing_count, increment_offer_count,
@@ -50,14 +53,6 @@ const ADMIN_PROPOSAL_TTL: u64 = 604_800; // 7 days
 /// `InvalidAuctionDuration`.  This prevents meaningless or front-runnable
 /// auctions that expire almost immediately.
 const MIN_AUCTION_DURATION: u64 = 3_600; // 1 hour
-
-/// Semantic version reported by `version()` and used as the per-version
-/// migration marker in `migrate`.
-///
-/// 1.1.0 introduces bucketed (paged) index storage: the 1.1.0 migration
-/// transforms the legacy monolithic `Vec<u64>` index entries into
-/// fixed-capacity pages and rebuilds the per-listing pending-offer sets.
-const CONTRACT_VERSION: &str = "1.1.0";
 
 /// Maximum number of listing ids accepted by one `cancel_listings` batch.
 ///
@@ -838,9 +833,9 @@ impl MarketplaceContract {
         // in the interactions phase below).  The sweep iterates the bounded
         // pending-offer set (≤ MAX_OFFERS_PER_LISTING), not the full history.
         let offers = load_pending_offer_ids(&env, listing_id);
-        let mut pending_offerers: Vec<Address> = Vec::new(&env);
-        let mut pending_amounts: Vec<i128> = Vec::new(&env);
-        let mut pending_tokens: Vec<Address> = Vec::new(&env);
+        let mut p_offerers: Vec<Address> = Vec::new(&env);
+        let mut p_amounts: Vec<i128> = Vec::new(&env);
+        let mut p_tokens: Vec<Address> = Vec::new(&env);
         for offer_id in offers.iter() {
             if let Some(mut offer) = load_offer(&env, offer_id) {
                 if offer.status == OfferStatus::Pending {
@@ -1172,6 +1167,7 @@ impl MarketplaceContract {
             offerer: offerer.clone(),
             amount,
             token,
+            expires_at,
         }
         .publish(&env);
 
@@ -1272,16 +1268,16 @@ impl MarketplaceContract {
         listing.status = ListingStatus::Sold;
         listing.owner = Some(accepted_offerer.clone());
         save_listing(&env, &listing);
-        remove_from_active_listings(&env, accepted_listing_id);
+        remove_from_active_listings(&env, listing_id);
 
         // #31: Mark all other pending offers Rejected; collect refund data and
         // emit OfferRejectedEvent for each.  Sweeps the bounded pending-offer
         // set (≤ MAX_OFFERS_PER_LISTING), then drops it — the accepted offer
         // and every sibling have reached a terminal state.
         let sibling_offers = load_pending_offer_ids(&env, listing.listing_id);
-        let mut refund_offerers: Vec<Address> = Vec::new(&env);
-        let mut refund_amounts: Vec<i128> = Vec::new(&env);
-        let mut refund_tokens: Vec<Address> = Vec::new(&env);
+        let mut r_offerers: Vec<Address> = Vec::new(&env);
+        let mut r_amounts: Vec<i128> = Vec::new(&env);
+        let mut r_tokens: Vec<Address> = Vec::new(&env);
         for oid in sibling_offers.iter() {
             if oid != offer_id {
                 if let Some(mut other) = load_offer(&env, oid) {
@@ -1524,10 +1520,10 @@ impl MarketplaceContract {
         let mut total_bps: u32 = 0;
         for i in 0..len {
             let bps = recipients.get(i).unwrap().percentage;
-            total = total.checked_add(bps)
+            total_bps = total_bps.checked_add(bps)
                 .unwrap_or_else(|| panic_with_error!(env, MarketplaceError::RoyaltyExceedsLimit));
         }
-        let combined = total.checked_add(protocol_fee_bps)
+        let combined = total_bps.checked_add(protocol_fee_bps)
             .unwrap_or_else(|| panic_with_error!(env, MarketplaceError::RoyaltyExceedsLimit));
         if combined > 10_000 { panic_with_error!(env, MarketplaceError::RoyaltyExceedsLimit); }
     }
