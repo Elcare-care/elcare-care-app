@@ -24,6 +24,24 @@ pub enum IndexId {
     ListingOffers(u64),
 }
 
+/// A pending two-step admin rotation.
+///
+/// Stored under `DataKey::PendingAdmin` between `transfer_admin` (propose) and
+/// `accept_admin`.  `expires_at` is an absolute ledger timestamp (seconds); once
+/// `env.ledger().timestamp()` passes it, `accept_admin` reverts with
+/// `AdminProposalExpired` so a proposal can never leave governance half-locked
+/// forever.  The current admin can clear a live proposal early via
+/// `cancel_admin_proposal`.
+#[contracttype]
+#[derive(Clone)]
+pub struct PendingAdminProposal {
+    /// Address invited to become the new admin.
+    pub candidate: Address,
+    /// Absolute ledger timestamp after which the proposal can no longer be
+    /// accepted.
+    pub expires_at: u64,
+}
+
 /// Resumable progress marker for a versioned storage migration.
 #[contracttype]
 #[derive(Clone)]
@@ -669,15 +687,18 @@ pub fn release_auction_lock(env: &Env, auction_id: u64) {
 
 // ── Admin transfer ───────────────────────────────────────────
 
-pub fn set_pending_admin_storage(env: &Env, pending: &Address) {
+pub fn set_pending_admin_storage(env: &Env, pending: &PendingAdminProposal) {
     env.storage()
         .persistent()
         .set(&DataKey::PendingAdmin, pending);
     bump_entry_ttl(env, &DataKey::PendingAdmin);
 }
 
-pub fn get_pending_admin_storage(env: &Env) -> Option<Address> {
-    let value = env.storage().persistent().get(&DataKey::PendingAdmin);
+pub fn get_pending_admin_storage(env: &Env) -> Option<PendingAdminProposal> {
+    let value = env
+        .storage()
+        .persistent()
+        .get::<DataKey, PendingAdminProposal>(&DataKey::PendingAdmin);
     if value.is_some() {
         bump_entry_ttl(env, &DataKey::PendingAdmin);
     }

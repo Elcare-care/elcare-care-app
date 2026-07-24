@@ -77,6 +77,16 @@ pub enum MarketplaceError {
     PriceOutOfBounds = 39,
     /// A checked arithmetic operation overflowed while computing fee splits.
     ArithmeticOverflow = 40,
+    /// `accept_admin` was called after the pending admin proposal's `expires_at`
+    /// ledger timestamp has passed.  The proposal must be re-issued.
+    ///
+    /// NOTE: Issue #202 suggested discriminant 35, but 35/36 are already taken
+    /// (`OfferLimitReached`/`BatchTooLarge`); the next free codes 41/42 are used
+    /// instead so existing on-chain error codes are not renumbered.
+    AdminProposalExpired = 41,
+    /// `accept_admin` or `cancel_admin_proposal` was called when no admin
+    /// proposal is currently pending.
+    NoAdminProposalPending = 42,
 }
 
 #[contracttype]

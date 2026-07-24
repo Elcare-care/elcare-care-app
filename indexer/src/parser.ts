@@ -57,6 +57,7 @@ const TOPIC_MAP: Record<string, string> = {
   'artist_reinstated':  'ARTIST_REINSTATED',
   'admin_transfer_proposed':  'ADMIN_TRANSFER_PROPOSED',
   'admin_transferred':  'ADMIN_TRANSFERRED',
+  'admin_proposal_cancelled':  'ADMIN_PROPOSAL_CANCELLED',
   'contract_paused':   'CONTRACT_PAUSED',
   'contract_unpaused': 'CONTRACT_UNPAUSED',
   // Launchpad deploy events (topics[0] = "deploy", topics[1] = kind tag)
