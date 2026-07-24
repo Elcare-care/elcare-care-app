@@ -70,6 +70,8 @@ const mockRedis = vi.hoisted(() => ({
 }));
 
 vi.mock('../db', () => ({ default: mockPrisma }));
+// poller.ts imports from prisma-write; alias so applyDecodedEvents sees the same mock
+vi.mock('../prisma-write', () => ({ default: mockPrisma }));
 vi.mock('../redis.js', () => ({ default: mockRedis }));
 
 import { applyDecodedEvents } from '../poller';

@@ -4,18 +4,20 @@ import cors from 'cors';
 import compression from 'compression';
 import dotenv from 'dotenv';
 import routes, { closeSSEClients } from './api/routes.js';
-import { startPolling, registerShutdownHook } from './poller.js';
+import { startPolling, registerShutdownHook, stopPoller, gracefulShutdown } from './poller.js';
 import { rateLimiter, globalRateLimiter } from './api/rate-limit-middleware.js';
 import { metricsMiddleware, handleMetrics, requestLogger } from './metrics.js';
 import { errorHandler } from './api/errors.js';
 import { startReconciler } from './reconciler.js';
-import { validateRequiredEnv, loadKeeperConfig } from './config.js';
+import { validateRequiredEnv, loadKeeperConfig, loadConfig } from './config.js';
 import { parseCorsOrigins, buildCorsOptions } from './cors.js';
 import { startKeeper } from './keeper/index.js';
 import { startGapRepairWorker } from './gap-repair.js';
 import { logger } from './logger.js';
 import prisma from './db.js';
 import docsRouter from './api/docs-router.js';
+import { startDbHealthProbe } from './db-health.js';
+import { isStalled } from './stall.js';
 
 dotenv.config();
 
@@ -31,151 +33,190 @@ try {
   process.exit(1);
 }
 
-const app = express();
+const cfg  = loadConfig();
+const app  = express();
 const PORT = process.env.PORT || 4000;
 
 // ── CORS ──────────────────────────────────────────────────────────────────────
-// Parse the whitelist once at startup. An empty list = dev mode (all origins).
 const corsOrigins = parseCorsOrigins(process.env.CORS_ORIGIN);
 app.use(cors(buildCorsOptions(corsOrigins)));
-// Handle OPTIONS preflight explicitly — Express 5 requires a valid route pattern.
 app.options(/.*/, cors(buildCorsOptions(corsOrigins)));
 app.use(compression());
 app.use(express.json());
 
-// Apply global baseline rate limiter to all public endpoints
+// Global baseline rate limiter
 app.use(globalRateLimiter);
 
 // Request logging and metrics
 app.use(requestLogger);
 app.use(metricsMiddleware);
 
-// Expose /metrics for Prometheus scrapers
+// Prometheus metrics endpoint
 app.get('/metrics', handleMetrics);
 
-// Apply standard rate limiting for fallback
+// Standard rate limiting fallback
 app.use(rateLimiter);
 
-// OpenAPI spec + Swagger UI (no rate-limit — static/read-only)
+// OpenAPI spec + Swagger UI
 app.use('/', docsRouter);
 
-// API Routes
+// API routes
 app.use('/', routes);
 
-// Sentry error handler must be registered before the custom error handler
+// Sentry error handler must come before the custom error handler
 Sentry.setupExpressErrorHandler(app);
 
-// Central error handler — must be registered after all routes
+// ── Global error handler ──────────────────────────────────────────────────────
+// Catches any unhandled errors from route/middleware and returns a sanitized
+// 500 response.  Stack traces are never leaked to clients.
 app.use(errorHandler);
 
-// Health check
+// ── Liveness probe ────────────────────────────────────────────────────────────
 app.get('/health', (_req: express.Request, res: express.Response) => {
   res.json({ status: 'ok' });
 });
 
 // ── Dev-only CORS debug endpoint ──────────────────────────────────────────────
-// Echo the request origin, relevant headers, and the CORS decision so developers
-// can verify their browser / curl config without reading server logs.
-// Stripped in production — never exposed to end users.
 if (process.env.NODE_ENV !== 'production') {
-    app.get('/cors-test', (req: express.Request, res: express.Response) => {
-        const origin = req.headers.origin ?? null;
-        const allowed = corsOrigins.length === 0
-            ? true
-            : origin !== null && corsOrigins.includes(origin);
+  app.get('/cors-test', (req: express.Request, res: express.Response) => {
+    const origin = req.headers.origin ?? null;
+    const allowed =
+      corsOrigins.length === 0
+        ? true
+        : origin !== null && corsOrigins.includes(origin);
 
-        res.json({
-            origin,
-            allowed,
-            whitelist: corsOrigins,
-            mode: corsOrigins.length === 0 ? 'development (all origins)' : 'production (whitelist)',
-            headers: {
-                'access-control-allow-origin': res.getHeader('access-control-allow-origin') ?? null,
-                'access-control-allow-credentials': res.getHeader('access-control-allow-credentials') ?? null,
-            },
-        });
+    res.json({
+      origin,
+      allowed,
+      whitelist: corsOrigins,
+      mode: corsOrigins.length === 0 ? 'development (all origins)' : 'production (whitelist)',
+      headers: {
+        'access-control-allow-origin': res.getHeader('access-control-allow-origin') ?? null,
+        'access-control-allow-credentials': res.getHeader('access-control-allow-credentials') ?? null,
+      },
     });
+  });
 }
 
-// Readiness probe — returns 503 until the indexer has processed at least one ledger,
-// or if the indexer has stalled (no progress for STALL_THRESHOLD_MS).
-app.get('/readyz', async (req: express.Request, res: express.Response) => {
-    if (isStalled()) {
-        return res.status(503).json({ status: 'stalled', reason: 'Indexer not advancing' });
-    }
+// ── Readiness probe ───────────────────────────────────────────────────────────
+app.get('/readyz', async (_req: express.Request, res: express.Response) => {
+  if (isStalled()) {
+    return res.status(503).json({ status: 'stalled', reason: 'Indexer not advancing' });
+  }
 
-    try {
-        const contracts = await prisma.trackedContract.findMany({
-            where: { active: true },
-            select: { contractId: true, lastLedger: true, label: true },
-        });
-        const ready = contracts.length > 0 && contracts.some((c) => c.lastLedger > 0);
-        if (ready) {
-            return res.json({
-                status: 'ready',
-                contracts: contracts.map((c) => ({ contractId: c.contractId, label: c.label, lastLedger: c.lastLedger })),
-            });
-        }
-        return res.status(503).json({ status: 'not_ready', reason: 'No ledgers indexed yet' });
-    } catch {
-        // Fall back to legacy SyncState check
-        const state = await prisma.syncState.findUnique({ where: { id: 1 } });
-        if (state && state.lastLedger > 0) {
-            return res.json({ status: 'ready', lastLedger: state.lastLedger });
-        }
-        return res.status(503).json({ status: 'not_ready', reason: 'No ledgers indexed yet' });
+  try {
+    const contracts = await prisma.trackedContract.findMany({
+      where:  { active: true },
+      select: { contractId: true, lastLedger: true, label: true },
+    });
+    const ready = contracts.length > 0 && contracts.some((c) => c.lastLedger > 0);
+    if (ready) {
+      return res.json({
+        status: 'ready',
+        contracts: contracts.map((c) => ({
+          contractId: c.contractId,
+          label:      c.label,
+          lastLedger: c.lastLedger,
+        })),
+      });
     }
+    return res.status(503).json({ status: 'not_ready', reason: 'No ledgers indexed yet' });
+  } catch {
+    const state = await prisma.syncState.findUnique({ where: { id: 1 } });
+    if (state && state.lastLedger > 0) {
+      return res.json({ status: 'ready', lastLedger: state.lastLedger });
+    }
+    return res.status(503).json({ status: 'not_ready', reason: 'No ledgers indexed yet' });
+  }
 });
 
-// Start the server
+// ── Start server ──────────────────────────────────────────────────────────────
 const httpServer = app.listen(PORT, () => {
-    console.log(`Indexer API listening on http://localhost:${PORT}`);
+  logger.info(`Indexer API listening on http://localhost:${PORT}`);
 
-    // Start the background polling loop
-    startPolling().catch((err) => {
-        logger.error('Fatal error in poller', { err });
-        process.exit(1);
+  // ── DB health probe — warns on pool exhaustion before requests time out ──
+  const stopProbe = startDbHealthProbe();
+  registerShutdownHook(async () => { stopProbe(); });
+
+  // ── Background polling loop ───────────────────────────────────────────────
+  startPolling().catch((err) => {
+    logger.error('Fatal error in poller', { err });
+    process.exit(1);
+  });
+
+  // ── Periodic reconciliation (non-fatal) ───────────────────────────────────
+  startReconciler().catch((err) => {
+    logger.error('[Reconciler] Failed to start', { err });
+  });
+
+  // ── Gap-repair worker ─────────────────────────────────────────────────────
+  if (process.env.GAP_REPAIR_ENABLED === 'true') {
+    startGapRepairWorker().catch((err) => {
+      logger.error('gap-repair: worker fatal error', {
+        err: err instanceof Error ? err.message : String(err),
+      });
     });
+  }
 
-    // Start the periodic reconciliation job (non-fatal if it fails)
-    startReconciler().catch((err) => {
-        console.error('[Reconciler] Failed to start:', err);
-    });
-
-    // Start gap-repair worker when GAP_REPAIR_ENABLED=true
-    if (process.env.GAP_REPAIR_ENABLED === 'true') {
-        startGapRepairWorker().catch((err) => {
-            logger.error('gap-repair: worker fatal error', {
-                err: err instanceof Error ? err.message : String(err),
-            });
+  // ── Keeper loop ───────────────────────────────────────────────────────────
+  if (process.env.KEEPER_ENABLED === 'true') {
+    try {
+      const keeperCfg = loadKeeperConfig();
+      logger.info('keeper: enabled — starting loop', {
+        dryRun:     keeperCfg.KEEPER_DRY_RUN,
+        intervalMs: keeperCfg.KEEPER_INTERVAL_MS,
+      });
+      startKeeper().catch((err) => {
+        logger.error('keeper: fatal loop error', {
+          err: err instanceof Error ? err.message : String(err),
         });
+      });
+    } catch (err) {
+      logger.error('keeper: invalid configuration — keeper not started', {
+        err: err instanceof Error ? err.message : String(err),
+      });
     }
-
-    // Start the keeper loop when KEEPER_ENABLED=true.
-    // Validated here so a bad config fails loud at startup rather than silently
-    // doing nothing.  Errors are non-fatal to the main indexer process.
-    if (process.env.KEEPER_ENABLED === 'true') {
-        try {
-            const keeperCfg = loadKeeperConfig();
-            logger.info('keeper: enabled — starting loop', {
-                dryRun: keeperCfg.KEEPER_DRY_RUN,
-                intervalMs: keeperCfg.KEEPER_INTERVAL_MS,
-            });
-            startKeeper().catch((err) => {
-                logger.error('keeper: fatal loop error', {
-                    err: err instanceof Error ? err.message : String(err),
-                });
-            });
-        } catch (err) {
-            logger.error('keeper: invalid configuration — keeper not started', {
-                err: err instanceof Error ? err.message : String(err),
-            });
-        }
-    }
+  }
 });
 
-// Register HTTP server and SSE cleanup so gracefulShutdown() in poller closes them too.
-registerShutdownHook(() => new Promise<void>((resolve) => {
-  closeSSEClients();
-  httpServer.close(() => resolve());
-}));
+// ── Graceful shutdown ─────────────────────────────────────────────────────────
+// Register HTTP server + SSE cleanup as a shutdown hook so gracefulShutdown()
+// in poller.ts drains in-flight requests and sends server-shutdown to SSE clients.
+registerShutdownHook(
+  () =>
+    new Promise<void>((resolve) => {
+      // 1. Tell SSE clients the server is going down.
+      closeSSEClients();
+
+      // 2. Stop accepting new connections; wait for in-flight requests.
+      httpServer.close(() => resolve());
+
+      // 3. If requests haven't drained within the configured timeout, force-close.
+      setTimeout(resolve, cfg.shutdownTimeoutMs).unref();
+    }),
+);
+
+// ── Signal handlers ───────────────────────────────────────────────────────────
+// SIGTERM is sent by Kubernetes / docker stop.
+// SIGINT  is sent by Ctrl-C in development.
+//
+// Sequence:
+//   1. Set shuttingDown flag — poller loop exits after current batch.
+//   2. Call gracefulShutdown() — drains HTTP, closes SSE, disconnects DB/Redis.
+//   3. Exit with code 0.
+
+function handleSignal(signal: string): void {
+  logger.info(`[shutdown] ${signal} received — initiating graceful shutdown`);
+
+  // Signal the poller to stop after its current ledger batch completes.
+  stopPoller();
+
+  // Run the full shutdown sequence (registered hooks + DB/Redis disconnect).
+  gracefulShutdown().catch((err) => {
+    logger.error('[shutdown] Graceful shutdown failed', { err });
+    process.exit(1);
+  });
+}
+
+process.once('SIGTERM', () => handleSignal('SIGTERM'));
+process.once('SIGINT',  () => handleSignal('SIGINT'));

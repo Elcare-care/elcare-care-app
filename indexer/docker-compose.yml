@@ -8,6 +8,22 @@ services:
       - POSTGRES_USER=postgres
       - POSTGRES_PASSWORD=postgres
       - POSTGRES_DB=marketplace_indexer
+      # Raise the connection ceiling so two Prisma pools (read=10 + write=3)
+      # plus pgAdmin / migration tooling never hit the default limit of 100.
+      # Total pool claim is ~13; 50 leaves comfortable headroom for operators.
+      - POSTGRES_MAX_CONNECTIONS=50
+      # shared_buffers = 25 % of RAM is the PostgreSQL recommendation.
+      # 256 MB is appropriate for a 1 GB container; tune up for larger hosts.
+      - POSTGRES_SHARED_BUFFERS=256MB
+    # The command override applies the same settings at the server level so
+    # they survive configuration reloads (ALTER SYSTEM is not used here to
+    # keep the image stateless).
+    command:
+      - postgres
+      - -c
+      - max_connections=50
+      - -c
+      - shared_buffers=256MB
     ports:
       - "5432:5432"
     volumes:

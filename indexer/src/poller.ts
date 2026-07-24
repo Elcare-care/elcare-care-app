@@ -1,5 +1,7 @@
 import { rpc, Contract, TransactionBuilder, BASE_FEE, nativeToScVal, scValToNative } from '@stellar/stellar-sdk';
-import prisma from './db.js';
+// Write-path client: poller / parser writes use the dedicated 3-connection pool
+// so burst writes never starve the API read pool (db.ts, connection_limit=10).
+import prisma from './prisma-write.js';
 import { emitSSEEvent } from './api/routes.js';
 import dotenv from 'dotenv';
 import {
@@ -88,6 +90,17 @@ export function registerShutdownHook(fn: () => Promise<void>): void {
   shutdownHooks.push(fn);
 }
 
+/**
+ * Signal the polling loop(s) to stop after completing their current batch.
+ * Safe to call multiple times — subsequent calls are no-ops.
+ */
+export function stopPoller(): void {
+  if (!shuttingDown) {
+    shuttingDown = true;
+    logger.info('poller: stop requested — will exit after current batch');
+  }
+}
+
 function getContractIds(): string[] {
   return parseTrackedContracts().map((c) => c.id).filter(Boolean);
 }
@@ -117,6 +130,8 @@ export async function gracefulShutdown(): Promise<void> {
   if (shutdownStarted) return;
   shutdownStarted = true;
 
+  const shutdownTimeoutMs = parseInt(process.env.SHUTDOWN_TIMEOUT_MS || '30000', 10);
+
   console.log('[Shutdown] Closing resources: Prisma + Redis + registered hooks');
   const cleanup = Promise.allSettled([
     prisma.$disconnect(),
@@ -127,7 +142,7 @@ export async function gracefulShutdown(): Promise<void> {
   try {
     await Promise.race([
       cleanup,
-      new Promise((_, rej) => setTimeout(() => rej(new Error('shutdown timeout')), 10_000)),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('shutdown timeout')), shutdownTimeoutMs)),
     ]);
     logger.info('Shutdown: cleanup complete');
     process.exit(0);

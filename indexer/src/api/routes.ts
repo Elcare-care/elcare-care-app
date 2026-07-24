@@ -17,6 +17,7 @@ import {
   collectionsQuerySchema,
   statsQuerySchema,
   syncGapsQuerySchema,
+  artistMetricsQuerySchema,
 } from './query-schemas.js';
 import {
   getOverviewStats,
@@ -208,8 +209,21 @@ router.get('/listings/:id/history', async (req: Request, res: Response, next: Ne
     return next(badRequest('Invalid ID format'));
   }
 
-  const limit  = Math.min(parseInt(String(req.query.limit  ?? '100'), 10) || 100, 500);
-  const offset = Math.min(parseInt(String(req.query.offset ?? '0'),   10) || 0,   10000);
+  const limitRaw  = req.query.limit  as string | undefined;
+  const offsetRaw = req.query.offset as string | undefined;
+
+  const limitParsed  = limitRaw  !== undefined ? parseInt(limitRaw,  10) : 100;
+  const offsetParsed = offsetRaw !== undefined ? parseInt(offsetRaw, 10) : 0;
+
+  if (limitRaw !== undefined  && (!Number.isInteger(limitParsed)  || limitParsed  < 1 || limitParsed  > 500)) {
+    return next(badRequest('limit must be an integer between 1 and 500'));
+  }
+  if (offsetRaw !== undefined && (!Number.isInteger(offsetParsed) || offsetParsed < 0 || offsetParsed > 10_000)) {
+    return next(badRequest('offset must be a non-negative integer up to 10000'));
+  }
+
+  const limit  = limitParsed;
+  const offset = offsetParsed;
 
   try {
     const where = { listingId: BigInt(id) };
@@ -578,9 +592,9 @@ router.get('/events', (req: Request, res: Response) => {
 // Returns mints-over-time, volume-over-time, and conversion rate aggregates
 // for a given artist, scoped by an optional ?range=day|week|month query param.
 
-router.get('/artists/:address/metrics', cacheMiddleware(60), async (req: Request, res: Response, next: NextFunction) => {
+router.get('/artists/:address/metrics', cacheMiddleware(60), validateQuery(artistMetricsQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
   const address = req.params.address as string;
-  const range = req.query.range as string | undefined;
+  const { range } = (req as any).validatedQuery;
 
   const now = new Date();
   let dateFrom: Date | undefined;
@@ -651,6 +665,21 @@ router.get('/artists/:address/metrics', cacheMiddleware(60), async (req: Request
     });
   } catch (err) {
     next(internalError('Failed to fetch artist metrics'));
+  }
+});
+
+// ── GET /backfill/status ──────────────────────────────────────────────────────
+//
+// Returns the current state of any running backfill job: progress percentage,
+// throughput (events/s), ETA, and ledger range.  Returns running: false when
+// no backfill is currently active.
+
+router.get('/backfill/status', async (_req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { getBackfillStatus } = await import('../backfill.js');
+    res.json(getBackfillStatus());
+  } catch (err) {
+    next(internalError('Failed to fetch backfill status'));
   }
 });
 
