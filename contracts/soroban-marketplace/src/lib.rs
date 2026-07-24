@@ -7,6 +7,7 @@
 pub mod events;
 mod contract;
 pub mod escrow;
+pub mod math;
 pub mod storage;
 mod types;
 

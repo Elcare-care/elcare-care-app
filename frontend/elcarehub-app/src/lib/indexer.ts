@@ -540,13 +540,21 @@ export type MarketplaceSSEEventType =
   | "BID_PLACED"
   | "AUCTION_FINALIZED"
   | "AUCTION_CANCELLED"
-  | "AUCTION_EXTENDED";
+  | "AUCTION_EXTENDED"
+  | "REORG"
+  | "CRITICAL_REORG";
 
 export interface MarketplaceSSEEvent {
   type: MarketplaceSSEEventType;
   listingId?: number;
   auctionId?: number;
   data?: Record<string, unknown>;
+  // Re-org specific fields
+  from_ledger?: number;
+  to_ledger?: number;
+  timestamp?: string;
+  depth?: number;
+  message?: string;
 }
 
 /** Options for {@link subscribeToMarketplaceEvents}. */
@@ -598,6 +606,8 @@ const SSE_RELEVANT_TYPES = new Set<string>([
   "AUCTION_FINALIZED",
   "AUCTION_CANCELLED",
   "AUCTION_EXTENDED",
+  "REORG",
+  "CRITICAL_REORG",
 ]);
 
 function parseSSEData(rawData: string): MarketplaceSSEEvent | null {
@@ -615,6 +625,12 @@ function parseSSEData(rawData: string): MarketplaceSSEEvent | null {
         typeof parsed.data === "object" && parsed.data !== null
           ? (parsed.data as Record<string, unknown>)
           : undefined,
+      // Re-org specific fields
+      from_ledger: parsed.from_ledger != null ? Number(parsed.from_ledger) : undefined,
+      to_ledger: parsed.to_ledger != null ? Number(parsed.to_ledger) : undefined,
+      timestamp: typeof parsed.timestamp === "string" ? parsed.timestamp : undefined,
+      depth: parsed.depth != null ? Number(parsed.depth) : undefined,
+      message: typeof parsed.message === "string" ? parsed.message : undefined,
     };
   } catch {
     return null;
@@ -715,7 +731,6 @@ export function subscribeToMarketplaceEvents(
         if (parsed) dispatchEvent(parsed);
       });
     }
-
     es.onerror = () => {
       es?.close();
       es = null;

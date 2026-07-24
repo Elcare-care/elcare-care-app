@@ -1491,46 +1491,55 @@ impl MarketplaceContract {
         if transfer_from_buyer {
             token.transfer(buyer, &env.current_contract_address(), &amount);
         }
-        let mut payout = amount;
+
+        // ── Royalty deduction (before fee/recipient split) ────────────────────
         let royalty_info: (Address, u32) = env.invoke_contract(
             collection_addr,
             &soroban_sdk::Symbol::new(env, "royalty_info"),
             soroban_sdk::vec![env],
         );
         let (royalty_receiver, royalty_bps) = royalty_info;
+        let mut payout = amount;
         if royalty_bps > 0 && royalty_receiver != *seller {
-            let royalty = amount
-                .checked_mul(royalty_bps as i128)
-                .unwrap_or_else(|| panic_with_error!(env, MarketplaceError::ArithmeticOverflow))
-                .checked_div(10_000)
-                .unwrap_or_else(|| panic_with_error!(env, MarketplaceError::ArithmeticOverflow));
-            token.transfer(&env.current_contract_address(), &royalty_receiver, &royalty);
-            payout -= royalty;
-        }
-        let mut fee_collected: i128 = 0;
-        if let Some(t) = crate::storage::get_treasury_storage(env) {
-            let fee = payout * fee_bps as i128 / 10_000;
-            if fee > 0 {
-                token.transfer(&env.current_contract_address(), &t, &fee);
-                fee_collected = fee;
+            // Use math::calc_fee for royalty calculation (same basis-point logic).
+            let royalty = crate::math::calc_fee(amount, royalty_bps);
+            if royalty > 0 {
+                token.transfer(&env.current_contract_address(), &royalty_receiver, &royalty);
+                payout = payout
+                    .checked_sub(royalty)
+                    .unwrap_or_else(|| panic_with_error!(env, MarketplaceError::ArithmeticOverflow));
             }
-            payout -= fee;
         }
-        let len = recipients.len();
-        let mut ds = 0i128;
-        for i in 0..len {
-            let r = recipients.get(i).unwrap();
-            let amt = if i == len - 1 {
-                payout - ds
-            } else {
-                payout.checked_mul(r.percentage as i128)
-                    .unwrap_or_else(|| panic_with_error!(env, MarketplaceError::ArithmeticOverflow))
-                    .checked_div(10_000)
-                    .unwrap_or_else(|| panic_with_error!(env, MarketplaceError::ArithmeticOverflow))
-            };
-            token.transfer(&env.current_contract_address(), &r.address, &amt);
-            ds += amt;
+
+        // ── Fee + recipient split via math::distribute ────────────────────────
+        // `distribute` uses checked arithmetic throughout and guarantees
+        // fee + sum(payouts) == payout (no stroop lost).
+        //
+        // Only collect the fee when a treasury address is configured.
+        // When no treasury is set the fee_bps is ignored and the full `payout`
+        // is distributed to recipients — this preserves the original semantics.
+        let effective_fee_bps = if crate::storage::get_treasury_storage(env).is_some() {
+            fee_bps
+        } else {
+            0
+        };
+        let dist = crate::math::distribute(env, payout, effective_fee_bps, recipients);
+
+        // Transfer protocol fee to treasury (only when treasury is configured
+        // and fee > 0).
+        let mut fee_collected: i128 = 0;
+        if dist.fee > 0 {
+            if let Some(t) = crate::storage::get_treasury_storage(env) {
+                token.transfer(&env.current_contract_address(), &t, &dist.fee);
+                fee_collected = dist.fee;
+            }
         }
+
+        // Transfer per-recipient payouts.
+        for p in dist.iter_payouts() {
+            token.transfer(&env.current_contract_address(), &p.address, &p.amount);
+        }
+
         fee_collected
     }
 }

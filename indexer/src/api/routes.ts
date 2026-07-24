@@ -6,7 +6,7 @@ import { cacheMiddleware } from './cache-middleware.js';
 import { etagMiddleware } from './etag-middleware.js';
 import { strictRateLimiter } from './rate-limit-middleware.js';
 import { badRequest, notFound, internalError } from './errors.js';
-import { applyDecodedEvents } from '../poller.js';
+import { applyDecodedEvents, isPollerHalted, getHaltReason, resumePoller, revertLedgers } from '../poller.js';
 import { collectMarketplaceEvents } from '../event-sync.js';
 import {
   validateQuery,
@@ -874,6 +874,57 @@ router.delete('/admin/contracts/:id', async (req: Request, res: Response, next: 
     res.json(serialize(updated));
   } catch (err) {
     next(internalError('Failed to deactivate tracked contract'));
+  }
+});
+
+// ── POST /admin/reorg-recovery ────────────────────────────────────────────────
+//
+// Operator-only endpoint for recovering from a critical re-org that halted the
+// poller.  The operator must have verified the chain state and optionally
+// supply a `target_ledger` to roll back to before resuming.
+//
+// Body (optional): { target_ledger?: number }
+// Returns: { resumed: true, rolledBackTo?: number }
+
+router.post('/admin/reorg-recovery', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const wasHalted = isPollerHalted();
+    const haltReason = getHaltReason();
+
+    const { target_ledger } = (req.body ?? {}) as { target_ledger?: number };
+
+    let rolledBackTo: number | undefined;
+
+    if (target_ledger !== undefined) {
+      if (!Number.isInteger(target_ledger) || target_ledger < 0) {
+        return next(badRequest('target_ledger must be a non-negative integer'));
+      }
+      // Validate the rollback target exists in the database before executing.
+      const targetExists = await prisma.syncState.findFirst({
+        where: { lastLedger: { lte: target_ledger } },
+      });
+      if (!targetExists) {
+        return next(
+          badRequest(
+            `Rollback target ledger ${target_ledger} is not reachable from the current database state. ` +
+            `The SyncState does not have a checkpoint at or before this ledger.`
+          )
+        );
+      }
+      await revertLedgers(target_ledger);
+      rolledBackTo = target_ledger;
+    }
+
+    resumePoller();
+
+    res.json({
+      resumed: true,
+      wasHalted,
+      haltReason: wasHalted ? haltReason : null,
+      ...(rolledBackTo !== undefined && { rolledBackTo }),
+    });
+  } catch (err) {
+    next(internalError('Failed to execute reorg recovery'));
   }
 });
 

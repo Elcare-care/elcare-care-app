@@ -129,9 +129,26 @@ export function validateRequiredEnv(): void {
 }
 
 export function loadConfig() {
+  // MAX_ROLLBACK_DEPTH: the maximum number of ledgers the poller will roll back
+  // automatically when a re-org is detected.  If a re-org requires rolling back
+  // MORE than this many ledgers the poller halts and emits a CRITICAL_REORG SSE
+  // event rather than executing a potentially destructive deep rollback.
+  const maxRollbackDepth = parsePositiveInt(
+    'MAX_ROLLBACK_DEPTH',
+    process.env.MAX_ROLLBACK_DEPTH,
+    100
+  );
+
+  // REORG_HALT_ON_DEEP: when true (default) the poller halts on deep re-orgs
+  // instead of attempting them.  Set to "false" to disable the safety guard
+  // (not recommended for production).
+  const reorgHaltOnDeep = process.env.REORG_HALT_ON_DEEP !== 'false';
+
   return {
     pollIntervalMs: parsePositiveInt('POLL_INTERVAL_MS', process.env.POLL_INTERVAL_MS, 5000),
     maxLedgersPerCycle: parsePositiveInt('MAX_LEDGERS_PER_CYCLE', process.env.MAX_LEDGERS_PER_CYCLE, 1000),
+    maxRollbackDepth,
+    reorgHaltOnDeep,
   };
 }
 

@@ -63,6 +63,31 @@ type FetchAuction = (
   auctionId: bigint
 ) => Promise<{ status: string; highestBid: string } | null>;
 
+/**
+ * Validates that the rollback target ledger exists in the database before
+ * the reconciler issues any DELETE statements.
+ *
+ * This check prevents a situation where the reconciler targets a ledger that
+ * has no corresponding checkpoint in SyncState, which would indicate a
+ * deeper re-org than the DB can recover from automatically — treat as critical.
+ *
+ * Returns the safe ledger number if reachable, otherwise throws an error.
+ */
+export async function validateRollbackTarget(targetLedger: number): Promise<void> {
+  const checkpoint = await prisma.syncState.findFirst({
+    where: { lastLedger: { lte: targetLedger } },
+    orderBy: { lastLedger: 'desc' },
+  });
+
+  if (!checkpoint) {
+    throw new Error(
+      `[Reconciler] CRITICAL: Rollback target ledger ${targetLedger} is not reachable ` +
+      `from any SyncState checkpoint in the database. ` +
+      `This indicates a deep re-org — manual operator intervention required.`
+    );
+  }
+}
+
 export async function runReconciliation(
   server: rpc.Server,
   contractId: string,
