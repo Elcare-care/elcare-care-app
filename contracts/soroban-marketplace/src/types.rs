@@ -87,6 +87,18 @@ pub enum MarketplaceError {
     /// `accept_admin` or `cancel_admin_proposal` was called when no admin
     /// proposal is currently pending.
     NoAdminProposalPending = 42,
+    /// `escrow_nft` was called for a token the seller does not own —
+    /// `owner_of(token_id)` returned a different address.
+    ///
+    /// NOTE: the NFT-escrow feature branch numbered this 36, but 36/37 were
+    /// already taken on main (`BatchTooLarge`/`AlreadyMigrated`); the next free
+    /// codes 43/44 are used so existing on-chain error codes are not
+    /// renumbered.
+    NotTokenOwner = 43,
+    /// `escrow_nft` was called for a `(collection, token_id)` that already has
+    /// an `EscrowedToken` record — the token backs another active listing or
+    /// auction (double-listing guard).
+    TokenAlreadyEscrowed = 44,
 }
 
 #[contracttype]
