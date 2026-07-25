@@ -308,7 +308,39 @@ router.get('/listings/:id/history', async (req: Request, res: Response, next: Ne
   }
 });
 
-// ── GET /ipfs/:cid ────────────────────────────────────────────────────────────
+// ── GET /listings/:id/price-history (Issue #213) ──────────────────────────────
+//
+// Returns every price-change event for a listing in chronological order.
+// Each row carries oldPrice, newPrice, changedBy (artist address), the ledger
+// sequence, and the wall-clock timestamp so the frontend can render a chart.
+
+router.get('/listings/:id/price-history', cacheMiddleware(60), async (req: Request, res: Response, next: NextFunction) => {
+  const id = req.params.id as string;
+  if (!/^\d+$/.test(id)) {
+    return next(badRequest('Invalid listing ID format'));
+  }
+
+  try {
+    const history = await prisma.priceHistory.findMany({
+      where: { listingId: BigInt(id) },
+      orderBy: { changedAtLedger: 'asc' },
+      select: {
+        id: true,
+        listingId: true,
+        oldPrice: true,
+        newPrice: true,
+        changedBy: true,
+        changedAtLedger: true,
+        changedAt: true,
+      },
+    });
+    res.json(serialize(history));
+  } catch (err) {
+    next(internalError('Failed to fetch price history'));
+  }
+});
+
+
 //
 // Serves cached IPFS metadata for a given CID.  If the metadata is not yet
 // cached, fetches it on-demand (populating the cache), enqueues a background

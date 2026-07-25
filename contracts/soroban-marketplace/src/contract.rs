@@ -1725,6 +1725,7 @@ impl MarketplaceContract {
         if nrlen == 0 { panic_with_error!(env, MarketplaceError::InvalidSplit); }
         if nrlen > 4  { panic_with_error!(env, MarketplaceError::TooManyRecipients); }
         Self::validate_recipients(env, &new_recipients, listing.protocol_fee_bps);
+        let old_price = listing.price;
         listing.price = new_price;
         listing.token = new_token;
         listing.recipients = new_recipients;
@@ -1737,6 +1738,16 @@ impl MarketplaceContract {
             token_id: listing.token_id,
             ledger_sequence: env.ledger().sequence(),
         }.publish(env);
+        // Emit price-change event whenever the price actually changes so
+        // the indexer can maintain a full PriceHistory table (Issue #213).
+        if old_price != new_price {
+            ListingPriceUpdatedEvent {
+                listing_id,
+                old_price,
+                new_price,
+                updated_by: artist.clone(),
+            }.publish(env);
+        }
         true
     }
 

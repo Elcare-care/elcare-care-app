@@ -684,7 +684,29 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
       break;
     }
 
-    case 'LISTING_PRICE_UPDATED':
+    case 'LISTING_PRICE_UPDATED': {
+      // Persist a price-history row so the indexer maintains a full audit trail
+      // of every price change for this listing (Issue #213).
+      await db.priceHistory.create({
+        data: {
+          listingId,
+          oldPrice: String(data.old_price ?? '0'),
+          newPrice: String(data.new_price ?? '0'),
+          changedBy: String(data.updated_by ?? actor ?? ''),
+          changedAtLedger: ledgerSequence,
+        },
+      });
+      // Also keep the live Listing.price in sync when changed via update_listing_price
+      await db.listing.updateMany({
+        where: { listingId },
+        data: { price: String(data.new_price ?? '0'), updatedAtLedger: ledgerSequence },
+      });
+      invalidatePattern('cache:*/listings*').catch(() => {});
+      invalidateKey(`cache:/listings/${listingId.toString()}`).catch(() => {});
+      invalidateKey(`cache:/listings/${listingId.toString()}/price-history`).catch(() => {});
+      break;
+    }
+
     case 'LISTING_EXPIRED': {
       invalidatePattern('cache:*/listings*').catch(() => {});
       invalidateKey(`cache:/listings/${listingId.toString()}`).catch(() => {});
