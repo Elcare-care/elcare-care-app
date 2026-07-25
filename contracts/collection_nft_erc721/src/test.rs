@@ -1,6 +1,8 @@
 extern crate std;
 
-use soroban_sdk::{testutils::Address as _, testutils::Ledger as _, Address, Env, String};
+use soroban_sdk::{
+    testutils::Address as _, testutils::Events as _, testutils::Ledger as _, Address, Env, String,
+};
 
 use crate::{DataKey, Error, NormalNFT721, NormalNFT721Client};
 
@@ -1475,4 +1477,83 @@ fn transfer_clears_expiry_key_alongside_approval() {
             .get::<DataKey, u32>(&DataKey::ApprovedExpiry(id))
     });
     assert!(expiry_after.is_none(), "expiry key must be cleared after transfer");
+}
+
+// ─── Metadata mutability / freeze semantics (#276) ─────────────────────────
+
+#[test]
+fn mint_rejects_empty_uri() {
+    let (env, client, _, _) = setup();
+    let alice = Address::generate(&env);
+    let result = client.try_mint(&alice, &String::from_str(&env, ""));
+    assert_eq!(result, Err(Ok(Error::EmptyUri)));
+    assert_eq!(client.total_supply(), 0);
+}
+
+#[test]
+fn mint_rejects_oversized_uri() {
+    let (env, client, _, _) = setup();
+    let alice = Address::generate(&env);
+    let big = "a".repeat(2049);
+    let result = client.try_mint(&alice, &String::from_str(&env, &big));
+    assert_eq!(result, Err(Ok(Error::UriTooLong)));
+    assert_eq!(client.total_supply(), 0);
+}
+
+#[test]
+fn mint_at_max_uri_len_boundary_succeeds() {
+    let (env, client, _, _) = setup();
+    let alice = Address::generate(&env);
+    let boundary = "a".repeat(2048);
+    let id = client.mint(&alice, &String::from_str(&env, &boundary));
+    assert_eq!(client.token_uri(&id).len(), 2048);
+}
+
+#[test]
+fn set_base_uri_rejects_empty_uri() {
+    let (env, client, _, _) = setup();
+    let result = client.try_set_base_uri(&String::from_str(&env, ""));
+    assert_eq!(result, Err(Ok(Error::EmptyUri)));
+}
+
+#[test]
+fn set_base_uri_rejects_oversized_uri() {
+    let (env, client, _, _) = setup();
+    let big = "a".repeat(2049);
+    let result = client.try_set_base_uri(&String::from_str(&env, &big));
+    assert_eq!(result, Err(Ok(Error::UriTooLong)));
+    assert_eq!(client.base_uri(), None);
+}
+
+#[test]
+fn set_base_uri_emits_metadata_update_event() {
+    let (env, client, _, _) = setup();
+    let before = env.events().all().len();
+    client.set_base_uri(&String::from_str(&env, "ipfs://new-base/"));
+    let after = env.events().all().len();
+    assert!(after > before, "set_base_uri should emit a metadata update event");
+}
+
+#[test]
+fn freeze_metadata_emits_event() {
+    let (env, client, _, _) = setup();
+    let before = env.events().all().len();
+    client.freeze_metadata();
+    let after = env.events().all().len();
+    assert!(after > before, "freeze_metadata should emit an event");
+}
+
+#[test]
+fn frozen_collection_rejects_base_uri_update_through_the_only_entry_point() {
+    // set_base_uri is the sole mutator for collection-level metadata; once
+    // frozen there is no alternate entry point that can bypass the check.
+    let (env, client, _, _) = setup();
+    client.set_base_uri(&String::from_str(&env, "ipfs://before-freeze/"));
+    client.freeze_metadata();
+    let result = client.try_set_base_uri(&String::from_str(&env, "ipfs://after-freeze/"));
+    assert_eq!(result, Err(Ok(Error::MetadataFrozen)));
+    assert_eq!(
+        client.base_uri(),
+        Some(String::from_str(&env, "ipfs://before-freeze/"))
+    );
 }

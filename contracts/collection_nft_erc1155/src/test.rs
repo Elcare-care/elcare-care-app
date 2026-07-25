@@ -1,7 +1,7 @@
 extern crate std;
 
 use soroban_sdk::{
-    testutils::{Address as _, Ledger as _},
+    testutils::{Address as _, Events as _, Ledger as _},
     Address, Env, String, Vec,
 };
 
@@ -1170,4 +1170,85 @@ fn balance_of_batch_mismatched_lengths_returns_empty() {
     let ids: Vec<u64> = Vec::from_array(&env, [0u64, 1u64]);
     let result = client.balance_of_batch(&accounts, &ids);
     assert_eq!(result.len(), 0);
+}
+
+// ─── Metadata mutability / freeze semantics (#276) ─────────────────────────
+
+#[test]
+fn mint_new_rejects_empty_uri() {
+    let (env, client, _, _) = setup();
+    let alice = Address::generate(&env);
+    let result = client.try_mint_new(&alice, &10u128, &String::from_str(&env, ""));
+    assert_eq!(result, Err(Ok(Error::EmptyUri)));
+}
+
+#[test]
+fn mint_new_rejects_oversized_uri() {
+    let (env, client, _, _) = setup();
+    let alice = Address::generate(&env);
+    let big = "a".repeat(2049);
+    let result = client.try_mint_new(&alice, &10u128, &String::from_str(&env, &big));
+    assert_eq!(result, Err(Ok(Error::UriTooLong)));
+}
+
+#[test]
+fn mint_batch_rejects_empty_uri_before_any_mutation() {
+    let (env, client, _, _) = setup();
+    let alice = Address::generate(&env);
+    let ids = Vec::from_array(&env, [0u64, 1u64]);
+    let amounts = Vec::from_array(&env, [10u128, 10u128]);
+    let uris = Vec::from_array(
+        &env,
+        [String::from_str(&env, "u0"), String::from_str(&env, "")],
+    );
+    let result = client.try_mint_batch(&alice, &ids, &amounts, &uris);
+    assert_eq!(result, Err(Ok(Error::EmptyUri)));
+    assert_eq!(client.balance_of(&alice, &0u64), 0, "no partial mutation on rejection");
+}
+
+#[test]
+fn set_base_uri_rejects_empty_uri() {
+    let (env, client, _, _) = setup();
+    let result = client.try_set_base_uri(&String::from_str(&env, ""));
+    assert_eq!(result, Err(Ok(Error::EmptyUri)));
+}
+
+#[test]
+fn set_base_uri_rejects_oversized_uri() {
+    let (env, client, _, _) = setup();
+    let big = "a".repeat(2049);
+    let result = client.try_set_base_uri(&String::from_str(&env, &big));
+    assert_eq!(result, Err(Ok(Error::UriTooLong)));
+    assert_eq!(client.base_uri(), None);
+}
+
+#[test]
+fn set_base_uri_emits_metadata_update_event() {
+    let (env, client, _, _) = setup();
+    let before = env.events().all().len();
+    client.set_base_uri(&String::from_str(&env, "ipfs://new-base/"));
+    let after = env.events().all().len();
+    assert!(after > before, "set_base_uri should emit a metadata update event");
+}
+
+#[test]
+fn freeze_metadata_emits_event() {
+    let (env, client, _, _) = setup();
+    let before = env.events().all().len();
+    client.freeze_metadata();
+    let after = env.events().all().len();
+    assert!(after > before, "freeze_metadata should emit an event");
+}
+
+#[test]
+fn frozen_collection_rejects_base_uri_update_through_the_only_entry_point() {
+    let (env, client, _, _) = setup();
+    client.set_base_uri(&String::from_str(&env, "ipfs://before-freeze/"));
+    client.freeze_metadata();
+    let result = client.try_set_base_uri(&String::from_str(&env, "ipfs://after-freeze/"));
+    assert_eq!(result, Err(Ok(Error::MetadataFrozen)));
+    assert_eq!(
+        client.base_uri(),
+        Some(String::from_str(&env, "ipfs://before-freeze/"))
+    );
 }

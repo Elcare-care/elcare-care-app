@@ -842,3 +842,57 @@ fn persistent_balance_ttl_extended_on_transfer() {
     });
     assert!(still_has);
 }
+
+// ─── Metadata mutability / freeze semantics (#276) ─────────────────────────
+
+#[test]
+fn is_metadata_frozen_is_always_true() {
+    // An edition's URI is set once by whichever voucher first registers it
+    // and is never updatable afterwards — the collection is permanently
+    // frozen from the start, unlike the normal collections where freeze is
+    // an explicit creator action.
+    let (env, client, _creator, _fee) = setup(0);
+    assert!(client.is_metadata_frozen());
+    client.set_public_phase();
+    let token_id = 900u64;
+    client.register_edition(&token_id, &1000u128);
+    let buyer = Address::generate(&env);
+    let v = make_voucher(&env, token_id, 900);
+    let sig = sign_voucher(&env, &client.address, &v);
+    client.redeem(&buyer, &v, &1u128, &sig, &empty_proof(&env));
+    assert!(client.is_metadata_frozen());
+}
+
+#[test]
+fn redeem_rejects_empty_uri_voucher() {
+    let (env, client, _creator, _fee) = setup(0);
+    client.set_public_phase();
+    let token_id = 901u64;
+    client.register_edition(&token_id, &1000u128);
+    let buyer = Address::generate(&env);
+    let v = MintVoucher1155 {
+        uri: String::from_str(&env, ""),
+        ..make_voucher(&env, token_id, 901)
+    };
+    let sig = sign_voucher(&env, &client.address, &v);
+    let res = client.try_redeem(&buyer, &v, &1u128, &sig, &empty_proof(&env));
+    assert_eq!(res, Err(Ok(Error::EmptyUri)));
+}
+
+#[test]
+fn redeem_rejects_oversized_uri_voucher() {
+    let (env, client, _creator, _fee) = setup(0);
+    client.set_public_phase();
+    let token_id = 902u64;
+    client.register_edition(&token_id, &1000u128);
+    let buyer = Address::generate(&env);
+    let big = "a".repeat(2049);
+    let v = MintVoucher1155 {
+        uri: String::from_str(&env, &big),
+        ..make_voucher(&env, token_id, 902)
+    };
+    let sig = sign_voucher(&env, &client.address, &v);
+    let res = client.try_redeem(&buyer, &v, &1u128, &sig, &empty_proof(&env));
+    assert_eq!(res, Err(Ok(Error::UriTooLong)));
+    assert_eq!(client.balance_of(&buyer, &token_id), 0u128, "no partial mutation on rejection");
+}

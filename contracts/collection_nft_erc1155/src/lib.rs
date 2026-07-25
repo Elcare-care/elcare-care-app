@@ -29,6 +29,8 @@ use soroban_sdk::{
 const TTL_THRESHOLD: u32 = 50_000;
 const TTL_BUMP: u32 = 100_000;
 const MAX_BPS: u32 = 10_000; // 100 % in basis points
+/// Maximum accepted length (in bytes) for any metadata URI (#276).
+const MAX_URI_LEN: u32 = 2048;
 
 // ─── Errors ──────────────────────────────────────────────────────────────────
 
@@ -54,6 +56,10 @@ pub enum Error {
     AlreadyFrozen = 11,
     /// basis points exceed MAX_BPS (10_000).
     InvalidBps = 12,
+    /// A URI is empty (#276).
+    EmptyUri = 13,
+    /// A URI exceeds MAX_URI_LEN bytes (#276).
+    UriTooLong = 14,
 }
 
 // ─── Storage Keys ─────────────────────────────────────────────────────────────
@@ -110,6 +116,20 @@ fn u64_to_string(env: &Env, mut n: u64) -> String {
         buf[..len].reverse();
     }
     String::from_bytes(env, &buf[..len])
+}
+
+/// Rejects empty or oversized metadata URIs (#276). Applied to every mint
+/// path and to `set_base_uri` so boundary/malformed values are caught
+/// consistently regardless of entry point.
+fn validate_uri(uri: &String) -> Result<(), Error> {
+    let len = uri.len();
+    if len == 0 {
+        return Err(Error::EmptyUri);
+    }
+    if len > MAX_URI_LEN {
+        return Err(Error::UriTooLong);
+    }
+    Ok(())
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -237,7 +257,7 @@ impl NormalNFT1155 {
     /// Callable only by creator.
     pub fn set_base_uri(env: Env, base_uri: String) -> Result<(), Error> {
         Self::extend_instance_ttl(&env);
-        Self::only_creator(&env)?;
+        let creator = Self::only_creator(&env)?;
         if env
             .storage()
             .instance()
@@ -246,7 +266,13 @@ impl NormalNFT1155 {
         {
             return Err(Error::MetadataFrozen);
         }
+        validate_uri(&base_uri)?;
+        let old_uri: Option<String> = env.storage().instance().get(&DataKey::BaseUri);
         env.storage().instance().set(&DataKey::BaseUri, &base_uri);
+        env.events().publish(
+            (symbol_short!("meta_upd"), creator),
+            (old_uri, base_uri),
+        );
         Ok(())
     }
 
@@ -259,7 +285,7 @@ impl NormalNFT1155 {
     /// After this, `set_base_uri` reverts forever. Callable only by creator.
     pub fn freeze_metadata(env: Env) -> Result<(), Error> {
         Self::extend_instance_ttl(&env);
-        Self::only_creator(&env)?;
+        let creator = Self::only_creator(&env)?;
         if env
             .storage()
             .instance()
@@ -271,6 +297,8 @@ impl NormalNFT1155 {
         env.storage()
             .instance()
             .set(&DataKey::MetadataFrozen, &true);
+        env.events()
+            .publish((symbol_short!("meta_frz"),), creator);
         Ok(())
     }
 
@@ -393,6 +421,7 @@ impl NormalNFT1155 {
         Self::extend_instance_ttl(&env);
         Self::only_creator(&env)?;
         Self::require_not_paused(&env)?;
+        validate_uri(&uri)?;
         let token_id: u64 = env
             .storage()
             .instance()
@@ -420,6 +449,7 @@ impl NormalNFT1155 {
         Self::extend_instance_ttl(&env);
         Self::only_creator(&env)?;
         Self::require_not_paused(&env)?;
+        validate_uri(&uri)?;
         Self::_check_supply_cap(&env, token_id, amount)?;
         Self::_check_wallet_limit(&env, &to, token_id, amount)?;
         Self::_mint(&env, &to, token_id, amount, &uri);
@@ -449,6 +479,11 @@ impl NormalNFT1155 {
         }
         if token_ids.len() != amounts.len() || token_ids.len() != uris.len() {
             return Err(Error::LengthMismatch);
+        }
+
+        // Validate every URI up front (#276) — before any storage mutation.
+        for uri in uris.iter() {
+            validate_uri(&uri)?;
         }
 
         // ── Invariant hardening: accumulate amounts per-id within the batch ──

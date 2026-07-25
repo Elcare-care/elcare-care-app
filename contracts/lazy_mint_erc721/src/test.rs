@@ -821,3 +821,51 @@ fn different_nonces_are_independent() {
     let res = client.try_redeem(&buyer, &v2, &bad_sig, &empty_proof(&env));
     assert_ne!(res, Err(Ok(Error::VoucherAlreadyRedeemed)));
 }
+
+// ─── Metadata mutability / freeze semantics (#276) ─────────────────────────
+
+#[test]
+fn is_metadata_frozen_is_always_true() {
+    // Lazy-minted tokens have no metadata setter at all — the URI is fixed
+    // by the signed voucher at redemption time — so the collection is
+    // permanently frozen from the start, unlike the normal collections
+    // where freeze is an explicit creator action.
+    let (env, client, _creator, _fee) = setup(0);
+    assert!(client.is_metadata_frozen());
+    client.set_public_phase();
+    let buyer = Address::generate(&env);
+    let v = make_voucher(&env, 1);
+    let sig = sign_voucher(&env, &client.address, &v);
+    client.redeem(&buyer, &v, &sig, &empty_proof(&env));
+    assert!(client.is_metadata_frozen());
+}
+
+#[test]
+fn redeem_rejects_empty_uri_voucher() {
+    let (env, client, _creator, _fee) = setup(0);
+    client.set_public_phase();
+    let buyer = Address::generate(&env);
+    let v = MintVoucher {
+        uri: String::from_str(&env, ""),
+        ..make_voucher(&env, 1)
+    };
+    let sig = sign_voucher(&env, &client.address, &v);
+    let res = client.try_redeem(&buyer, &v, &sig, &empty_proof(&env));
+    assert_eq!(res, Err(Ok(Error::EmptyUri)));
+}
+
+#[test]
+fn redeem_rejects_oversized_uri_voucher() {
+    let (env, client, _creator, _fee) = setup(0);
+    client.set_public_phase();
+    let buyer = Address::generate(&env);
+    let big = "a".repeat(2049);
+    let v = MintVoucher {
+        uri: String::from_str(&env, &big),
+        ..make_voucher(&env, 1)
+    };
+    let sig = sign_voucher(&env, &client.address, &v);
+    let res = client.try_redeem(&buyer, &v, &sig, &empty_proof(&env));
+    assert_eq!(res, Err(Ok(Error::UriTooLong)));
+    assert!(client.try_owner_of(&1u64).is_err(), "no partial mutation on rejection");
+}

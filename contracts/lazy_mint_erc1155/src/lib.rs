@@ -40,6 +40,8 @@ use soroban_sdk::{
 
 const TTL_THRESHOLD: u32 = 50_000;
 const TTL_BUMP: u32 = 100_000;
+/// Maximum accepted length (in bytes) for a voucher's metadata URI (#276).
+const MAX_URI_LEN: u32 = 2048;
 
 // ─── Errors ──────────────────────────────────────────────────────────────────
 
@@ -65,6 +67,10 @@ pub enum Error {
     InvalidMerkleProof = 15,
     /// Voucher nonce has been explicitly revoked by the creator.
     VoucherRevoked = 16,
+    /// A voucher's URI is empty (#276).
+    EmptyUri = 17,
+    /// A voucher's URI exceeds MAX_URI_LEN bytes (#276).
+    UriTooLong = 18,
 }
 
 // ─── Data types ───────────────────────────────────────────────────────────────
@@ -203,6 +209,16 @@ impl LazyMint1155 {
     ) -> Result<(), Error> {
         if voucher.valid_until != 0 && env.ledger().sequence() > voucher.valid_until as u32 {
             return Err(Error::VoucherExpired);
+        }
+        // Metadata is set once, at redemption, and is never updatable
+        // afterwards (#276: immutable-at-mint by design — see
+        // `is_metadata_frozen`). Still validate boundary/malformed URIs.
+        let uri_len = voucher.uri.len();
+        if uri_len == 0 {
+            return Err(Error::EmptyUri);
+        }
+        if uri_len > MAX_URI_LEN {
+            return Err(Error::UriTooLong);
         }
         if env
             .storage()
@@ -783,6 +799,14 @@ impl LazyMint1155 {
             .persistent()
             .get(&DataKey::TokenUri(token_id))
             .unwrap()
+    }
+
+    /// Always `true` — an edition's URI is set once by whichever voucher
+    /// first registers it and is never updatable afterwards (#276). Exposed
+    /// as a method so every collection type — normal and lazy — exposes the
+    /// same `is_metadata_frozen()` query for frontend/indexer consumers.
+    pub fn is_metadata_frozen(_env: Env) -> bool {
+        true
     }
 
     pub fn total_supply(env: Env, token_id: u64) -> u128 {

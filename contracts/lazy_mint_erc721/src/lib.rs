@@ -40,6 +40,8 @@ use soroban_sdk::{
 
 const TTL_THRESHOLD: u32 = 50_000;
 const TTL_BUMP: u32 = 100_000;
+/// Maximum accepted length (in bytes) for a voucher's metadata URI (#276).
+const MAX_URI_LEN: u32 = 2048;
 
 // ─── Errors ──────────────────────────────────────────────────────────────────
 
@@ -62,6 +64,10 @@ pub enum Error {
     InvalidMerkleProof = 12,
     /// Voucher nonce has been explicitly revoked by the creator.
     VoucherRevoked = 13,
+    /// A voucher's URI is empty (#276).
+    EmptyUri = 14,
+    /// A voucher's URI exceeds MAX_URI_LEN bytes (#276).
+    UriTooLong = 15,
 }
 
 // ─── Data types ───────────────────────────────────────────────────────────────
@@ -200,6 +206,16 @@ impl LazyMint721 {
     ) -> Result<(), Error> {
         if voucher.valid_until != 0 && env.ledger().sequence() > voucher.valid_until as u32 {
             return Err(Error::VoucherExpired);
+        }
+        // Metadata is set once, at redemption, and is never updatable
+        // afterwards (#276: immutable-at-mint by design — see
+        // `is_metadata_frozen`). Still validate boundary/malformed URIs.
+        let uri_len = voucher.uri.len();
+        if uri_len == 0 {
+            return Err(Error::EmptyUri);
+        }
+        if uri_len > MAX_URI_LEN {
+            return Err(Error::UriTooLong);
         }
         // Replay before revocation: if already redeemed, surface that error.
         if env
@@ -680,6 +696,15 @@ impl LazyMint721 {
             .persistent()
             .get(&DataKey::TokenUri(token_id))
             .ok_or(Error::TokenNotFound)
+    }
+
+    /// Always `true` — a lazy-minted token's URI comes from its signed
+    /// voucher and is set once at redemption; there is no setter to change
+    /// it afterwards (#276). Exposed as a method (rather than left implicit)
+    /// so every collection type — normal and lazy — exposes the same
+    /// `is_metadata_frozen()` query for frontend/indexer consumers.
+    pub fn is_metadata_frozen(_env: Env) -> bool {
+        true
     }
 
     pub fn balance_of(env: Env, owner: Address) -> u64 {
