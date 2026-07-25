@@ -25,10 +25,17 @@ import {
   getTopCollections,
   getTopArtists,
 } from '../stats.js';
+import {
+  sseConnectionsTotal,
+  sseActiveConnectionsGauge,
+  apiRequestDurationHistogram,
+} from '../metrics.js';
+import { TTL } from '../cache-warmer.js';
 
 // ── SSE registry ───────────────────────────────────────────────────────────────
 
 const SSE_BUFFER_SIZE = 200;
+const MAX_SSE_CONNECTIONS = parseInt(process.env.MAX_SSE_CONNECTIONS || '500');
 
 interface SSEEvent {
   id: number;
@@ -52,6 +59,18 @@ export function _resetSseState() {
   sseClients.clear();
 }
 
+/** Track SSE client metrics and run cleanup on disconnect. */
+function setupSSEHeartbeat(res: Response): ReturnType<typeof setInterval> {
+  return setInterval(() => {
+    try { res.write(': heartbeat\n\n'); } catch { cleanupSSEClient(res); }
+  }, 30_000);
+}
+
+function cleanupSSEClient(res: Response): void {
+  sseClients.delete(res);
+  sseActiveConnectionsGauge.set(sseClients.size);
+}
+
 // SSE clients registry — keyed by Response, value is last-seen event ID
 
 export function emitSSEEvent(event: any) {
@@ -68,7 +87,7 @@ export function emitSSEEvent(event: any) {
       client.write(frame);
       sseClients.set(client, id);
     } catch {
-      sseClients.delete(client);
+      cleanupSSEClient(client);
     }
   }
 }
@@ -78,11 +97,28 @@ export function closeSSEClients(): void {
         try { client.end(); } catch { /* ignore */ }
     }
     sseClients.clear();
+    sseActiveConnectionsGauge.set(0);
+}
+
+// ── API request duration middleware ───────────────────────────────────────────
+// Records per-route latency histogram with method / route / status_code labels.
+
+export function apiDurationMiddleware(req: Request, res: Response, next: NextFunction) {
+  const start = process.hrtime();
+  res.on('finish', () => {
+    const [s, ns] = process.hrtime(start);
+    const route = req.route ? (req.baseUrl || '') + req.route.path : req.path;
+    apiRequestDurationHistogram
+      .labels(req.method, route, String(res.statusCode))
+      .observe(s + ns / 1e9);
+  });
+  next();
 }
 
 const router = Router();
 
 router.use(etagMiddleware);
+router.use(apiDurationMiddleware);
 
 const CACHE_TTL_SECONDS = parseInt(process.env.REDIS_CACHE_TTL_SECONDS || '30');
 
@@ -95,7 +131,7 @@ async function getCached<T>(key: string, ttl: number, fetcher: () => Promise<T>)
   }
   const result = await fetcher();
   try {
-    await redis.set(key, JSON.stringify(result), { expiration: { type: 'EX', value: ttl } });
+    await (redis as any).setEx(key, ttl, JSON.stringify(result));
   } catch {
     // ignore cache write failures
   }
@@ -110,35 +146,49 @@ const serialize = (obj: any) =>
 // ── GET /events (SSE) ─────────────────────────────────────────────────────────
 
 router.get('/events', (req: Request, res: Response) => {
+  // Check connection limit
+  if (sseClients.size >= MAX_SSE_CONNECTIONS) {
+    return res.status(503).json({ error: 'Too many SSE connections' });
+  }
+
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
-  res.setHeader('X-Accel-Buffering', 'no'); // prevent nginx from buffering SSE chunks
+  res.setHeader('X-Accel-Buffering', 'no');
   res.flushHeaders();
 
   const lastEventId = req.headers['last-event-id'];
   const resumeFrom = lastEventId ? parseInt(String(lastEventId), 10) : null;
 
   sseClients.set(res, resumeFrom ?? sseEventCounter);
+  sseConnectionsTotal.inc();
+  sseActiveConnectionsGauge.set(sseClients.size);
 
+  // Replay missed events
   if (resumeFrom !== null && !isNaN(resumeFrom)) {
     const missed = sseBuffer.filter(e => e.id > resumeFrom);
     for (const ev of missed) {
-      try {
-        res.write(`id: ${ev.id}\ndata: ${ev.data}\n\n`);
-      } catch {
-        break;
-      }
+      try { res.write(`id: ${ev.id}\ndata: ${ev.data}\n\n`); } catch { break; }
     }
   }
 
-  req.on('close', () => sseClients.delete(res));
+  // Send initial connection message
+  res.write(`data: ${JSON.stringify({ type: 'CONNECTED' })}\n\n`);
+
+  const heartbeat = setupSSEHeartbeat(res);
+
+  const cleanup = () => {
+    clearInterval(heartbeat);
+    cleanupSSEClient(res);
+  };
+  req.on('close', cleanup);
+  res.on('error', cleanup);
 });
 
 // ── GET /listings ─────────────────────────────────────────────────────────────
 
-router.get('/listings', validateQuery(listingsQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
-  const { artist, owner, status, limit, offset, minPrice, maxPrice, search } =
+router.get('/listings', cacheMiddleware(TTL.LISTINGS_LIST), validateQuery(listingsQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
+  const { artist, owner, status, limit, offset, minPrice, maxPrice, search, cursor_ledger, cursor_direction } =
     (req as any).validatedQuery;
   try {
     const where: any = {};
@@ -159,21 +209,37 @@ router.get('/listings', validateQuery(listingsQuerySchema), async (req: Request,
       ];
     }
 
-    const take = limit || undefined;
-    const skip = offset || undefined;
-
-    const results = await prisma.listing.findMany({
-      where,
-      orderBy: { updatedAtLedger: 'desc' },
-      take,
-      skip,
-    });
-
-    if (take !== undefined || skip !== undefined) {
-      const total = await prisma.listing.count({ where });
-      return res.json({ listings: serialize(results), total });
+    // ── Cursor pagination ─────────────────────────────────────────────────
+    const direction: 'asc' | 'desc' = cursor_direction ?? 'desc';
+    if (cursor_ledger !== undefined) {
+      where.updatedAtLedger = direction === 'desc'
+        ? { lt: cursor_ledger }
+        : { gt: cursor_ledger };
     }
 
+    const take = limit ?? 20;
+    const skip = cursor_ledger !== undefined ? 0 : (offset ?? 0);
+
+    const [results, total] = await Promise.all([
+      prisma.listing.findMany({
+        where,
+        orderBy: { updatedAtLedger: direction },
+        take,
+        skip,
+      }),
+      prisma.listing.count({ where: { ...where, updatedAtLedger: undefined } }),
+    ]);
+
+    const nextCursor = results.length === take
+      ? String(results[results.length - 1].updatedAtLedger)
+      : '';
+
+    res.setHeader('X-Next-Cursor', nextCursor);
+    res.setHeader('X-Total-Count', String(total));
+
+    if (limit !== undefined || offset !== undefined || cursor_ledger !== undefined) {
+      return res.json({ listings: serialize(results), total });
+    }
     res.json(serialize(results));
   } catch (err) {
     next(internalError('Failed to fetch listings'));
@@ -182,7 +248,7 @@ router.get('/listings', validateQuery(listingsQuerySchema), async (req: Request,
 
 // ── GET /listings/:id ─────────────────────────────────────────────────────────
 
-router.get('/listings/:id', async (req: Request, res: Response, next: NextFunction) => {
+router.get('/listings/:id', cacheMiddleware(TTL.LISTING_DETAIL), async (req: Request, res: Response, next: NextFunction) => {
   const { id } = req.params;
   try {
     const listing = await prisma.listing.findUnique({
@@ -305,17 +371,29 @@ router.get('/ipfs/:cid', cacheMiddleware(300), async (req: Request, res: Respons
 
 // ── GET /auctions ─────────────────────────────────────────────────────────────
 
-router.get('/auctions', validateQuery(auctionsQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
-  const { creator, status } = (req as any).validatedQuery;
+router.get('/auctions', cacheMiddleware(TTL.AUCTIONS_LIST), validateQuery(auctionsQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
+  const { creator, status, limit, offset, cursor_ledger, cursor_direction } = (req as any).validatedQuery;
   try {
     const where: any = {};
     if (creator) where.creator = creator;
     if (status) where.status = status;
 
-    const results = await prisma.auction.findMany({
-      where,
-      orderBy: { updatedAtLedger: 'desc' },
-    });
+    const direction: 'asc' | 'desc' = cursor_direction ?? 'desc';
+    if (cursor_ledger !== undefined) {
+      where.updatedAtLedger = direction === 'desc' ? { lt: cursor_ledger } : { gt: cursor_ledger };
+    }
+
+    const take = limit ?? 20;
+    const skip = cursor_ledger !== undefined ? 0 : (offset ?? 0);
+
+    const [results, total] = await Promise.all([
+      prisma.auction.findMany({ where, orderBy: { updatedAtLedger: direction }, take, skip }),
+      prisma.auction.count({ where: { ...(creator ? { creator } : {}), ...(status ? { status } : {}) } }),
+    ]);
+
+    const nextCursor = results.length === take ? String(results[results.length - 1].updatedAtLedger) : '';
+    res.setHeader('X-Next-Cursor', nextCursor);
+    res.setHeader('X-Total-Count', String(total));
     res.json(serialize(results));
   } catch (err) {
     next(internalError('Failed to fetch auctions'));
@@ -324,7 +402,7 @@ router.get('/auctions', validateQuery(auctionsQuerySchema), async (req: Request,
 
 // ── GET /auctions/:id ─────────────────────────────────────────────────────────
 
-router.get('/auctions/:id', async (req: Request, res: Response, next: NextFunction) => {
+router.get('/auctions/:id', cacheMiddleware(TTL.AUCTION_DETAIL), async (req: Request, res: Response, next: NextFunction) => {
   const id = req.params.id as string;
   if (!/^\d+$/.test(id)) {
     return next(badRequest('Invalid ID format'));
@@ -343,17 +421,27 @@ router.get('/auctions/:id', async (req: Request, res: Response, next: NextFuncti
 // ── GET /offers ───────────────────────────────────────────────────────────────
 
 router.get('/offers', validateQuery(offersQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
-  const { listing_id } = (req as any).validatedQuery;
+  const { listing_id, limit, offset, cursor_ledger, cursor_direction } = (req as any).validatedQuery;
   try {
     const where: any = {};
-    if (listing_id) {
-      where.listingId = BigInt(listing_id);
+    if (listing_id) where.listingId = BigInt(listing_id);
+
+    const direction: 'asc' | 'desc' = cursor_direction ?? 'desc';
+    if (cursor_ledger !== undefined) {
+      where.updatedAtLedger = direction === 'desc' ? { lt: cursor_ledger } : { gt: cursor_ledger };
     }
 
-    const results = await prisma.offer.findMany({
-      where,
-      orderBy: { updatedAtLedger: 'desc' },
-    });
+    const take = limit ?? 20;
+    const skip = cursor_ledger !== undefined ? 0 : (offset ?? 0);
+
+    const [results, total] = await Promise.all([
+      prisma.offer.findMany({ where, orderBy: { updatedAtLedger: direction }, take, skip }),
+      prisma.offer.count({ where: listing_id ? { listingId: BigInt(listing_id) } : {} }),
+    ]);
+
+    const nextCursor = results.length === take ? String(results[results.length - 1].updatedAtLedger) : '';
+    res.setHeader('X-Next-Cursor', nextCursor);
+    res.setHeader('X-Total-Count', String(total));
     res.json(serialize(results));
   } catch (err) {
     next(internalError('Failed to fetch offers'));
@@ -362,9 +450,9 @@ router.get('/offers', validateQuery(offersQuerySchema), async (req: Request, res
 
 // ── GET /activity/recent ──────────────────────────────────────────────────────
 
-router.get('/activity/recent', cacheMiddleware(30), async (req: Request, res: Response, next: NextFunction) => {
+router.get('/activity/recent', cacheMiddleware(TTL.ACTIVITY_RECENT), async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const results = await getCached('activity:recent', CACHE_TTL_SECONDS, () =>
+    const results = await getCached('activity:recent', TTL.ACTIVITY_RECENT, () =>
       prisma.marketplaceEvent.findMany({
         take: 20,
         orderBy: { ledgerSequence: 'desc' },
@@ -378,19 +466,29 @@ router.get('/activity/recent', cacheMiddleware(30), async (req: Request, res: Re
 
 // ── GET /collections ──────────────────────────────────────────────────────────
 
-router.get('/collections', cacheMiddleware(60), validateQuery(collectionsQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
-  const { kind, creator } = (req as any).validatedQuery;
+router.get('/collections', cacheMiddleware(TTL.COLLECTIONS), validateQuery(collectionsQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
+  const { kind, creator, limit, offset, cursor_ledger, cursor_direction } = (req as any).validatedQuery;
   try {
     const where: any = {};
     if (kind)    where.kind    = kind;
     if (creator) where.creator = creator;
-    const cacheKey = `collections:${kind ?? ''}:${creator ?? ''}`;
-    const results = await getCached(cacheKey, CACHE_TTL_SECONDS, () =>
-      prisma.collection.findMany({
-        where,
-        orderBy: { deployedAtLedger: 'desc' },
-      })
-    );
+
+    const direction: 'asc' | 'desc' = cursor_direction ?? 'desc';
+    if (cursor_ledger !== undefined) {
+      where.deployedAtLedger = direction === 'desc' ? { lt: cursor_ledger } : { gt: cursor_ledger };
+    }
+
+    const take = limit ?? 20;
+    const skip = cursor_ledger !== undefined ? 0 : (offset ?? 0);
+
+    const [results, total] = await Promise.all([
+      prisma.collection.findMany({ where, orderBy: { deployedAtLedger: direction }, take, skip }),
+      prisma.collection.count({ where: { ...(kind ? { kind } : {}), ...(creator ? { creator } : {}) } }),
+    ]);
+
+    const nextCursor = results.length === take ? String(results[results.length - 1].deployedAtLedger) : '';
+    res.setHeader('X-Next-Cursor', nextCursor);
+    res.setHeader('X-Total-Count', String(total));
     res.json(serialize(results));
   } catch (err) {
     next(internalError('Failed to fetch collections'));
@@ -416,22 +514,36 @@ router.get('/creators/:address/collections', async (req: Request, res: Response,
 
 router.get('/wallets/:address/activity', strictRateLimiter, validateQuery(walletActivityQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
   const address = req.params.address as string;
-  const { limit } = (req as any).validatedQuery;
+  const { limit, offset, cursor_ledger, cursor_direction } = (req as any).validatedQuery;
   const take = Math.min(limit ?? 50, 200);
+
   try {
+    const direction: 'asc' | 'desc' = cursor_direction ?? 'desc';
+    const cursorWhere: any = cursor_ledger !== undefined
+      ? { ledgerSequence: direction === 'desc' ? { lt: cursor_ledger } : { gt: cursor_ledger } }
+      : {};
+
     const jsonKeys = ['buyer', 'artist', 'offerer', 'bidder', 'winner', 'creator'];
     const fromJson = jsonKeys.map((path) => ({
       data: { path: [path], equals: address },
     }));
 
-    const events = await prisma.marketplaceEvent.findMany({
-      where: {
-        OR: [{ actor: address }, ...fromJson],
-      },
-      orderBy: { ledgerSequence: 'desc' },
-      take,
-    });
+    const baseWhere = { OR: [{ actor: address }, ...fromJson] };
+    const where = { ...baseWhere, ...cursorWhere };
 
+    const [events, total] = await Promise.all([
+      prisma.marketplaceEvent.findMany({
+        where,
+        orderBy: { ledgerSequence: direction },
+        take,
+        skip: cursor_ledger !== undefined ? 0 : (offset ?? 0),
+      }),
+      prisma.marketplaceEvent.count({ where: baseWhere }),
+    ]);
+
+    const nextCursor = events.length === take ? String(events[events.length - 1].ledgerSequence) : '';
+    res.setHeader('X-Next-Cursor', nextCursor);
+    res.setHeader('X-Total-Count', String(total));
     res.json(serialize(events));
   } catch (err) {
     next(internalError('Failed to fetch wallet activity'));

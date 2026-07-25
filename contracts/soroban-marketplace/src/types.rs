@@ -77,6 +77,16 @@ pub enum MarketplaceError {
     PriceOutOfBounds = 39,
     /// A checked arithmetic operation overflowed while computing fee splits.
     ArithmeticOverflow = 40,
+    /// `accept_admin` was called after the pending admin proposal's `expires_at`
+    /// ledger timestamp has passed.  The proposal must be re-issued.
+    ///
+    /// NOTE: Issue #202 suggested discriminant 35, but 35/36 are already taken
+    /// (`OfferLimitReached`/`BatchTooLarge`); the next free codes 41/42 are used
+    /// instead so existing on-chain error codes are not renumbered.
+    AdminProposalExpired = 41,
+    /// `accept_admin` or `cancel_admin_proposal` was called when no admin
+    /// proposal is currently pending.
+    NoAdminProposalPending = 42,
 }
 
 #[contracttype]
@@ -150,6 +160,15 @@ pub struct Auction {
     pub extension_window: u64,
     pub extension_trigger: u64,
     pub protocol_fee_bps: u32,
+    /// Bid-history ring-buffer capacity snapshotted at auction creation time.
+    ///
+    /// Snapshotting here means a later admin change to the global
+    /// `BidHistoryCap` never retroactively shrinks or grows the history of
+    /// an already-running auction — each auction's ring-buffer behaviour is
+    /// fixed when it is created.
+    ///
+    /// Valid range: 1 – 200 (enforced by `set_bid_history_cap`).
+    pub bid_history_cap: u32,
 }
 
 #[contracttype]

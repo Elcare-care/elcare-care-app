@@ -14,48 +14,44 @@ const positiveInt = (max: number) =>
 
 const optionalString = z.string().optional();
 
-/**
- * Optional Stellar G-address field.
- * Rejects strings that are not exactly 56 base32 characters starting with G.
- * Accepts `undefined` (field not supplied).
- */
-const optionalStellarAddress = z
-  .string()
-  .refine(isValidStellarAddress, { message: STELLAR_ADDRESS_ERROR })
-  .optional();
+// ── Cursor pagination fields (shared across list endpoints) ───────────────────
+//
+// cursor_ledger    : ledgerSequence value to paginate from (exclusive boundary).
+// cursor_direction : "desc" (default, newest-first) | "asc" (oldest-first).
+//
+// When cursor_ledger is provided the endpoint uses:
+//   DESC → WHERE updatedAtLedger < cursor_ledger  (next older page)
+//   ASC  → WHERE updatedAtLedger > cursor_ledger  (next newer page)
+//
+// Responses include:
+//   X-Next-Cursor  : ledgerSequence of the last item returned, or "" when exhausted.
+//   X-Total-Count  : total matching rows (independent COUNT query).
 
-/**
- * Positive decimal string validator.
- * Accepts "0", "100", "1.5000000" etc.
- * Rejects empty strings, negative values, and non-numeric input.
- */
-const positiveDecimalString = z
-  .string()
-  .regex(/^\d+(\.\d+)?$/, 'Must be a non-negative decimal number string')
-  .optional();
+const cursorFields = {
+  cursor_ledger:    z.coerce.number().int().min(0).optional(),
+  cursor_direction: z.enum(['asc', 'desc']).optional().default('desc'),
+};
 
 // ── Per-endpoint schemas ──────────────────────────────────────────────────────
 
 export const listingsQuerySchema = z.object({
-  // artist: must be a valid Stellar G-address when supplied.
-  artist: optionalStellarAddress,
-  // owner: Stellar G-address of the current holder.
-  owner: optionalStellarAddress,
-  // status: enum — only known values accepted.
-  status: z.enum(['Active', 'Sold', 'Cancelled', 'Auction']).optional(),
-  // search: free-text search; strip leading/trailing whitespace.
-  search: z.string().trim().optional(),
-  // Price range: positive decimal strings.
-  minPrice: positiveDecimalString,
-  maxPrice: positiveDecimalString,
-  // Pagination: integers in [0, max].
-  limit:  positiveInt(100).optional(),   // tightened from 1000 per spec
-  offset: positiveInt(10_000).optional(),
+  artist:   optionalString,
+  owner:    optionalString,
+  status:   optionalString,
+  search:   optionalString,
+  minPrice: z.coerce.number().nonnegative().optional(),
+  maxPrice: z.coerce.number().nonnegative().optional(),
+  limit:    positiveInt(1000).optional(),
+  offset:   positiveInt(10_000).optional(),
+  ...cursorFields,
 });
 
 export const auctionsQuerySchema = z.object({
-  creator: optionalStellarAddress,
-  status:  z.enum(['Active', 'Finalized', 'Cancelled']).optional(),
+  creator: optionalString,
+  status:  optionalString,
+  limit:   positiveInt(1000).optional(),
+  offset:  positiveInt(10_000).optional(),
+  ...cursorFields,
 });
 
 export const offersQuerySchema = z.object({
@@ -63,16 +59,23 @@ export const offersQuerySchema = z.object({
     .string()
     .regex(/^\d+$/, 'listing_id must be a non-negative integer')
     .optional(),
+  limit:  positiveInt(1000).optional(),
+  offset: positiveInt(10_000).optional(),
+  ...cursorFields,
 });
 
 export const walletActivityQuerySchema = z.object({
-  // limit: 1–200; default applied in route handler.
-  limit: z.coerce.number().int().min(1).max(200).optional(),
+  limit:  positiveInt(200).optional(),
+  offset: positiveInt(10_000).optional(),
+  ...cursorFields,
 });
 
 export const collectionsQuerySchema = z.object({
-  kind:    z.enum(['normal_721', 'normal_1155', 'lazy_721', 'lazy_1155']).optional(),
-  creator: optionalStellarAddress,
+  kind:    optionalString,
+  creator: optionalString,
+  limit:   positiveInt(1000).optional(),
+  offset:  positiveInt(10_000).optional(),
+  ...cursorFields,
 });
 
 export const statsQuerySchema = z.object({

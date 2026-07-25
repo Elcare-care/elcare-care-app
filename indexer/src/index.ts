@@ -16,8 +16,12 @@ import { startGapRepairWorker } from './gap-repair.js';
 import { logger } from './logger.js';
 import prisma from './db.js';
 import docsRouter from './api/docs-router.js';
-import { startDbHealthProbe } from './db-health.js';
 import { isStalled } from './stall.js';
+import {
+  runAllChecks,
+  runReadinessChecks,
+} from './health.js';
+import { warmCache } from './cache-warmer.js';
 
 dotenv.config();
 
@@ -71,9 +75,43 @@ Sentry.setupExpressErrorHandler(app);
 // 500 response.  Stack traces are never leaked to clients.
 app.use(errorHandler);
 
-// ── Liveness probe ────────────────────────────────────────────────────────────
-app.get('/health', (_req: express.Request, res: express.Response) => {
-  res.json({ status: 'ok' });
+// Health check — runs all dependency probes in parallel
+app.get('/health', async (_req: express.Request, res: express.Response) => {
+  const result = await runAllChecks();
+  const httpStatus = result.status === 'down' ? 503 : 200;
+  res.status(httpStatus).json(result);
+});
+
+// GET /health/details — full diagnostics, requires admin token
+app.get('/health/details', async (req: express.Request, res: express.Response) => {
+  const adminToken = process.env.HEALTH_DETAILS_TOKEN;
+  if (adminToken) {
+    const provided = req.headers['x-admin-token'] ?? req.query.token;
+    if (provided !== adminToken) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+  }
+
+  try {
+    const [health, sseClientsModule] = await Promise.all([
+      runAllChecks(),
+      import('./api/routes.js'),
+    ]);
+
+    const payload = {
+      ...health,
+      details: {
+        sseActiveConnections: (sseClientsModule as any)._getSseBuffer?.()?.length ?? 0,
+        nodeVersion: process.version,
+        uptime: process.uptime(),
+        memoryUsage: process.memoryUsage(),
+      },
+    };
+    const httpStatus = health.status === 'down' ? 503 : 200;
+    res.status(httpStatus).json(payload);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to collect diagnostics' });
+  }
 });
 
 // ── Dev-only CORS debug endpoint ──────────────────────────────────────────────
@@ -98,63 +136,32 @@ if (process.env.NODE_ENV !== 'production') {
   });
 }
 
-// ── Readiness probe ───────────────────────────────────────────────────────────
+// Readiness probe — returns 503 if DB is down or sync lag is critical
 app.get('/readyz', async (_req: express.Request, res: express.Response) => {
   if (isStalled()) {
     return res.status(503).json({ status: 'stalled', reason: 'Indexer not advancing' });
   }
 
-  try {
-    const contracts = await prisma.trackedContract.findMany({
-      where:  { active: true },
-      select: { contractId: true, lastLedger: true, label: true },
-    });
-    const ready = contracts.length > 0 && contracts.some((c) => c.lastLedger > 0);
-    if (ready) {
-      return res.json({
-        status: 'ready',
-        contracts: contracts.map((c) => ({
-          contractId: c.contractId,
-          label:      c.label,
-          lastLedger: c.lastLedger,
-        })),
-      });
-    }
-    return res.status(503).json({ status: 'not_ready', reason: 'No ledgers indexed yet' });
-  } catch {
-    const state = await prisma.syncState.findUnique({ where: { id: 1 } });
-    if (state && state.lastLedger > 0) {
-      return res.json({ status: 'ready', lastLedger: state.lastLedger });
-    }
-    return res.status(503).json({ status: 'not_ready', reason: 'No ledgers indexed yet' });
+  const { ready, checks } = await runReadinessChecks();
+  if (ready) {
+    return res.json({ status: 'ready', checks });
   }
+  return res.status(503).json({ status: 'not_ready', checks });
 });
 
 // ── Start server ──────────────────────────────────────────────────────────────
 const httpServer = app.listen(PORT, () => {
-  logger.info(`Indexer API listening on http://localhost:${PORT}`);
+    console.log(`Indexer API listening on http://localhost:${PORT}`);
 
-  // ── DB health probe — warns on pool exhaustion before requests time out ──
-  const stopProbe = startDbHealthProbe();
-  registerShutdownHook(async () => { stopProbe(); });
+    // Warm the most common cache keys so first requests are fast
+    warmCache().catch((err) => {
+        logger.warn('Cache warm failed (non-fatal)', { err: err instanceof Error ? err.message : String(err) });
+    });
 
-  // ── Background polling loop ───────────────────────────────────────────────
-  startPolling().catch((err) => {
-    logger.error('Fatal error in poller', { err });
-    process.exit(1);
-  });
-
-  // ── Periodic reconciliation (non-fatal) ───────────────────────────────────
-  startReconciler().catch((err) => {
-    logger.error('[Reconciler] Failed to start', { err });
-  });
-
-  // ── Gap-repair worker ─────────────────────────────────────────────────────
-  if (process.env.GAP_REPAIR_ENABLED === 'true') {
-    startGapRepairWorker().catch((err) => {
-      logger.error('gap-repair: worker fatal error', {
-        err: err instanceof Error ? err.message : String(err),
-      });
+    // Start the background polling loop
+    startPolling().catch((err) => {
+        logger.error('Fatal error in poller', { err });
+        process.exit(1);
     });
   }
 

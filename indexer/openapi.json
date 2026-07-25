@@ -251,6 +251,11 @@
             ],
             "example": "Pending"
           },
+          "expiresAt": {
+            "type": "string",
+            "example": "1735689600",
+            "description": "Ledger timestamp after which the offer can be reclaimed; absent when it never expires"
+          },
           "createdAtLedger": {
             "type": "integer",
             "example": 50000000
