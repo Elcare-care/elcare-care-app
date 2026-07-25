@@ -29,6 +29,7 @@ import { logger } from './logger.js';
 import redis, { invalidatePattern, invalidateKey } from './redis.js';
 import { loadConfig, parseTrackedContracts } from './config.js';
 import { enqueueIpfsFetch } from './ipfs-cache.js';
+import { promoteConfirmedEvents, rollbackReorg } from './reorg.js';
 
 dotenv.config();
 
@@ -200,6 +201,9 @@ export async function revertLedgers(safeAtLedger: number): Promise<void> {
       where: { id: 1 },
       data: { lastLedger: safeAtLedger, lastLedgerHash: null },
     });
+
+    // Issue #286: also rollback offer and bid state inside the transaction
+    await rollbackReorg(safeAtLedger, tx);
   });
   logger.info('Reorg: rollback complete', { resumeFromLedger: safeAtLedger + 1 });
 }
@@ -446,6 +450,15 @@ async function pollContract(
         latestLedgerProcessedGauge.set(advanceTo);
         syncLatencyGauge.set(Math.max(0, networkLatestLedger - advanceTo));
         recordProgress();
+
+        // Issue #286: promote events that are now CONFIRMATION_DEPTH ledgers old.
+        // Non-fatal — confirmation promotion failures must never crash the poller.
+        promoteConfirmedEvents(networkLatestLedger, config.confirmationDepth).catch((err) => {
+          logger.error('pollContract: failed to promote confirmed events', {
+            contractId: contract.contractId,
+            err: err instanceof Error ? err.message : String(err),
+          });
+        });
       } else {
         latestLedgerProcessedGauge.set(contract.lastLedger);
         syncLatencyGauge.set(Math.max(0, networkLatestLedger - contract.lastLedger));

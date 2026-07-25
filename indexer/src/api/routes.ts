@@ -292,7 +292,12 @@ router.get('/listings/:id/history', async (req: Request, res: Response, next: Ne
   const offset = offsetParsed;
 
   try {
-    const where = { listingId: BigInt(id) };
+    const where: any = { listingId: BigInt(id) };
+    // Issue #286: optional filter for confirmed-only events
+    const confirmedOnly = (req.query as any).confirmed === 'true';
+    if (confirmedOnly) {
+      where.confirmed = true;
+    }
     const [results, total] = await Promise.all([
       prisma.marketplaceEvent.findMany({
         where,

@@ -133,6 +133,20 @@ export function loadConfig() {
     pollIntervalMs: parsePositiveInt('POLL_INTERVAL_MS', process.env.POLL_INTERVAL_MS, 5000),
     maxLedgersPerCycle: parsePositiveInt('MAX_LEDGERS_PER_CYCLE', process.env.MAX_LEDGERS_PER_CYCLE, 1000),
     shutdownTimeoutMs: parsePositiveInt('SHUTDOWN_TIMEOUT_MS', process.env.SHUTDOWN_TIMEOUT_MS, 30_000),
+    /**
+     * Issue #286: Number of ledgers that must accumulate on top of a window
+     * before its events are considered "confirmed" (finalized enough).
+     *
+     * Stellar testnet/mainnet achieves practical finality within 1-2 ledgers,
+     * but a conservative default of 10 gives a safety margin without
+     * meaningfully delaying UI visibility.
+     *
+     * Set to 0 to mark all events confirmed immediately (useful for testnet
+     * environments with no reorg risk).
+     *
+     * Configurable via CONFIRMATION_DEPTH environment variable.
+     */
+    confirmationDepth: parseInt(process.env.CONFIRMATION_DEPTH || '10', 10),
   };
 }
 
