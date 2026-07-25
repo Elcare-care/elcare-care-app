@@ -54,6 +54,7 @@ export async function deployNormal721(
   maxSupply: number,
   royaltyBps: number,
   royaltyReceiver: string,
+  platformFeeBps: number,
   salt: Buffer // 32 bytes
 ): Promise<string> {
   const args: xdr.ScVal[] = [
@@ -64,6 +65,7 @@ export async function deployNormal721(
     nativeToScVal(BigInt(maxSupply), { type: "u64" }),
     nativeToScVal(royaltyBps, { type: "u32" }),
     toAddressScVal(royaltyReceiver),
+    nativeToScVal(platformFeeBps, { type: "u32" }),
     nativeToScVal(Uint8Array.from(salt), { type: "bytes" }),
   ];
 
@@ -86,6 +88,7 @@ export async function deployNormal1155(
   name: string,
   royaltyBps: number,
   royaltyReceiver: string,
+  platformFeeBps: number,
   salt: Buffer
 ): Promise<string> {
   const args: xdr.ScVal[] = [
@@ -94,6 +97,7 @@ export async function deployNormal1155(
     nativeToScVal(name, { type: "string" }),
     nativeToScVal(royaltyBps, { type: "u32" }),
     toAddressScVal(royaltyReceiver),
+    nativeToScVal(platformFeeBps, { type: "u32" }),
     nativeToScVal(Uint8Array.from(salt), { type: "bytes" }),
   ];
 
@@ -119,6 +123,7 @@ export async function deployLazy721(
   maxSupply: number,
   royaltyBps: number,
   royaltyReceiver: string,
+  platformFeeBps: number,
   salt: Buffer
 ): Promise<string> {
   const args: xdr.ScVal[] = [
@@ -130,6 +135,7 @@ export async function deployLazy721(
     nativeToScVal(BigInt(maxSupply), { type: "u64" }),
     nativeToScVal(royaltyBps, { type: "u32" }),
     toAddressScVal(royaltyReceiver),
+    nativeToScVal(platformFeeBps, { type: "u32" }),
     nativeToScVal(Uint8Array.from(salt), { type: "bytes" }),
   ];
 
@@ -153,6 +159,7 @@ export async function deployLazy1155(
   name: string,
   royaltyBps: number,
   royaltyReceiver: string,
+  platformFeeBps: number,
   salt: Buffer
 ): Promise<string> {
   const args: xdr.ScVal[] = [
@@ -162,6 +169,7 @@ export async function deployLazy1155(
     nativeToScVal(name, { type: "string" }),
     nativeToScVal(royaltyBps, { type: "u32" }),
     toAddressScVal(royaltyReceiver),
+    nativeToScVal(platformFeeBps, { type: "u32" }),
     nativeToScVal(Uint8Array.from(salt), { type: "bytes" }),
   ];
 
@@ -173,6 +181,159 @@ export async function deployLazy1155(
     config.launchpadContractId
   );
   return (scValToNative(retVal) as Address).toString();
+}
+
+export interface PreflightResult {
+  predictedAddress: string;
+  requiredFee: bigint;
+  platformFeeBps: number;
+  currency: string;
+  errors: string[];
+}
+
+function parsePreflightResult(raw: any): PreflightResult {
+  const native = raw as {
+    predicted_address: Address;
+    required_fee: bigint;
+    platform_fee_bps: number;
+    currency: Address;
+    errors: unknown[];
+  };
+  return {
+    predictedAddress: native.predicted_address.toString(),
+    requiredFee: BigInt(native.required_fee),
+    platformFeeBps: Number(native.platform_fee_bps),
+    currency: native.currency.toString(),
+    errors: native.errors.map((e) => String(e)),
+  };
+}
+
+const DUMMY_SIM_KEY = "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN";
+
+/**
+ * preflight_deploy_normal_721 — read-only validation of deploy_normal_721's
+ * exact inputs. Never signs or mutates state; safe to call on every
+ * wizard step change.
+ */
+export async function preflightDeployNormal721(
+  creatorPublicKey: string,
+  currencyAddress: string,
+  name: string,
+  symbol: string,
+  maxSupply: number,
+  royaltyBps: number,
+  platformFeeBps: number,
+  salt: Buffer
+): Promise<PreflightResult> {
+  const args: xdr.ScVal[] = [
+    toAddressScVal(creatorPublicKey),
+    toAddressScVal(currencyAddress),
+    nativeToScVal(name, { type: "string" }),
+    nativeToScVal(symbol, { type: "string" }),
+    nativeToScVal(BigInt(maxSupply), { type: "u64" }),
+    nativeToScVal(royaltyBps, { type: "u32" }),
+    nativeToScVal(platformFeeBps, { type: "u32" }),
+    nativeToScVal(Uint8Array.from(salt), { type: "bytes" }),
+  ];
+  const retVal = await invokeContract(
+    DUMMY_SIM_KEY,
+    "preflight_deploy_normal_721",
+    args,
+    true,
+    config.launchpadContractId
+  );
+  return parsePreflightResult(scValToNative(retVal));
+}
+
+/**
+ * preflight_deploy_normal_1155
+ */
+export async function preflightDeployNormal1155(
+  creatorPublicKey: string,
+  currencyAddress: string,
+  name: string,
+  royaltyBps: number,
+  platformFeeBps: number,
+  salt: Buffer
+): Promise<PreflightResult> {
+  const args: xdr.ScVal[] = [
+    toAddressScVal(creatorPublicKey),
+    toAddressScVal(currencyAddress),
+    nativeToScVal(name, { type: "string" }),
+    nativeToScVal(royaltyBps, { type: "u32" }),
+    nativeToScVal(platformFeeBps, { type: "u32" }),
+    nativeToScVal(Uint8Array.from(salt), { type: "bytes" }),
+  ];
+  const retVal = await invokeContract(
+    DUMMY_SIM_KEY,
+    "preflight_deploy_normal_1155",
+    args,
+    true,
+    config.launchpadContractId
+  );
+  return parsePreflightResult(scValToNative(retVal));
+}
+
+/**
+ * preflight_deploy_lazy_721
+ */
+export async function preflightDeployLazy721(
+  creatorPublicKey: string,
+  currencyAddress: string,
+  name: string,
+  symbol: string,
+  maxSupply: number,
+  royaltyBps: number,
+  platformFeeBps: number,
+  salt: Buffer
+): Promise<PreflightResult> {
+  const args: xdr.ScVal[] = [
+    toAddressScVal(creatorPublicKey),
+    toAddressScVal(currencyAddress),
+    nativeToScVal(name, { type: "string" }),
+    nativeToScVal(symbol, { type: "string" }),
+    nativeToScVal(BigInt(maxSupply), { type: "u64" }),
+    nativeToScVal(royaltyBps, { type: "u32" }),
+    nativeToScVal(platformFeeBps, { type: "u32" }),
+    nativeToScVal(Uint8Array.from(salt), { type: "bytes" }),
+  ];
+  const retVal = await invokeContract(
+    DUMMY_SIM_KEY,
+    "preflight_deploy_lazy_721",
+    args,
+    true,
+    config.launchpadContractId
+  );
+  return parsePreflightResult(scValToNative(retVal));
+}
+
+/**
+ * preflight_deploy_lazy_1155
+ */
+export async function preflightDeployLazy1155(
+  creatorPublicKey: string,
+  currencyAddress: string,
+  name: string,
+  royaltyBps: number,
+  platformFeeBps: number,
+  salt: Buffer
+): Promise<PreflightResult> {
+  const args: xdr.ScVal[] = [
+    toAddressScVal(creatorPublicKey),
+    toAddressScVal(currencyAddress),
+    nativeToScVal(name, { type: "string" }),
+    nativeToScVal(royaltyBps, { type: "u32" }),
+    nativeToScVal(platformFeeBps, { type: "u32" }),
+    nativeToScVal(Uint8Array.from(salt), { type: "bytes" }),
+  ];
+  const retVal = await invokeContract(
+    DUMMY_SIM_KEY,
+    "preflight_deploy_lazy_1155",
+    args,
+    true,
+    config.launchpadContractId
+  );
+  return parsePreflightResult(scValToNative(retVal));
 }
 
 /**
