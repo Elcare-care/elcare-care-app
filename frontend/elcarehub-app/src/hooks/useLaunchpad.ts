@@ -9,9 +9,14 @@ import {
   deployNormal1155,
   deployLazy721,
   deployLazy1155,
+  preflightDeployNormal721,
+  preflightDeployNormal1155,
+  preflightDeployLazy721,
+  preflightDeployLazy1155,
   CollectionRecord,
   CollectionMetadata,
   CollectionKind,
+  PreflightResult,
 } from "@/lib/launchpad";
 import { assertSupportedTokenAddress } from "@/lib/token-support";
 
@@ -109,6 +114,137 @@ export interface DeployCollectionInput {
   royaltyReceiver: string;
   currencyAddress: string;
   creatorPubkeyBytes?: Buffer; // only for Lazy
+  platformFeeBps?: number;
+  /**
+   * Deterministic deploy salt. Pass the same salt used for
+   * `usePreflightDeploy` so the predicted address shown to the creator
+   * matches the address the transaction actually deploys to (#277).
+   * A fresh random salt is generated when omitted.
+   */
+  salt?: Buffer;
+}
+
+/**
+ * Generates a stable, wizard-lifetime salt so the address predicted by
+ * `usePreflightDeploy` is guaranteed to match the address `useDeployCollection`
+ * ends up deploying to (#277).
+ */
+export function useDeploySalt(): Buffer {
+  const [salt] = useState(() => {
+    const buf = Buffer.alloc(32);
+    window.crypto.getRandomValues(buf);
+    return buf;
+  });
+  return salt;
+}
+
+async function runPreflight(
+  input: DeployCollectionInput,
+  creatorPublicKey: string,
+  currencyAddress: string,
+  salt: Buffer
+): Promise<PreflightResult> {
+  switch (input.kind) {
+    case "Normal721":
+      return preflightDeployNormal721(
+        creatorPublicKey,
+        currencyAddress,
+        input.name,
+        input.symbol || "",
+        input.maxSupply || 0,
+        input.royaltyBps,
+        input.platformFeeBps || 0,
+        salt
+      );
+    case "Normal1155":
+      return preflightDeployNormal1155(
+        creatorPublicKey,
+        currencyAddress,
+        input.name,
+        input.royaltyBps,
+        input.platformFeeBps || 0,
+        salt
+      );
+    case "LazyMint721":
+      return preflightDeployLazy721(
+        creatorPublicKey,
+        currencyAddress,
+        input.name,
+        input.symbol || "",
+        input.maxSupply || 0,
+        input.royaltyBps,
+        input.platformFeeBps || 0,
+        salt
+      );
+    case "LazyMint1155":
+      return preflightDeployLazy1155(
+        creatorPublicKey,
+        currencyAddress,
+        input.name,
+        input.royaltyBps,
+        input.platformFeeBps || 0,
+        salt
+      );
+  }
+}
+
+/**
+ * Read-only preflight for the collection wizard's Review step (#277).
+ * Re-runs whenever the relevant form fields or the salt change, and never
+ * requests a wallet signature.
+ */
+export function usePreflightDeploy(
+  creatorPublicKey: string | null,
+  input: DeployCollectionInput | null,
+  salt: Buffer
+) {
+  const [result, setResult] = useState<PreflightResult | null>(null);
+  const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const inputKey = input
+    ? JSON.stringify({
+        kind: input.kind,
+        name: input.name,
+        symbol: input.symbol,
+        maxSupply: input.maxSupply,
+        royaltyBps: input.royaltyBps,
+        currencyAddress: input.currencyAddress,
+        platformFeeBps: input.platformFeeBps,
+      })
+    : null;
+
+  useEffect(() => {
+    if (!creatorPublicKey || !input) {
+      setResult(null);
+      return;
+    }
+    let cancelled = false;
+    setIsLoading(true);
+    setError(null);
+
+    assertSupportedTokenAddress(input.currencyAddress, "collection")
+      .then((token) => runPreflight(input, creatorPublicKey, token.address, salt))
+      .then((r) => {
+        if (!cancelled) setResult(r);
+      })
+      .catch((err: unknown) => {
+        if (!cancelled) {
+          setResult(null);
+          setError(err instanceof Error ? err.message : "Preflight check failed");
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setIsLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [creatorPublicKey, inputKey, salt]);
+
+  return { result, isLoading, error };
 }
 
 export function useDeployCollection(creatorPublicKey: string | null) {
@@ -127,10 +263,15 @@ export function useDeployCollection(creatorPublicKey: string | null) {
 
       try {
         const token = await assertSupportedTokenAddress(input.currencyAddress, "collection");
-        const salt = Buffer.alloc(32); // Simple salt for now, can be randomized
-        window.crypto.getRandomValues(salt);
+        let salt = input.salt;
+        if (!salt) {
+          salt = Buffer.alloc(32);
+          window.crypto.getRandomValues(salt);
+        }
 
         let address = "";
+
+        const platformFeeBps = input.platformFeeBps || 0;
 
         switch (input.kind) {
           case "Normal721":
@@ -142,6 +283,7 @@ export function useDeployCollection(creatorPublicKey: string | null) {
               input.maxSupply || 0,
               input.royaltyBps,
               input.royaltyReceiver,
+              platformFeeBps,
               salt
             );
             break;
@@ -152,6 +294,7 @@ export function useDeployCollection(creatorPublicKey: string | null) {
               input.name,
               input.royaltyBps,
               input.royaltyReceiver,
+              platformFeeBps,
               salt
             );
             break;
@@ -166,6 +309,7 @@ export function useDeployCollection(creatorPublicKey: string | null) {
               input.maxSupply || 0,
               input.royaltyBps,
               input.royaltyReceiver,
+              platformFeeBps,
               salt
             );
             break;
@@ -178,6 +322,7 @@ export function useDeployCollection(creatorPublicKey: string | null) {
               input.name,
               input.royaltyBps,
               input.royaltyReceiver,
+              platformFeeBps,
               salt
             );
             break;
