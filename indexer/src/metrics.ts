@@ -298,6 +298,139 @@ export const backfillLockContentions = new client.Counter({
   help: 'Number of times a BackfillJob advisory lock was already held by another worker',
 });
 
+// ── Correctness & reconciliation metrics ─────────────────────────────────────
+
+/**
+ * Total reconciliation mismatches found (field-level discrepancies between
+ * DB and on-chain state). Labelled by kind (listing | auction) and field.
+ */
+export const reconciliationMismatchesTotal = new client.Counter({
+  name: 'elcarehub_reconciliation_mismatches_total',
+  help: 'Total field-level discrepancies found during reconciliation, by resource kind and field',
+  labelNames: ['kind', 'field'],
+});
+
+/**
+ * Gauge: number of listings with ESCROW status that have remained unresolved
+ * beyond a configurable threshold (set externally on each reconciler run).
+ */
+export const unresolvedEscrowGauge = new client.Gauge({
+  name: 'elcarehub_unresolved_escrow_listings',
+  help: 'Number of listings currently in Escrow status (payment held, NFT not yet transferred)',
+});
+
+/**
+ * Total dead-letter events — events that could not be applied after all retries.
+ * Labelled by event_type so operators can identify the failing event class.
+ */
+export const deadLetterEventsTotal = new client.Counter({
+  name: 'elcarehub_dead_letter_events_total',
+  help: 'Total events that exhausted all retry attempts and were moved to dead-letter state, by event type',
+  labelNames: ['event_type'],
+});
+
+/**
+ * Gauge: age (in seconds) of the oldest unprocessed dead-letter event.
+ * Useful for alerting when dead letters are accumulating without resolution.
+ */
+export const deadLetterAgeSecondsGauge = new client.Gauge({
+  name: 'elcarehub_dead_letter_age_seconds',
+  help: 'Age in seconds of the oldest unprocessed dead-letter event (0 when queue is empty)',
+});
+
+/**
+ * Total re-org rollback events, labelled by depth bucket.
+ * Depth label is coarsened to <10, 10-50, 50-100, >100 to keep cardinality low.
+ */
+export const reorgRollbacksTotal = new client.Counter({
+  name: 'elcarehub_reorg_rollbacks_total',
+  help: 'Total chain re-org rollback events detected by the indexer, by approximate depth bucket',
+  labelNames: ['depth_bucket'],
+});
+
+/**
+ * Gauge: current chain re-org depth during an active rollback (0 when none).
+ */
+export const reorgDepthGauge = new client.Gauge({
+  name: 'elcarehub_reorg_depth_current',
+  help: 'Current chain re-org rollback depth (ledgers rewound). 0 when no active reorg.',
+});
+
+// ── Ingestion lag metrics ─────────────────────────────────────────────────────
+
+/**
+ * Histogram: wall-clock seconds between a ledger being finalised on-chain and
+ * the indexer applying its events to the database. Measures ingestion lag.
+ */
+export const ingestionLagSeconds = new client.Histogram({
+  name: 'elcarehub_ingestion_lag_seconds',
+  help: 'Wall-clock lag between ledger close time and event application to the database',
+  buckets: [1, 5, 10, 30, 60, 120, 300, 600],
+});
+
+/**
+ * Histogram: seconds between a ledger being finalised on-chain and the indexer
+ * emitting the corresponding SSE event — the end-to-end "finalized lag".
+ */
+export const finalizedLagSeconds = new client.Histogram({
+  name: 'elcarehub_finalized_lag_seconds',
+  help: 'End-to-end lag from ledger close time to SSE event emission',
+  buckets: [1, 5, 10, 30, 60, 120, 300, 600],
+});
+
+/**
+ * Total event replays triggered (e.g. by re-org recovery or manual backfill).
+ * Labelled by reason so operators can distinguish the source.
+ */
+export const eventReplaysTotal = new client.Counter({
+  name: 'elcarehub_event_replays_total',
+  help: 'Total event replay operations triggered, by reason (reorg | backfill | manual)',
+  labelNames: ['reason'],
+});
+
+// ── Cache behaviour metrics ───────────────────────────────────────────────────
+
+/**
+ * Total Redis cache hits. Labelled by cache_key_prefix to identify hot paths
+ * without exposing full dynamic keys.
+ */
+export const cacheHitsTotal = new client.Counter({
+  name: 'elcarehub_cache_hits_total',
+  help: 'Total Redis cache hits, by cache key prefix',
+  labelNames: ['key_prefix'],
+});
+
+/**
+ * Total Redis cache misses.
+ */
+export const cacheMissesTotal = new client.Counter({
+  name: 'elcarehub_cache_misses_total',
+  help: 'Total Redis cache misses, by cache key prefix',
+  labelNames: ['key_prefix'],
+});
+
+/**
+ * Total Redis cache invalidations (pattern or key).
+ */
+export const cacheInvalidationsTotal = new client.Counter({
+  name: 'elcarehub_cache_invalidations_total',
+  help: 'Total cache invalidation operations, by scope (key | pattern)',
+  labelNames: ['scope'],
+});
+
+// ── Endpoint error class metrics ──────────────────────────────────────────────
+
+/**
+ * Total API errors categorised into low-cardinality classes.
+ * Classes: rpc_error, parser_error, db_error, validation_error, not_found,
+ *          rate_limited, unknown.
+ */
+export const apiErrorsTotal = new client.Counter({
+  name: 'elcarehub_api_errors_total',
+  help: 'Total API errors by low-cardinality error class and HTTP method',
+  labelNames: ['error_class', 'method'],
+});
+
 // ── Expose metrics handler ────────────────────────────────────────────────────
 
 export async function handleMetrics(req: express.Request, res: express.Response) {

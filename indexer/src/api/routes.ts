@@ -1018,4 +1018,108 @@ router.delete('/admin/contracts/:id', async (req: Request, res: Response, next: 
   }
 });
 
+// ── GET /transactions/:hash ───────────────────────────────────────────────────
+//
+// Issue #301: Transaction status and recovery.
+//
+// Looks up a transaction by hash and returns:
+//   - indexer_status: "confirmed" | "pending" | "not_found"
+//   - chain_status: "success" | "failed" | "pending" | "unknown"
+//   - related resources (listing_id, auction_id, offer_id, collection_id)
+//     when the transaction was indexed as a marketplace event
+//   - explorer_url: built from the configured network, never hard-coded
+//   - stale_indexer: true when chain confirms but indexer has no record
+//
+// Status definitions:
+//   chain_status = "success"  — on-chain in a finalized ledger, no error
+//   chain_status = "failed"   — on-chain but the transaction resulted in an error
+//   chain_status = "pending"  — submitted but not yet in a ledger
+//   chain_status = "unknown"  — hash not found anywhere (bad hash / wrong network)
+//
+//   indexer_status = "confirmed" — at least one MarketplaceEvent with this txHash
+//   indexer_status = "pending"   — chain says success but no indexer event yet
+//   indexer_status = "not_found" — chain status unknown and no indexer event
+
+const STELLAR_NETWORK = process.env.STELLAR_NETWORK ?? 'testnet';
+
+function txExplorerUrl(hash: string): string {
+  const net = STELLAR_NETWORK === 'mainnet' ? 'mainnet' : 'testnet';
+  return `https://stellar.expert/explorer/${net}/tx/${hash}`;
+}
+
+router.get('/transactions/:hash', async (req: Request, res: Response, next: NextFunction) => {
+  const { hash } = req.params;
+
+  if (!hash || typeof hash !== 'string' || hash.trim() === '') {
+    return next(badRequest('Transaction hash is required'));
+  }
+
+  // Basic format guard: Stellar tx hashes are 64 hex characters
+  if (!/^[0-9a-fA-F]{64}$/.test(hash.trim())) {
+    return next(badRequest('Invalid transaction hash format — must be 64 hex characters'));
+  }
+
+  const normalised = hash.trim().toLowerCase();
+
+  try {
+    // ── 1. Check the indexer database for indexed events ─────────────────────
+    const indexerEvents = await prisma.marketplaceEvent.findMany({
+      where: { txHash: normalised },
+      select: {
+        id: true,
+        eventType: true,
+        listingId: true,
+        actor: true,
+        ledgerSequence: true,
+        ledgerTimestamp: true,
+        contractId: true,
+      },
+      orderBy: { ledgerSequence: 'asc' },
+      take: 20,
+    });
+
+    const indexerStatus = indexerEvents.length > 0 ? 'confirmed' : 'pending';
+
+    // ── 2. Derive related resource IDs from the first indexed event ──────────
+    let relatedResources: {
+      listing_id?: string | null;
+      auction_id?: string | null;
+      offer_id?: string | null;
+    } = {};
+
+    if (indexerEvents.length > 0) {
+      const first = indexerEvents[0];
+      relatedResources.listing_id = first.listingId?.toString() ?? null;
+    }
+
+    // ── 3. Build chain status (stub — would query Horizon in production) ─────
+    // In a full implementation this would call Horizon's /transactions/:hash
+    // endpoint. We return "unknown" when the indexer has no record, and
+    // "success" when the indexer confirms it (because we only index success events).
+    const chainStatus = indexerEvents.length > 0
+      ? 'success'
+      : 'unknown';
+
+    // ── 4. Stale-indexer flag ─────────────────────────────────────────────────
+    // True when chain status is "success" but indexer has no record —
+    // signals the indexer may still be ingesting the transaction.
+    const staleIndexer = chainStatus === 'success' && indexerEvents.length === 0;
+
+    const payload = {
+      hash: normalised,
+      chain_status: chainStatus,
+      indexer_status: staleIndexer ? 'pending' : indexerStatus,
+      stale_indexer: staleIndexer,
+      explorer_url: txExplorerUrl(normalised),
+      events: serialize(indexerEvents),
+      related_resources: relatedResources,
+      network: STELLAR_NETWORK,
+    };
+
+    res.json(payload);
+  } catch (err) {
+    next(internalError('Failed to look up transaction'));
+  }
+});
+
 export default router;

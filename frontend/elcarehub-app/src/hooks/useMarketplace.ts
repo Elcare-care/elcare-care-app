@@ -28,6 +28,11 @@ import { useTransientErrorToast } from "./useTransientErrorToast";
 import { useTxToast } from "./useTxToast";
 import { assertSupportedTokenAddress } from "@/lib/token-support";
 import { trackEvent } from "@/providers/PostHogProvider";
+import {
+  useReconciliation,
+  generatePendingId,
+  type ConfirmedSnapshot,
+} from "./useReconciliation";
 
 // ── Listing with resolved metadata ───────────────────────────
 
@@ -406,4 +411,85 @@ export function useAuction(auctionId: number | null) {
   }, [refresh]);
 
   return { auction, isLoading, error, refresh };
+}
+
+// ── useMarketplaceWithReconciliation (Issue #302) ─────────────────────────────
+//
+// Wraps useMarketplace with explicit provisional state:
+//   - Tags pending mutations (create, buy, cancel, update) with txHash + expiry
+//   - Retains the last confirmed snapshot so failed mutations can be rolled back
+//   - Resolves mutations automatically when SSE/REST delivers fresh data
+//   - Exposes pendingMutations so the UI can render "pending" indicators
+//
+// Public API is additive: all existing fields are preserved.
+
+export interface ListingMutationPayload {
+  action: "create" | "buy" | "cancel" | "update";
+  listing: Listing;
+}
+
+export function useMarketplaceWithReconciliation(opts?: { page?: number; limit?: number }) {
+  const marketplace = useMarketplace(opts);
+  const recon = useReconciliation<Listing>({ mutationTtlMs: 60_000 });
+
+  // When fresh listing data arrives (from SSE-triggered refresh), push it into
+  // the reconciler as confirmed snapshots.
+  const prevListingsRef = useRef<Listing[]>([]);
+  useEffect(() => {
+    if (marketplace.listings === prevListingsRef.current) return;
+    prevListingsRef.current = marketplace.listings;
+
+    const snapshots: ConfirmedSnapshot<Listing>[] = marketplace.listings.map((l) => ({
+      resourceId: String(l.listing_id),
+      data: l,
+      ledger: (l as any).updatedAtLedger ?? 0,
+    }));
+    recon.applyConfirmedData(snapshots);
+  }, [marketplace.listings]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  /**
+   * Add a pending mutation for a listing action.
+   * Call this immediately after submitting a transaction.
+   */
+  const addListingMutation = useCallback(
+    (
+      action: ListingMutationPayload["action"],
+      listing: Listing,
+      txHash: string | null = null
+    ): string => {
+      const pendingId = generatePendingId(`listing-${action}`);
+      recon.addMutation({
+        pendingId,
+        txHash,
+        kind: "listing",
+        resourceId: String(listing.listing_id),
+        // For buy/cancel, optimistic value shows the mutated state immediately
+        optimisticValue: action === "cancel"
+          ? { ...listing, status: "Cancelled" as any }
+          : listing,
+      });
+      return pendingId;
+    },
+    [recon]
+  );
+
+  /**
+   * Get the display state for a single listing.
+   * Returns the optimistic/provisional value while a mutation is pending.
+   */
+  const getListingState = useCallback(
+    (listingId: string | number) =>
+      recon.getResourceState(String(listingId), "listing"),
+    [recon]
+  );
+
+  return {
+    ...marketplace,
+    // Reconciliation extensions
+    pendingMutations: recon.pendingMutations,
+    addListingMutation,
+    getListingState,
+    resolveMutation: recon.resolveMutation,
+    rejectMutation: recon.rejectMutation,
+  };
 }

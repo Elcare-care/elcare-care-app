@@ -31,7 +31,21 @@ Thumbs.db
 
 # Generated test snapshots
 **/test_snapshots/
+**/__snapshots__/
 **/issues.md
+
+# Jest / Vitest coverage outputs
+coverage/
+.nyc_output/
+
+# TypeScript incremental build info
+*.tsbuildinfo
+
+# Playwright test outputs
+playwright-report/
+test-results/
+/frontend/elcarehub-app/playwright-report/
+/frontend/elcarehub-app/test-results/
 
 # PR description files (gitignored — saved locally for reference)
 PR_ISSUE_322.md
