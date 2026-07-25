@@ -53,7 +53,7 @@ use soroban_sdk::{
     testutils::Events as _,
     testutils::Ledger,
     token::{StellarAssetClient, TokenClient},
-    vec, Address, Env,
+    vec, Address, Env, Symbol,
 };
 
 /// Standard test setup. Token #1 on the mock NFT is pre-assigned to `artist`.
@@ -8281,6 +8281,8 @@ fn setup_legacy_v1_fixture(
                 extension_trigger: 0,
                 protocol_fee_bps: 0,
                 bid_history_cap: 20,
+                max_extensions: 0,
+                extension_count: 0,
             },
         );
         env.storage()
@@ -8562,8 +8564,8 @@ fn test_pause_function_buy_artwork_blocks_purchases() {
         &token_id, &collection_id, &1u64,
         &valid_recipients(&env, &artist), &None::<u64>,
     );
-    client.pause_function(&artist, &symbol_short!("buy_artwork"));
-    assert!(client.is_function_paused(&symbol_short!("buy_artwork")));
+    client.pause_function(&artist, &Symbol::new(&env, "buy_artwork"));
+    assert!(client.is_function_paused(&Symbol::new(&env, "buy_artwork")));
     let result = client.try_buy_artwork(&buyer, &id);
     assert!(result.is_err(), "buy_artwork must be blocked when function is paused");
 }
@@ -8574,7 +8576,7 @@ fn test_pause_function_buy_artwork_allows_create_listing() {
     let (env, client, artist, _, token_id, _, collection_id) = setup();
     client.set_admin(&artist);
     client.add_token_to_whitelist(&token_id);
-    client.pause_function(&artist, &symbol_short!("buy_artwork"));
+    client.pause_function(&artist, &Symbol::new(&env, "buy_artwork"));
     let id = client.create_listing(
         &artist, &1_000_000_i128, &symbol_short!("XLM"),
         &token_id, &collection_id, &1u64,
@@ -8588,7 +8590,7 @@ fn test_pause_function_create_listing_blocks_new_listings() {
     let (env, client, artist, _, token_id, _, collection_id) = setup();
     client.set_admin(&artist);
     client.add_token_to_whitelist(&token_id);
-    client.pause_function(&artist, &symbol_short!("create_listing"));
+    client.pause_function(&artist, &Symbol::new(&env, "create_listing"));
     let result = client.try_create_listing(
         &artist, &1_000_000_i128, &symbol_short!("XLM"),
         &token_id, &collection_id, &1u64,
@@ -8607,9 +8609,9 @@ fn test_unpause_function_restores_buy_artwork() {
         &token_id, &collection_id, &1u64,
         &valid_recipients(&env, &artist), &None::<u64>,
     );
-    client.pause_function(&artist, &symbol_short!("buy_artwork"));
-    client.unpause_function(&artist, &symbol_short!("buy_artwork"));
-    assert!(!client.is_function_paused(&symbol_short!("buy_artwork")));
+    client.pause_function(&artist, &Symbol::new(&env, "buy_artwork"));
+    client.unpause_function(&artist, &Symbol::new(&env, "buy_artwork"));
+    assert!(!client.is_function_paused(&Symbol::new(&env, "buy_artwork")));
     assert!(client.buy_artwork(&buyer, &id), "buy_artwork must succeed after unpause");
 }
 
@@ -8638,7 +8640,7 @@ fn test_pause_function_make_offer_blocks_offers() {
         &token_id, &collection_id, &1u64,
         &valid_recipients(&env, &artist), &None::<u64>,
     );
-    client.pause_function(&artist, &symbol_short!("make_offer"));
+    client.pause_function(&artist, &Symbol::new(&env, "make_offer"));
     let result = client.try_make_offer(&buyer, &id, &500_000_i128, &token_id, &None::<u64>);
     assert!(result.is_err(), "make_offer must be blocked when function is paused");
 }
@@ -8658,9 +8660,9 @@ fn test_pause_collection_requires_admin() {
 #[test]
 #[should_panic]
 fn test_pause_function_requires_admin() {
-    let (_, client, artist, buyer, _, _, _) = setup();
+    let (env, client, artist, buyer, _, _, _) = setup();
     client.set_admin(&artist);
-    client.pause_function(&buyer, &symbol_short!("buy_artwork"));
+    client.pause_function(&buyer, &Symbol::new(&env, "buy_artwork"));
 }
 
 // ════════════════════════════════════════════════════════════
