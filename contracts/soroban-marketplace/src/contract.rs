@@ -400,6 +400,30 @@ impl MarketplaceContract {
         crate::storage::get_protocol_fee_bps_storage(&env).unwrap_or(0)
     }
 
+    // ── Accounting views (Issue #279) ─────────────────────────
+    //
+    // Read-only, no auth required. Lifetime, monotonic totals per payment
+    // token — see the "Accounting counters" doc comment in storage.rs and
+    // docs/guides/accounting-reconciliation.md for the immutability and
+    // rounding policy.
+
+    /// Lifetime total of protocol fee amounts actually collected for `token`.
+    pub fn get_protocol_fee_total(env: Env, token: Address) -> i128 {
+        crate::storage::get_protocol_fee_total(&env, &token)
+    }
+
+    /// Lifetime total settlement value (gross `total_amount`, matching
+    /// `RoyaltySettlementEvent`) for `token`.
+    pub fn get_royalty_total(env: Env, token: Address) -> i128 {
+        crate::storage::get_royalty_total(&env, &token)
+    }
+
+    /// Lifetime count of successful settlements (purchase, auction-finalize
+    /// with a winner, offer-accept) for `token`.
+    pub fn get_settlement_count(env: Env, token: Address) -> u64 {
+        crate::storage::get_settlement_count(&env, &token)
+    }
+
     pub fn set_min_bid_increment(env: Env, admin: Address, increment: i128) {
         admin.require_auth();
         if admin != Self::get_admin(env.clone()).expect("admin not set") {
@@ -976,11 +1000,17 @@ impl MarketplaceContract {
         );
         if fee > 0 {
             if let Some(treasury) = crate::storage::get_treasury_storage(&env) {
+                crate::storage::add_protocol_fee_total(&env, &listing.token, fee);
                 ProtocolFeeCollectedEvent {
                     listing_id, amount: fee, token: listing.token.clone(), treasury,
                 }.publish(&env);
             }
         }
+        // On-chain accounting counters (Issue #279) — bumped only after the
+        // transfer plan above has fully succeeded, alongside the royalty
+        // settlement snapshot so they always agree with the emitted event.
+        crate::storage::add_royalty_total(&env, &listing.token, listing.price);
+        crate::storage::increment_settlement_count(&env, &listing.token);
         // Emit royalty settlement snapshot for auditability (Issue #270)
         RoyaltySettlementEvent {
             id: listing_id,
@@ -1256,12 +1286,16 @@ impl MarketplaceContract {
             );
             if fee > 0 {
                 if let Some(treasury) = crate::storage::get_treasury_storage(&env) {
+                    crate::storage::add_protocol_fee_total(&env, &auction.token, fee);
                     ProtocolFeeCollectedEvent {
                         listing_id: auction_id, amount: fee,
                         token: auction.token.clone(), treasury,
                     }.publish(&env);
                 }
             }
+            // On-chain accounting counters (Issue #279) — see buy_artwork.
+            crate::storage::add_royalty_total(&env, &auction.token, winning_bid);
+            crate::storage::increment_settlement_count(&env, &auction.token);
             // Emit royalty settlement snapshot for auditability (Issue #270)
             RoyaltySettlementEvent {
                 id: auction_id,
@@ -1560,11 +1594,15 @@ impl MarketplaceContract {
         );
         if fee > 0 {
             if let Some(treasury) = crate::storage::get_treasury_storage(&env) {
+                crate::storage::add_protocol_fee_total(&env, &offer.token, fee);
                 ProtocolFeeCollectedEvent {
                     listing_id, amount: fee, token: offer.token.clone(), treasury,
                 }.publish(&env);
             }
         }
+        // On-chain accounting counters (Issue #279) — see buy_artwork.
+        crate::storage::add_royalty_total(&env, &offer.token, offer.amount);
+        crate::storage::increment_settlement_count(&env, &offer.token);
         // Emit royalty settlement snapshot for auditability (Issue #270)
         RoyaltySettlementEvent {
             id: listing_id,

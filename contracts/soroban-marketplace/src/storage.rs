@@ -1,6 +1,6 @@
 // storage.rs
-use crate::types::{Auction, BidRecord, Listing, Offer};
-use soroban_sdk::{contracttype, Address, Env, Vec};
+use crate::types::{Auction, BidRecord, Listing, MarketplaceError, Offer};
+use soroban_sdk::{contracttype, panic_with_error, Address, Env, Vec};
 
 /// Identifies one of the growing id-collections kept by the marketplace.
 ///
@@ -126,6 +126,19 @@ pub enum DataKey {
     /// listing or auction; a double-listing guard reads it and settlement /
     /// cancellation clears it.
     EscrowedToken(Address, u64),
+    /// Lifetime, monotonic total of protocol fee amounts actually collected
+    /// (transferred to the treasury), keyed by payment token address.
+    /// See "Accounting counters" (Issue #279) for the immutability contract.
+    ProtocolFeeTotal(Address),
+    /// Lifetime, monotonic total of the gross settlement value (`total_amount`
+    /// as emitted on `RoyaltySettlementEvent`) across every successful
+    /// purchase / auction-finalize / offer-accept, keyed by payment token
+    /// address. See "Accounting counters" (Issue #279).
+    RoyaltyTotal(Address),
+    /// Lifetime, monotonic count of successful settlements (purchase,
+    /// auction-finalize-with-winner, offer-accept), keyed by payment token
+    /// address. See "Accounting counters" (Issue #279).
+    SettlementCount(Address),
 }
 
 /// Custody record for an NFT held by the marketplace, keyed by
@@ -353,6 +366,111 @@ pub fn increment_offer_count(env: &Env) -> u64 {
     let count = get_offer_count(env) + 1;
     env.storage().persistent().set(&DataKey::OfferCount, &count);
     bump_entry_ttl(env, &DataKey::OfferCount);
+    count
+}
+
+// ── Accounting counters (Issue #279) ─────────────────────────
+//
+// On-chain, per-payment-token totals so operators/creators/indexers can
+// reconcile expected fees and royalties against actual transfers without
+// relying solely on off-chain event aggregation.
+//
+// Design (deliberately simple — see docs/guides/accounting-reconciliation.md
+// for the full rationale):
+//   • Lifetime, monotonic, non-resettable totals. Never reset, never
+//     decremented — the simplest policy, hardest to game, and it matches
+//     "cannot be manipulated by failed transactions" (Soroban transactions
+//     are atomic, so a panic anywhere rolls back the whole invocation
+//     including any counter bump that happened earlier in the same call —
+//     these functions are only ever invoked *after* the corresponding token
+//     transfer(s) have already succeeded, right alongside the existing
+//     `ProtocolFeeCollectedEvent` / `RoyaltySettlementEvent` emissions).
+//   • Keyed by payment token address only (not by recipient) — an unbounded
+//     per-recipient breakdown would grow storage without bound as new
+//     recipients appear; the existing `RoyaltySettlementEvent` snapshot
+//     already carries the full per-recipient split for anyone who needs
+//     finer granularity, so the on-chain counter intentionally stays a
+//     per-token lifetime aggregate.
+//   • `RoyaltyTotal` accumulates the same `total_amount` value that is
+//     emitted on every `RoyaltySettlementEvent` (the gross settlement value:
+//     listing price / winning bid / accepted offer amount), so an indexer
+//     can reconcile by summing `RoyaltySettlementEvent.total_amount` grouped
+//     by token and comparing against `get_royalty_total(token)`.
+//   • `ProtocolFeeTotal` accumulates the same `amount` emitted on every
+//     `ProtocolFeeCollectedEvent`.
+//   • `SettlementCount` increments once per successful settlement (one per
+//     `RoyaltySettlementEvent` emission), regardless of whether a protocol
+//     fee was actually collected on that settlement.
+
+pub fn get_protocol_fee_total(env: &Env, token: &Address) -> i128 {
+    let key = DataKey::ProtocolFeeTotal(token.clone());
+    let value = env.storage().persistent().get::<DataKey, i128>(&key).unwrap_or(0);
+    if value != 0 {
+        bump_entry_ttl(env, &key);
+    }
+    value
+}
+
+/// Add `amount` to the lifetime protocol-fee total for `token`. No-op when
+/// `amount <= 0` (fee collection never subtracts). Panics with
+/// `ArithmeticOverflow` on i128 overflow (practically unreachable given real
+/// token supplies, kept for defense-in-depth consistency with the rest of
+/// the contract's checked-arithmetic style).
+pub fn add_protocol_fee_total(env: &Env, token: &Address, amount: i128) {
+    if amount <= 0 {
+        return;
+    }
+    let key = DataKey::ProtocolFeeTotal(token.clone());
+    let current = get_protocol_fee_total(env, token);
+    let updated = current
+        .checked_add(amount)
+        .unwrap_or_else(|| panic_with_error!(env, MarketplaceError::ArithmeticOverflow));
+    env.storage().persistent().set(&key, &updated);
+    bump_entry_ttl(env, &key);
+}
+
+pub fn get_royalty_total(env: &Env, token: &Address) -> i128 {
+    let key = DataKey::RoyaltyTotal(token.clone());
+    let value = env.storage().persistent().get::<DataKey, i128>(&key).unwrap_or(0);
+    if value != 0 {
+        bump_entry_ttl(env, &key);
+    }
+    value
+}
+
+/// Add `amount` to the lifetime royalty-settlement total for `token`. No-op
+/// when `amount <= 0`.
+pub fn add_royalty_total(env: &Env, token: &Address, amount: i128) {
+    if amount <= 0 {
+        return;
+    }
+    let key = DataKey::RoyaltyTotal(token.clone());
+    let current = get_royalty_total(env, token);
+    let updated = current
+        .checked_add(amount)
+        .unwrap_or_else(|| panic_with_error!(env, MarketplaceError::ArithmeticOverflow));
+    env.storage().persistent().set(&key, &updated);
+    bump_entry_ttl(env, &key);
+}
+
+pub fn get_settlement_count(env: &Env, token: &Address) -> u64 {
+    let key = DataKey::SettlementCount(token.clone());
+    let value = env.storage().persistent().get::<DataKey, u64>(&key).unwrap_or(0);
+    if value != 0 {
+        bump_entry_ttl(env, &key);
+    }
+    value
+}
+
+/// Increment the lifetime settlement count for `token` by one and return the
+/// new value.
+pub fn increment_settlement_count(env: &Env, token: &Address) -> u64 {
+    let key = DataKey::SettlementCount(token.clone());
+    let count = get_settlement_count(env, token)
+        .checked_add(1)
+        .unwrap_or_else(|| panic_with_error!(env, MarketplaceError::ArithmeticOverflow));
+    env.storage().persistent().set(&key, &count);
+    bump_entry_ttl(env, &key);
     count
 }
 
