@@ -471,6 +471,69 @@ impl MarketplaceContract {
         crate::storage::is_paused(&env)
     }
 
+    // ── Granular circuit-breakers (Issue #205) ───────────────
+    //
+    // Three independent axes of pause control:
+    //   1. Global (admin_pause / admin_unpause — existing)
+    //   2. Per-collection (pause_collection / unpause_collection)
+    //   3. Per-function   (pause_function / unpause_function)
+    //
+    // Any active axis blocks the affected operations.  Global pause
+    // still blocks everything; collection and function pauses are
+    // additive narrow restrictions layered on top.
+
+    /// Pause all operations for a specific collection.
+    pub fn pause_collection(env: Env, admin: Address, collection: Address) {
+        admin.require_auth();
+        if admin != Self::get_admin(env.clone()).expect("admin not set") {
+            panic_with_error!(&env, MarketplaceError::Unauthorized);
+        }
+        crate::storage::set_collection_paused(&env, &collection, true);
+        crate::events::emit_collection_paused(&env, collection);
+    }
+
+    /// Resume all operations for a previously paused collection.
+    pub fn unpause_collection(env: Env, admin: Address, collection: Address) {
+        admin.require_auth();
+        if admin != Self::get_admin(env.clone()).expect("admin not set") {
+            panic_with_error!(&env, MarketplaceError::Unauthorized);
+        }
+        crate::storage::set_collection_paused(&env, &collection, false);
+        crate::events::emit_collection_unpaused(&env, collection);
+    }
+
+    /// Return whether a specific collection is individually paused.
+    pub fn is_collection_paused(env: Env, collection: Address) -> bool {
+        crate::storage::is_collection_paused(&env, &collection)
+    }
+
+    /// Pause a specific entry-point by its function name symbol.
+    /// Valid names: "buy_artwork", "create_listing", "place_bid",
+    ///              "create_auction", "make_offer", "accept_offer".
+    pub fn pause_function(env: Env, admin: Address, function_name: Symbol) {
+        admin.require_auth();
+        if admin != Self::get_admin(env.clone()).expect("admin not set") {
+            panic_with_error!(&env, MarketplaceError::Unauthorized);
+        }
+        crate::storage::set_function_paused(&env, &function_name, true);
+        crate::events::emit_function_paused(&env, function_name);
+    }
+
+    /// Resume a previously paused entry-point.
+    pub fn unpause_function(env: Env, admin: Address, function_name: Symbol) {
+        admin.require_auth();
+        if admin != Self::get_admin(env.clone()).expect("admin not set") {
+            panic_with_error!(&env, MarketplaceError::Unauthorized);
+        }
+        crate::storage::set_function_paused(&env, &function_name, false);
+        crate::events::emit_function_unpaused(&env, function_name);
+    }
+
+    /// Return whether a specific function is individually paused.
+    pub fn is_function_paused(env: Env, function_name: Symbol) -> bool {
+        crate::storage::is_function_paused(&env, &function_name)
+    }
+
     // ── Artist Moderation ────────────────────────────────────
 
     pub fn revoke_artist(env: Env, artist: Address) {
@@ -663,7 +726,11 @@ impl MarketplaceContract {
         token: Address, collection: Address, token_id: u64,
         recipients: Vec<Recipient>, expires_at: Option<u64>,
     ) -> u64 {
-        Self::require_not_paused(&env);
+        Self::require_not_paused_ctx(
+            &env,
+            Some(&collection),
+            Some(&Symbol::new(&env, "create_listing")),
+        );
         artist.require_auth();
         Self::require_not_revoked(&env, &artist);
         if price <= 0 { panic_with_error!(&env, MarketplaceError::InvalidPrice); }
@@ -783,7 +850,8 @@ impl MarketplaceContract {
     //   4. emit   5. interactions (payment payout, release_nft, refund offers)
     //   6. unlock
     pub fn buy_artwork(env: Env, buyer: Address, listing_id: u64) -> bool {
-        Self::require_not_paused(&env);
+        // Function-level circuit-breaker (cheap, before any storage reads).
+        Self::require_not_paused_ctx(&env, None, Some(&Symbol::new(&env, "buy_artwork")));
         buyer.require_auth();
         if !acquire_listing_lock(&env, listing_id) {
             panic_with_error!(&env, MarketplaceError::ReentrancyGuard);
@@ -793,6 +861,11 @@ impl MarketplaceContract {
             None => { release_listing_lock(&env, listing_id);
                       panic_with_error!(&env, MarketplaceError::ListingNotFound); }
         };
+        // Collection-level circuit-breaker (after loading listing).
+        if crate::storage::is_collection_paused(&env, &listing.collection) {
+            release_listing_lock(&env, listing_id);
+            panic_with_error!(&env, MarketplaceError::ContractPaused);
+        }
         if listing.status == ListingStatus::Sold {
             release_listing_lock(&env, listing_id);
             panic_with_error!(&env, MarketplaceError::ListingSold);
@@ -952,7 +1025,11 @@ impl MarketplaceContract {
         env: Env, creator: Address, token: Address, collection: Address,
         token_id: u64, reserve_price: i128, duration: u64, recipients: Vec<Recipient>,
     ) -> u64 {
-        Self::require_not_paused(&env);
+        Self::require_not_paused_ctx(
+            &env,
+            Some(&collection),
+            Some(&Symbol::new(&env, "create_auction")),
+        );
         creator.require_auth();
         Self::require_not_revoked(&env, &creator);
         if reserve_price <= 0 { panic_with_error!(&env, MarketplaceError::InvalidPrice); }
@@ -997,10 +1074,12 @@ impl MarketplaceContract {
 
     // ── place_bid ────────────────────────────────────────────
     pub fn place_bid(env: Env, bidder: Address, auction_id: u64, amount: i128) {
-        Self::require_not_paused(&env);
+        Self::require_not_paused_ctx(&env, None, Some(&Symbol::new(&env, "place_bid")));
         bidder.require_auth();
         let mut auction = load_auction(&env, auction_id)
             .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::AuctionNotFound));
+        // Collection-level check after loading auction.
+        Self::require_not_paused_ctx(&env, Some(&auction.collection), None);
         if auction.status != AuctionStatus::Active {
             panic_with_error!(&env, MarketplaceError::AuctionNotActive);
         }
@@ -1122,10 +1201,12 @@ impl MarketplaceContract {
         env: Env, offerer: Address, listing_id: u64,
         amount: i128, token: Address, expires_at: Option<u64>,
     ) -> u64 {
-        Self::require_not_paused(&env);
+        Self::require_not_paused_ctx(&env, None, Some(&Symbol::new(&env, "make_offer")));
         offerer.require_auth();
         let listing = load_listing(&env, listing_id)
             .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::ListingNotFound));
+        // Collection-level check after loading listing.
+        Self::require_not_paused_ctx(&env, Some(&listing.collection), None);
         if listing.status != ListingStatus::Active {
             panic_with_error!(&env, MarketplaceError::ListingNotActive);
         }
@@ -1481,6 +1562,18 @@ impl MarketplaceContract {
 
     fn require_not_paused(env: &Env) {
         if crate::storage::is_paused(env) {
+            panic_with_error!(env, MarketplaceError::ContractPaused);
+        }
+    }
+
+    /// Granular pause check with optional collection and function context.
+    /// Panics with ContractPaused if ANY active circuit-breaker fires.
+    fn require_not_paused_ctx(
+        env: &Env,
+        collection: Option<&Address>,
+        function_name: Option<&Symbol>,
+    ) {
+        if crate::storage::is_paused_for(env, collection, function_name) {
             panic_with_error!(env, MarketplaceError::ContractPaused);
         }
     }
