@@ -8457,3 +8457,167 @@ fn test_event_catalog_topics() {
     assert_eq!(crate::events::LISTING_CREATED, "listing_created");
     assert_eq!(crate::events::PROTOCOL_FEE_COLLECTED, "protocol_fee_collected");
 }
+
+// ════════════════════════════════════════════════════════════
+// SECTION: IPFS CID validation (Issue #206)
+// ════════════════════════════════════════════════════════════
+
+fn sdk_str(env: &Env, s: &str) -> soroban_sdk::String {
+    soroban_sdk::String::from_str(env, s)
+}
+
+fn cid_client() -> (Env, MarketplaceContractClient<'static>) {
+    let env = Env::default();
+    env.mock_all_auths();
+    let id = env.register(MarketplaceContract, ());
+    let client = MarketplaceContractClient::new(&env, &id);
+    (env, client)
+}
+
+// ── Valid CIDs ────────────────────────────────────────────────
+
+#[test]
+fn test_cid_valid_cidv1_base32() {
+    let (env, client) = cid_client();
+    let cid = sdk_str(&env, "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi");
+    assert!(client.check_cid_valid(&cid));
+}
+
+#[test]
+fn test_cid_valid_cidv0_base58() {
+    let (env, client) = cid_client();
+    let cid = sdk_str(&env, "QmPK1s3pNYLi9ERiq3BDxKa4XosgWwFRQUydHUtz4YgpqB");
+    assert!(client.check_cid_valid(&cid));
+}
+
+#[test]
+fn test_cid_valid_cidv1_min_length_46() {
+    let (env, client) = cid_client();
+    // 1 prefix char + 45 base32 chars = 46 total
+    let s: &str = "baaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let cid = sdk_str(&env, s);
+    assert_eq!(cid.len(), 46);
+    assert!(client.check_cid_valid(&cid));
+}
+
+#[test]
+fn test_cid_valid_cidv1_max_length_100() {
+    let (env, client) = cid_client();
+    // 1 prefix char + 99 base32 chars = 100 total
+    let s = "b".repeat(1) + &"a".repeat(99);
+    let cid = sdk_str(&env, &s);
+    assert_eq!(cid.len(), 100);
+    assert!(client.check_cid_valid(&cid));
+}
+
+#[test]
+fn test_cid_valid_cidv1_digits_2_to_7() {
+    let (env, client) = cid_client();
+    // Mix base32 letters a-z and digits 2-7
+    let s = "b".to_string() + &"a2b3c4d5e6f7".repeat(4) + "aaaaaaa";
+    let cid = sdk_str(&env, &s);
+    assert!(client.check_cid_valid(&cid));
+}
+
+#[test]
+fn test_cid_valid_cidv0_mixed_case_base58() {
+    let (env, client) = cid_client();
+    let cid = sdk_str(&env, "QmABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwx");
+    assert_eq!(cid.len(), 46);
+    assert!(client.check_cid_valid(&cid));
+}
+
+// ── Invalid: length ───────────────────────────────────────────
+
+#[test]
+fn test_cid_invalid_empty_string() {
+    let (env, client) = cid_client();
+    let cid = sdk_str(&env, "");
+    assert!(!client.check_cid_valid(&cid));
+}
+
+#[test]
+fn test_cid_invalid_too_short_45() {
+    let (env, client) = cid_client();
+    let s = "b".to_string() + &"a".repeat(44); // 45 chars
+    let cid = sdk_str(&env, &s);
+    assert!(!client.check_cid_valid(&cid));
+}
+
+#[test]
+fn test_cid_invalid_too_long_101() {
+    let (env, client) = cid_client();
+    let s = "b".to_string() + &"a".repeat(100); // 101 chars
+    let cid = sdk_str(&env, &s);
+    assert!(!client.check_cid_valid(&cid));
+}
+
+// ── Invalid: prefix ───────────────────────────────────────────
+
+#[test]
+fn test_cid_invalid_wrong_prefix_z() {
+    let (env, client) = cid_client();
+    let s = "z".to_string() + &"a".repeat(58);
+    let cid = sdk_str(&env, &s);
+    assert!(!client.check_cid_valid(&cid));
+}
+
+#[test]
+fn test_cid_invalid_uppercase_prefix_b() {
+    let (env, client) = cid_client();
+    let s = "B".to_string() + &"a".repeat(58);
+    let cid = sdk_str(&env, &s);
+    assert!(!client.check_cid_valid(&cid));
+}
+
+// ── Invalid: characters ───────────────────────────────────────
+
+#[test]
+fn test_cid_invalid_uppercase_in_cidv1() {
+    let (env, client) = cid_client();
+    // uppercase after 'b' — not in base32 lowercase alphabet
+    let cid = sdk_str(&env, "bAFYBEIGDYRZT5SFP7UDM7HU76UH7Y26NF3EFUYLQABF3OC");
+    assert!(!client.check_cid_valid(&cid));
+}
+
+#[test]
+fn test_cid_invalid_base32_digits_8_9() {
+    let (env, client) = cid_client();
+    let s = "b".to_string() + &"a".repeat(55) + "89"; // 59 chars, '8'/'9' invalid
+    let cid = sdk_str(&env, &s);
+    assert!(!client.check_cid_valid(&cid));
+}
+
+#[test]
+fn test_cid_invalid_cidv0_bad_char_zero() {
+    let (env, client) = cid_client();
+    // '0' is excluded from base58
+    let cid = sdk_str(&env, "QmPK1s3pNYLi9ERiq3BDxKa4XosgWwFRQUydHUtz4Ygpq0");
+    assert!(!client.check_cid_valid(&cid));
+}
+
+#[test]
+fn test_cid_invalid_cidv0_bad_char_capital_o() {
+    let (env, client) = cid_client();
+    // 'O' is excluded from base58
+    let cid = sdk_str(&env, "QmPK1s3pNYLi9ERiq3BDxKa4XosgWwFRQUydHUtz4YgpqO");
+    assert!(!client.check_cid_valid(&cid));
+}
+
+// ── Invalid: CIDv0 exact-length enforcement ───────────────────
+
+#[test]
+fn test_cid_invalid_cidv0_too_long_47() {
+    let (env, client) = cid_client();
+    // 47 chars — one beyond the required 46
+    let cid = sdk_str(&env, "QmPK1s3pNYLi9ERiq3BDxKa4XosgWwFRQUydHUtz4YgpqBA");
+    assert!(!client.check_cid_valid(&cid));
+}
+
+#[test]
+fn test_cid_invalid_only_whitespace() {
+    let (env, client) = cid_client();
+    // 46 spaces — passes length but fails character check
+    let cid = sdk_str(&env, "                                              ");
+    assert!(!client.check_cid_valid(&cid));
+}

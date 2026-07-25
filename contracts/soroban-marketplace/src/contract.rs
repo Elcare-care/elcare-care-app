@@ -1505,6 +1505,79 @@ impl MarketplaceContract {
         }
     }
 
+    // ── IPFS CID validation (Issue #206) ─────────────────────────────────────
+    //
+    // Accepts two canonical CID formats:
+    //
+    //   CIDv1 base32:  starts with 'b' (multibase prefix), followed by
+    //                  lowercase a-z and digits 2-7, total length 46–100 chars.
+    //
+    //   CIDv0 base58:  starts with "Qm", exactly 46 characters, using the
+    //                  base58 alphabet (1-9, A-H, J-N, P-Z, a-k, m-z).
+    //
+    // Implemented with soroban_sdk::Bytes character iteration — no std, no
+    // external dependencies, fully no_std compatible with the Soroban runtime.
+    fn validate_cid(cid: &soroban_sdk::String) -> bool {
+        let len = cid.len();
+        // Minimum 46 chars covers both CIDv0 (exactly 46) and CIDv1 (≥ 46).
+        // Maximum 100 chars provides headroom for variant CIDv1 encodings.
+        if len < 46 || len > 100 {
+            return false;
+        }
+
+        // Collect bytes for indexed access (soroban String = UTF-8; CIDs are ASCII).
+        let mut bytes = soroban_sdk::Bytes::new(cid.env());
+        cid.iter().for_each(|b| bytes.push_back(b));
+
+        let first  = bytes.get(0).unwrap_or(0) as char;
+        let second = bytes.get(1).unwrap_or(0) as char;
+
+        // ── CIDv1 base32 lowercase (multibase prefix 'b') ────────────────────
+        if first == 'b' {
+            for i in 1..len {
+                let c = bytes.get(i).unwrap_or(0) as char;
+                if !matches!(c, 'a'..='z' | '2'..='7') {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        // ── CIDv0 base58 (prefix "Qm", exactly 46 chars) ─────────────────────
+        if first == 'Q' && second == 'm' {
+            if len != 46 {
+                return false;
+            }
+            // base58 alphabet excludes: '0', 'I', 'O', 'l'
+            for i in 0..len {
+                let c = bytes.get(i).unwrap_or(0) as char;
+                if !matches!(c,
+                    '1'..='9'
+                    | 'A'..='H' | 'J'..='N' | 'P'..='Z'
+                    | 'a'..='k' | 'm'..='z'
+                ) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        false
+    }
+
+    /// View: return `true` for a well-formed IPFS CID (CIDv0 or CIDv1),
+    /// `false` for any malformed input.
+    ///
+    /// Accepted formats:
+    /// - CIDv1 base32: starts with `b`, 46–100 lowercase base32 chars (`a-z`, `2-7`).
+    /// - CIDv0 base58: starts with `Qm`, exactly 46 base58 chars.
+    ///
+    /// Callers can pre-validate CIDs returned by IPFS pinning services before
+    /// including them in `create_listing` or `create_auction` invocations.
+    pub fn check_cid_valid(env: Env, cid: soroban_sdk::String) -> bool {
+        Self::validate_cid(&cid)
+    }
+
     /// Validate that the sum of all `Recipient.percentage` values (each expressed
     /// in basis points, 0–10 000) plus the current protocol fee does not exceed
     /// 10 000 bps (100 %).

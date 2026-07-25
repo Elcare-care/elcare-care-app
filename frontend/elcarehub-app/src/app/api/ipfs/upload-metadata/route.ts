@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { validateIpfsCid } from "@/lib/validation";
 
 const PINATA_BASE = "https://api.pinata.cloud";
 
@@ -59,7 +60,21 @@ export async function POST(req: Request) {
     }
 
     const data = (await pinataRes.json()) as { IpfsHash: string };
-    return NextResponse.json({ cid: data.IpfsHash });
+    const cid = data.IpfsHash;
+
+    // Validate the CID returned by Pinata before surfacing it to the client.
+    // A malformed CID would silently cause a contract InvalidCid error when
+    // the artist tries to create a listing, and break indexer metadata fetches.
+    const cidError = validateIpfsCid(cid);
+    if (cidError) {
+      console.error("[upload-metadata] Pinata returned a malformed CID", { cid, cidError });
+      return NextResponse.json(
+        { error: `Pinata returned a malformed CID: ${cidError}` },
+        { status: 502 }
+      );
+    }
+
+    return NextResponse.json({ cid });
   } catch (error) {
     const message = error instanceof Error ? error.message : "Upload failed";
     return NextResponse.json({ error: message }, { status: 500 });
