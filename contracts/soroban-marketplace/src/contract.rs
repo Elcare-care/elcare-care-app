@@ -20,9 +20,11 @@ use crate::{
         is_artist_revoked_storage, is_migration_done, load_auction, load_auction_bids,
         load_listing, load_listing_offers, load_offer, load_offerer_offers, release_auction_lock,
         release_listing_lock, remove_artist_revocation_storage, remove_from_active_listings,
-        save_auction, save_listing, save_listing_offers, save_offer, save_offerer_offers,
-        set_artist_revocation_storage, set_auction_extension_trigger_storage,
-        set_auction_extension_window_storage, set_max_price_storage, set_migration_done,
+        resolve_fee_bps, save_auction, save_listing, save_listing_offers, save_offer,
+        save_offerer_offers, set_artist_revocation_storage,
+        set_auction_extension_trigger_storage, set_auction_extension_window_storage,
+        set_collection_fee_bps_storage, clear_collection_fee_bps_storage,
+        get_collection_fee_bps_storage, set_max_price_storage, set_migration_done,
         set_min_price_storage, set_pending_admin_storage, PendingAdminProposal,
     },
     types::{
@@ -408,6 +410,45 @@ impl MarketplaceContract {
         crate::storage::get_protocol_fee_bps_storage(&env).unwrap_or(0)
     }
 
+    // ── Per-collection fee overrides (Issue #322) ────────────────────────────
+
+    /// Set a per-collection protocol fee override (admin-only).
+    ///
+    /// `bps` must be in 0–10 000 (100 %).  All new listings and auctions
+    /// created for `collection` after this call will snapshot `bps` instead of
+    /// the global protocol fee.  Existing listings/auctions are unaffected —
+    /// they already captured their fee at creation time.
+    pub fn set_collection_fee_bps(env: Env, admin: Address, collection: Address, bps: u32) {
+        admin.require_auth();
+        if admin != Self::get_admin(env.clone()).expect("admin not set") {
+            panic_with_error!(&env, MarketplaceError::Unauthorized);
+        }
+        if bps > 10_000 {
+            panic_with_error!(&env, MarketplaceError::InvalidPrice);
+        }
+        set_collection_fee_bps_storage(&env, &collection, bps);
+        crate::events::emit_collection_fee_set(&env, collection, bps);
+    }
+
+    /// Remove the per-collection fee override (admin-only).
+    ///
+    /// After this call, new listings and auctions for `collection` will fall
+    /// back to the global protocol fee (`get_protocol_fee`).
+    pub fn clear_collection_fee_bps(env: Env, admin: Address, collection: Address) {
+        admin.require_auth();
+        if admin != Self::get_admin(env.clone()).expect("admin not set") {
+            panic_with_error!(&env, MarketplaceError::Unauthorized);
+        }
+        clear_collection_fee_bps_storage(&env, &collection);
+        crate::events::emit_collection_fee_cleared(&env, collection);
+    }
+
+    /// View: return the per-collection fee override (in bps) for `collection`,
+    /// or `None` when no override is set (global fee applies).
+    pub fn get_collection_fee_bps(env: Env, collection: Address) -> Option<u32> {
+        get_collection_fee_bps_storage(&env, &collection)
+    }
+
     pub fn set_min_bid_increment(env: Env, admin: Address, increment: i128) {
         admin.require_auth();
         if admin != Self::get_admin(env.clone()).expect("admin not set") {
@@ -683,9 +724,10 @@ impl MarketplaceContract {
             panic_with_error!(&env, MarketplaceError::TooManyRecipients);
         }
 
-        // Snapshot the current protocol fee so the combined bps can be validated
-        // and the listing's economic terms are fixed at creation time.
-        let protocol_fee_bps = crate::storage::get_protocol_fee_bps_storage(&env).unwrap_or(0);
+        // Snapshot the collection-level fee (falling back to global) so the
+        // combined bps can be validated and the listing's economic terms are
+        // fixed at creation time.
+        let protocol_fee_bps = resolve_fee_bps(&env, &collection);
 
         // Reject if sum(recipient bps) + protocol_fee_bps > 10 000.
         // This must happen before persisting the listing so an invalid split
@@ -972,9 +1014,10 @@ impl MarketplaceContract {
             get_auction_extension_window_storage(&env).unwrap_or(DEFAULT_EXTENSION_WINDOW);
         let extension_trigger =
             get_auction_extension_trigger_storage(&env).unwrap_or(DEFAULT_EXTENSION_TRIGGER);
-        // Snapshot the global protocol fee so settlement math is fixed at
-        // creation time — consistent with how listings work (ISSUE-005 parity).
-        let protocol_fee_bps = crate::storage::get_protocol_fee_bps_storage(&env).unwrap_or(0);
+        // Snapshot the collection-level fee (falling back to global) so
+        // settlement math is fixed at creation time — consistent with how
+        // listings work (ISSUE-005 parity, updated by Issue #322).
+        let protocol_fee_bps = resolve_fee_bps(&env, &collection);
         let auction = Auction {
             auction_id, creator: creator.clone(), token: token.clone(),
             collection: collection.clone(), token_id, reserve_price,

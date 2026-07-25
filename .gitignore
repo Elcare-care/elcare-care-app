@@ -32,3 +32,9 @@ Thumbs.db
 # Generated test snapshots
 **/test_snapshots/
 **/issues.md
+
+# Issue #322 / #203 PR description
+PR_ISSUE_322.md
+
+# Kiro AI workspace
+.kiro/

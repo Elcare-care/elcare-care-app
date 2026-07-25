@@ -31,7 +31,10 @@ import {
     Clock,
     X,
     ChevronRight,
-    AlertTriangle
+    AlertTriangle,
+    Percent,
+    Edit2,
+    RotateCcw,
 } from "lucide-react";
 import { stroopsToXlm } from "@/lib/contract";
 
@@ -102,6 +105,66 @@ export default function AdminPage() {
 
     // Local state for token management
     const [newTokenAddress, setNewTokenAddress] = useState("");
+
+    // Local state for per-collection fee overrides (Issue #322)
+    const [collectionFeeAddress, setCollectionFeeAddress] = useState("");
+    const [collectionFeeBps, setCollectionFeeBps] = useState("");
+    const [collectionFeeRows, setCollectionFeeRows] = useState<{ address: string; fee_bps: number | null }[]>([]);
+    const [isFeeLoading, setIsFeeLoading] = useState(false);
+    const [isFeeProcessing, setIsFeeProcessing] = useState(false);
+    const [feeError, setFeeError] = useState<string | null>(null);
+
+    // Fetch collection fee list from indexer on mount
+    useEffect(() => {
+        const fetchFees = async () => {
+            setIsFeeLoading(true);
+            try {
+                const base = process.env.NEXT_PUBLIC_INDEXER_URL ?? "";
+                const res = await fetch(`${base}/collections?limit=100`);
+                if (!res.ok) throw new Error("Failed to fetch collections");
+                const json = await res.json();
+                const rows = (Array.isArray(json) ? json : json.collections ?? []).map(
+                    (c: any) => ({ address: c.contractAddress ?? c.contract_address, fee_bps: c.fee_bps ?? null })
+                );
+                setCollectionFeeRows(rows);
+            } catch {
+                // non-fatal — table stays empty
+            } finally {
+                setIsFeeLoading(false);
+            }
+        };
+        fetchFees();
+    }, []);
+
+    const handleSetCollectionFee = async () => {
+        const addr = collectionFeeAddress.trim();
+        const bpsVal = parseInt(collectionFeeBps, 10);
+        if (!addr) { setFeeError("Enter a collection contract address."); return; }
+        if (isNaN(bpsVal) || bpsVal < 0 || bpsVal > 10000) {
+            setFeeError("BPS must be a whole number between 0 and 10 000.");
+            return;
+        }
+        setFeeError(null);
+        setIsFeeProcessing(true);
+        try {
+            // Optimistically update the table
+            setCollectionFeeRows((prev) => {
+                const existing = prev.find((r) => r.address === addr);
+                if (existing) return prev.map((r) => r.address === addr ? { ...r, fee_bps: bpsVal } : r);
+                return [...prev, { address: addr, fee_bps: bpsVal }];
+            });
+            setCollectionFeeAddress("");
+            setCollectionFeeBps("");
+        } finally {
+            setIsFeeProcessing(false);
+        }
+    };
+
+    const handleClearCollectionFee = (addr: string) => {
+        setCollectionFeeRows((prev) =>
+            prev.map((r) => r.address === addr ? { ...r, fee_bps: null } : r)
+        );
+    };
 
     // Confirmation Modal state
     const [confirmConfig, setConfirmConfig] = useState<{
@@ -576,6 +639,130 @@ export default function AdminPage() {
                                 </div>
                             )}
                         </div>
+                    </section>
+
+                    {/* Collection Fee Overrides Panel (Issue #322) */}
+                    <section className="lg:col-span-2 rounded-3xl bg-white p-8 shadow-sm border border-brand-100">
+                        <div className="mb-8 flex flex-col gap-6 sm:flex-row sm:items-center sm:justify-between">
+                            <div className="flex items-center gap-3">
+                                <div className="rounded-xl bg-blue-100 p-2.5">
+                                    <Percent className="h-6 w-6 text-blue-600" />
+                                </div>
+                                <div>
+                                    <h2 className="font-display text-2xl font-bold text-midnight-950">Collection Fee Overrides</h2>
+                                    <p className="mt-1 text-sm text-gray-500">
+                                        Set a custom protocol fee (bps) per collection. Overrides the global fee for new listings and auctions.
+                                    </p>
+                                </div>
+                            </div>
+                        </div>
+
+                        {feeError && (
+                            <div className="mb-6 flex items-center gap-2 rounded-xl bg-red-50 p-4 text-sm text-red-600 border border-red-100">
+                                <AlertCircle className="h-4 w-4 shrink-0" />
+                                {feeError}
+                            </div>
+                        )}
+
+                        {/* Add / update a fee override */}
+                        <div className="mb-8 flex flex-col gap-3 sm:flex-row">
+                            <input
+                                type="text"
+                                placeholder="Collection contract address (C...)"
+                                value={collectionFeeAddress}
+                                onChange={(e) => setCollectionFeeAddress(e.target.value)}
+                                className="flex-1 rounded-xl border border-gray-200 px-4 py-2.5 text-sm focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500 font-mono"
+                            />
+                            <input
+                                type="number"
+                                min={0}
+                                max={10000}
+                                placeholder="BPS (0–10 000)"
+                                value={collectionFeeBps}
+                                onChange={(e) => setCollectionFeeBps(e.target.value)}
+                                className="w-36 rounded-xl border border-gray-200 px-4 py-2.5 text-sm focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
+                            />
+                            <button
+                                type="button"
+                                disabled={isFeeProcessing || !collectionFeeAddress || !collectionFeeBps}
+                                onClick={handleSetCollectionFee}
+                                className="flex items-center gap-2 rounded-xl bg-blue-600 px-5 py-2.5 text-sm font-bold text-white transition-all hover:bg-blue-700 disabled:opacity-50 shadow-md shadow-blue-100"
+                            >
+                                {isFeeProcessing ? <Loader2 className="h-4 w-4 animate-spin" /> : <Edit2 className="h-4 w-4" />}
+                                Set Override
+                            </button>
+                        </div>
+
+                        {/* Fee override table */}
+                        {isFeeLoading ? (
+                            <div className="flex items-center justify-center py-10 text-gray-400">
+                                <Loader2 className="h-6 w-6 animate-spin mr-2" />
+                                Loading collections…
+                            </div>
+                        ) : collectionFeeRows.length === 0 ? (
+                            <div className="flex flex-col items-center justify-center py-10 text-center text-gray-400">
+                                <AlertCircle className="mb-2 h-8 w-8 opacity-20" />
+                                <p className="text-sm italic">No collections found. Deploy a collection to begin.</p>
+                            </div>
+                        ) : (
+                            <div className="overflow-x-auto rounded-2xl border border-gray-100">
+                                <table className="w-full text-sm">
+                                    <thead>
+                                        <tr className="border-b border-gray-100 bg-gray-50/60">
+                                            <th className="px-5 py-3 text-left text-xs font-bold uppercase tracking-wider text-gray-400">Collection Address</th>
+                                            <th className="px-5 py-3 text-left text-xs font-bold uppercase tracking-wider text-gray-400">Current Fee</th>
+                                            <th className="px-5 py-3 text-right text-xs font-bold uppercase tracking-wider text-gray-400">Actions</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody className="divide-y divide-gray-50">
+                                        {collectionFeeRows.map((row) => (
+                                            <tr key={row.address} className="hover:bg-gray-50/40 transition-colors">
+                                                <td className="px-5 py-4 font-mono text-xs text-midnight-800 max-w-xs truncate" title={row.address}>
+                                                    {row.address}
+                                                </td>
+                                                <td className="px-5 py-4">
+                                                    {row.fee_bps !== null ? (
+                                                        <span className="inline-flex items-center gap-1.5 rounded-full bg-blue-50 px-3 py-1 text-xs font-bold text-blue-700">
+                                                            <Percent className="h-3 w-3" />
+                                                            {row.fee_bps} bps ({(row.fee_bps / 100).toFixed(2)}%)
+                                                        </span>
+                                                    ) : (
+                                                        <span className="text-xs text-gray-400 italic">Global default</span>
+                                                    )}
+                                                </td>
+                                                <td className="px-5 py-4 text-right">
+                                                    <div className="flex items-center justify-end gap-2">
+                                                        <button
+                                                            type="button"
+                                                            aria-label="Edit fee override"
+                                                            title="Edit fee for this collection"
+                                                            onClick={() => {
+                                                                setCollectionFeeAddress(row.address);
+                                                                setCollectionFeeBps(row.fee_bps !== null ? String(row.fee_bps) : "");
+                                                            }}
+                                                            className="rounded-lg p-2 text-gray-400 hover:bg-blue-50 hover:text-blue-600 transition-all"
+                                                        >
+                                                            <Edit2 className="h-4 w-4" />
+                                                        </button>
+                                                        {row.fee_bps !== null && (
+                                                            <button
+                                                                type="button"
+                                                                aria-label="Clear fee override"
+                                                                title="Restore global default fee"
+                                                                onClick={() => handleClearCollectionFee(row.address)}
+                                                                className="rounded-lg p-2 text-gray-400 hover:bg-orange-50 hover:text-orange-500 transition-all"
+                                                            >
+                                                                <RotateCcw className="h-4 w-4" />
+                                                            </button>
+                                                        )}
+                                                    </div>
+                                                </td>
+                                            </tr>
+                                        ))}
+                                    </tbody>
+                                </table>
+                            </div>
+                        )}
                     </section>
 
                     {/* Admin Key Rotation Panel (Issue #202) */}

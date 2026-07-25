@@ -111,6 +111,11 @@ pub enum DataKey {
     /// listing or auction; a double-listing guard reads it and settlement /
     /// cancellation clears it.
     EscrowedToken(Address, u64),
+    /// Per-collection protocol fee override (in basis points).  When present,
+    /// new listings and auctions for this collection snapshot this value
+    /// instead of the global `ProtocolFeeBps`.  Cleared by
+    /// `clear_collection_fee_bps` to restore global-fee fallback behaviour.
+    CollectionFeeBps(Address),
 }
 
 /// Custody record for an NFT held by the marketplace, keyed by
@@ -878,4 +883,49 @@ pub fn take_legacy_index_vec(env: &Env, key: &DataKey) -> Option<Vec<u64>> {
         env.storage().persistent().remove(key);
     }
     value
+}
+
+// ── Per-collection fee overrides (Issue #322) ────────────────────────────────
+//
+// When a `CollectionFeeBps` entry exists for a collection address, new
+// listings and auctions for that collection snapshot the override instead of
+// the global `ProtocolFeeBps` value.  The override is optional (`Option<u32>`)
+// in the storage layer so callers can distinguish "no override" from "override
+// is 0 bps".
+
+/// Persist a per-collection fee override.
+pub fn set_collection_fee_bps_storage(env: &Env, collection: &Address, bps: u32) {
+    let key = DataKey::CollectionFeeBps(collection.clone());
+    env.storage().persistent().set(&key, &bps);
+    bump_entry_ttl(env, &key);
+}
+
+/// Return the per-collection fee override, or `None` when no override is set.
+pub fn get_collection_fee_bps_storage(env: &Env, collection: &Address) -> Option<u32> {
+    let key = DataKey::CollectionFeeBps(collection.clone());
+    let value = env
+        .storage()
+        .persistent()
+        .get::<DataKey, u32>(&key);
+    if value.is_some() {
+        bump_entry_ttl(env, &key);
+    }
+    value
+}
+
+/// Remove the per-collection fee override so the global fee takes effect again.
+pub fn clear_collection_fee_bps_storage(env: &Env, collection: &Address) {
+    env.storage()
+        .persistent()
+        .remove(&DataKey::CollectionFeeBps(collection.clone()));
+}
+
+/// Resolve the effective protocol fee for `collection`:
+/// returns the collection-level override if set, otherwise falls back to the
+/// global `ProtocolFeeBps` (defaulting to 0 when neither is configured).
+pub fn resolve_fee_bps(env: &Env, collection: &Address) -> u32 {
+    if let Some(bps) = get_collection_fee_bps_storage(env, collection) {
+        return bps;
+    }
+    get_protocol_fee_bps_storage(env).unwrap_or(0)
 }

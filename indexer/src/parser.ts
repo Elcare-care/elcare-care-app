@@ -60,6 +60,9 @@ const TOPIC_MAP: Record<string, string> = {
   'admin_proposal_cancelled':  'ADMIN_PROPOSAL_CANCELLED',
   'contract_paused':   'CONTRACT_PAUSED',
   'contract_unpaused': 'CONTRACT_UNPAUSED',
+  // Per-collection fee overrides (Issue #322)
+  'collection_fee_set':     'COLLECTION_FEE_SET',
+  'collection_fee_cleared': 'COLLECTION_FEE_CLEARED',
   // Launchpad deploy events (topics[0] = "deploy", topics[1] = kind tag)
   'dep_n721':  'DEPLOY_NORMAL_721',
   'dep_n1155': 'DEPLOY_NORMAL_1155',
@@ -143,6 +146,9 @@ export function parseMarketplaceEvent(
   else if (obj.offerer)  actor = String(obj.offerer);
   else if (obj.bidder)   actor = String(obj.bidder);
   else if (obj.buyer)    actor = String(obj.buyer);
+  // Collection fee events carry no personal actor — use the collection address
+  // as a stable identifier so the MarketplaceEvent.actor column is never empty.
+  else if (obj.collection) actor = String(obj.collection);
 
   // For deploy events the value is a 2-tuple [creator, contract_address]
   if (

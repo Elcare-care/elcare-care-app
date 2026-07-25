@@ -475,9 +475,44 @@ router.get('/collections', cacheMiddleware(TTL.COLLECTIONS), validateQuery(colle
     const nextCursor = results.length === take ? String(results[results.length - 1].deployedAtLedger) : '';
     res.setHeader('X-Next-Cursor', nextCursor);
     res.setHeader('X-Total-Count', String(total));
-    res.json(serialize(results));
+
+    // Attach a resolved fee_bps field: collection override when set, otherwise null
+    // (clients should fall back to the global fee from GET /stats or contract view).
+    const withFee = results.map((c) => ({
+      ...c,
+      fee_bps: c.feeBpsOverride ?? null,
+    }));
+
+    res.json(serialize(withFee));
   } catch (err) {
     next(internalError('Failed to fetch collections'));
+  }
+});
+
+// ── GET /collections/:address/fee ─────────────────────────────────────────────
+// Returns the per-collection fee override for a given collection contract
+// address, or null when the collection is using the global default fee.
+// Response is Redis-cached with a 30-second TTL.
+
+router.get('/collections/:address/fee', async (req: Request, res: Response, next: NextFunction) => {
+  const address = req.params.address as string;
+  if (!address) return next(badRequest('Collection address is required'));
+
+  const cacheKey = `collection_fee:${address}`;
+  try {
+    const result = await getCached(cacheKey, 30, async () => {
+      const collection = await prisma.collection.findUnique({
+        where: { contractAddress: address },
+        select: { feeBpsOverride: true },
+      });
+      if (!collection) return null;
+      return { fee_bps: collection.feeBpsOverride ?? null };
+    });
+
+    if (result === null) return next(notFound('Collection not found'));
+    res.json(result);
+  } catch (err) {
+    next(internalError('Failed to fetch collection fee'));
   }
 });
 
