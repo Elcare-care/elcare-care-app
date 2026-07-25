@@ -35,6 +35,11 @@ pub const COLLECTION_PAUSED: &str = "collection_paused";
 pub const COLLECTION_UNPAUSED: &str = "collection_unpaused";
 pub const FUNCTION_PAUSED: &str = "function_paused";
 pub const FUNCTION_UNPAUSED: &str = "function_unpaused";
+// Royalty settlement snapshot event (Issue #270)
+pub const ROYALTY_SETTLEMENT: &str = "royalty_settlement";
+// Auction escrow recovery events (Issue #271)
+pub const AUCTION_BID_REFUNDED: &str = "auction_bid_refunded";
+pub const AUCTION_ADMIN_CANCELLED: &str = "auction_admin_cancelled";
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -148,7 +153,11 @@ impl AuctionFinalizedEvent {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AuctionExtendedEvent {
     pub auction_id: u64,
+    /// End time before the extension was applied.
+    pub prev_end_time: u64,
     pub new_end_time: u64,
+    /// Which extension this is (1-based); allows consumers to detect cap proximity.
+    pub extension_count: u32,
 }
 impl AuctionExtendedEvent {
     #[allow(deprecated)]
@@ -162,11 +171,69 @@ impl AuctionExtendedEvent {
 pub struct AuctionCancelledEvent {
     pub auction_id: u64,
     pub cancelled_by: Address,
+    /// Reason code: "owner" | "admin" | "no_bids"
+    pub reason: soroban_sdk::Symbol,
 }
 impl AuctionCancelledEvent {
     #[allow(deprecated)]
     pub fn publish(self, env: &Env) {
         env.events().publish((soroban_sdk::Symbol::new(env, AUCTION_CANCELLED),), self);
+    }
+}
+
+/// Emitted when a losing bidder's escrowed funds are returned.
+/// Provides full audit trail for escrow reconciliation. (Issue #271)
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuctionBidRefundedEvent {
+    pub auction_id: u64,
+    pub bidder: Address,
+    pub amount: i128,
+    pub token: Address,
+    /// Reason code: "outbid" | "cancelled" | "admin_cancel"
+    pub reason: soroban_sdk::Symbol,
+    pub ledger_sequence: u32,
+}
+impl AuctionBidRefundedEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events().publish((soroban_sdk::Symbol::new(env, AUCTION_BID_REFUNDED),), self);
+    }
+}
+
+/// Emitted when admin force-cancels an active auction, including bids. (Issue #271)
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuctionAdminCancelledEvent {
+    pub auction_id: u64,
+    pub cancelled_by: Address,
+    pub refunded_amount: i128,
+    pub token: Address,
+    pub ledger_sequence: u32,
+}
+impl AuctionAdminCancelledEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events().publish((soroban_sdk::Symbol::new(env, AUCTION_ADMIN_CANCELLED),), self);
+    }
+}
+
+/// Emitted at settlement with a snapshot of the normalized recipient list. (Issue #270)
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoyaltySettlementEvent {
+    /// Listing or auction id.
+    pub id: u64,
+    /// Normalized recipients at the moment of settlement (read-only snapshot).
+    pub recipients: soroban_sdk::Vec<crate::types::Recipient>,
+    pub total_amount: i128,
+    pub token: Address,
+    pub ledger_sequence: u32,
+}
+impl RoyaltySettlementEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events().publish((soroban_sdk::Symbol::new(env, ROYALTY_SETTLEMENT),), self);
     }
 }
 

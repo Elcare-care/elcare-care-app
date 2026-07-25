@@ -1,4 +1,4 @@
-use soroban_sdk::{contracterror, contracttype, Address, BytesN, String};
+use soroban_sdk::{contracterror, contracttype, Address, BytesN, String, Vec};
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -13,7 +13,18 @@ pub enum Error {
     InvalidDeployFee = 7,
     NoPendingAdmin = 8,
     NotPendingAdmin = 9,
-    CollectionNotFound = 10,
+    /// The (creator, salt) pair has already been used for a deployment (#277).
+    DuplicateSalt = 10,
+    /// royalty_bps exceeds 10_000 (100%) (#277).
+    InvalidRoyaltyBps = 11,
+    /// Collection name is empty (#277).
+    EmptyName = 12,
+    /// Collection symbol is empty for a kind that requires one (#277).
+    EmptySymbol = 13,
+    /// max_supply is zero (#277).
+    InvalidMaxSupply = 14,
+    /// Creator's balance of `currency` is insufficient to cover the deploy fee (#277).
+    InsufficientFee = 15,
 }
 
 /// Which of the four collection types was deployed.
@@ -51,6 +62,32 @@ pub struct WasmHashes {
     pub version: u32,
 }
 
+/// Result of a read-only `preflight_deploy_*` call (#277). Lets creators and
+/// operators validate the exact deployment inputs before submitting a
+/// transaction: the predicted deterministic address, the flat fee that will
+/// be charged, and the full set of validation failures (empty when the
+/// matching `deploy_*` call is expected to succeed).
+#[contracttype]
+#[derive(Clone)]
+pub struct PreflightResult {
+    /// The address the collection would be deployed to — identical to the
+    /// address returned by the matching `deploy_*` call given the same
+    /// (creator, salt) pair.
+    pub predicted_address: Address,
+    /// The flat `deploy_fee` (token smallest unit) that will be charged in
+    /// `currency`. Zero when no flat fee is configured.
+    pub required_fee: i128,
+    /// The per-collection platform fee (bps) that would be recorded in the
+    /// registry, echoed back for convenience.
+    pub platform_fee_bps: u32,
+    /// The currency the required fee would be charged in.
+    pub currency: Address,
+    /// Every validation failure that the matching `deploy_*` call would
+    /// raise given identical inputs. Empty means the deployment is expected
+    /// to succeed.
+    pub errors: Vec<Error>,
+}
+
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
@@ -79,4 +116,7 @@ pub enum DataKey {
     CreatorCollectionByIndex(Address, u64),
     /// Direct lookup by collection address (#37)
     CollectionByAddress(Address),
+    /// Marks a (creator, raw_salt) pair — hashed into the secure salt — as
+    /// already consumed by a successful deployment (#277).
+    SaltUsed(BytesN<32>),
 }
