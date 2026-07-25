@@ -581,7 +581,9 @@ impl NormalNFT1155 {
         Self::_transfer(&env, &from, &to, token_id, amount)
     }
 
-    /// Operator transfer on behalf of `from`. Blocked while paused.
+    /// Transfer on behalf of `from` — the owner themselves or an authorized
+    /// operator (#275: matches the owner-shortcut already used by
+    /// `batch_transfer`/`burn`, so single and batch paths behave the same).
     pub fn transfer_from(
         env: Env,
         operator: Address,
@@ -593,7 +595,7 @@ impl NormalNFT1155 {
         Self::extend_instance_ttl(&env);
         operator.require_auth();
         Self::require_not_paused(&env)?;
-        if !Self::_is_approved_for_all(&env, &operator, &from) {
+        if operator != from && !Self::_is_approved_for_all(&env, &operator, &from) {
             return Err(Error::NotApproved);
         }
         Self::_transfer_with_operator(&env, &from, &to, token_id, amount)
