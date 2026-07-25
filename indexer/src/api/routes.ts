@@ -15,10 +15,12 @@ import {
   offersQuerySchema,
   walletActivityQuerySchema,
   collectionsQuerySchema,
+  creatorCollectionsQuerySchema,
   statsQuerySchema,
   syncGapsQuerySchema,
   artistMetricsQuerySchema,
 } from './query-schemas.js';
+import { isValidStellarAddress } from '../stellar-address.js';
 import {
   getOverviewStats,
   getDailyStats,
@@ -497,13 +499,29 @@ router.get('/collections', cacheMiddleware(TTL.COLLECTIONS), validateQuery(colle
 
 // ── GET /creators/:address/collections ───────────────────────────────────────
 
-router.get('/creators/:address/collections', async (req: Request, res: Response, next: NextFunction) => {
-  const { address } = req.params;
+router.get('/creators/:address/collections', validateQuery(creatorCollectionsQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
+  const address = req.params.address as string;
+  if (!isValidStellarAddress(address)) {
+    return next(badRequest('Invalid creator address: must be a valid 56-character Stellar G-address'));
+  }
+  const { limit, offset, cursor_ledger, cursor_direction } = (req as any).validatedQuery;
   try {
-    const results = await prisma.collection.findMany({
-      where: { creator: address as string },
-      orderBy: { deployedAtLedger: 'desc' },
-    });
+    const direction: 'asc' | 'desc' = cursor_direction ?? 'desc';
+    const where: any = { creator: address };
+    if (cursor_ledger !== undefined) {
+      where.deployedAtLedger = direction === 'desc' ? { lt: cursor_ledger } : { gt: cursor_ledger };
+    }
+    const take = limit ?? 20;
+    const skip = cursor_ledger !== undefined ? 0 : (offset ?? 0);
+
+    const [results, total] = await Promise.all([
+      prisma.collection.findMany({ where, orderBy: { deployedAtLedger: direction }, take, skip }),
+      prisma.collection.count({ where: { creator: address } }),
+    ]);
+
+    const nextCursor = results.length === take ? String(results[results.length - 1].deployedAtLedger) : '';
+    res.setHeader('X-Next-Cursor', nextCursor);
+    res.setHeader('X-Total-Count', String(total));
     res.json(serialize(results));
   } catch (err) {
     next(internalError('Failed to fetch creator collections'));
