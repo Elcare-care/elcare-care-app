@@ -230,6 +230,11 @@ export function useBuyArtwork(buyerPublicKey: string | null) {
       const result = await run(
         async () => {
           const listing = await getListing(listingId);
+          // Issue #282: reject settlement up front when the listing's
+          // payment token doesn't resolve to a known, whitelisted asset —
+          // an unsupported or misconfigured token must never reach
+          // buyArtwork (and the wallet signing prompt) in the first place.
+          await assertSupportedTokenAddress(listing.token, "listing");
           await buyArtwork(buyerPublicKey, listingId);
           // Track successful purchase
           trackEvent.purchaseSuccessful(

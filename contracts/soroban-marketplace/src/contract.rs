@@ -734,9 +734,18 @@ impl MarketplaceContract {
 
     pub fn add_token_to_whitelist(env: Env, token: Address) {
         Self::require_admin(&env);
+        // Boundary validation (Issue #282): reject the marketplace's own
+        // address before it can ever land in the whitelist. Decimals/asset
+        // identity for the token are the off-chain registry's job (see
+        // `validate_token_asset` doc comment); this is deliberately a cheap,
+        // on-chain-only sanity check.
+        Self::validate_token_asset(&env, &token, None);
         let key = crate::storage::DataKey::TokenWhitelist;
         let mut wl = env.storage().persistent()
             .get::<_, Vec<Address>>(&key).unwrap_or(Vec::new(&env));
+        // Idempotent by design: re-whitelisting an already-present token is a
+        // no-op rather than an error, so an admin re-running a setup script
+        // can never accidentally create duplicate entries.
         if !wl.contains(&token) { wl.push_back(token); env.storage().persistent().set(&key, &wl); }
     }
 
@@ -800,6 +809,7 @@ impl MarketplaceContract {
         // This must happen before persisting the listing so an invalid split
         // is never observable in the indexer or UI.
         Self::validate_recipients(&env, &recipients, protocol_fee_bps);
+        Self::validate_token_asset(&env, &token, Some(&collection));
         if !Self::is_token_whitelisted(&env, &token) {
             panic_with_error!(&env, MarketplaceError::TokenNotWhitelisted);
         }
@@ -848,6 +858,7 @@ impl MarketplaceContract {
             panic_with_error!(&env, MarketplaceError::Unauthorized);
         }
         if new_price <= 0 { panic_with_error!(&env, MarketplaceError::InvalidPrice); }
+        Self::validate_token_asset(&env, &new_token, Some(&listing.collection));
         if !Self::is_token_whitelisted(&env, &new_token) {
             panic_with_error!(&env, MarketplaceError::Unauthorized);
         }
@@ -1086,6 +1097,7 @@ impl MarketplaceContract {
         if duration < MIN_AUCTION_DURATION {
             panic_with_error!(&env, MarketplaceError::InvalidAuctionDuration);
         }
+        Self::validate_token_asset(&env, &token, Some(&collection));
         if !Self::is_token_whitelisted(&env, &token) {
             panic_with_error!(&env, MarketplaceError::TokenNotWhitelisted);
         }
@@ -1385,6 +1397,7 @@ impl MarketplaceContract {
         }
         if listing.artist == offerer { panic_with_error!(&env, MarketplaceError::CannotOfferOwnListing); }
         if amount <= 0 { panic_with_error!(&env, MarketplaceError::InsufficientOfferAmount); }
+        Self::validate_token_asset(&env, &token, Some(&listing.collection));
         if !Self::is_token_whitelisted(&env, &token) {
             panic_with_error!(&env, MarketplaceError::TokenNotWhitelisted);
         }
@@ -1776,6 +1789,40 @@ impl MarketplaceContract {
             true
         } else {
             whitelist.contains(token)
+        }
+    }
+
+    /// Boundary sanity check for a payment-token address (Issue #282).
+    ///
+    /// Soroban cannot cheaply or safely cross-call an arbitrary token
+    /// contract's `decimals()`/`symbol()` from inside a purchase/offer/
+    /// auction path just to introspect it, so canonical asset identity
+    /// (native XLM vs. SAC-wrapped classic asset vs. any future asset form)
+    /// and decimal/precision policy are maintained in an off-chain registry
+    /// (frontend `config/tokens.ts`, mirrored by the indexer). The
+    /// contract's job is narrower: treat every amount as an opaque i128 base
+    /// unit (no scaling, ever — see `Listing::token` / `Listing::price` docs)
+    /// and reject `token` addresses that are obviously wrong before they can
+    /// ever be persisted:
+    ///   - the marketplace contract's own address (nothing can ever pay
+    ///     itself; almost certainly a copy-paste mistake), and
+    ///   - the NFT `collection` address being listed/auctioned, when one is
+    ///     in scope (a payment token can never legitimately equal the asset
+    ///     being sold).
+    ///
+    /// This does not (and cannot) prove `token` is a real, well-behaved SAC —
+    /// that's what the admin-curated whitelist (`is_token_whitelisted`) is
+    /// for. It only closes off a class of obviously-invalid inputs that
+    /// would otherwise silently brick settlement for the listing/auction/
+    /// offer that stored them.
+    fn validate_token_asset(env: &Env, token: &Address, collection: Option<&Address>) {
+        if *token == env.current_contract_address() {
+            panic_with_error!(env, MarketplaceError::InvalidTokenAsset);
+        }
+        if let Some(c) = collection {
+            if token == c {
+                panic_with_error!(env, MarketplaceError::InvalidTokenAsset);
+            }
         }
     }
 

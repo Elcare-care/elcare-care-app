@@ -8,9 +8,9 @@ import {
   Loader2,
   CheckCircle2,
 } from "lucide-react";
-import { Listing, stroopsToXlm, getProtocolFee } from "@/lib/contract";
+import { Listing, getProtocolFee } from "@/lib/contract";
 import { useSupportedTokens } from "@/hooks/useSupportedTokens";
-import { TokenConfig, getTokenConfigByAddress } from "@/config/tokens";
+import { TokenConfig, getTokenConfigByAddress, baseUnitsToDisplay } from "@/config/tokens";
 import { resolveSupportedTokens, getDefaultSupportedToken } from "@/lib/token-support";
 import posthog from "posthog-js";
 import { useModalA11y } from "@/hooks/useModalA11y";
@@ -67,13 +67,27 @@ export function CheckoutModal({
 
   if (!isOpen || !selectedToken) return null;
 
-  const priceXlm = Number(stroopsToXlm(listing.price));
-  const estimatedFiat = (priceXlm * 0.12).toFixed(2);
-  
-  // Calculate fee breakdown
-  const protocolFeeAmount = (priceXlm * protocolFee) / 10000;
-  const royaltyAmount = 0; // Placeholder for future royalty implementation
-  const totalAmount = priceXlm + protocolFeeAmount + royaltyAmount;
+  // Issue #282: derive decimals from the listing's own payment token (never
+  // assume XLM's 7 decimals for a token that might differ) and do all money
+  // math in base units (BigInt) so fee/total calculations can't drift from
+  // float rounding — only the final values are converted to display strings.
+  const listingTokenConfig = getTokenConfigByAddress(listing.token);
+  const decimals = listingTokenConfig?.decimals ?? selectedToken.decimals;
+
+  const priceBaseUnits = listing.price;
+  const protocolFeeBaseUnits = (priceBaseUnits * BigInt(protocolFee)) / 10_000n;
+  const royaltyBaseUnits = 0n; // Placeholder for future royalty implementation
+  const totalBaseUnits = priceBaseUnits + protocolFeeBaseUnits + royaltyBaseUnits;
+
+  const priceDisplay = baseUnitsToDisplay(priceBaseUnits, decimals);
+  const protocolFeeDisplay = baseUnitsToDisplay(protocolFeeBaseUnits, decimals);
+  const royaltyDisplay = baseUnitsToDisplay(royaltyBaseUnits, decimals);
+  const totalDisplay = baseUnitsToDisplay(totalBaseUnits, decimals);
+
+  // Fiat estimate is a rough, non-settlement display value only — fine to
+  // route through Number() here since it never feeds back into a base-unit
+  // calculation.
+  const estimatedFiat = (Number(priceDisplay) * 0.12).toFixed(2);
 
   const handleCryptoPurchase = async () => {
     if (!confirmed) {
@@ -85,7 +99,7 @@ export function CheckoutModal({
     if (success) {
       posthog.capture("Purchase Successful", {
         listing_id: listing.listing_id,
-        price_xlm: priceXlm,
+        price_xlm: priceDisplay,
         method: "crypto",
       });
       onPurchased?.();
@@ -177,20 +191,20 @@ export function CheckoutModal({
             <div className="rounded-2xl bg-gray-50 p-4 space-y-3">
               <div className="flex justify-between items-center">
                 <span className="text-gray-600">Item Price</span>
-                <span className="font-semibold text-gray-900">{priceXlm} {selectedToken.symbol}</span>
+                <span className="font-semibold text-gray-900">{priceDisplay} {selectedToken.symbol}</span>
               </div>
               <div className="flex justify-between items-center">
                 <span className="text-gray-600">Protocol Fee ({protocolFee / 100}%)</span>
-                <span className="font-semibold text-gray-900">{protocolFeeAmount.toFixed(7)} {selectedToken.symbol}</span>
+                <span className="font-semibold text-gray-900">{protocolFeeDisplay} {selectedToken.symbol}</span>
               </div>
               <div className="flex justify-between items-center">
                 <span className="text-gray-600">Royalties</span>
-                <span className="font-semibold text-gray-900">{royaltyAmount.toFixed(7)} {selectedToken.symbol}</span>
+                <span className="font-semibold text-gray-900">{royaltyDisplay} {selectedToken.symbol}</span>
               </div>
               <div className="border-t border-gray-200 pt-3 flex justify-between items-center">
                 <span className="font-bold text-gray-900">Total</span>
                 <span className="font-display text-xl font-bold text-brand-600">
-                  {totalAmount.toFixed(7)} {selectedToken.symbol}
+                  {totalDisplay} {selectedToken.symbol}
                 </span>
               </div>
               <div className="flex justify-between">
@@ -239,7 +253,7 @@ export function CheckoutModal({
               ) : confirmed ? (
                 "Confirm & Pay"
               ) : (
-                `Pay ${priceXlm} ${selectedToken.symbol}`
+                `Pay ${priceDisplay} ${selectedToken.symbol}`
               )}
             </button>
             

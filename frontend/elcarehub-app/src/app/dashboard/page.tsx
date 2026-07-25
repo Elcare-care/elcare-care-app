@@ -135,7 +135,13 @@ function MetricsDashboard({ publicKey }: { publicKey: string }) {
           <div className="rounded-[2rem] bg-white/[0.03] border border-white/5 p-6 space-y-2">
             <p className="text-[10px] uppercase tracking-widest font-bold text-white/40">Total Volume</p>
             <p className="text-4xl font-display font-bold text-white">
-              {stroopsToXlm(BigInt(Math.round(parseFloat(metrics.totalVolume))))}
+              {/* Issue #282: metrics.totalVolume is the RAW on-chain base-unit
+                  (stroops) sum as a string — routing it through
+                  parseFloat/Math.round first (as this used to) both loses
+                  precision for large sums and double-applies the stroops→XLM
+                  scaling, since stroopsToXlm already divides by 10^7. Parse
+                  the integer part directly as a BigInt instead. */}
+              {stroopsToXlm(BigInt(metrics.totalVolume.split(".")[0] || "0"))}
               <span className="ml-2 text-sm font-normal text-brand-400">XLM</span>
             </p>
           </div>
