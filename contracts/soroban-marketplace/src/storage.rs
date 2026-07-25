@@ -79,6 +79,12 @@ pub enum DataKey {
     ListingLock(u64),
     AuctionLock(u64),
     IsPaused,
+    /// Per-collection pause flag. When present, operations on this collection
+    /// are blocked regardless of the global pause state.
+    CollectionPaused(Address),
+    /// Per-function pause flag. Stored as a Symbol key; when present, the named
+    /// entry-point is blocked regardless of global or collection pause state.
+    FunctionPaused(soroban_sdk::Symbol),
     PendingAdmin,
     /// LEGACY (pre-1.1.0): monolithic active-listings index (see above).
     ActiveListings,
@@ -797,6 +803,97 @@ pub fn is_paused(env: &Env) -> bool {
         .persistent()
         .get::<DataKey, bool>(&DataKey::IsPaused)
         .unwrap_or(false)
+}
+
+// ── Granular pause helpers (Issue #205) ──────────────────────────────────────
+//
+// Three independent circuit-breaker axes:
+//   1. Global flag           — DataKey::IsPaused (existing)
+//   2. Per-collection flag   — DataKey::CollectionPaused(address)
+//   3. Per-function flag     — DataKey::FunctionPaused(symbol)
+//
+// is_paused_for() returns true when ANY of the three axes fires.
+
+/// Pause a specific collection.
+pub fn set_collection_paused(env: &Env, collection: &Address, paused: bool) {
+    let key = DataKey::CollectionPaused(collection.clone());
+    if paused {
+        env.storage().persistent().set(&key, &true);
+        bump_entry_ttl(env, &key);
+    } else {
+        env.storage().persistent().remove(&key);
+    }
+}
+
+/// Return whether the given collection is individually paused.
+pub fn is_collection_paused(env: &Env, collection: &Address) -> bool {
+    let key = DataKey::CollectionPaused(collection.clone());
+    let paused = env
+        .storage()
+        .persistent()
+        .get::<DataKey, bool>(&key)
+        .unwrap_or(false);
+    if paused {
+        bump_entry_ttl(env, &key);
+    }
+    paused
+}
+
+/// Pause a specific entry-point function by its symbol name.
+pub fn set_function_paused(env: &Env, func: &soroban_sdk::Symbol, paused: bool) {
+    let key = DataKey::FunctionPaused(func.clone());
+    if paused {
+        env.storage().persistent().set(&key, &true);
+        bump_entry_ttl(env, &key);
+    } else {
+        env.storage().persistent().remove(&key);
+    }
+}
+
+/// Return whether the given function symbol is individually paused.
+pub fn is_function_paused(env: &Env, func: &soroban_sdk::Symbol) -> bool {
+    let key = DataKey::FunctionPaused(func.clone());
+    let paused = env
+        .storage()
+        .persistent()
+        .get::<DataKey, bool>(&key)
+        .unwrap_or(false);
+    if paused {
+        bump_entry_ttl(env, &key);
+    }
+    paused
+}
+
+/// Composite pause check: returns true when ANY of the three circuit-breakers
+/// is active for the given (optional) collection and function context.
+///
+/// Call sites:
+///   - Global-only check:           is_paused_for(env, None, None)
+///   - Collection-scoped check:     is_paused_for(env, Some(&col), None)
+///   - Function-scoped check:       is_paused_for(env, None, Some(&func))
+///   - Full context check:          is_paused_for(env, Some(&col), Some(&func))
+pub fn is_paused_for(
+    env: &Env,
+    collection: Option<&Address>,
+    func: Option<&soroban_sdk::Symbol>,
+) -> bool {
+    // Global flag (cheapest read — check first).
+    if is_paused(env) {
+        return true;
+    }
+    // Per-function flag.
+    if let Some(f) = func {
+        if is_function_paused(env, f) {
+            return true;
+        }
+    }
+    // Per-collection flag.
+    if let Some(c) = collection {
+        if is_collection_paused(env, c) {
+            return true;
+        }
+    }
+    false
 }
 
 // ── Price bounds ─────────────────────────────────────────────

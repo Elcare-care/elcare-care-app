@@ -8457,3 +8457,231 @@ fn test_event_catalog_topics() {
     assert_eq!(crate::events::LISTING_CREATED, "listing_created");
     assert_eq!(crate::events::PROTOCOL_FEE_COLLECTED, "protocol_fee_collected");
 }
+
+// ════════════════════════════════════════════════════════════
+// SECTION: Granular pause — collection-level (Issue #205)
+// ════════════════════════════════════════════════════════════
+
+#[test]
+fn test_pause_collection_blocks_create_listing() {
+    let (env, client, artist, _, token_id, _, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    client.pause_collection(&artist, &collection_id);
+    assert!(client.is_collection_paused(&collection_id));
+    // create_listing for the paused collection must revert with ContractPaused.
+    let result = client.try_create_listing(
+        &artist, &1_000_000_i128, &symbol_short!("XLM"),
+        &token_id, &collection_id, &1u64,
+        &valid_recipients(&env, &artist), &None::<u64>,
+    );
+    assert!(result.is_err(), "create_listing must be blocked for a paused collection");
+}
+
+#[test]
+fn test_unpause_collection_restores_create_listing() {
+    let (env, client, artist, _, token_id, _, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    client.pause_collection(&artist, &collection_id);
+    client.unpause_collection(&artist, &collection_id);
+    assert!(!client.is_collection_paused(&collection_id));
+    // create_listing must succeed after unpause.
+    let id = client.create_listing(
+        &artist, &1_000_000_i128, &symbol_short!("XLM"),
+        &token_id, &collection_id, &1u64,
+        &valid_recipients(&env, &artist), &None::<u64>,
+    );
+    assert!(id > 0);
+}
+
+#[test]
+fn test_pause_collection_blocks_buy_artwork() {
+    let (env, client, artist, buyer, token_id, _, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    let id = client.create_listing(
+        &artist, &1_000_000_i128, &symbol_short!("XLM"),
+        &token_id, &collection_id, &1u64,
+        &valid_recipients(&env, &artist), &None::<u64>,
+    );
+    client.pause_collection(&artist, &collection_id);
+    let result = client.try_buy_artwork(&buyer, &id);
+    assert!(result.is_err(), "buy_artwork must be blocked for a paused collection");
+}
+
+#[test]
+fn test_pause_collection_blocks_create_auction() {
+    let (env, client, artist, _, token_id, _, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    client.pause_collection(&artist, &collection_id);
+    let result = client.try_create_auction(
+        &artist, &token_id, &collection_id, &1u64,
+        &1_000_000_i128, &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+    assert!(result.is_err(), "create_auction must be blocked for a paused collection");
+}
+
+#[test]
+fn test_pause_one_collection_allows_other_collection() {
+    // Pausing collection A must not block operations on collection B.
+    let (env, client, artist, buyer, token_id, _, col_a) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    // Register a second collection.
+    let col_b = env.register(mock_nft::MockNft, ());
+    MockNftClient::new(&env, &col_b).set_owner(&2u64, &artist);
+
+    client.pause_collection(&artist, &col_a);
+
+    // Listing on col_b must succeed.
+    let id_b = client.create_listing(
+        &artist, &500_000_i128, &symbol_short!("XLM"),
+        &token_id, &col_b, &2u64,
+        &valid_recipients(&env, &artist), &None::<u64>,
+    );
+    assert!(id_b > 0, "col_b listing must succeed while col_a is paused");
+    assert!(client.buy_artwork(&buyer, &id_b));
+}
+
+// ════════════════════════════════════════════════════════════
+// SECTION: Granular pause — function-level (Issue #205)
+// ════════════════════════════════════════════════════════════
+
+#[test]
+fn test_pause_function_buy_artwork_blocks_purchases() {
+    let (env, client, artist, buyer, token_id, _, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    let id = client.create_listing(
+        &artist, &1_000_000_i128, &symbol_short!("XLM"),
+        &token_id, &collection_id, &1u64,
+        &valid_recipients(&env, &artist), &None::<u64>,
+    );
+    client.pause_function(&artist, &symbol_short!("buy_artwork"));
+    assert!(client.is_function_paused(&symbol_short!("buy_artwork")));
+    let result = client.try_buy_artwork(&buyer, &id);
+    assert!(result.is_err(), "buy_artwork must be blocked when function is paused");
+}
+
+#[test]
+fn test_pause_function_buy_artwork_allows_create_listing() {
+    // Pausing buy_artwork must NOT prevent create_listing.
+    let (env, client, artist, _, token_id, _, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    client.pause_function(&artist, &symbol_short!("buy_artwork"));
+    let id = client.create_listing(
+        &artist, &1_000_000_i128, &symbol_short!("XLM"),
+        &token_id, &collection_id, &1u64,
+        &valid_recipients(&env, &artist), &None::<u64>,
+    );
+    assert!(id > 0, "create_listing must succeed while buy_artwork is paused");
+}
+
+#[test]
+fn test_pause_function_create_listing_blocks_new_listings() {
+    let (env, client, artist, _, token_id, _, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    client.pause_function(&artist, &symbol_short!("create_listing"));
+    let result = client.try_create_listing(
+        &artist, &1_000_000_i128, &symbol_short!("XLM"),
+        &token_id, &collection_id, &1u64,
+        &valid_recipients(&env, &artist), &None::<u64>,
+    );
+    assert!(result.is_err(), "create_listing must be blocked when function is paused");
+}
+
+#[test]
+fn test_unpause_function_restores_buy_artwork() {
+    let (env, client, artist, buyer, token_id, _, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    let id = client.create_listing(
+        &artist, &1_000_000_i128, &symbol_short!("XLM"),
+        &token_id, &collection_id, &1u64,
+        &valid_recipients(&env, &artist), &None::<u64>,
+    );
+    client.pause_function(&artist, &symbol_short!("buy_artwork"));
+    client.unpause_function(&artist, &symbol_short!("buy_artwork"));
+    assert!(!client.is_function_paused(&symbol_short!("buy_artwork")));
+    assert!(client.buy_artwork(&buyer, &id), "buy_artwork must succeed after unpause");
+}
+
+#[test]
+fn test_pause_function_place_bid_blocks_bidding() {
+    let (env, client, artist, buyer, token_id, _, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    let aid = client.create_auction(
+        &artist, &token_id, &collection_id, &1u64,
+        &1_000_000_i128, &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+    client.pause_function(&artist, &symbol_short!("place_bid"));
+    let result = client.try_place_bid(&buyer, &aid, &1_500_000_i128);
+    assert!(result.is_err(), "place_bid must be blocked when function is paused");
+}
+
+#[test]
+fn test_pause_function_make_offer_blocks_offers() {
+    let (env, client, artist, buyer, token_id, _, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    let id = client.create_listing(
+        &artist, &1_000_000_i128, &symbol_short!("XLM"),
+        &token_id, &collection_id, &1u64,
+        &valid_recipients(&env, &artist), &None::<u64>,
+    );
+    client.pause_function(&artist, &symbol_short!("make_offer"));
+    let result = client.try_make_offer(&buyer, &id, &500_000_i128, &token_id, &None::<u64>);
+    assert!(result.is_err(), "make_offer must be blocked when function is paused");
+}
+
+// ════════════════════════════════════════════════════════════
+// SECTION: Granular pause — auth guards (Issue #205)
+// ════════════════════════════════════════════════════════════
+
+#[test]
+#[should_panic]
+fn test_pause_collection_requires_admin() {
+    let (_, client, artist, buyer, _, _, collection_id) = setup();
+    client.set_admin(&artist);
+    client.pause_collection(&buyer, &collection_id);
+}
+
+#[test]
+#[should_panic]
+fn test_pause_function_requires_admin() {
+    let (_, client, artist, buyer, _, _, _) = setup();
+    client.set_admin(&artist);
+    client.pause_function(&buyer, &symbol_short!("buy_artwork"));
+}
+
+// ════════════════════════════════════════════════════════════
+// SECTION: Granular pause — global still blocks all (Issue #205)
+// ════════════════════════════════════════════════════════════
+
+#[test]
+fn test_global_pause_still_blocks_collection_aware_functions() {
+    let (env, client, artist, buyer, token_id, _, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    let id = client.create_listing(
+        &artist, &1_000_000_i128, &symbol_short!("XLM"),
+        &token_id, &collection_id, &1u64,
+        &valid_recipients(&env, &artist), &None::<u64>,
+    );
+    client.admin_pause(&artist);
+    // Both global-only and context-aware functions must be blocked.
+    assert!(client.try_buy_artwork(&buyer, &id).is_err());
+    assert!(client.try_create_listing(
+        &artist, &1_000_000_i128, &symbol_short!("XLM"),
+        &token_id, &collection_id, &1u64,
+        &valid_recipients(&env, &artist), &None::<u64>,
+    ).is_err());
+}

@@ -30,6 +30,11 @@ pub const PROTOCOL_FEE_COLLECTED: &str = "protocol_fee_collected";
 pub const OFFER_RECLAIMED: &str = "offer_reclaimed";
 pub const NFT_ESCROWED: &str = "nft_escrowed";
 pub const NFT_RELEASED: &str = "nft_released";
+// Granular pause events (Issue #205)
+pub const COLLECTION_PAUSED: &str = "collection_paused";
+pub const COLLECTION_UNPAUSED: &str = "collection_unpaused";
+pub const FUNCTION_PAUSED: &str = "function_paused";
+pub const FUNCTION_UNPAUSED: &str = "function_unpaused";
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -441,4 +446,78 @@ impl NftReleasedEvent {
     pub fn publish(self, env: &Env) {
         env.events().publish((NFT_RELEASED,), self);
     }
+}
+
+// ── Granular pause events (Issue #205) ───────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CollectionPausedEvent {
+    pub collection: Address,
+}
+impl CollectionPausedEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, COLLECTION_PAUSED),), self);
+    }
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CollectionUnpausedEvent {
+    pub collection: Address,
+}
+impl CollectionUnpausedEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, COLLECTION_UNPAUSED),), self);
+    }
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FunctionPausedEvent {
+    pub function_name: soroban_sdk::Symbol,
+}
+impl FunctionPausedEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, FUNCTION_PAUSED),), self);
+    }
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FunctionUnpausedEvent {
+    pub function_name: soroban_sdk::Symbol,
+}
+impl FunctionUnpausedEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, FUNCTION_UNPAUSED),), self);
+    }
+}
+
+/// Emit collection_paused event.
+pub fn emit_collection_paused(env: &Env, collection: Address) {
+    CollectionPausedEvent { collection }.publish(env);
+}
+
+/// Emit collection_unpaused event.
+pub fn emit_collection_unpaused(env: &Env, collection: Address) {
+    CollectionUnpausedEvent { collection }.publish(env);
+}
+
+/// Emit function_paused event.
+pub fn emit_function_paused(env: &Env, function_name: soroban_sdk::Symbol) {
+    FunctionPausedEvent { function_name }.publish(env);
+}
+
+/// Emit function_unpaused event.
+pub fn emit_function_unpaused(env: &Env, function_name: soroban_sdk::Symbol) {
+    FunctionUnpausedEvent { function_name }.publish(env);
 }

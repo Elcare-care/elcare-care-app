@@ -32,3 +32,12 @@ Thumbs.db
 # Generated test snapshots
 **/test_snapshots/
 **/issues.md
+
+# PR description files (gitignored — saved locally for reference)
+PR_ISSUE_322.md
+PR_ISSUE_206.md
+PR_ISSUE_204.md
+PR_ISSUE_205.md
+
+# Kiro AI workspace
+.kiro/

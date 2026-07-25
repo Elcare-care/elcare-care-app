@@ -951,3 +951,106 @@ export async function getPendingAdmin(): Promise<PendingAdminProposal | null> {
     return null;
   }
 }
+
+// ── Granular pause controls (Issue #205) ─────────────────────────────────────
+
+/** admin_pause — global circuit-breaker ON. */
+export async function adminPause(adminPublicKey: string): Promise<boolean> {
+  const args: xdr.ScVal[] = [new Address(adminPublicKey).toScVal()];
+  await invokeContract(adminPublicKey, "admin_pause", args);
+  return true;
+}
+
+/** admin_unpause — global circuit-breaker OFF. */
+export async function adminUnpause(adminPublicKey: string): Promise<boolean> {
+  const args: xdr.ScVal[] = [new Address(adminPublicKey).toScVal()];
+  await invokeContract(adminPublicKey, "admin_unpause", args);
+  return true;
+}
+
+/** is_paused — read global pause flag. */
+export async function getIsContractPaused(): Promise<boolean> {
+  const callerPublicKey = await getReadOnlyCallerPublicKey();
+  try {
+    const retVal = await invokeContract(callerPublicKey, "is_paused", [], true);
+    return scValToNative(retVal) as boolean;
+  } catch {
+    return false;
+  }
+}
+
+/** pause_collection — pause all operations for a specific collection. */
+export async function pauseCollection(
+  adminPublicKey: string,
+  collectionAddress: string
+): Promise<boolean> {
+  const args: xdr.ScVal[] = [
+    new Address(adminPublicKey).toScVal(),
+    new Address(collectionAddress).toScVal(),
+  ];
+  await invokeContract(adminPublicKey, "pause_collection", args);
+  return true;
+}
+
+/** unpause_collection — resume a paused collection. */
+export async function unpauseCollection(
+  adminPublicKey: string,
+  collectionAddress: string
+): Promise<boolean> {
+  const args: xdr.ScVal[] = [
+    new Address(adminPublicKey).toScVal(),
+    new Address(collectionAddress).toScVal(),
+  ];
+  await invokeContract(adminPublicKey, "unpause_collection", args);
+  return true;
+}
+
+/** is_collection_paused — read the pause flag for a specific collection. */
+export async function isCollectionPaused(collectionAddress: string): Promise<boolean> {
+  const callerPublicKey = await getReadOnlyCallerPublicKey();
+  try {
+    const args: xdr.ScVal[] = [new Address(collectionAddress).toScVal()];
+    const retVal = await invokeContract(callerPublicKey, "is_collection_paused", args, true);
+    return scValToNative(retVal) as boolean;
+  } catch {
+    return false;
+  }
+}
+
+/** pause_function — block a specific entry-point by name. */
+export async function pauseFunction(
+  adminPublicKey: string,
+  functionName: string
+): Promise<boolean> {
+  const args: xdr.ScVal[] = [
+    new Address(adminPublicKey).toScVal(),
+    nativeToScVal(functionName, { type: "symbol" }),
+  ];
+  await invokeContract(adminPublicKey, "pause_function", args);
+  return true;
+}
+
+/** unpause_function — unblock a previously paused entry-point. */
+export async function unpauseFunction(
+  adminPublicKey: string,
+  functionName: string
+): Promise<boolean> {
+  const args: xdr.ScVal[] = [
+    new Address(adminPublicKey).toScVal(),
+    nativeToScVal(functionName, { type: "symbol" }),
+  ];
+  await invokeContract(adminPublicKey, "unpause_function", args);
+  return true;
+}
+
+/** is_function_paused — read the pause flag for a specific function. */
+export async function isFunctionPaused(functionName: string): Promise<boolean> {
+  const callerPublicKey = await getReadOnlyCallerPublicKey();
+  try {
+    const args: xdr.ScVal[] = [nativeToScVal(functionName, { type: "symbol" })];
+    const retVal = await invokeContract(callerPublicKey, "is_function_paused", args, true);
+    return scValToNative(retVal) as boolean;
+  } catch {
+    return false;
+  }
+}
