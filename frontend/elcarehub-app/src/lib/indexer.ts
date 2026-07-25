@@ -289,6 +289,64 @@ export async function getRoyaltyStats(
   return empty;
 }
 
+// ── Royalty payout breakdown (Issue #201) ─────────────────────────────────────
+
+/** One RoyaltyPayment row from GET /wallets/:address/royalty-breakdown. */
+export interface RoyaltyPaymentRow {
+  id: number;
+  /** Set for fixed-price / offer settlements, null for auctions. */
+  listingId: string | null;
+  /** Set for auction settlements, null otherwise. */
+  auctionId: string | null;
+  recipient: string;
+  amount: string;
+  salePrice: string;
+  ledgerSequence: number;
+  createdAt?: string;
+}
+
+export interface RoyaltyBreakdownPage {
+  payments: RoyaltyPaymentRow[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+/**
+ * Fetches the paginated per-sale royalty payout audit trail for a wallet,
+ * optionally bounded to the inclusive ledger-sequence window [from, to].
+ */
+export async function fetchRoyaltyBreakdown(
+  address: string,
+  opts: { limit?: number; offset?: number; from?: number; to?: number } = {}
+): Promise<RoyaltyBreakdownPage> {
+  const empty: RoyaltyBreakdownPage = {
+    payments: [],
+    total: 0,
+    limit: opts.limit ?? 50,
+    offset: opts.offset ?? 0,
+  };
+  if (!isNonEmptyString(address)) return empty;
+  try {
+    const params = new URLSearchParams();
+    if (opts.limit !== undefined) params.set("limit", String(opts.limit));
+    if (opts.offset !== undefined) params.set("offset", String(opts.offset));
+    if (opts.from !== undefined) params.set("from", String(opts.from));
+    if (opts.to !== undefined) params.set("to", String(opts.to));
+    const qs = params.toString();
+    const data = await fetchWithRetry<RoyaltyBreakdownPage>(
+      `/wallets/${encodeURIComponent(address)}/royalty-breakdown${qs ? `?${qs}` : ""}`
+    );
+    if (data && typeof data === "object" && Array.isArray(data.payments)) return data;
+  } catch (e) {
+    console.warn(
+      "[indexer] fetchRoyaltyBreakdown:",
+      e instanceof Error ? e.message : e
+    );
+  }
+  return empty;
+}
+
 /**
  * Fetches activity (event timeline) for a specific marketplace listing.
  */

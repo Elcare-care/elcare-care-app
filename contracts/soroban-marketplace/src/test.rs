@@ -8688,3 +8688,255 @@ fn test_global_pause_still_blocks_collection_aware_functions() {
         &valid_recipients(&env, &artist), &None::<u64>,
     ).is_err());
 }
+
+// ════════════════════════════════════════════════════════════
+// SECTION: Royalty audit trail — RoyaltyPaid event (Issue #201)
+// ════════════════════════════════════════════════════════════
+
+/// Locate the single `royalty_paid` event and return its data payload map.
+fn find_royalty_paid_data(env: &Env) -> Option<soroban_sdk::xdr::ScMap> {
+    use soroban_sdk::xdr::{ContractEventBody, ScVal};
+    let all = env.events().all();
+    for e in all.events().iter() {
+        if let ContractEventBody::V0(body) = &e.body {
+            let is_rp = body.topics.iter().any(|t| {
+                if let ScVal::Symbol(s) = t {
+                    core::str::from_utf8(s.0.as_slice()).unwrap_or("") == "royalty_paid"
+                } else {
+                    false
+                }
+            });
+            if is_rp {
+                if let ScVal::Map(Some(m)) = &body.data {
+                    return Some(m.clone());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Look up a field of a decoded `#[contracttype]` struct map by key symbol.
+fn rp_field(m: &soroban_sdk::xdr::ScMap, name: &str) -> Option<soroban_sdk::xdr::ScVal> {
+    use soroban_sdk::xdr::ScVal;
+    for entry in m.iter() {
+        if let ScVal::Symbol(s) = &entry.key {
+            if core::str::from_utf8(s.0.as_slice()).unwrap_or("") == name {
+                return Some(entry.val.clone());
+            }
+        }
+    }
+    None
+}
+
+fn rp_i128(v: &soroban_sdk::xdr::ScVal) -> i128 {
+    match v {
+        soroban_sdk::xdr::ScVal::I128(p) => ((p.hi as i128) << 64) | (p.lo as i128),
+        other => panic!("expected i128 ScVal, got {:?}", other),
+    }
+}
+
+/// Decode an `Option<u64>` field (`None` → Void, `Some(n)` → U64).
+fn rp_opt_u64(v: &soroban_sdk::xdr::ScVal) -> Option<u64> {
+    match v {
+        soroban_sdk::xdr::ScVal::Void => None,
+        soroban_sdk::xdr::ScVal::U64(n) => Some(*n),
+        other => panic!("expected Option<u64> ScVal, got {:?}", other),
+    }
+}
+
+/// Return the `amount` of the `idx`-th `{address, amount}` breakdown entry.
+fn rp_breakdown_amount(recipients: &soroban_sdk::xdr::ScVal, idx: usize) -> i128 {
+    use soroban_sdk::xdr::ScVal;
+    if let ScVal::Vec(Some(v)) = recipients {
+        if let ScVal::Map(Some(entry)) = &v.0[idx] {
+            return rp_i128(&rp_field(entry, "amount").expect("amount field missing"));
+        }
+        panic!("breakdown entry {} is not a map", idx);
+    }
+    panic!("recipients is not a vec");
+}
+
+fn rp_breakdown_len(recipients: &soroban_sdk::xdr::ScVal) -> usize {
+    if let soroban_sdk::xdr::ScVal::Vec(Some(v)) = recipients {
+        v.0.len()
+    } else {
+        panic!("recipients is not a vec");
+    }
+}
+
+/// buy_artwork must emit `royalty_paid` carrying the actual amount each
+/// configured recipient received; entries sum to price − protocol fee.
+#[test]
+fn test_buy_artwork_emits_royalty_paid_with_recipient_breakdown() {
+    let (env, client, artist, buyer, token_id, _cid, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    let treasury = Address::generate(&env);
+    client.set_treasury(&artist, &treasury);
+    client.set_protocol_fee(&artist, &500u32);
+
+    let collab = Address::generate(&env);
+    let price = 10_000_000_i128;
+    // 7000 + 2500 recipient bps + 500 fee bps = 10 000 (valid)
+    let recipients = vec![
+        &env,
+        Recipient { address: artist.clone(), percentage: 7_000 },
+        Recipient { address: collab.clone(), percentage: 2_500 },
+    ];
+    let id = client.create_listing(
+        &artist, &price, &symbol_short!("XLM"),
+        &token_id, &collection_id, &1u64, &recipients, &None::<u64>,
+    );
+    client.buy_artwork(&buyer, &id);
+
+    let data = find_royalty_paid_data(&env)
+        .expect("royalty_paid event not emitted from buy_artwork");
+
+    // Identity: listing-path settlement → listing_id set, auction_id empty.
+    assert_eq!(rp_opt_u64(&rp_field(&data, "listing_id").unwrap()), Some(id));
+    assert_eq!(rp_opt_u64(&rp_field(&data, "auction_id").unwrap()), None);
+
+    // fee = 10 000 000 × 500 / 10 000 = 500 000; distributable = 9 500 000
+    let expected_fee = price * 500 / 10_000;
+    assert_eq!(rp_i128(&rp_field(&data, "sale_price").unwrap()), price);
+    assert_eq!(rp_i128(&rp_field(&data, "protocol_fee_amount").unwrap()), expected_fee);
+
+    // artist: 9 500 000 × 7000 / 10 000 = 6 650 000; collab (last) takes the
+    // remainder 2 850 000. Together: price − fee.
+    let breakdown = rp_field(&data, "recipients").unwrap();
+    assert_eq!(rp_breakdown_len(&breakdown), 2);
+    let artist_amt = rp_breakdown_amount(&breakdown, 0);
+    let collab_amt = rp_breakdown_amount(&breakdown, 1);
+    assert_eq!(artist_amt, 6_650_000);
+    assert_eq!(collab_amt, 2_850_000);
+    assert_eq!(artist_amt + collab_amt, price - expected_fee);
+
+    // Event amounts must match the transfers that actually happened.
+    let token = TokenClient::new(&env, &token_id);
+    assert_eq!(token.balance(&artist), 100_000_000_000_i128 + artist_amt);
+    assert_eq!(token.balance(&collab), collab_amt);
+    assert_eq!(token.balance(&treasury), expected_fee);
+}
+
+/// finalize_auction must emit `royalty_paid` identified by auction_id.
+#[test]
+fn test_finalize_auction_emits_royalty_paid_with_auction_id() {
+    let (env, client, artist, buyer, token_id, _cid, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    let treasury = Address::generate(&env);
+    client.set_treasury(&artist, &treasury);
+    client.set_protocol_fee(&artist, &500u32);
+
+    // 9500 recipient bps + 500 fee bps = 10 000 (valid)
+    let recipients = vec![
+        &env,
+        Recipient { address: artist.clone(), percentage: 9_500 },
+    ];
+    let aid = client.create_auction(
+        &artist, &token_id, &collection_id, &1u64,
+        &1_000_000_i128, &3600u64, &recipients,
+    );
+    let winning_bid = 2_000_000_i128;
+    client.place_bid(&buyer, &aid, &winning_bid);
+    env.ledger().set_timestamp(env.ledger().timestamp() + 3601);
+    client.finalize_auction(&buyer, &aid);
+
+    let data = find_royalty_paid_data(&env)
+        .expect("royalty_paid event not emitted from finalize_auction");
+
+    assert_eq!(rp_opt_u64(&rp_field(&data, "listing_id").unwrap()), None);
+    assert_eq!(rp_opt_u64(&rp_field(&data, "auction_id").unwrap()), Some(aid));
+
+    // fee = 2 000 000 × 500 / 10 000 = 100 000; sole recipient takes the rest.
+    let expected_fee = winning_bid * 500 / 10_000;
+    assert_eq!(rp_i128(&rp_field(&data, "sale_price").unwrap()), winning_bid);
+    assert_eq!(rp_i128(&rp_field(&data, "protocol_fee_amount").unwrap()), expected_fee);
+
+    let breakdown = rp_field(&data, "recipients").unwrap();
+    assert_eq!(rp_breakdown_len(&breakdown), 1);
+    assert_eq!(rp_breakdown_amount(&breakdown, 0), winning_bid - expected_fee);
+
+    let token = TokenClient::new(&env, &token_id);
+    assert_eq!(token.balance(&artist), 100_000_000_000_i128 + winning_bid - expected_fee);
+    assert_eq!(token.balance(&treasury), expected_fee);
+}
+
+/// accept_offer settles a sale too, so it must also emit `royalty_paid`.
+/// With no treasury configured the fee is 0 and recipients receive the full
+/// offer amount.
+#[test]
+fn test_accept_offer_emits_royalty_paid_zero_fee() {
+    let (env, client, artist, buyer, token_id, _cid, _collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let listing_id = create_test_listing(&env, &client, &artist, &token_id);
+    let offer_amount = 5_000_000_i128;
+    let offer_id = client.make_offer(&buyer, &listing_id, &offer_amount, &token_id, &None);
+    client.accept_offer(&artist, &offer_id);
+
+    let data = find_royalty_paid_data(&env)
+        .expect("royalty_paid event not emitted from accept_offer");
+
+    assert_eq!(rp_opt_u64(&rp_field(&data, "listing_id").unwrap()), Some(listing_id));
+    assert_eq!(rp_opt_u64(&rp_field(&data, "auction_id").unwrap()), None);
+    assert_eq!(rp_i128(&rp_field(&data, "sale_price").unwrap()), offer_amount);
+    assert_eq!(rp_i128(&rp_field(&data, "protocol_fee_amount").unwrap()), 0);
+
+    let breakdown = rp_field(&data, "recipients").unwrap();
+    assert_eq!(rp_breakdown_len(&breakdown), 1);
+    assert_eq!(rp_breakdown_amount(&breakdown, 0), offer_amount);
+}
+
+/// When the collection reports an ERC2981-style royalty receiver distinct from
+/// the seller, that payout must appear in the breakdown so entries still sum
+/// to price − protocol fee.
+#[test]
+fn test_royalty_paid_includes_collection_royalty_receiver() {
+    let (env, client, artist, buyer, token_id, _cid, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    let treasury = Address::generate(&env);
+    client.set_treasury(&artist, &treasury);
+    client.set_protocol_fee(&artist, &500u32);
+
+    // Collection-level royalty: 1000 bps to an external receiver.
+    let royalty_recv = Address::generate(&env);
+    MockNftClient::new(&env, &collection_id).set_royalty(&royalty_recv, &1_000u32);
+
+    let price = 10_000_000_i128;
+    let recipients = vec![
+        &env,
+        Recipient { address: artist.clone(), percentage: 9_500 },
+    ];
+    let id = client.create_listing(
+        &artist, &price, &symbol_short!("XLM"),
+        &token_id, &collection_id, &1u64, &recipients, &None::<u64>,
+    );
+    client.buy_artwork(&buyer, &id);
+
+    let data = find_royalty_paid_data(&env)
+        .expect("royalty_paid event not emitted");
+
+    // royalty = 10 000 000 × 1000 / 10 000 = 1 000 000 (off the top);
+    // fee = 9 000 000 × 500 / 10 000 = 450 000; artist takes the remainder.
+    let expected_royalty = 1_000_000_i128;
+    let expected_fee = 450_000_i128;
+    let expected_artist = price - expected_royalty - expected_fee;
+    assert_eq!(rp_i128(&rp_field(&data, "protocol_fee_amount").unwrap()), expected_fee);
+
+    let breakdown = rp_field(&data, "recipients").unwrap();
+    assert_eq!(rp_breakdown_len(&breakdown), 2);
+    let recv_amt = rp_breakdown_amount(&breakdown, 0);
+    let artist_amt = rp_breakdown_amount(&breakdown, 1);
+    assert_eq!(recv_amt, expected_royalty);
+    assert_eq!(artist_amt, expected_artist);
+    assert_eq!(recv_amt + artist_amt, price - expected_fee);
+
+    let token = TokenClient::new(&env, &token_id);
+    assert_eq!(token.balance(&royalty_recv), expected_royalty);
+    assert_eq!(token.balance(&artist), 100_000_000_000_i128 + expected_artist);
+    assert_eq!(token.balance(&treasury), expected_fee);
+}

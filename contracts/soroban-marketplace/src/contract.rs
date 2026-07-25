@@ -974,7 +974,7 @@ impl MarketplaceContract {
             ledger_sequence: env.ledger().sequence(),
         }.publish(&env);
         // Interactions
-        let fee = Self::distribute_payout(
+        let (fee, payouts) = Self::distribute_payout(
             &env, &listing.token, &listing.collection, listing.price,
             &listing.artist, &listing.recipients, &buyer, true, listing.protocol_fee_bps,
         );
@@ -993,6 +993,11 @@ impl MarketplaceContract {
             token: listing.token.clone(),
             ledger_sequence: env.ledger().sequence(),
         }.publish(&env);
+        // Per-recipient payout breakdown for the royalty audit trail (Issue #201)
+        emit_royalty_paid(
+            &env, Some(listing_id), None, listing.price, fee,
+            listing.token.clone(), payouts,
+        );
         // NFT: from escrow → buyer (CEI: state already Sold)
         escrow::release_nft(&env, &listing.collection, listing.token_id,
             &buyer, env.ledger().sequence(), listing_id);
@@ -1254,7 +1259,7 @@ impl MarketplaceContract {
         save_auction(&env, &auction);
         AuctionFinalizedEvent { auction_id, winner: winner.clone(), amount: winning_bid }.publish(&env);
         if let Some(ref w) = winner {
-            let fee = Self::distribute_payout(
+            let (fee, payouts) = Self::distribute_payout(
                 &env, &auction.token, &auction.collection, winning_bid,
                 &auction.creator, &auction.recipients, w, false, snapshotted_fee,
             );
@@ -1274,6 +1279,11 @@ impl MarketplaceContract {
                 token: auction.token.clone(),
                 ledger_sequence: env.ledger().sequence(),
             }.publish(&env);
+            // Per-recipient payout breakdown for the royalty audit trail (Issue #201)
+            emit_royalty_paid(
+                &env, None, Some(auction_id), winning_bid, fee,
+                auction.token.clone(), payouts,
+            );
             // NFT: escrow → winner (CEI: status Finalized already)
             escrow::release_nft(&env, &auction.collection, auction.token_id,
                 w, env.ledger().sequence(), auction_id);
@@ -1558,7 +1568,7 @@ impl MarketplaceContract {
             offer_id, listing_id, offerer: accepted_offerer.clone(), amount: accepted_amount,
         }.publish(&env);
         // Interactions
-        let fee = Self::distribute_payout(
+        let (fee, payouts) = Self::distribute_payout(
             &env, &offer.token, &listing.collection, offer.amount,
             &artist, &listing.recipients, &offer.offerer, false, listing.protocol_fee_bps,
         );
@@ -1577,6 +1587,11 @@ impl MarketplaceContract {
             token: offer.token.clone(),
             ledger_sequence: env.ledger().sequence(),
         }.publish(&env);
+        // Per-recipient payout breakdown for the royalty audit trail (Issue #201)
+        emit_royalty_paid(
+            &env, Some(listing_id), None, offer.amount, fee,
+            offer.token.clone(), payouts,
+        );
         // NFT: escrow → accepted offerer (CEI: status Sold already)
         escrow::release_nft(&env, &listing.collection, listing.token_id,
             &accepted_offerer, env.ledger().sequence(), listing_id);
@@ -1818,16 +1833,22 @@ impl MarketplaceContract {
         if combined > 10_000 { panic_with_error!(env, MarketplaceError::RoyaltyExceedsLimit); }
     }
 
+    /// Returns `(protocol_fee_collected, per-recipient payouts)`. The payout
+    /// vector records every transfer made out of the sale price except the
+    /// protocol fee — i.e. the collection-level `royalty_info` receiver (when
+    /// paid) followed by each configured recipient — so entries always sum to
+    /// `amount - protocol_fee_collected`. (Issue #201)
     #[allow(clippy::too_many_arguments)]
     fn distribute_payout(
         env: &Env, token_addr: &Address, collection_addr: &Address,
         amount: i128, seller: &Address, recipients: &Vec<Recipient>,
         buyer: &Address, transfer_from_buyer: bool, fee_bps: u32,
-    ) -> i128 {
+    ) -> (i128, Vec<RecipientPayout>) {
         let token = TokenClient::new(env, token_addr);
         if transfer_from_buyer {
             token.transfer(buyer, &env.current_contract_address(), &amount);
         }
+        let mut payouts: Vec<RecipientPayout> = Vec::new(env);
         let mut payout = amount;
         let royalty_info: (Address, u32) = env.invoke_contract(
             collection_addr,
@@ -1842,6 +1863,7 @@ impl MarketplaceContract {
                 .checked_div(10_000)
                 .unwrap_or_else(|| panic_with_error!(env, MarketplaceError::ArithmeticOverflow));
             token.transfer(&env.current_contract_address(), &royalty_receiver, &royalty);
+            payouts.push_back(RecipientPayout { address: royalty_receiver, amount: royalty });
             payout -= royalty;
         }
         let mut fee_collected: i128 = 0;
@@ -1866,8 +1888,9 @@ impl MarketplaceContract {
                     .unwrap_or_else(|| panic_with_error!(env, MarketplaceError::ArithmeticOverflow))
             };
             token.transfer(&env.current_contract_address(), &r.address, &amt);
+            payouts.push_back(RecipientPayout { address: r.address, amount: amt });
             ds += amt;
         }
-        fee_collected
+        (fee_collected, payouts)
     }
 }
