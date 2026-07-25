@@ -8469,6 +8469,7 @@ fn setup_legacy_v1_fixture(
                 extension_window: 600,
                 extension_trigger: 0,
                 protocol_fee_bps: 0,
+                bid_history_cap: 20,
             },
         );
         env.storage()
@@ -8645,4 +8646,168 @@ fn test_event_catalog_topics() {
     // Test a subset of events covering all new topics, specifically those that might be long
     assert_eq!(crate::events::LISTING_CREATED, "listing_created");
     assert_eq!(crate::events::PROTOCOL_FEE_COLLECTED, "protocol_fee_collected");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Property-based tests: bid-history ring-buffer correctness
+//
+// Uses proptest to exhaustively verify that `append_bid_record` always keeps
+// exactly `min(N, C)` entries in the stored history, regardless of the
+// specific combination of bid count N and cap C.
+//
+// The proptest crate is a dev-dependency only; these tests compile and run
+// with `cargo test` but are excluded from the WASM contract binary.
+// ═══════════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod bid_history_proptest {
+    extern crate std;
+
+    use proptest::prelude::*;
+    use soroban_sdk::{testutils::Address as _, Address, Env};
+
+    use crate::{
+        storage::{
+            append_bid_record, load_auction_bids, DEFAULT_BID_HISTORY_CAP, MAX_BID_HISTORY_CAP,
+        },
+        types::BidRecord,
+    };
+
+    // ── Helper ─────────────────────────────────────────────────────────────
+
+    /// Run N `append_bid_record` calls on `auction_id` with cap C and return
+    /// the length of the stored bid history.
+    fn run_ring_buffer(env: &Env, auction_id: u64, n: u32, cap: u32) -> u32 {
+        let bidder = Address::generate(env);
+        for i in 0..n {
+            let record = BidRecord {
+                bidder: bidder.clone(),
+                amount: (i as i128 + 1) * 1_000_000,
+                ledger: i,
+            };
+            append_bid_record(env, auction_id, &record, cap);
+        }
+        load_auction_bids(env, auction_id).len()
+    }
+
+    // ── Property: stored_count == min(N, C) ────────────────────────────────
+
+    proptest! {
+        /// For every (N, C) pair in the valid range, the stored bid count must
+        /// be exactly min(N, C).  This property covers:
+        ///   - N = 0  (nothing appended, history is empty)
+        ///   - N < C  (history fills up but never hits the eviction path)
+        ///   - N == C (boundary: exactly full, no eviction yet)
+        ///   - N > C  (ring-buffer eviction fires C times)
+        ///
+        /// The cap range 1–MAX_BID_HISTORY_CAP mirrors the constraint enforced
+        /// by `set_bid_history_cap`.
+        #[test]
+        fn prop_stored_count_equals_min_n_cap(
+            n in 0u32..=60u32,
+            cap in 1u32..=MAX_BID_HISTORY_CAP,
+        ) {
+            let env = Env::default();
+            // Each proptest iteration uses a distinct auction_id so history
+            // vectors never collide.
+            let auction_id: u64 = ((n as u64) << 16) | cap as u64;
+
+            let stored = run_ring_buffer(&env, auction_id, n, cap);
+            let expected = n.min(cap);
+
+            prop_assert_eq!(
+                stored,
+                expected,
+                "N={n}, C={cap}: expected min({n},{cap})={expected} entries but got {stored}"
+            );
+        }
+    }
+
+    // ── Property: oldest entries evicted first ─────────────────────────────
+
+    proptest! {
+        /// When N > C, the retained slice must be the *last* C bids (amounts
+        /// C+1 through N, 1-indexed), and they must appear in insertion order.
+        #[test]
+        fn prop_oldest_entries_evicted_first(
+            excess in 1u32..=10u32,
+            cap in 1u32..=30u32,
+        ) {
+            let n = cap + excess;
+            let env = Env::default();
+            let auction_id: u64 = ((excess as u64) << 24) | ((cap as u64) << 8) | 0xEF;
+
+            run_ring_buffer(&env, auction_id, n, cap);
+            let history = load_auction_bids(&env, auction_id);
+
+            prop_assert_eq!(history.len(), cap,
+                "N={n}, C={cap}: expected {cap} entries but got {}", history.len());
+
+            // The first retained bid should have amount (excess+1) * 1_000_000.
+            let first_amount = (excess as i128 + 1) * 1_000_000;
+            prop_assert_eq!(
+                history.get(0).unwrap().amount,
+                first_amount,
+                "N={n}, C={cap}: oldest retained bid amount mismatch"
+            );
+
+            // The last retained bid should have amount n * 1_000_000.
+            let last_amount = n as i128 * 1_000_000;
+            prop_assert_eq!(
+                history.get(cap - 1).unwrap().amount,
+                last_amount,
+                "N={n}, C={cap}: newest bid amount mismatch"
+            );
+
+            // Verify strict ascending order.
+            for i in 0..(cap - 1) {
+                prop_assert!(
+                    history.get(i).unwrap().amount < history.get(i + 1).unwrap().amount,
+                    "N={n}, C={cap}: history not in ascending order at index {i}"
+                );
+            }
+        }
+    }
+
+    // ── Property: default cap boundary ─────────────────────────────────────
+
+    proptest! {
+        /// Using the DEFAULT_BID_HISTORY_CAP (50), the ring-buffer never stores
+        /// more than 50 entries regardless of how many bids are placed.
+        #[test]
+        fn prop_default_cap_never_exceeded(n in 0u32..=200u32) {
+            let env = Env::default();
+            let auction_id: u64 = n as u64 | 0xDEF0_0000;
+
+            let stored = run_ring_buffer(&env, auction_id, n, DEFAULT_BID_HISTORY_CAP);
+
+            prop_assert!(
+                stored <= DEFAULT_BID_HISTORY_CAP,
+                "N={n}: stored {stored} > DEFAULT_BID_HISTORY_CAP ({DEFAULT_BID_HISTORY_CAP})"
+            );
+            prop_assert_eq!(
+                stored,
+                n.min(DEFAULT_BID_HISTORY_CAP),
+                "N={n}: expected min({n},{DEFAULT_BID_HISTORY_CAP}) but got {stored}"
+            );
+        }
+    }
+
+    // ── Property: max cap boundary ─────────────────────────────────────────
+
+    proptest! {
+        /// Using the MAX_BID_HISTORY_CAP (200), the ring-buffer stores at most
+        /// 200 entries.
+        #[test]
+        fn prop_max_cap_never_exceeded(n in 0u32..=250u32) {
+            let env = Env::default();
+            let auction_id: u64 = n as u64 | 0xCAP0_0000;
+
+            let stored = run_ring_buffer(&env, auction_id, n, MAX_BID_HISTORY_CAP);
+
+            prop_assert!(
+                stored <= MAX_BID_HISTORY_CAP,
+                "N={n}: stored {stored} > MAX_BID_HISTORY_CAP ({MAX_BID_HISTORY_CAP})"
+            );
+        }
+    }
 }

@@ -150,6 +150,15 @@ pub struct Auction {
     pub extension_window: u64,
     pub extension_trigger: u64,
     pub protocol_fee_bps: u32,
+    /// Bid-history ring-buffer capacity snapshotted at auction creation time.
+    ///
+    /// Snapshotting here means a later admin change to the global
+    /// `BidHistoryCap` never retroactively shrinks or grows the history of
+    /// an already-running auction — each auction's ring-buffer behaviour is
+    /// fixed when it is created.
+    ///
+    /// Valid range: 1 – 200 (enforced by `set_bid_history_cap`).
+    pub bid_history_cap: u32,
 }
 
 #[contracttype]
