@@ -29,6 +29,7 @@ import { logger } from './logger.js';
 import redis, { invalidatePattern, invalidateKey } from './redis.js';
 import { loadConfig, parseTrackedContracts } from './config.js';
 import { enqueueIpfsFetch } from './ipfs-cache.js';
+import { upsertEvents } from './event-idempotency.js';
 
 dotenv.config();
 
@@ -520,45 +521,16 @@ async function fetchAuctionFromChain(_auctionId: bigint): Promise<any | null> {
 export async function applyDecodedEvents(decodedEvents: any[], tx: any) {
   if (decodedEvents.length === 0) return [];
 
-  const toInsert: any[] = [];
+  // Use the idempotent batch writer — DB-level unique constraints ensure that
+  // concurrent workers or replayed windows cannot create duplicate rows.
+  // Any duplicate is counted as a benign replay (not an error).
+  const { newEvents } = await upsertEvents(decodedEvents, tx);
 
-  for (const event of decodedEvents) {
-    const eventHash: string = event.eventHash ?? '';
-
-    // Upsert on eventHash — the unique identity of this on-chain event.
-    // On conflict (duplicate) the update is a no-op; we detect it by checking
-    // whether the row's id changed (Prisma returns the upserted row).
-    const existing = eventHash
-      ? await tx.marketplaceEvent.findUnique({ where: { eventHash }, select: { id: true } })
-      : null;
-
-    if (existing) {
-      duplicateEventsCounter.inc();
-      logger.debug('[Dedup] Skipping duplicate event', {
-        eventHash,
-        eventType: event.eventType,
-        ledger: event.ledgerSequence,
-      });
-      continue;
-    }
-
-    await tx.marketplaceEvent.create({
-      data: {
-        listingId: event.listingId ?? null,
-        eventType: event.eventType,
-        actor: event.actor,
-        data: event.data,
-        ledgerSequence: event.ledgerSequence,
-        eventHash,
-        contractId: event.contractId ?? '',
-      },
-    });
-
-    toInsert.push(event);
+  for (const event of newEvents) {
     await processEvent(event, tx, true);
   }
 
-  return toInsert;
+  return newEvents;
 }
 
 export async function processEvent(event: any, tx?: any, skipInsert = false) {
@@ -573,17 +545,12 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
   };
 
   if (!skipInsert) {
-    await db.marketplaceEvent.create({
-      data: {
-        listingId,
-        eventType,
-        actor,
-        ledgerSequence,
-        data,
-        eventHash: event.eventHash ?? '',
-        contractId: event.contractId ?? '',
-      },
-    });
+    const { skipped } = await (upsertEvents as any)([event], db);
+    if (skipped > 0) {
+      // This is a duplicate — all domain state is already correct from the prior write.
+      // Return early rather than double-applying business logic.
+      return;
+    }
   }
 
   // Handle deploy events (no listingId — collection deployments)

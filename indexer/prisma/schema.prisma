@@ -140,15 +140,21 @@ model MarketplaceEvent {
   data            Json
   ledgerSequence  Int
   ledgerTimestamp DateTime @default(now())
-  eventHash       String   @unique @default("")  // SHA256(contractId:ledger:txHash:eventIndex)
-  contractId      String   @default("")          // source contract address
+  /// Canonical event identity: SHA256(contractId:ledger:txHash:eventIndex).
+  /// NULL only for legacy rows ingested before this field was introduced.
+  /// The DB-level unique index enforces no two rows share the same non-NULL hash.
+  eventHash       String?  @unique                    // nullable — no @default("") to prevent degenerate collisions
+  contractId      String   @default("")               // source contract address
   @@index([actor])
   @@index([eventType])
   @@index([listingId])
   @@index([ledgerSequence])
   @@index([listingId, ledgerSequence])
   @@index([contractId])
-  @@unique([listingId, eventType, ledgerSequence])
+  /// Belt-and-suspenders composite uniqueness guard (contractId + listingId + type + ledger).
+  /// The primary idempotency key is eventHash; this index catches legacy events
+  /// without eventHash and prevents the most common accidental duplicate category.
+  @@unique([contractId, listingId, eventType, ledgerSequence], name: "MarketplaceEvent_contractId_listingId_eventType_ledgerSeq_key")
 }
 
 model Collection {
