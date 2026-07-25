@@ -30,7 +30,7 @@ use crate::{
     },
     types::{
         Auction, AuctionStatus, BidRecord, CancelReason, Listing, ListingStatus, MarketplaceError,
-        Offer, OfferStatus, Recipient,
+        Offer, OfferStatus, PayoutLeg, PayoutPlan, Recipient,
     },
 };
 
@@ -1814,55 +1814,252 @@ impl MarketplaceContract {
         if combined > 10_000 { panic_with_error!(env, MarketplaceError::RoyaltyExceedsLimit); }
     }
 
+    /// Centralized, side-effect-free settlement calculator. Given a payment
+    /// `amount` and the resolved royalty/fee/recipient inputs, computes the
+    /// complete [`PayoutPlan`] — every leg that will be transferred — without
+    /// performing any transfer itself. This is the single source of truth
+    /// for settlement arithmetic: `distribute_payout` (real transfers) and
+    /// `simulate_payout` (read-only frontend preview) both call it and are
+    /// guaranteed to agree on the split.
+    ///
+    /// # Rounding policy (Issue #269)
+    ///
+    /// There is exactly one deterministic rounding policy, applied in this
+    /// fixed order:
+    ///
+    /// 1. **Royalty** — `royalty_amt = floor(amount * royalty_bps / 10_000)`,
+    ///    computed independently via checked multiply-then-divide. Skipped
+    ///    (no leg, `royalty: None`) when `royalty_bps == 0` or the royalty
+    ///    receiver is the seller.
+    /// 2. **Protocol fee** — `fee_amt = floor(remaining * fee_bps / 10_000)`,
+    ///    where `remaining = amount - royalty_amt`. Also computed
+    ///    independently via checked multiply-then-divide. If no treasury is
+    ///    configured, `fee_amt` is `0` regardless of `fee_bps` — there is
+    ///    nowhere to send a fee, so none is deducted (pre-existing
+    ///    behavior, preserved here).
+    /// 3. **Recipients** — every recipient except the last gets
+    ///    `floor(remaining * percentage / 10_000)` (`remaining` after
+    ///    subtracting the fee). The **last recipient in the input list**
+    ///    receives whatever is left: `remaining - sum(previous recipients)`.
+    ///
+    /// Truncation from basis-point division is deterministically absorbed by
+    /// the last recipient in insertion order; royalty and protocol-fee
+    /// amounts are computed independently via checked division and are never
+    /// adjusted for remainder — only the final recipient split absorbs
+    /// sub-unit truncation, guaranteeing `sum(all transfers) == amount` for
+    /// every input. The last recipient is used (rather than the seller,
+    /// creator, or treasury) because `recipients: Vec<Recipient>` preserves
+    /// insertion order from listing/auction creation, so "last recipient"
+    /// is a stable, deterministic, caller-visible choice that requires no
+    /// additional state — the same recipient absorbs the remainder every
+    /// time a given listing/auction settles.
+    ///
+    /// ## Worked examples
+    ///
+    /// * **Small price** (treasury configured): `amount = 3`,
+    ///   `fee_bps = 250` (2.5%), one recipient at `10_000` bps (100%), no
+    ///   royalty.
+    ///   `fee = floor(3 * 250 / 10_000) = floor(0.075) = 0`.
+    ///   `remaining = 3`. The single recipient is last, so it receives
+    ///   `3 - 0 = 3`. Total transferred: `0 (fee) + 3 (recipient) = 3`. ✅
+    /// * **High basis points** (treasury configured): `amount = 1_000_000`,
+    ///   `royalty_bps = 1_000` (10%), `fee_bps = 500` (5%), one recipient
+    ///   at `9_500` bps (95%, the remaining share after fee+royalty are
+    ///   reserved).
+    ///   `royalty = floor(1_000_000 * 1_000 / 10_000) = 100_000`.
+    ///   `remaining = 900_000`.
+    ///   `fee = floor(900_000 * 500 / 10_000) = 45_000`.
+    ///   `remaining = 855_000`. The single (last) recipient gets all of it:
+    ///   `855_000`. Total: `100_000 + 45_000 + 855_000 = 1_000_000`. ✅
+    /// * **Multiple recipients with remainder**: `amount = 100`,
+    ///   `fee_bps = 0`, no royalty, three recipients at `3_334`, `3_333`,
+    ///   `3_333` bps (an even three-way split that doesn't divide evenly).
+    ///   Recipient 0: `floor(100 * 3_334 / 10_000) = 33`.
+    ///   Recipient 1: `floor(100 * 3_333 / 10_000) = 33`.
+    ///   Recipient 2 (last): `100 - 33 - 33 = 34` — absorbs the remainder.
+    ///   Total: `33 + 33 + 34 = 100`. ✅
+    ///
+    /// # Overflow and validity
+    ///
+    /// Every multiplication/division/addition/subtraction uses
+    /// `checked_*` and panics with `MarketplaceError::ArithmeticOverflow` on
+    /// failure — no intermediate product can silently wrap. `royalty_bps`
+    /// is read from an external, untrusted collection contract, so it is
+    /// bounds-checked (`<= 10_000`) up front and rejected with
+    /// `MarketplaceError::InvalidRoyalty` otherwise — this prevents a
+    /// misbehaving/malicious collection from causing `royalty_amt > amount`,
+    /// which would otherwise make `remaining` negative and could drain
+    /// unrelated escrowed funds from the contract's pooled token balance.
+    /// `recipients`/`fee_bps` are re-validated with `validate_recipients`
+    /// here (in addition to the validation already performed at
+    /// listing/auction creation and update time), so an invalid split can
+    /// never reach the transfer phase regardless of caller. Finally, before
+    /// returning, the plan is checked end-to-end:
+    /// `royalty_amt + fee_amt + sum(recipient amounts) == amount` exactly —
+    /// this is unreachable given the checked math above, but it is the last
+    /// line of defense guaranteeing "no transfer starts from an invalid
+    /// plan" and "payout totals are conserved" (Issue #269 acceptance
+    /// criteria).
+    #[allow(clippy::too_many_arguments)]
+    fn calculate_payout_plan(
+        env: &Env,
+        amount: i128,
+        seller: &Address,
+        royalty_receiver: &Address,
+        royalty_bps: u32,
+        recipients: &Vec<Recipient>,
+        fee_bps: u32,
+    ) -> PayoutPlan {
+        // Reject invalid recipient/fee combinations before computing anything.
+        Self::validate_recipients(env, recipients, fee_bps);
+        if royalty_bps > 10_000 {
+            panic_with_error!(env, MarketplaceError::InvalidRoyalty);
+        }
+
+        let mut remaining = amount;
+
+        // 1. Royalty (independent checked division; never adjusted for
+        //    remainder).
+        let royalty_leg: Option<PayoutLeg> = if royalty_bps > 0 && royalty_receiver != seller {
+            let royalty_amt = amount
+                .checked_mul(royalty_bps as i128)
+                .unwrap_or_else(|| panic_with_error!(env, MarketplaceError::ArithmeticOverflow))
+                .checked_div(10_000)
+                .unwrap_or_else(|| panic_with_error!(env, MarketplaceError::ArithmeticOverflow));
+            remaining = remaining
+                .checked_sub(royalty_amt)
+                .unwrap_or_else(|| panic_with_error!(env, MarketplaceError::ArithmeticOverflow));
+            Some(PayoutLeg { address: royalty_receiver.clone(), amount: royalty_amt })
+        } else {
+            None
+        };
+
+        // 2. Protocol fee (independent checked division; never adjusted for
+        //    remainder). Matches pre-existing behavior: if no treasury is
+        //    configured there is nowhere to send a fee, so none is deducted
+        //    — `fee_bps` is treated as inapplicable rather than leaving the
+        //    computed amount stranded in the contract's balance.
+        let fee_amt = if crate::storage::get_treasury_storage(env).is_some() {
+            let f = remaining
+                .checked_mul(fee_bps as i128)
+                .unwrap_or_else(|| panic_with_error!(env, MarketplaceError::ArithmeticOverflow))
+                .checked_div(10_000)
+                .unwrap_or_else(|| panic_with_error!(env, MarketplaceError::ArithmeticOverflow));
+            remaining = remaining
+                .checked_sub(f)
+                .unwrap_or_else(|| panic_with_error!(env, MarketplaceError::ArithmeticOverflow));
+            f
+        } else {
+            0i128
+        };
+
+        // 3. Recipients — last recipient in insertion order absorbs the
+        //    truncation remainder so the split always conserves `remaining`
+        //    exactly.
+        let len = recipients.len();
+        let mut recipient_legs: Vec<PayoutLeg> = Vec::new(env);
+        let mut distributed = 0i128;
+        for i in 0..len {
+            let r = recipients.get(i).unwrap();
+            let amt = if i == len - 1 {
+                remaining - distributed
+            } else {
+                remaining
+                    .checked_mul(r.percentage as i128)
+                    .unwrap_or_else(|| panic_with_error!(env, MarketplaceError::ArithmeticOverflow))
+                    .checked_div(10_000)
+                    .unwrap_or_else(|| panic_with_error!(env, MarketplaceError::ArithmeticOverflow))
+            };
+            recipient_legs.push_back(PayoutLeg { address: r.address.clone(), amount: amt });
+            distributed = distributed
+                .checked_add(amt)
+                .unwrap_or_else(|| panic_with_error!(env, MarketplaceError::ArithmeticOverflow));
+        }
+
+        // Conservation check — the last line of defense before any transfer
+        // is allowed to start. Unreachable given correct checked math above.
+        let royalty_amt = royalty_leg.as_ref().map(|l| l.amount).unwrap_or(0);
+        let total = royalty_amt
+            .checked_add(fee_amt)
+            .and_then(|s| s.checked_add(distributed))
+            .unwrap_or_else(|| panic_with_error!(env, MarketplaceError::ArithmeticOverflow));
+        if total != amount {
+            panic_with_error!(env, MarketplaceError::ArithmeticOverflow);
+        }
+
+        PayoutPlan { royalty: royalty_leg, fee: fee_amt, recipients: recipient_legs, total }
+    }
+
+    /// Fetch a collection's `royalty_info()` the same way `distribute_payout`
+    /// does, for use by both the real settlement path and `simulate_payout`.
+    fn fetch_royalty_info(env: &Env, collection_addr: &Address) -> (Address, u32) {
+        env.invoke_contract(
+            collection_addr,
+            &soroban_sdk::Symbol::new(env, "royalty_info"),
+            soroban_sdk::vec![env],
+        )
+    }
+
+    /// Read-only settlement preview: computes the exact [`PayoutPlan`] a real
+    /// purchase/finalization for `amount` would produce, using the same
+    /// [`calculate_payout_plan`] helper the real settlement path uses — no
+    /// storage mutation, no token transfers. Lets the frontend fee display
+    /// use identical calculation semantics to the contract (Issue #269).
+    pub fn simulate_payout(
+        env: Env,
+        amount: i128,
+        collection: Address,
+        seller: Address,
+        recipients: Vec<Recipient>,
+        fee_bps: u32,
+    ) -> PayoutPlan {
+        let (royalty_receiver, royalty_bps) = Self::fetch_royalty_info(&env, &collection);
+        Self::calculate_payout_plan(
+            &env, amount, &seller, &royalty_receiver, royalty_bps, &recipients, fee_bps,
+        )
+    }
+
+    /// Computes the complete [`PayoutPlan`] up front via
+    /// [`calculate_payout_plan`] — including its internal validation and
+    /// conservation checks — before touching a single token. Only once the
+    /// plan is known to be valid does this wrapper pull the buyer's funds in
+    /// (if applicable) and perform every transfer — royalty, protocol fee,
+    /// each recipient — in sequence. Per Issue #269's requirement, no
+    /// transfer of any kind starts before settlement calculation is fully
+    /// complete and validated.
     #[allow(clippy::too_many_arguments)]
     fn distribute_payout(
         env: &Env, token_addr: &Address, collection_addr: &Address,
         amount: i128, seller: &Address, recipients: &Vec<Recipient>,
         buyer: &Address, transfer_from_buyer: bool, fee_bps: u32,
     ) -> i128 {
+        let (royalty_receiver, royalty_bps) = Self::fetch_royalty_info(env, collection_addr);
+        let plan = Self::calculate_payout_plan(
+            env, amount, seller, &royalty_receiver, royalty_bps, recipients, fee_bps,
+        );
+
+        // Only now — after the full plan has been computed and validated
+        // (including the conservation assertion) — does any token move.
         let token = TokenClient::new(env, token_addr);
         if transfer_from_buyer {
             token.transfer(buyer, &env.current_contract_address(), &amount);
         }
-        let mut payout = amount;
-        let royalty_info: (Address, u32) = env.invoke_contract(
-            collection_addr,
-            &soroban_sdk::Symbol::new(env, "royalty_info"),
-            soroban_sdk::vec![env],
-        );
-        let (royalty_receiver, royalty_bps) = royalty_info;
-        if royalty_bps > 0 && royalty_receiver != *seller {
-            let royalty = amount
-                .checked_mul(royalty_bps as i128)
-                .unwrap_or_else(|| panic_with_error!(env, MarketplaceError::ArithmeticOverflow))
-                .checked_div(10_000)
-                .unwrap_or_else(|| panic_with_error!(env, MarketplaceError::ArithmeticOverflow));
-            token.transfer(&env.current_contract_address(), &royalty_receiver, &royalty);
-            payout -= royalty;
+        if let Some(royalty_leg) = &plan.royalty {
+            if royalty_leg.amount > 0 {
+                token.transfer(&env.current_contract_address(), &royalty_leg.address, &royalty_leg.amount);
+            }
         }
         let mut fee_collected: i128 = 0;
-        if let Some(t) = crate::storage::get_treasury_storage(env) {
-            let fee = payout * fee_bps as i128 / 10_000;
-            if fee > 0 {
-                token.transfer(&env.current_contract_address(), &t, &fee);
-                fee_collected = fee;
+        if plan.fee > 0 {
+            if let Some(t) = crate::storage::get_treasury_storage(env) {
+                token.transfer(&env.current_contract_address(), &t, &plan.fee);
+                fee_collected = plan.fee;
             }
-            payout -= fee;
         }
-        let len = recipients.len();
-        let mut ds = 0i128;
+        let len = plan.recipients.len();
         for i in 0..len {
-            let r = recipients.get(i).unwrap();
-            let amt = if i == len - 1 {
-                payout - ds
-            } else {
-                payout.checked_mul(r.percentage as i128)
-                    .unwrap_or_else(|| panic_with_error!(env, MarketplaceError::ArithmeticOverflow))
-                    .checked_div(10_000)
-                    .unwrap_or_else(|| panic_with_error!(env, MarketplaceError::ArithmeticOverflow))
-            };
-            token.transfer(&env.current_contract_address(), &r.address, &amt);
-            ds += amt;
+            let leg = plan.recipients.get(i).unwrap();
+            token.transfer(&env.current_contract_address(), &leg.address, &leg.amount);
         }
         fee_collected
     }
