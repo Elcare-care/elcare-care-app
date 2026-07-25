@@ -36,6 +36,63 @@ export interface ContractEventSchema {
   data: SchemaField[];
 }
 
+// ── Schema versioning (Issue #278) ────────────────────────────────────────────
+//
+// Some event structs on the contract side (see the versioning policy at the
+// top of `contracts/soroban-marketplace/src/events.rs`) carry an additive
+// `schema_version: u32` field. That field is declared here as an *optional*
+// `number` field (Soroban u32 decodes via scValToNative to a JS `number`, not
+// `bigint`) on the schemas below — this is what makes historical events
+// (emitted before the field existed, and therefore missing it entirely)
+// continue to decode exactly as before. Absence of `schema_version` is always
+// treated as implicit version 0, and version 0 is always supported.
+//
+// `SUPPORTED_SCHEMA_VERSIONS` records the highest schema_version each event
+// type's schema in this file has been updated to understand. If a decoded
+// event carries a `schema_version` higher than that, the shape *may* still
+// decode successfully (additive fields the older schema doesn't know about
+// are simply ignored), but the indexer cannot be sure that's safe — a future
+// version could also mean a field's *meaning* changed. `parser.ts` uses this
+// map, via `isSupportedSchemaVersion`, to flag that case distinctly (see
+// `UnsupportedSchemaVersionError`) instead of silently accepting it or
+// treating it as a generic decode failure.
+export const SUPPORTED_SCHEMA_VERSIONS: Record<string, number> = {
+  LISTING_CREATED: 1,
+  ARTWORK_SOLD: 1,
+  AUCTION_CREATED: 1,
+  AUCTION_RESOLVED: 1,
+  OFFER_MADE: 1,
+  OFFER_ACCEPTED: 1,
+  PROTOCOL_FEE_COLLECTED: 1,
+  ROYALTY_SETTLEMENT: 1,
+  AUCTION_BID_REFUNDED: 1,
+  AUCTION_ADMIN_CANCELLED: 1,
+  DEPLOY_NORMAL_721: 1,
+  DEPLOY_NORMAL_1155: 1,
+  DEPLOY_LAZY_721: 1,
+  DEPLOY_LAZY_1155: 1,
+};
+
+/**
+ * Returns true when `version` is a schema version this indexer build knows
+ * how to interpret for `eventType`.
+ *
+ * - `undefined`/`null` (field absent) is always supported — it represents a
+ *   legacy/implicit version-0 event emitted before `schema_version` existed.
+ * - Event types with no entry in `SUPPORTED_SCHEMA_VERSIONS` have never been
+ *   versioned; any value is passed through unpoliced.
+ * - Otherwise, supported iff `0 <= version <= SUPPORTED_SCHEMA_VERSIONS[eventType]`.
+ */
+export function isSupportedSchemaVersion(
+  eventType: string,
+  version: number | null | undefined
+): boolean {
+  if (version === undefined || version === null) return true;
+  const maxSupported = SUPPORTED_SCHEMA_VERSIONS[eventType];
+  if (maxSupported === undefined) return true;
+  return Number.isFinite(version) && version >= 0 && version <= maxSupported;
+}
+
 // ── Typed event payloads ──────────────────────────────────────────────────────
 
 export interface ListingCreatedData {
@@ -48,6 +105,8 @@ export interface ListingCreatedData {
   ledger_sequence?: bigint;
   recipients?: Array<{ address: string; percentage: bigint }>;
   token?: string;
+  /** Absent on events emitted before Issue #278; treated as version 0. */
+  schema_version?: number;
 }
 
 export interface ArtworkSoldData {
@@ -57,6 +116,8 @@ export interface ArtworkSoldData {
   price: bigint;
   currency?: string;
   ledger_sequence?: bigint;
+  /** Absent on events emitted before Issue #278; treated as version 0. */
+  schema_version?: number;
 }
 
 export interface ListingCancelledData {
@@ -83,6 +144,8 @@ export interface AuctionCreatedData {
   collection: string;
   token_id: bigint;
   end_time: bigint;
+  /** Absent on events emitted before Issue #278; treated as version 0. */
+  schema_version?: number;
 }
 
 export interface BidPlacedData {
@@ -95,6 +158,32 @@ export interface AuctionFinalizedData {
   auction_id: bigint;
   winner?: string | null;
   amount: bigint;
+  /** Absent on events emitted before Issue #278; treated as version 0. */
+  schema_version?: number;
+}
+
+/** Emitted when a losing bidder's escrow is refunded (Issue #271). */
+export interface AuctionBidRefundedData {
+  auction_id: bigint;
+  bidder: string;
+  amount: bigint;
+  token: string;
+  /** Reason code: "outbid" | "cancelled" | "admin_cancel" */
+  reason?: string;
+  ledger_sequence?: bigint;
+  /** Absent on events emitted before Issue #278; treated as version 0. */
+  schema_version?: number;
+}
+
+/** Emitted when admin force-cancels an active auction (Issue #271). */
+export interface AuctionAdminCancelledData {
+  auction_id: bigint;
+  cancelled_by?: string;
+  refunded_amount: bigint;
+  token: string;
+  ledger_sequence?: bigint;
+  /** Absent on events emitted before Issue #278; treated as version 0. */
+  schema_version?: number;
 }
 
 export interface AuctionCancelledData {
@@ -115,6 +204,8 @@ export interface OfferMadeData {
   token: string;
   /** Optional expiry (ledger timestamp); absent when the offer never expires. */
   expires_at?: bigint;
+  /** Absent on events emitted before Issue #278; treated as version 0. */
+  schema_version?: number;
 }
 
 export interface OfferAcceptedData {
@@ -122,6 +213,8 @@ export interface OfferAcceptedData {
   listing_id: bigint;
   offerer: string;
   amount?: bigint;
+  /** Absent on events emitted before Issue #278; treated as version 0. */
+  schema_version?: number;
 }
 
 export interface OfferRejectedData {
@@ -161,6 +254,20 @@ export interface ProtocolFeeCollectedData {
   amount: bigint;
   token: string;
   treasury: string;
+  /** Absent on events emitted before Issue #278; treated as version 0. */
+  schema_version?: number;
+}
+
+/** Emitted at settlement with a snapshot of normalized recipients (Issue #270). */
+export interface RoyaltySettlementData {
+  /** Listing or auction id. */
+  id: bigint;
+  recipients: Array<{ address: string; percentage: bigint }>;
+  total_amount: bigint;
+  token: string;
+  ledger_sequence?: bigint;
+  /** Absent on events emitted before Issue #278; treated as version 0. */
+  schema_version?: number;
 }
 
 export interface RoyaltyPaidData {
@@ -240,6 +347,8 @@ export const LISTING_CREATED_SCHEMA: ContractEventSchema = {
     { name: 'ledger_sequence', type: 'bigint', optional: true },
     { name: 'token', type: 'string', optional: true },
     { name: 'recipients', type: 'array', optional: true },
+    // Issue #278: additive, absent on pre-upgrade historical events.
+    { name: 'schema_version', type: 'number', optional: true },
   ],
 };
 
@@ -252,6 +361,8 @@ export const ARTWORK_SOLD_SCHEMA: ContractEventSchema = {
     { name: 'artist', type: 'string', optional: true },
     { name: 'currency', type: 'string', optional: true },
     { name: 'ledger_sequence', type: 'bigint', optional: true },
+    // Issue #278: additive, absent on pre-upgrade historical events.
+    { name: 'schema_version', type: 'number', optional: true },
   ],
 };
 
@@ -306,6 +417,8 @@ export const AUCTION_CREATED_SCHEMA: ContractEventSchema = {
     { name: 'collection', type: 'string' },
     { name: 'token_id', type: 'bigint' },
     { name: 'end_time', type: 'bigint' },
+    // Issue #278: additive, absent on pre-upgrade historical events.
+    { name: 'schema_version', type: 'number', optional: true },
   ],
 };
 
@@ -325,6 +438,37 @@ export const AUCTION_RESOLVED_SCHEMA: ContractEventSchema = {
     { name: 'amount', type: 'bigint' },
     // winner is Option<Address> — null when no bids were placed
     { name: 'winner', type: 'string', optional: true },
+    // Issue #278: additive, absent on pre-upgrade historical events.
+    { name: 'schema_version', type: 'number', optional: true },
+  ],
+};
+
+/** Emitted when a losing bidder's escrowed funds are returned (Issue #271). */
+export const AUCTION_BID_REFUNDED_SCHEMA: ContractEventSchema = {
+  type: 'AUCTION_BID_REFUNDED',
+  data: [
+    { name: 'auction_id', type: 'bigint' },
+    { name: 'bidder', type: 'string' },
+    { name: 'amount', type: 'bigint' },
+    { name: 'token', type: 'string' },
+    { name: 'reason', type: 'string', optional: true },
+    { name: 'ledger_sequence', type: 'bigint', optional: true },
+    // Issue #278: additive, absent on pre-upgrade historical events.
+    { name: 'schema_version', type: 'number', optional: true },
+  ],
+};
+
+/** Emitted when admin force-cancels an active auction (Issue #271). */
+export const AUCTION_ADMIN_CANCELLED_SCHEMA: ContractEventSchema = {
+  type: 'AUCTION_ADMIN_CANCELLED',
+  data: [
+    { name: 'auction_id', type: 'bigint' },
+    { name: 'cancelled_by', type: 'string', optional: true },
+    { name: 'refunded_amount', type: 'bigint' },
+    { name: 'token', type: 'string' },
+    { name: 'ledger_sequence', type: 'bigint', optional: true },
+    // Issue #278: additive, absent on pre-upgrade historical events.
+    { name: 'schema_version', type: 'number', optional: true },
   ],
 };
 
@@ -353,6 +497,8 @@ export const OFFER_MADE_SCHEMA: ContractEventSchema = {
     { name: 'amount', type: 'bigint' },
     { name: 'token', type: 'string' },
     { name: 'expires_at', type: 'bigint', optional: true },
+    // Issue #278: additive, absent on pre-upgrade historical events.
+    { name: 'schema_version', type: 'number', optional: true },
   ],
 };
 
@@ -363,6 +509,8 @@ export const OFFER_ACCEPTED_SCHEMA: ContractEventSchema = {
     { name: 'listing_id', type: 'bigint' },
     { name: 'offerer', type: 'string' },
     { name: 'amount', type: 'bigint', optional: true },
+    // Issue #278: additive, absent on pre-upgrade historical events.
+    { name: 'schema_version', type: 'number', optional: true },
   ],
 };
 
@@ -410,6 +558,22 @@ export const PROTOCOL_FEE_COLLECTED_SCHEMA: ContractEventSchema = {
     { name: 'amount', type: 'bigint' },
     { name: 'token', type: 'string' },
     { name: 'treasury', type: 'string' },
+    // Issue #278: additive, absent on pre-upgrade historical events.
+    { name: 'schema_version', type: 'number', optional: true },
+  ],
+};
+
+/** Emitted at settlement with a snapshot of normalized recipients (Issue #270). */
+export const ROYALTY_SETTLEMENT_SCHEMA: ContractEventSchema = {
+  type: 'ROYALTY_SETTLEMENT',
+  data: [
+    { name: 'id', type: 'bigint' },
+    { name: 'recipients', type: 'array' },
+    { name: 'total_amount', type: 'bigint' },
+    { name: 'token', type: 'string' },
+    { name: 'ledger_sequence', type: 'bigint', optional: true },
+    // Issue #278: additive, absent on pre-upgrade historical events.
+    { name: 'schema_version', type: 'number', optional: true },
   ],
 };
 
@@ -494,6 +658,9 @@ export const SCHEMA_REGISTRY: Map<string, ContractEventSchema> = new Map([
   ['OFFER_RECLAIMED', OFFER_RECLAIMED_SCHEMA],
   ['ROYALTY_PAID', ROYALTY_PAID_SCHEMA],
   ['PROTOCOL_FEE_COLLECTED', PROTOCOL_FEE_COLLECTED_SCHEMA],
+  ['ROYALTY_SETTLEMENT', ROYALTY_SETTLEMENT_SCHEMA],
+  ['AUCTION_BID_REFUNDED', AUCTION_BID_REFUNDED_SCHEMA],
+  ['AUCTION_ADMIN_CANCELLED', AUCTION_ADMIN_CANCELLED_SCHEMA],
   ['ARTIST_REVOKED', ARTIST_REVOKED_SCHEMA],
   ['ARTIST_REINSTATED', ARTIST_REINSTATED_SCHEMA],
   ['ADMIN_TRANSFER_PROPOSED', ADMIN_TRANSFER_PROPOSED_SCHEMA],

@@ -81,6 +81,27 @@ When introducing schema updates, new event topics, smart contract entry points, 
 2. Verify all path links and environment variable names match the repository.
 3. Ensure no example command or log output requests or prints un-redacted secrets.
 
+### Contract event schema changes (Issue #278)
+
+Any PR that changes a contract event's shape (`contracts/*/src/events.rs`) or the
+matching indexer schema (`indexer/src/event-schemas.ts`) must, in the same PR:
+
+1. Follow the additive-only versioning policy documented at the top of
+   `contracts/soroban-marketplace/src/events.rs` and in
+   `docs/guides/event-parsing.md` §5 — bump `EVENT_SCHEMA_VERSION` /
+   `SUPPORTED_SCHEMA_VERSIONS` together, never independently.
+2. Update the version catalog table in `docs/guides/event-parsing.md` §5.
+3. Update (or add) the fixture for that event type in
+   `indexer/src/__tests__/parser.test.ts` to cover both the pre-change and
+   post-change payload shape.
+
+**Follow-up (not yet enforced):** a CI check that fails the build when
+`events.rs` changes without a corresponding fixture/schema update in the same
+diff would close this gap mechanically instead of relying on review. That is
+out of scope for Issue #278 (which focused on the versioning mechanism
+itself) and is tracked as follow-up work — reviewers should manually verify
+the three steps above until it lands.
+
 ## Commit messages
 
 Follow [Conventional Commits](https://www.conventionalcommits.org/), e.g. `feat(frontend): add checkout coverage thresholds`.

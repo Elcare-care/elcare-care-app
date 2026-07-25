@@ -39,6 +39,19 @@ export const eventDecodeErrorsCounter = new client.Counter({
   labelNames: ['event_type'],
 });
 
+/**
+ * Counts events whose `schema_version` is higher than what this indexer
+ * build understands (Issue #278). Distinct from `eventDecodeErrorsCounter`:
+ * the event decoded structurally fine, it's just a version the indexer
+ * hasn't been updated to recognize as safe — a signal that the indexer is
+ * behind the deployed contract and needs investigation/upgrade.
+ */
+export const unsupportedSchemaVersionCounter = new client.Counter({
+  name: 'indexer_unsupported_schema_version_total',
+  help: 'Total events skipped because their schema_version is not recognized by this indexer build, by event type and version',
+  labelNames: ['event_type', 'schema_version'],
+});
+
 export const duplicateEventsCounter = new client.Counter({
   name: 'elcarehub_duplicate_events_total',
   help: 'Total number of duplicate on-chain events skipped during idempotent processing',

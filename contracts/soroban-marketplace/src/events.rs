@@ -1,6 +1,51 @@
 // events.rs — Defines all contract event schemas for ELCARE-HUB Marketplace
+//
+// ── Event Schema Versioning Policy (Issue #278) ─────────────────────────────
+//
+// The indexer (`indexer/src/event-schemas.ts`) decodes these events from raw
+// Soroban XDR using a per-event-type schema registry. The indexer is deployed
+// and upgraded independently from these contracts, and must remain able to
+// decode historical ledger events forever (raw XDR is replayable via
+// `indexer/src/backfill.ts`). That cross-component dependency is why event
+// shape changes follow explicit rules rather than being made ad hoc:
+//
+// 1. Numbering: `EVENT_SCHEMA_VERSION` below applies to the settlement- and
+//    audit-critical event structs that carry an explicit `schema_version:
+//    u32` field (see the list in `docs/guides/event-parsing.md`). Bump it
+//    whenever any of those structs gains a new field. Historical events
+//    emitted before the field existed have no `schema_version` in their XDR
+//    at all — the indexer treats that absence as implicit version 0.
+// 2. Additive-only: existing fields are never renamed, retyped, removed, or
+//    given a different meaning. A shape change is always a NEW field
+//    appended to the struct. Soroban encodes `#[contracttype]` structs as an
+//    ordered map keyed by field name, so appending a field never changes how
+//    existing fields decode.
+// 3. Numeric encoding is fixed per field once chosen: prices/amounts are
+//    `i128`, ledger sequences are `u32`, ids/timestamps are `u64`. Never
+//    narrow or widen an existing field's numeric type — add a new field
+//    instead of changing one in place.
+// 4. Topic naming: topic constants (e.g. `ARTWORK_SOLD`) are permanent once
+//    shipped. A new event kind gets a new topic constant; an existing topic
+//    is never reused for a differently-shaped payload.
+// 5. Deprecation: old struct fields are never mutated or deleted while any
+//    historical ledger data referencing them may still need to be replayed.
+//    Mark superseded fields as deprecated in a doc comment only.
+// 6. Migration for historical records: because the indexer persists decoded
+//    JSON and can always fall back to raw XDR, a shape change never requires
+//    rewriting historical rows. Instead, the indexer's schema field for the
+//    new struct field MUST be marked `optional: true` in `SCHEMA_REGISTRY`
+//    (see `indexer/src/event-schemas.ts`) so both pre- and post-bump events
+//    decode through the same code path. Full migration guidance and the
+//    per-event version catalog live in `docs/guides/event-parsing.md`.
 
 use soroban_sdk::{contracttype, Address, Env, Symbol};
+
+/// Schema version for the explicitly-versioned event structs in this module
+/// (those with a `schema_version: u32` field). See the versioning policy
+/// above. Bump this — and only this — when one of those structs gains a new
+/// field; unversioned event structs are covered by their topic name alone
+/// because they have never required a shape change.
+pub const EVENT_SCHEMA_VERSION: u32 = 1;
 
 // Versioned event topics as string constants
 pub const LISTING_CREATED: &str = "listing_created";
@@ -51,6 +96,9 @@ pub struct ListingCreatedEvent {
     pub collection: Address,
     pub token_id: u64,
     pub ledger_sequence: u32,
+    /// Event schema version (Issue #278). Added additively; absent on
+    /// historical pre-upgrade events, which the indexer treats as version 0.
+    pub schema_version: u32,
 }
 
 #[contracttype]
@@ -62,6 +110,9 @@ pub struct ArtworkSoldEvent {
     pub price: i128,
     pub currency: Symbol,
     pub ledger_sequence: u32,
+    /// Event schema version (Issue #278). Added additively; absent on
+    /// historical pre-upgrade events, which the indexer treats as version 0.
+    pub schema_version: u32,
 }
 
 #[contracttype]
@@ -94,6 +145,9 @@ pub struct AuctionCreatedEvent {
     pub collection: Address,
     pub token_id: u64,
     pub end_time: u64,
+    /// Event schema version (Issue #278). Added additively; absent on
+    /// historical pre-upgrade events, which the indexer treats as version 0.
+    pub schema_version: u32,
 }
 
 #[contracttype]
@@ -110,6 +164,9 @@ pub struct AuctionFinalizedEvent {
     pub auction_id: u64,
     pub winner: Option<Address>,
     pub amount: i128,
+    /// Event schema version (Issue #278). Added additively; absent on
+    /// historical pre-upgrade events, which the indexer treats as version 0.
+    pub schema_version: u32,
 }
 
 impl ListingCreatedEvent {
@@ -193,6 +250,9 @@ pub struct AuctionBidRefundedEvent {
     /// Reason code: "outbid" | "cancelled" | "admin_cancel"
     pub reason: soroban_sdk::Symbol,
     pub ledger_sequence: u32,
+    /// Event schema version (Issue #278). Added additively; absent on
+    /// historical pre-upgrade events, which the indexer treats as version 0.
+    pub schema_version: u32,
 }
 impl AuctionBidRefundedEvent {
     #[allow(deprecated)]
@@ -210,6 +270,9 @@ pub struct AuctionAdminCancelledEvent {
     pub refunded_amount: i128,
     pub token: Address,
     pub ledger_sequence: u32,
+    /// Event schema version (Issue #278). Added additively; absent on
+    /// historical pre-upgrade events, which the indexer treats as version 0.
+    pub schema_version: u32,
 }
 impl AuctionAdminCancelledEvent {
     #[allow(deprecated)]
@@ -229,6 +292,9 @@ pub struct RoyaltySettlementEvent {
     pub total_amount: i128,
     pub token: Address,
     pub ledger_sequence: u32,
+    /// Event schema version (Issue #278). Added additively; absent on
+    /// historical pre-upgrade events, which the indexer treats as version 0.
+    pub schema_version: u32,
 }
 impl RoyaltySettlementEvent {
     #[allow(deprecated)]
@@ -286,6 +352,9 @@ pub struct OfferMadeEvent {
     /// reclaimed; `None` when the offer never expires.  Emitted so the indexer
     /// can surface countdown timers without a separate contract read.
     pub expires_at: Option<u64>,
+    /// Event schema version (Issue #278). Added additively; absent on
+    /// historical pre-upgrade events, which the indexer treats as version 0.
+    pub schema_version: u32,
 }
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -294,6 +363,9 @@ pub struct OfferAcceptedEvent {
     pub listing_id: u64,
     pub offerer: Address,
     pub amount: i128,
+    /// Event schema version (Issue #278). Added additively; absent on
+    /// historical pre-upgrade events, which the indexer treats as version 0.
+    pub schema_version: u32,
 }
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -452,6 +524,9 @@ pub struct ProtocolFeeCollectedEvent {
     pub amount: i128,
     pub token: Address,
     pub treasury: Address,
+    /// Event schema version (Issue #278). Added additively; absent on
+    /// historical pre-upgrade events, which the indexer treats as version 0.
+    pub schema_version: u32,
 }
 impl ProtocolFeeCollectedEvent {
     #[allow(deprecated)]
