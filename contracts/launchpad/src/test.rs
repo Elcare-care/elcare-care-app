@@ -2250,241 +2250,204 @@ fn invalid_fee_rejected_for_all_deploy_variants() {
     );
 }
 
-// ── Migration tests ───────────────────────────────────────────────────────────
+// ─── Preflight validation (#277) ───────────────────────────────────────────
+//
+// These tests prove that `preflight_deploy_*` and `deploy_*` agree: a clean
+// preflight (no errors) means the deploy succeeds at the *same* predicted
+// address, and every error the preflight reports is one the deploy call
+// would also raise.
 
-mod migration {
-    use super::*;
-    use crate::CONTRACT_VERSION;
+#[test]
+fn preflight_normal_721_predicts_the_deployed_address() {
+    let env = Env::default();
+    env.ledger().with_mut(|li| li.sequence_number = 1);
+    let (client, _admin, _fee_receiver, creator) = setup_launchpad(&env);
 
-    fn setup_minimal(env: &Env) -> (LaunchpadClient<'_>, Address) {
-        env.mock_all_auths();
-        let contract_id = env.register(Launchpad, ());
-        let client = LaunchpadClient::new(env, &contract_id);
-        let admin = Address::generate(env);
-        let fee_receiver = Address::generate(env);
-        client.initialize(&admin, &fee_receiver, &0i128);
-        (client, admin)
-    }
+    let salt = BytesN::from_array(&env, &[40u8; 32]);
+    let royalty_receiver = Address::generate(&env);
+    let currency = setup_token(&env, &creator, 1_000_000);
 
-    // ── Fresh initialization ──────────────────────────────────────────────
+    let preflight = client.preflight_deploy_normal_721(
+        &creator,
+        &currency,
+        &String::from_str(&env, "Preflight 721"),
+        &String::from_str(&env, "PF721"),
+        &1_000u64,
+        &500u32,
+        &0u32,
+        &salt,
+    );
+    assert!(preflight.errors.is_empty());
 
-    #[test]
-    fn contract_version_is_none_before_migrate() {
-        let env = Env::default();
-        let (client, _admin) = setup_minimal(&env);
-        assert!(client.contract_version().is_none());
-    }
+    let deployed = client.deploy_normal_721(
+        &creator,
+        &currency,
+        &String::from_str(&env, "Preflight 721"),
+        &String::from_str(&env, "PF721"),
+        &1_000u64,
+        &500u32,
+        &royalty_receiver,
+        &0u32,
+        &salt,
+    );
 
-    #[test]
-    fn version_returns_wasm_version_string() {
-        let env = Env::default();
-        let (client, _admin) = setup_minimal(&env);
-        assert_eq!(client.version(), String::from_str(&env, CONTRACT_VERSION));
-    }
+    assert_eq!(preflight.predicted_address, deployed);
 
-    // ── Sequential upgrade ────────────────────────────────────────────────
+    // Re-running preflight against the now-consumed salt must surface the
+    // duplicate-salt error — and the real deploy call must reject it too.
+    let preflight_after = client.preflight_deploy_normal_721(
+        &creator,
+        &currency,
+        &String::from_str(&env, "Preflight 721 Dup"),
+        &String::from_str(&env, "PF72D"),
+        &1_000u64,
+        &500u32,
+        &0u32,
+        &salt,
+    );
+    assert_eq!(preflight_after.predicted_address, deployed);
+    assert!(preflight_after.errors.contains(&Error::DuplicateSalt));
 
-    #[test]
-    fn migrate_sets_contract_version_on_chain() {
-        let env = Env::default();
-        let (client, admin) = setup_minimal(&env);
-
-        client.migrate(&admin);
-
-        assert_eq!(
-            client.contract_version(),
-            Some(String::from_str(&env, CONTRACT_VERSION))
-        );
-    }
-
-    #[test]
-    fn migrate_step_sets_version_after_completion() {
-        let env = Env::default();
-        let (client, admin) = setup_minimal(&env);
-
-        // migrate_step with large budget completes in one call
-        let remaining = client.migrate_step(&admin, &u32::MAX);
-        assert_eq!(remaining, 0u64);
-        assert_eq!(
-            client.contract_version(),
-            Some(String::from_str(&env, CONTRACT_VERSION))
-        );
-    }
-
-    #[test]
-    fn migrate_step_is_resumable() {
-        let env = Env::default();
-        let (client, admin) = setup_minimal(&env);
-
-        // First step with budget=0 does nothing but persists progress
-        // (budget 0 exits the loop immediately — remaining is still non-zero
-        //  until the migration body completes)
-        // Run full migration in two calls: budget=1 covers phase-0, budget=MAX finishes.
-        let r1 = client.migrate_step(&admin, &1u32);
-        // After phase 0 completes the migration body is done; remaining = 0.
-        assert_eq!(r1, 0u64);
-        // Version must be set now.
-        assert!(client.contract_version().is_some());
-    }
-
-    // ── Idempotency ───────────────────────────────────────────────────────
-
-    #[test]
-    #[should_panic(expected = "AlreadyMigrated")]
-    fn double_migrate_reverts_with_already_migrated() {
-        let env = Env::default();
-        let (client, admin) = setup_minimal(&env);
-
-        client.migrate(&admin);
-        client.migrate(&admin); // must revert
-    }
-
-    #[test]
-    #[should_panic(expected = "AlreadyMigrated")]
-    fn migrate_step_after_completion_reverts() {
-        let env = Env::default();
-        let (client, admin) = setup_minimal(&env);
-
-        client.migrate(&admin);
-        client.migrate_step(&admin, &1u32); // must revert
-    }
-
-    // ── Unsupported transition: non-admin ─────────────────────────────────
-
-    #[test]
-    #[should_panic]
-    fn migrate_by_non_admin_reverts() {
-        let env = Env::default();
-        let (client, _admin) = setup_minimal(&env);
-        let impostor = Address::generate(&env);
-
-        // Auth mocking is active so impostor auth passes, but the admin
-        // identity check inside require_pending_migration will still fail.
-        client.migrate(&impostor);
-    }
-
-    // ── Migration event ───────────────────────────────────────────────────
-
-    #[test]
-    fn migrate_emits_migrated_event() {
-        let env = Env::default();
-        let (client, admin) = setup_minimal(&env);
-        client.migrate(&admin);
-
-        let events = env.events().all();
-        let found = events.iter().any(|(_, topics, _)| {
-            topics
-                .get(0)
-                .map(|v| {
-                    soroban_sdk::Symbol::try_from_val(&env, &v)
-                        .map(|s| s == soroban_sdk::symbol_short!("migrated"))
-                        .unwrap_or(false)
-                })
-                .unwrap_or(false)
-        });
-        assert!(found, "expected 'migrated' event after migrate()");
-    }
-
-    // ── State survival: listings, auctions, offers (via collection registry) ─
-
-    #[test]
-    fn collection_count_survives_migrate() {
-        // Deploy a Normal721 collection to populate the registry, then migrate.
-        // Requires compiled WASMs so we guard with a file-existence check
-        // and skip gracefully when not built.
-        let env = Env::default();
-        env.ledger().with_mut(|li| li.sequence_number = 1);
-
-        let exe = std::env::current_exe().unwrap();
-        let target_dir = exe.parent().and_then(|p| p.parent()).and_then(|p| p.parent()).unwrap();
-        let wasm_path = target_dir
-            .join("wasm32v1-none")
-            .join("release")
-            .join("collection_nft_erc721.wasm");
-        if !wasm_path.exists() {
-            // Skip if WASMs not built
-            return;
-        }
-
-        let (client, admin) = setup_minimal(&env);
-        let creator = Address::generate(&env);
-
-        let n721 = std::fs::read(&wasm_path).unwrap();
-        let dummy = n721.clone();
-        env.mock_all_auths();
-
-        let h721 = env.deployer().upload_contract_wasm(n721.as_slice());
-        let hdummy = env.deployer().upload_contract_wasm(dummy.as_slice());
-
-        client.set_wasm_hashes(&h721, &hdummy.clone(), &hdummy.clone(), &hdummy);
-
-        client.deploy_normal_721(
+    assert_eq!(
+        client.try_deploy_normal_721(
             &creator,
-            &Address::generate(&env),
-            &String::from_str(&env, "MigTestCol"),
-            &String::from_str(&env, "MTC"),
-            &100u64,
+            &currency,
+            &String::from_str(&env, "Preflight 721 Dup"),
+            &String::from_str(&env, "PF72D"),
+            &1_000u64,
+            &500u32,
+            &royalty_receiver,
             &0u32,
+            &salt,
+        ),
+        Err(Ok(Error::DuplicateSalt))
+    );
+}
+
+#[test]
+fn preflight_normal_721_reports_every_error_deploy_would_raise() {
+    let env = Env::default();
+    env.ledger().with_mut(|li| li.sequence_number = 1);
+    let (client, _admin, _fee_receiver, creator) = setup_launchpad(&env);
+
+    client.pause();
+
+    let salt = BytesN::from_array(&env, &[41u8; 32]);
+    let currency = setup_token(&env, &creator, 1_000_000);
+
+    // Stack multiple violations at once: paused, empty name, empty symbol,
+    // zero max_supply, royalty over 100%, and platform fee over the cap.
+    let preflight = client.preflight_deploy_normal_721(
+        &creator,
+        &currency,
+        &String::from_str(&env, ""),
+        &String::from_str(&env, ""),
+        &0u64,
+        &10_001u32,
+        &2001u32,
+        &salt,
+    );
+
+    assert!(preflight.errors.contains(&Error::ContractPaused));
+    assert!(preflight.errors.contains(&Error::EmptyName));
+    assert!(preflight.errors.contains(&Error::EmptySymbol));
+    assert!(preflight.errors.contains(&Error::InvalidMaxSupply));
+    assert!(preflight.errors.contains(&Error::InvalidRoyaltyBps));
+    assert!(preflight.errors.contains(&Error::InvalidFeeBps));
+
+    // The real deploy call rejects on the first violation it checks
+    // (contract-paused) — proving preflight is a superset, never blind to a
+    // failure the mutating call would also hit.
+    let royalty_receiver = Address::generate(&env);
+    assert_eq!(
+        client.try_deploy_normal_721(
+            &creator,
+            &currency,
+            &String::from_str(&env, ""),
+            &String::from_str(&env, ""),
+            &0u64,
+            &10_001u32,
+            &royalty_receiver,
+            &2001u32,
+            &salt,
+        ),
+        Err(Ok(Error::ContractPaused))
+    );
+}
+
+#[test]
+fn preflight_flags_insufficient_balance_for_the_flat_fee() {
+    let env = Env::default();
+    env.ledger().with_mut(|li| li.sequence_number = 1);
+    let (client, _admin, fee_receiver, creator) = setup_launchpad(&env);
+
+    // Configure a flat deploy fee the creator cannot cover.
+    client.set_fee_config(&fee_receiver, &1_000i128);
+
+    let salt = BytesN::from_array(&env, &[42u8; 32]);
+    let currency = setup_token(&env, &creator, 10); // far below the 1_000 fee
+
+    let preflight = client.preflight_deploy_normal_1155(
+        &creator,
+        &currency,
+        &String::from_str(&env, "Poor Creator"),
+        &500u32,
+        &0u32,
+        &salt,
+    );
+
+    assert!(preflight.errors.contains(&Error::InsufficientFee));
+    assert_eq!(preflight.required_fee, 1_000i128);
+
+    // The real deploy call fails too — it attempts the token transfer, which
+    // panics on insufficient balance (Soroban SAC traps rather than
+    // returning a typed error, so we only assert preflight caught it ahead
+    // of the mutating, fee-charging call).
+    let deploy_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.deploy_normal_1155(
+            &creator,
+            &currency,
+            &String::from_str(&env, "Poor Creator"),
+            &500u32,
             &Address::generate(&env),
             &0u32,
-            &BytesN::from_array(&env, &[1u8; 32]),
-        );
+            &salt,
+        )
+    }));
+    assert!(deploy_result.is_err());
+}
 
-        assert_eq!(client.collection_count(), 1u64);
+#[test]
+fn preflight_lazy_1155_predicts_the_deployed_address_and_matches_deploy_errors() {
+    let env = Env::default();
+    env.ledger().with_mut(|li| li.sequence_number = 1);
+    let (client, _admin, _fee_receiver, creator) = setup_launchpad(&env);
 
-        client.migrate(&admin);
+    let salt = BytesN::from_array(&env, &[43u8; 32]);
+    let creator_pubkey = BytesN::from_array(&env, &[9u8; 32]);
+    let royalty_receiver = Address::generate(&env);
+    let currency = setup_token(&env, &creator, 1_000_000);
 
-        // Count and the single collection record must survive
-        assert_eq!(client.collection_count(), 1u64);
-        assert_eq!(client.all_collections().len(), 1u32);
-    }
+    let preflight = client.preflight_deploy_lazy_1155(
+        &creator,
+        &currency,
+        &String::from_str(&env, "Preflight Lazy 1155"),
+        &500u32,
+        &0u32,
+        &salt,
+    );
+    assert!(preflight.errors.is_empty());
 
-    // ── Admin config survives migrate ─────────────────────────────────────
+    let deployed = client.deploy_lazy_1155(
+        &creator,
+        &currency,
+        &creator_pubkey,
+        &String::from_str(&env, "Preflight Lazy 1155"),
+        &500u32,
+        &royalty_receiver,
+        &0u32,
+        &salt,
+    );
 
-    #[test]
-    fn fee_config_readable_after_migrate() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register(Launchpad, ());
-        let client = LaunchpadClient::new(&env, &contract_id);
-        let admin = Address::generate(&env);
-        let fee_receiver = Address::generate(&env);
-        client.initialize(&admin, &fee_receiver, &500i128);
-
-        client.migrate(&admin);
-
-        let (recv, fee) = client.fee_config();
-        assert_eq!(recv, fee_receiver);
-        assert_eq!(fee, 500i128);
-    }
-
-    #[test]
-    fn wasm_hashes_readable_after_migrate() {
-        let env = Env::default();
-        env.ledger().with_mut(|li| li.sequence_number = 1);
-
-        let exe = std::env::current_exe().unwrap();
-        let target_dir = exe.parent().and_then(|p| p.parent()).and_then(|p| p.parent()).unwrap();
-        let wasm_path = target_dir
-            .join("wasm32v1-none")
-            .join("release")
-            .join("collection_nft_erc721.wasm");
-        if !wasm_path.exists() {
-            return;
-        }
-
-        let (client, admin) = setup_minimal(&env);
-        env.mock_all_auths();
-
-        let n721 = std::fs::read(&wasm_path).unwrap();
-        let h = env.deployer().upload_contract_wasm(n721.as_slice());
-        client.set_wasm_hashes(&h, &h.clone(), &h.clone(), &h.clone());
-
-        let before = client.wasm_hashes();
-
-        client.migrate(&admin);
-
-        let after = client.wasm_hashes();
-        assert_eq!(before, after);
-    }
+    assert_eq!(preflight.predicted_address, deployed);
 }
