@@ -661,7 +661,7 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
       if (token) {
         enqueueIpfsFetch(token).catch((err) => {
           logger.warn('[processEvent] Failed to enqueue IPFS fetch', {
-            listingId: listingId?.toString(), token, err: err instanceof Error ? err.message : String(err),
+            eventType, listingId: listingId?.toString(), ledger: ledgerSequence, token, err: err instanceof Error ? err.message : String(err),
           });
         });
       }
@@ -678,7 +678,7 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
           updatedAtLedger: ledgerSequence,
         },
       });
-      if (count === 0) logger.warn('LISTING_UPDATED: listing not found', { listingId: listingId?.toString(), ledger: ledgerSequence });
+      if (count === 0) logger.warn('LISTING_UPDATED: listing not found', { eventType, listingId: listingId?.toString(), ledger: ledgerSequence });
       invalidatePattern('cache:*/listings*').catch(() => {});
       invalidateKey(`cache:/listings/${listingId.toString()}`).catch(() => {});
       break;
@@ -696,7 +696,7 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
         where: { listingId },
         data: { status: 'Sold' as const, owner: data.buyer, updatedAtLedger: ledgerSequence },
       });
-      if (count === 0) logger.error('ARTWORK_SOLD: listing not found — sale not recorded', { listingId: listingId?.toString(), ledger: ledgerSequence });
+      if (count === 0) logger.error('ARTWORK_SOLD: listing not found — sale not recorded', { eventType, listingId: listingId?.toString(), ledger: ledgerSequence });
 
       // ── Metrics & cache invalidation ──────────────────────────────────────
       salesTotalCounter.labels(data.token ?? 'unknown').inc();
@@ -712,7 +712,7 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
         where: { listingId },
         data: { status: 'Cancelled' as const, updatedAtLedger: ledgerSequence },
       });
-      if (count === 0) logger.warn('LISTING_CANCELLED: listing not found', { listingId: listingId?.toString(), ledger: ledgerSequence });
+      if (count === 0) logger.warn('LISTING_CANCELLED: listing not found', { eventType, listingId: listingId?.toString(), ledger: ledgerSequence });
       invalidatePattern('cache:*/listings*').catch(() => {});
       invalidateKey(`cache:/listings/${listingId.toString()}`).catch(() => {});
       prisma.listing.count({ where: { status: 'Active' } })
@@ -758,7 +758,7 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
         where: { auctionId: listingId },
         data: { highestBid: data.bid_amount, highestBidder: data.bidder, updatedAtLedger: ledgerSequence },
       });
-      if (count === 0) logger.warn('BID_PLACED: auction not found', { auctionId: listingId?.toString(), ledger: ledgerSequence });
+      if (count === 0) logger.warn('BID_PLACED: auction not found', { eventType, auctionId: listingId?.toString(), ledger: ledgerSequence });
       invalidatePattern('cache:*/auctions*').catch(() => {});
       invalidateKey(`cache:/auctions/${listingId.toString()}`).catch(() => {});
       break;
@@ -774,7 +774,7 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
           updatedAtLedger: ledgerSequence,
         },
       });
-      if (count === 0) logger.error('AUCTION_RESOLVED: auction not found — resolution not recorded', { auctionId: listingId?.toString(), ledger: ledgerSequence });
+      if (count === 0) logger.error('AUCTION_RESOLVED: auction not found — resolution not recorded', { eventType, auctionId: listingId?.toString(), ledger: ledgerSequence });
 
       auctionFinalizationsTotal.inc();
       invalidatePattern('cache:*/auctions*').catch(() => {});
@@ -791,7 +791,7 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
           where: { auctionId: listingId },
           data: { status: 'Cancelled' as const, updatedAtLedger: ledgerSequence },
         });
-        if (count === 0) logger.warn('AUCTION_CANCELLED: auction not found', { auctionId: listingId?.toString(), ledger: ledgerSequence });
+        if (count === 0) logger.warn('AUCTION_CANCELLED: auction not found', { eventType, auctionId: listingId?.toString(), ledger: ledgerSequence });
         prisma.auction.count({ where: { status: 'Active' } })
           .then((n) => activeAuctionsGauge.set(n)).catch(() => {});
       }
@@ -839,7 +839,7 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
         where: { listingId: BigInt(data.listing_id) },
         data: { status: 'Sold' as const, owner: data.offerer, updatedAtLedger: ledgerSequence },
       });
-      if (listingCount === 0) logger.error('OFFER_ACCEPTED: listing not found', { listingId: data.listing_id?.toString(), offerId: data.offer_id?.toString(), ledger: ledgerSequence });
+      if (listingCount === 0) logger.error('OFFER_ACCEPTED: listing not found', { eventType, listingId: data.listing_id?.toString(), offerId: data.offer_id?.toString(), ledger: ledgerSequence });
 
       offersAcceptedTotal.inc();
       salesTotalCounter.labels(data.token ?? 'unknown').inc();
@@ -883,7 +883,7 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
           updatedAtLedger: ledgerSequence,
         }
       });
-      if (count === 0) logger.warn('OFFER_RECLAIMED: offer not found', { offerId: data.offer_id?.toString(), ledger: ledgerSequence });
+      if (count === 0) logger.warn('OFFER_RECLAIMED: offer not found', { eventType, offerId: data.offer_id?.toString(), ledger: ledgerSequence });
       break;
     }
   }

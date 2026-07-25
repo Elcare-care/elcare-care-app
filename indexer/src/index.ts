@@ -6,7 +6,8 @@ import dotenv from 'dotenv';
 import routes, { closeSSEClients } from './api/routes.js';
 import { startPolling, registerShutdownHook, stopPoller, gracefulShutdown } from './poller.js';
 import { rateLimiter, globalRateLimiter } from './api/rate-limit-middleware.js';
-import { metricsMiddleware, handleMetrics, requestLogger } from './metrics.js';
+import { metricsMiddleware, handleMetrics } from './metrics.js';
+import { requestIdMiddleware } from './api/request-id-middleware.js';
 import { errorHandler } from './api/errors.js';
 import { startReconciler } from './reconciler.js';
 import { validateRequiredEnv, loadKeeperConfig, loadConfig } from './config.js';
@@ -51,8 +52,8 @@ app.use(express.json());
 // Global baseline rate limiter
 app.use(globalRateLimiter);
 
-// Request logging and metrics
-app.use(requestLogger);
+// Request logging (structured JSON + correlation IDs) and Prometheus metrics
+app.use(requestIdMiddleware);
 app.use(metricsMiddleware);
 
 // Prometheus metrics endpoint
