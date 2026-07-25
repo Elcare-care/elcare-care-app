@@ -8280,6 +8280,7 @@ fn setup_legacy_v1_fixture(
                 extension_window: 600,
                 extension_trigger: 0,
                 protocol_fee_bps: 0,
+                bid_history_cap: 20,
             },
         );
         env.storage()

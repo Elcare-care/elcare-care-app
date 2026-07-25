@@ -95,6 +95,11 @@ pub enum DataKey {
     MinPrice,
     MaxPrice,
     MigrationDone(soroban_sdk::String),
+    /// Global admin-configurable bid-history ring-buffer capacity.
+    /// Default: 50.  Valid range: 1 – 200.
+    /// Each new auction snapshots this value into `Auction::bid_history_cap`
+    /// so changes here never affect in-progress auctions.
+    BidHistoryCap,
     /// One fixed-capacity page (`Vec<u64>`, at most `INDEX_PAGE_SIZE` entries)
     /// of the identified index.
     IndexPage(IndexId, u32),
@@ -975,4 +980,76 @@ pub fn take_legacy_index_vec(env: &Env, key: &DataKey) -> Option<Vec<u64>> {
         env.storage().persistent().remove(key);
     }
     value
+}
+
+// ── Bid-history cap ──────────────────────────────────────────
+
+/// Default bid-history ring-buffer capacity.
+pub const DEFAULT_BID_HISTORY_CAP: u32 = 50;
+/// Maximum allowed bid-history cap.  Kept at 200 so the O(n) eviction
+/// shift (see `append_bid_record`) stays within acceptable compute limits.
+pub const MAX_BID_HISTORY_CAP: u32 = 200;
+
+/// Persist the global bid-history cap.
+pub fn set_bid_history_cap_storage(env: &Env, cap: u32) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::BidHistoryCap, &cap);
+    bump_entry_ttl(env, &DataKey::BidHistoryCap);
+}
+
+/// Read the global bid-history cap, defaulting to `DEFAULT_BID_HISTORY_CAP`.
+pub fn get_bid_history_cap_storage(env: &Env) -> u32 {
+    let value = env
+        .storage()
+        .persistent()
+        .get::<DataKey, u32>(&DataKey::BidHistoryCap);
+    if value.is_some() {
+        bump_entry_ttl(env, &DataKey::BidHistoryCap);
+    }
+    value.unwrap_or(DEFAULT_BID_HISTORY_CAP)
+}
+
+// ── Escrow record ────────────────────────────────────────────
+
+/// A lightweight record written when an NFT is pulled into escrow and
+/// deleted when the NFT is released.  Supports the double-listing guard
+/// and the `get_escrow` view function.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct EscrowRecord {
+    /// `true` → held for a listing; `false` → held for an auction.
+    pub is_listing: bool,
+    /// The listing_id or auction_id holding the token.
+    pub id: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub enum EscrowKey {
+    EscrowedToken(Address, u64),
+}
+
+pub fn set_escrow_record(env: &Env, collection: &Address, token_id: u64, record: &EscrowRecord) {
+    let key = EscrowKey::EscrowedToken(collection.clone(), token_id);
+    env.storage().persistent().set(&key, record);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, LEDGER_TTL_THRESHOLD, LEDGER_TTL_BUMP);
+}
+
+pub fn get_escrow_record(env: &Env, collection: &Address, token_id: u64) -> Option<EscrowRecord> {
+    let key = EscrowKey::EscrowedToken(collection.clone(), token_id);
+    let value = env.storage().persistent().get::<EscrowKey, EscrowRecord>(&key);
+    if value.is_some() {
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, LEDGER_TTL_THRESHOLD, LEDGER_TTL_BUMP);
+    }
+    value
+}
+
+pub fn clear_escrow_record(env: &Env, collection: &Address, token_id: u64) {
+    let key = EscrowKey::EscrowedToken(collection.clone(), token_id);
+    env.storage().persistent().remove(&key);
 }

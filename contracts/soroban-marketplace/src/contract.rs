@@ -15,12 +15,13 @@ use crate::{
         get_active_listing_ids_range, get_artist_auction_ids,
         get_artist_cancel_cursor, get_artist_listing_ids, get_auction_count,
         get_auction_extension_trigger_storage, get_auction_extension_window_storage,
-        get_listing_count, get_max_price_storage, get_min_price_storage, get_pending_admin_storage,
+        get_bid_history_cap_storage, get_listing_count, get_max_price_storage,
+        get_min_price_storage, get_pending_admin_storage,
         increment_auction_count, increment_listing_count, increment_offer_count,
         is_artist_revoked_storage, is_migration_done, load_auction, load_auction_bids,
         load_listing, load_listing_offers, load_offer, load_offerer_offers, release_auction_lock,
         release_listing_lock, remove_artist_revocation_storage, remove_from_active_listings,
-        save_auction, save_listing, save_listing_offers, save_offer, save_offerer_offers,
+        save_auction, save_listing, save_offer,
         set_artist_revocation_storage, set_auction_extension_trigger_storage,
         set_auction_extension_window_storage, set_max_price_storage, set_migration_done,
         set_min_price_storage, set_pending_admin_storage, PendingAdminProposal,
@@ -55,19 +56,8 @@ const ADMIN_PROPOSAL_TTL: u64 = 604_800; // 7 days
 const MIN_AUCTION_DURATION: u64 = 3_600; // 1 hour
 
 /// Maximum number of listing ids accepted by one `cancel_listings` batch.
-///
-/// Sized so a full batch (listing + index-page + position-key + pending-offer
-/// writes per cancellation) stays comfortably inside Soroban's per-transaction
-/// ledger-entry limits (~100 footprint entries / ~50 written entries).
 const MAX_BATCH_CANCEL: u32 = 10;
 
-/// Maximum number of bid records retained per auction in the on-chain history.
-///
-/// When a new bid is placed and the history already holds `BID_HISTORY_CAP`
-/// entries, the oldest entry is evicted so storage growth is strictly bounded.
-/// Exposed via `get_auction_bids` for contract-side verification and frontend
-/// fallback.
-const BID_HISTORY_CAP: u32 = 20;
 const MAX_OFFERS_PER_LISTING: u32 = 50;
 
 #[contract]
@@ -419,6 +409,41 @@ impl MarketplaceContract {
 
     pub fn get_min_bid_increment(env: Env) -> i128 {
         crate::storage::get_min_bid_increment_storage(&env).unwrap_or(DEFAULT_MIN_BID_INCREMENT)
+    }
+
+    /// Set the global bid-history ring-buffer capacity.
+    ///
+    /// `cap` must be in the range 1–200 (enforced by `MAX_BID_HISTORY_CAP`).
+    /// The new value is snapshotted into every *future* auction at creation
+    /// time via `Auction::bid_history_cap`.  Already-running auctions keep
+    /// their original cap for the lifetime of the auction so that no in-flight
+    /// bid is silently evicted by a retroactive shrink.
+    ///
+    /// # Ring-buffer eviction — O(n) shift
+    /// `append_bid_record` (storage.rs) uses a plain `Vec<BidRecord>` as the
+    /// ring buffer.  When the history is full it removes the front element
+    /// with `Vec::remove(0)`, which shifts every remaining element down by one
+    /// position — O(n) in the cap.  This is acceptable because:
+    ///  • `cap` is bounded to 200 entries.
+    ///  • A 200-entry shift operates on stack-local XDR values; no additional
+    ///    ledger-entry reads are needed.
+    ///  • `place_bid` is called at most once per ledger, so the amortised cost
+    ///    per auction is negligible.
+    /// If a future version needs O(1) eviction, the ring buffer can be replaced
+    /// with an indexed page (write-head pointer in instance storage).
+    pub fn set_bid_history_cap(env: Env, admin: Address, cap: u32) {
+        admin.require_auth();
+        if admin != Self::get_admin(env.clone()).expect("admin not set") {
+            panic_with_error!(&env, MarketplaceError::Unauthorized);
+        }
+        if cap == 0 || cap > MAX_BID_HISTORY_CAP {
+            panic_with_error!(&env, MarketplaceError::InvalidPrice);
+        }
+        set_bid_history_cap_storage(&env, cap);
+    }
+
+    pub fn get_bid_history_cap(env: Env) -> u32 {
+        get_bid_history_cap_storage(&env)
     }
 
     pub fn set_auction_extension_window(env: Env, admin: Address, window: u64) {
@@ -1052,12 +1077,16 @@ impl MarketplaceContract {
         // Snapshot the global protocol fee so settlement math is fixed at
         // creation time — consistent with how listings work (ISSUE-005 parity).
         let protocol_fee_bps = crate::storage::get_protocol_fee_bps_storage(&env).unwrap_or(0);
+        // Snapshot the global bid-history cap so changing it later never
+        // retroactively affects this auction's ring-buffer.
+        let bid_history_cap = get_bid_history_cap_storage(&env);
         let auction = Auction {
             auction_id, creator: creator.clone(), token: token.clone(),
             collection: collection.clone(), token_id, reserve_price,
             highest_bid: 0, highest_bidder: None, end_time,
             status: AuctionStatus::Active, recipients,
             min_increment, extension_window, extension_trigger, protocol_fee_bps,
+            bid_history_cap,
         };
         save_auction(&env, &auction);
         add_artist_auction_id(&env, &creator, auction_id);
@@ -1108,7 +1137,7 @@ impl MarketplaceContract {
         save_auction(&env, &auction);
         append_bid_record(&env, auction_id,
             &BidRecord { bidder: bidder.clone(), amount, ledger: env.ledger().sequence() },
-            BID_HISTORY_CAP,
+            auction.bid_history_cap,
         );
         BidPlacedEvent { auction_id, bidder: bidder.clone(), bid_amount: amount }.publish(&env);
         if extended {
