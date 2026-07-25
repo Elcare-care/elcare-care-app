@@ -208,6 +208,17 @@ export interface DeployData {
   1: string;
 }
 
+export interface LaunchpadWasmUpdateData {
+  0: string;
+  1: string;
+}
+
+export interface LaunchpadCollectionUpgradedData {
+  0: string;
+  1: string;
+  2: string;
+}
+
 // ── Decode result types ───────────────────────────────────────────────────────
 
 export interface TypedEvent<T> {
@@ -473,6 +484,16 @@ export const DEPLOY_SCHEMA: ContractEventSchema = {
   ],
 };
 
+export const LAUNCHPAD_WASM_UPDATED_SCHEMA: ContractEventSchema = {
+  type: 'LAUNCHPAD_WASM_UPDATED',
+  data: [],
+};
+
+export const LAUNCHPAD_COLLECTION_UPGRADED_SCHEMA: ContractEventSchema = {
+  type: 'LAUNCHPAD_COLLECTION_UPGRADED',
+  data: [],
+};
+
 // ── Schema registry ───────────────────────────────────────────────────────────
 
 export const SCHEMA_REGISTRY: Map<string, ContractEventSchema> = new Map([
@@ -506,6 +527,8 @@ export const SCHEMA_REGISTRY: Map<string, ContractEventSchema> = new Map([
   ['DEPLOY_NORMAL_1155', DEPLOY_SCHEMA],
   ['DEPLOY_LAZY_721', DEPLOY_SCHEMA],
   ['DEPLOY_LAZY_1155', DEPLOY_SCHEMA],
+  ['LAUNCHPAD_WASM_UPDATED', LAUNCHPAD_WASM_UPDATED_SCHEMA],
+  ['LAUNCHPAD_COLLECTION_UPGRADED', LAUNCHPAD_COLLECTION_UPGRADED_SCHEMA],
 ]);
 
 // ── Schema-driven decoder ─────────────────────────────────────────────────────
@@ -532,33 +555,67 @@ export function decodeWithSchema<T = unknown>(
     eventType === 'DEPLOY_NORMAL_721' ||
     eventType === 'DEPLOY_NORMAL_1155' ||
     eventType === 'DEPLOY_LAZY_721' ||
-    eventType === 'DEPLOY_LAZY_1155'
+    eventType === 'DEPLOY_LAZY_1155' ||
+    eventType === 'LAUNCHPAD_WASM_UPDATED' ||
+    eventType === 'LAUNCHPAD_COLLECTION_UPGRADED'
   ) {
     if (!Array.isArray(nativeData)) {
       return {
         ok: false,
         eventType,
-        reason: `Deploy event data must be an array, got ${typeof nativeData}`,
+        reason: `Event data must be an array for ${eventType}`,
         raw: nativeData,
       };
     }
-    if (nativeData.length < 2) {
-      return {
-        ok: false,
-        eventType,
-        reason: `Deploy event tuple requires at least 2 elements, got ${nativeData.length}`,
-        raw: nativeData,
-      };
+
+    if (
+      eventType === 'DEPLOY_NORMAL_721' ||
+      eventType === 'DEPLOY_NORMAL_1155' ||
+      eventType === 'DEPLOY_LAZY_721' ||
+      eventType === 'DEPLOY_LAZY_1155'
+    ) {
+      if (nativeData.length < 2) {
+        return {
+          ok: false,
+          eventType,
+          reason: `Deploy event tuple requires at least 2 elements, got ${nativeData.length}`,
+          raw: nativeData,
+        };
+      }
+      if (typeof nativeData[0] !== 'string' || typeof nativeData[1] !== 'string') {
+        return {
+          ok: false,
+          eventType,
+          reason: `Deploy event tuple elements must be strings, got [${typeof nativeData[0]}, ${typeof nativeData[1]}]`,
+          raw: nativeData,
+        };
+      }
+      return { ok: true, eventType, data: nativeData as T };
     }
-    if (typeof nativeData[0] !== 'string' || typeof nativeData[1] !== 'string') {
-      return {
-        ok: false,
-        eventType,
-        reason: `Deploy event tuple elements must be strings, got [${typeof nativeData[0]}, ${typeof nativeData[1]}]`,
-        raw: nativeData,
-      };
+
+    if (eventType === 'LAUNCHPAD_WASM_UPDATED') {
+      if (nativeData.length < 2) {
+        return {
+          ok: false,
+          eventType,
+          reason: `WASM update event tuple requires 2 elements, got ${nativeData.length}`,
+          raw: nativeData,
+        };
+      }
+      return { ok: true, eventType, data: nativeData as T };
     }
-    return { ok: true, eventType, data: nativeData as T };
+
+    if (eventType === 'LAUNCHPAD_COLLECTION_UPGRADED') {
+      if (nativeData.length < 3) {
+        return {
+          ok: false,
+          eventType,
+          reason: `Collection upgrade event tuple requires 3 elements, got ${nativeData.length}`,
+          raw: nativeData,
+        };
+      }
+      return { ok: true, eventType, data: nativeData as T };
+    }
   }
 
   // ── Object path ───────────────────────────────────────────────────────────

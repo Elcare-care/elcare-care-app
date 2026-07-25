@@ -109,3 +109,29 @@ pub fn publish_wasm_hashes_set(
         ),
     );
 }
+
+/// Emitted when the admin updates the configured WASM hash for one kind.
+#[allow(deprecated)]
+pub fn publish_collection_wasm_updated(
+    env: &Env,
+    kind: &crate::types::CollectionKind,
+    old_hash: &BytesN<32>,
+    new_hash: &BytesN<32>,
+) {
+    env.events().publish(
+        (symbol_short!("wasm_upd"), kind.clone()),
+        (old_hash.clone(), new_hash.clone()),
+    );
+}
+
+/// Emitted when the launchpad upgrades one deployed collection.
+#[allow(deprecated)]
+pub fn publish_collection_upgraded(
+    env: &Env,
+    collection: &Address,
+    from_hash: &BytesN<32>,
+    to_hash: &BytesN<32>,
+) {
+    env.events().publish(
+        (symbol_short!("col_upgd"),),
+        (collection.clone(), from_hash.clone(), to_hash.clone()),

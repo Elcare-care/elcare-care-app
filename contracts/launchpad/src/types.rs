@@ -13,6 +13,7 @@ pub enum Error {
     InvalidDeployFee = 7,
     NoPendingAdmin = 8,
     NotPendingAdmin = 9,
+    CollectionNotFound = 10,
 }
 
 /// Which of the four collection types was deployed.
@@ -66,6 +67,8 @@ pub enum DataKey {
     WasmNormal1155,
     WasmLazy721,
     WasmLazy1155,
+    /// Active WASM hash for a specific collection kind.
+    CollectionWasmHash(CollectionKind),
     /// Incremented on every `set_wasm_hashes`.
     WasmVersion,
     CollectionCount,

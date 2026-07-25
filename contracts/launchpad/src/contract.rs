@@ -58,6 +58,7 @@ mod iface {
             royalty_bps: u32,
             royalty_receiver: Address,
         );
+        fn upgrade(env: Env, new_wasm_hash: BytesN<32>);
     }
 
     #[contractclient(name = "Normal1155Client")]
@@ -69,6 +70,7 @@ mod iface {
             royalty_bps: u32,
             royalty_receiver: Address,
         );
+        fn upgrade(env: Env, new_wasm_hash: BytesN<32>);
     }
 
     /// Issue #38: lazy mint contracts accept per-collection platform fee at init.
@@ -87,6 +89,7 @@ mod iface {
             platform_fee_receiver: Address,
             platform_fee_bps: u32,
         );
+        fn upgrade(env: Env, new_wasm_hash: BytesN<32>);
     }
 
     #[contractclient(name = "Lazy1155Client")]
@@ -102,6 +105,7 @@ mod iface {
             platform_fee_receiver: Address,
             platform_fee_bps: u32,
         );
+        fn upgrade(env: Env, new_wasm_hash: BytesN<32>);
     }
 }
 
@@ -229,7 +233,8 @@ impl Launchpad {
             );
         }
 
-        let wasm = storage::get_wasm_normal_721(&env).ok_or(Error::WasmHashNotSet)?;
+        let wasm = storage::get_wasm_for_kind(&env, &CollectionKind::Normal721)
+            .ok_or(Error::WasmHashNotSet)?;
         collect_deploy_fee(&env, &creator, &currency);
 
         let secure_salt = make_secure_salt(&env, &creator, &salt);
@@ -296,7 +301,8 @@ impl Launchpad {
             );
         }
 
-        let wasm = storage::get_wasm_normal_1155(&env).ok_or(Error::WasmHashNotSet)?;
+        let wasm = storage::get_wasm_for_kind(&env, &CollectionKind::Normal1155)
+            .ok_or(Error::WasmHashNotSet)?;
         collect_deploy_fee(&env, &creator, &currency);
 
         let secure_salt = make_secure_salt(&env, &creator, &salt);
@@ -368,7 +374,8 @@ impl Launchpad {
             );
         }
 
-        let wasm = storage::get_wasm_lazy_721(&env).ok_or(Error::WasmHashNotSet)?;
+        let wasm = storage::get_wasm_for_kind(&env, &CollectionKind::LazyMint721)
+            .ok_or(Error::WasmHashNotSet)?;
         let platform_fee_receiver = collect_deploy_fee(&env, &creator, &currency);
 
         let secure_salt = make_secure_salt(&env, &creator, &salt);
@@ -439,7 +446,8 @@ impl Launchpad {
             );
         }
 
-        let wasm = storage::get_wasm_lazy_1155(&env).ok_or(Error::WasmHashNotSet)?;
+        let wasm = storage::get_wasm_for_kind(&env, &CollectionKind::LazyMint1155)
+            .ok_or(Error::WasmHashNotSet)?;
         let platform_fee_receiver = collect_deploy_fee(&env, &creator, &currency);
 
         let secure_salt = make_secure_salt(&env, &creator, &salt);
@@ -526,6 +534,50 @@ impl Launchpad {
         let admin = storage::require_admin(&env)?;
         storage::set_paused(&env, false);
         events::publish_paused(&env, &admin, false);
+        Ok(())
+    }
+
+    pub fn update_collection_wasm(
+        env: Env,
+        kind: CollectionKind,
+        new_wasm_hash: BytesN<32>,
+    ) -> Result<(), Error> {
+        storage::extend_instance_ttl(&env);
+        storage::require_admin(&env)?;
+        let old_wasm = storage::get_wasm_for_kind(&env, &kind).unwrap_or_else(|| {
+            BytesN::from_array(&env, &[0u8; 32])
+        });
+        storage::set_wasm_hash_for_kind(&env, &kind, &new_wasm_hash);
+        events::publish_collection_wasm_updated(&env, &kind, &old_wasm, &new_wasm_hash);
+        Ok(())
+    }
+
+    pub fn upgrade_collection(env: Env, collection_address: Address) -> Result<(), Error> {
+        storage::extend_instance_ttl(&env);
+        storage::require_admin(&env)?;
+
+        let record = storage::get_collection_by_address(&env, &collection_address)
+            .ok_or(Error::CollectionNotFound)?;
+        let new_wasm = storage::get_wasm_for_kind(&env, &record.kind)
+            .ok_or(Error::WasmHashNotSet)?;
+        let from_wasm = new_wasm.clone();
+
+        match record.kind {
+            CollectionKind::Normal721 => {
+                Normal721Client::new(&env, &collection_address).upgrade(&new_wasm);
+            }
+            CollectionKind::Normal1155 => {
+                Normal1155Client::new(&env, &collection_address).upgrade(&new_wasm);
+            }
+            CollectionKind::LazyMint721 => {
+                Lazy721Client::new(&env, &collection_address).upgrade(&new_wasm);
+            }
+            CollectionKind::LazyMint1155 => {
+                Lazy1155Client::new(&env, &collection_address).upgrade(&new_wasm);
+            }
+        }
+
+        events::publish_collection_upgraded(&env, &collection_address, &from_wasm, &new_wasm);
         Ok(())
     }
 

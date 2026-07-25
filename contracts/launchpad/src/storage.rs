@@ -79,23 +79,47 @@ pub fn set_wasm_hashes(
     lazy_721: &BytesN<32>,
     lazy_1155: &BytesN<32>,
 ) -> u32 {
-    env.storage()
-        .instance()
-        .set(&DataKey::WasmNormal721, normal_721);
-    env.storage()
-        .instance()
-        .set(&DataKey::WasmNormal1155, normal_1155);
-    env.storage()
-        .instance()
-        .set(&DataKey::WasmLazy721, lazy_721);
-    env.storage()
-        .instance()
-        .set(&DataKey::WasmLazy1155, lazy_1155);
+    set_wasm_hash_for_kind(env, &CollectionKind::Normal721, normal_721);
+    set_wasm_hash_for_kind(env, &CollectionKind::Normal1155, normal_1155);
+    set_wasm_hash_for_kind(env, &CollectionKind::LazyMint721, lazy_721);
+    set_wasm_hash_for_kind(env, &CollectionKind::LazyMint1155, lazy_1155);
     let version = wasm_version(env) + 1;
     env.storage()
         .instance()
         .set(&DataKey::WasmVersion, &version);
     version
+}
+
+pub fn set_wasm_hash_for_kind(env: &Env, kind: &CollectionKind, wasm_hash: &BytesN<32>) {
+    env.storage()
+        .instance()
+        .set(&DataKey::CollectionWasmHash(kind.clone()), wasm_hash);
+    match kind {
+        CollectionKind::Normal721 => {
+            env.storage().instance().set(&DataKey::WasmNormal721, wasm_hash);
+        }
+        CollectionKind::Normal1155 => {
+            env.storage().instance().set(&DataKey::WasmNormal1155, wasm_hash);
+        }
+        CollectionKind::LazyMint721 => {
+            env.storage().instance().set(&DataKey::WasmLazy721, wasm_hash);
+        }
+        CollectionKind::LazyMint1155 => {
+            env.storage().instance().set(&DataKey::WasmLazy1155, wasm_hash);
+        }
+    }
+}
+
+pub fn get_wasm_for_kind(env: &Env, kind: &CollectionKind) -> Option<BytesN<32>> {
+    env.storage()
+        .instance()
+        .get(&DataKey::CollectionWasmHash(kind.clone()))
+        .or_else(|| match kind {
+            CollectionKind::Normal721 => get_wasm_normal_721(env),
+            CollectionKind::Normal1155 => get_wasm_normal_1155(env),
+            CollectionKind::LazyMint721 => get_wasm_lazy_721(env),
+            CollectionKind::LazyMint1155 => get_wasm_lazy_1155(env),
+        })
 }
 
 pub fn wasm_version(env: &Env) -> u32 {
