@@ -16,6 +16,7 @@ mod test;
 pub use contract::MarketplaceContract;
 pub use types::{
     BidRecord, CancelReason, Listing, ListingStatus, MarketplaceError, Offer, OfferStatus,
+    RoleType,
 };
 
 #[cfg(any(test, feature = "testutils"))]

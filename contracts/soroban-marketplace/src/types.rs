@@ -110,6 +110,39 @@ pub enum MarketplaceError {
     /// The auction has reached its `max_extensions` cap and can no longer be
     /// extended by the anti-sniping logic.
     MaxExtensionsReached = 48,
+    /// `accept_role_transfer` was called after the pending role proposal's
+    /// `expires_at` ledger timestamp has passed.  The proposal must be
+    /// re-issued via `propose_role_transfer`.
+    RoleProposalExpired = 49,
+    /// `accept_role_transfer` or `cancel_role_proposal` was called when no
+    /// proposal is currently pending for that role.
+    NoRoleProposalPending = 50,
+}
+
+/// Least-privilege authority roles (Issue #267).
+///
+/// Every privileged marketplace entry point is owned by exactly one of these
+/// roles rather than a single monolithic `Admin`. Until `migrate_roles`
+/// (see `contract.rs`) is invoked for a deployment, an unassigned role falls
+/// back to whoever holds `DataKey::Admin`, so existing single-admin
+/// deployments keep working unchanged and can migrate to distinct
+/// multisig-controlled authorities whenever the operator chooses to.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RoleType {
+    /// Routine protocol configuration: price bounds, treasury, protocol fee,
+    /// bid increment, bid-history cap, auction extension parameters.
+    ProtocolConfig,
+    /// Emergency circuit breakers: global, per-collection and per-function
+    /// pause/unpause. Kept independent of `ProtocolConfig` so an incident
+    /// responder can halt the marketplace even if the routine configuration
+    /// authority (e.g. a slower multisig) is unavailable or compromised.
+    EmergencyPause,
+    /// Collection/artist moderation: revoking and reinstating artists, and
+    /// cleaning up a revoked artist's listings.
+    CollectionAdmin,
+    /// Irreversible storage/version migrations (`migrate`, `migrate_step`).
+    Upgrade,
 }
 
 #[contracttype]

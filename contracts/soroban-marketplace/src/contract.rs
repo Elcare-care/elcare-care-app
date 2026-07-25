@@ -18,6 +18,7 @@ use crate::{
         get_auction_max_extensions_storage,
         get_bid_history_cap_storage, get_listing_count, get_max_price_storage,
         get_min_price_storage, get_pending_admin_storage,
+        get_pending_role_storage, get_role_storage,
         increment_auction_count, increment_listing_count, increment_offer_count,
         is_artist_revoked_storage, is_migration_done, load_auction, load_auction_bids,
         load_listing, load_listing_offers, load_offer, load_offerer_offers, release_auction_lock,
@@ -26,11 +27,13 @@ use crate::{
         set_artist_revocation_storage, set_auction_extension_trigger_storage,
         set_auction_extension_window_storage, set_auction_max_extensions_storage,
         set_max_price_storage, set_migration_done,
-        set_min_price_storage, set_pending_admin_storage, PendingAdminProposal,
+        set_min_price_storage, set_pending_admin_storage,
+        clear_pending_role_storage, set_pending_role_storage, set_role_storage,
+        PendingAdminProposal, PendingRoleProposal,
     },
     types::{
         Auction, AuctionStatus, BidRecord, CancelReason, Listing, ListingStatus, MarketplaceError,
-        Offer, OfferStatus, Recipient,
+        Offer, OfferStatus, Recipient, RoleType,
     },
 };
 
@@ -157,6 +160,123 @@ impl MarketplaceContract {
         get_pending_admin_storage(&env)
     }
 
+    // ── Role-based authorization (Issue #267) ─────────────────
+    //
+    // Every privileged entry point below is owned by exactly one `RoleType`:
+    // `ProtocolConfig` (price bounds, treasury, fees, bid/auction params),
+    // `EmergencyPause` (global/collection/function circuit breakers),
+    // `CollectionAdmin` (artist revocation/reinstatement, listing cleanup)
+    // and `Upgrade` (storage/version migration). A role with no explicit
+    // holder falls back to whoever holds `Admin`, so existing single-admin
+    // deployments keep working unchanged until an operator opts in via
+    // `migrate_roles` or a direct `propose_role_transfer` /
+    // `accept_role_transfer`. Keeping `EmergencyPause` independently
+    // assignable means an incident responder can still halt the marketplace
+    // even if the (potentially slower, multisig-gated) `ProtocolConfig`
+    // authority is unavailable or compromised.
+
+    /// Resolve the current holder of `role`: its explicit holder if one has
+    /// been assigned, otherwise the contract `Admin`.
+    pub fn get_role(env: Env, role: RoleType) -> Address {
+        get_role_storage(&env, &role)
+            .unwrap_or_else(|| Self::get_admin(env.clone()).expect("admin not set"))
+    }
+
+    /// View: the currently-pending role-transfer proposal for `role`, or
+    /// `None` when no rotation is in progress.
+    pub fn get_pending_role(env: Env, role: RoleType) -> Option<PendingRoleProposal> {
+        get_pending_role_storage(&env, &role)
+    }
+
+    /// Step 1 of the two-step role rotation: the current holder of `role`
+    /// proposes a candidate. Mirrors `transfer_admin`'s TTL/overwrite
+    /// semantics — a second call overwrites any still-pending proposal.
+    pub fn propose_role_transfer(
+        env: Env,
+        current_authority: Address,
+        role: RoleType,
+        candidate: Address,
+    ) {
+        current_authority.require_auth();
+        let stored = Self::get_role(env.clone(), role.clone());
+        if current_authority != stored {
+            panic_with_error!(&env, MarketplaceError::Unauthorized);
+        }
+        let expires_at = env.ledger().timestamp() + ADMIN_PROPOSAL_TTL;
+        set_pending_role_storage(
+            &env,
+            &role,
+            &PendingRoleProposal {
+                candidate: candidate.clone(),
+                expires_at,
+            },
+        );
+        emit_role_proposed(&env, role, current_authority, candidate, expires_at);
+    }
+
+    /// Step 2: the proposed candidate accepts and becomes the explicit
+    /// holder of `role`. Reverts with `NoRoleProposalPending` if no proposal
+    /// is active, `Unauthorized` if the caller is not the proposed candidate,
+    /// and `RoleProposalExpired` if the proposal's deadline has passed —
+    /// analogous to `accept_admin`.
+    pub fn accept_role_transfer(env: Env, role: RoleType, candidate: Address) {
+        candidate.require_auth();
+        let pending = get_pending_role_storage(&env, &role)
+            .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::NoRoleProposalPending));
+        if candidate != pending.candidate {
+            panic_with_error!(&env, MarketplaceError::Unauthorized);
+        }
+        if env.ledger().timestamp() > pending.expires_at {
+            panic_with_error!(&env, MarketplaceError::RoleProposalExpired);
+        }
+        let old_authority = Self::get_role(env.clone(), role.clone());
+        set_role_storage(&env, &role, &candidate);
+        clear_pending_role_storage(&env, &role);
+        emit_role_accepted(&env, role, old_authority, candidate);
+    }
+
+    /// Cancel a still-pending role-transfer proposal. Callable only by the
+    /// current holder of the role. Reverts with `NoRoleProposalPending` when
+    /// no proposal is active.
+    pub fn cancel_role_proposal(env: Env, current_authority: Address, role: RoleType) {
+        current_authority.require_auth();
+        let stored = Self::get_role(env.clone(), role.clone());
+        if current_authority != stored {
+            panic_with_error!(&env, MarketplaceError::Unauthorized);
+        }
+        let pending = get_pending_role_storage(&env, &role)
+            .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::NoRoleProposalPending));
+        clear_pending_role_storage(&env, &role);
+        emit_role_proposal_cancelled(&env, role, current_authority, pending.candidate);
+    }
+
+    /// Migration path for existing single-admin deployments (Issue #267):
+    /// explicitly assigns `admin` as the holder of every role that does not
+    /// yet have one, emitting `role_migrated` for each. Callable only by the
+    /// current `Admin`.
+    ///
+    /// Idempotent: a role that already has an explicit holder (including one
+    /// assigned by an earlier `migrate_roles` call, or one since transferred
+    /// to a distinct authority) is left untouched, so re-running it is always
+    /// safe.
+    pub fn migrate_roles(env: Env, admin: Address) {
+        admin.require_auth();
+        if admin != Self::get_admin(env.clone()).expect("admin not set") {
+            panic_with_error!(&env, MarketplaceError::Unauthorized);
+        }
+        for role in [
+            RoleType::ProtocolConfig,
+            RoleType::EmergencyPause,
+            RoleType::CollectionAdmin,
+            RoleType::Upgrade,
+        ] {
+            if get_role_storage(&env, &role).is_none() {
+                set_role_storage(&env, &role, &admin);
+                emit_role_migrated(&env, role, admin.clone());
+            }
+        }
+    }
+
     // ── Versioning & Migration ───────────────────────────────
 
     pub fn version(env: Env) -> soroban_sdk::String {
@@ -212,11 +332,7 @@ impl MarketplaceContract {
 
     /// Common guard for `migrate`/`migrate_step`: admin auth + not-yet-migrated.
     fn require_pending_migration(env: &Env, admin: &Address) -> soroban_sdk::String {
-        admin.require_auth();
-        let stored_admin = Self::get_admin(env.clone()).expect("admin not set");
-        if *admin != stored_admin {
-            panic_with_error!(env, MarketplaceError::Unauthorized);
-        }
+        Self::require_role(env, admin, RoleType::Upgrade);
         let version = soroban_sdk::String::from_str(env, CONTRACT_VERSION);
         if is_migration_done(env, &version) {
             panic_with_error!(env, MarketplaceError::AlreadyMigrated);
@@ -360,10 +476,7 @@ impl MarketplaceContract {
     // ── Price bounds ─────────────────────────────────────────
 
     pub fn set_price_bounds(env: Env, admin: Address, min: i128, max: i128) {
-        admin.require_auth();
-        if admin != Self::get_admin(env.clone()).expect("admin not set") {
-            panic_with_error!(&env, MarketplaceError::Unauthorized);
-        }
+        Self::require_role(&env, &admin, RoleType::ProtocolConfig);
         if min < 0 || max < 0 || min > max { panic_with_error!(&env, MarketplaceError::InvalidPrice); }
         set_min_price_storage(&env, min);
         set_max_price_storage(&env, max);
@@ -376,10 +489,7 @@ impl MarketplaceContract {
     // ── Treasury & Fees ──────────────────────────────────────
 
     pub fn set_treasury(env: Env, admin: Address, treasury: Address) {
-        admin.require_auth();
-        if admin != Self::get_admin(env.clone()).expect("admin not set") {
-            panic_with_error!(&env, MarketplaceError::Unauthorized);
-        }
+        Self::require_role(&env, &admin, RoleType::ProtocolConfig);
         crate::storage::set_treasury_storage(&env, &treasury);
     }
 
@@ -388,10 +498,7 @@ impl MarketplaceContract {
     }
 
     pub fn set_protocol_fee(env: Env, admin: Address, bps: u32) {
-        admin.require_auth();
-        if admin != Self::get_admin(env.clone()).expect("admin not set") {
-            panic_with_error!(&env, MarketplaceError::Unauthorized);
-        }
+        Self::require_role(&env, &admin, RoleType::ProtocolConfig);
         if bps > 1000 { panic_with_error!(&env, MarketplaceError::InvalidPrice); }
         crate::storage::set_protocol_fee_bps_storage(&env, bps);
     }
@@ -401,10 +508,7 @@ impl MarketplaceContract {
     }
 
     pub fn set_min_bid_increment(env: Env, admin: Address, increment: i128) {
-        admin.require_auth();
-        if admin != Self::get_admin(env.clone()).expect("admin not set") {
-            panic_with_error!(&env, MarketplaceError::Unauthorized);
-        }
+        Self::require_role(&env, &admin, RoleType::ProtocolConfig);
         if increment < 0 { panic_with_error!(&env, MarketplaceError::InvalidPrice); }
         crate::storage::set_min_bid_increment_storage(&env, increment);
     }
@@ -434,10 +538,7 @@ impl MarketplaceContract {
     /// If a future version needs O(1) eviction, the ring buffer can be replaced
     /// with an indexed page (write-head pointer in instance storage).
     pub fn set_bid_history_cap(env: Env, admin: Address, cap: u32) {
-        admin.require_auth();
-        if admin != Self::get_admin(env.clone()).expect("admin not set") {
-            panic_with_error!(&env, MarketplaceError::Unauthorized);
-        }
+        Self::require_role(&env, &admin, RoleType::ProtocolConfig);
         if cap == 0 || cap > MAX_BID_HISTORY_CAP {
             panic_with_error!(&env, MarketplaceError::InvalidPrice);
         }
@@ -449,10 +550,7 @@ impl MarketplaceContract {
     }
 
     pub fn set_auction_extension_window(env: Env, admin: Address, window: u64) {
-        admin.require_auth();
-        if admin != Self::get_admin(env.clone()).expect("admin not set") {
-            panic_with_error!(&env, MarketplaceError::Unauthorized);
-        }
+        Self::require_role(&env, &admin, RoleType::ProtocolConfig);
         set_auction_extension_window_storage(&env, window);
     }
 
@@ -461,10 +559,7 @@ impl MarketplaceContract {
     }
 
     pub fn set_auction_extension_trigger(env: Env, admin: Address, trigger: u64) {
-        admin.require_auth();
-        if admin != Self::get_admin(env.clone()).expect("admin not set") {
-            panic_with_error!(&env, MarketplaceError::Unauthorized);
-        }
+        Self::require_role(&env, &admin, RoleType::ProtocolConfig);
         set_auction_extension_trigger_storage(&env, trigger);
     }
 
@@ -476,10 +571,7 @@ impl MarketplaceContract {
     /// the anti-sniping logic.  0 = unlimited (default).
     /// Snapshotted into each new auction at creation time.
     pub fn set_auction_max_extensions(env: Env, admin: Address, max: u32) {
-        admin.require_auth();
-        if admin != Self::get_admin(env.clone()).expect("admin not set") {
-            panic_with_error!(&env, MarketplaceError::Unauthorized);
-        }
+        Self::require_role(&env, &admin, RoleType::ProtocolConfig);
         set_auction_max_extensions_storage(&env, max);
     }
 
@@ -490,20 +582,14 @@ impl MarketplaceContract {
     // ── Pause ────────────────────────────────────────────────
 
     pub fn admin_pause(env: Env, admin: Address) {
-        admin.require_auth();
-        if admin != Self::get_admin(env.clone()).expect("admin not set") {
-            panic_with_error!(&env, MarketplaceError::Unauthorized);
-        }
+        Self::require_role(&env, &admin, RoleType::EmergencyPause);
         crate::storage::set_paused(&env, true);
         #[allow(deprecated)]
         env.events().publish((crate::events::CONTRACT_PAUSED,), ());
     }
 
     pub fn admin_unpause(env: Env, admin: Address) {
-        admin.require_auth();
-        if admin != Self::get_admin(env.clone()).expect("admin not set") {
-            panic_with_error!(&env, MarketplaceError::Unauthorized);
-        }
+        Self::require_role(&env, &admin, RoleType::EmergencyPause);
         crate::storage::set_paused(&env, false);
         #[allow(deprecated)]
         env.events().publish((crate::events::CONTRACT_UNPAUSED,), ());
@@ -526,20 +612,14 @@ impl MarketplaceContract {
 
     /// Pause all operations for a specific collection.
     pub fn pause_collection(env: Env, admin: Address, collection: Address) {
-        admin.require_auth();
-        if admin != Self::get_admin(env.clone()).expect("admin not set") {
-            panic_with_error!(&env, MarketplaceError::Unauthorized);
-        }
+        Self::require_role(&env, &admin, RoleType::EmergencyPause);
         crate::storage::set_collection_paused(&env, &collection, true);
         crate::events::emit_collection_paused(&env, collection);
     }
 
     /// Resume all operations for a previously paused collection.
     pub fn unpause_collection(env: Env, admin: Address, collection: Address) {
-        admin.require_auth();
-        if admin != Self::get_admin(env.clone()).expect("admin not set") {
-            panic_with_error!(&env, MarketplaceError::Unauthorized);
-        }
+        Self::require_role(&env, &admin, RoleType::EmergencyPause);
         crate::storage::set_collection_paused(&env, &collection, false);
         crate::events::emit_collection_unpaused(&env, collection);
     }
@@ -553,20 +633,14 @@ impl MarketplaceContract {
     /// Valid names: "buy_artwork", "create_listing", "place_bid",
     ///              "create_auction", "make_offer", "accept_offer".
     pub fn pause_function(env: Env, admin: Address, function_name: Symbol) {
-        admin.require_auth();
-        if admin != Self::get_admin(env.clone()).expect("admin not set") {
-            panic_with_error!(&env, MarketplaceError::Unauthorized);
-        }
+        Self::require_role(&env, &admin, RoleType::EmergencyPause);
         crate::storage::set_function_paused(&env, &function_name, true);
         crate::events::emit_function_paused(&env, function_name);
     }
 
     /// Resume a previously paused entry-point.
     pub fn unpause_function(env: Env, admin: Address, function_name: Symbol) {
-        admin.require_auth();
-        if admin != Self::get_admin(env.clone()).expect("admin not set") {
-            panic_with_error!(&env, MarketplaceError::Unauthorized);
-        }
+        Self::require_role(&env, &admin, RoleType::EmergencyPause);
         crate::storage::set_function_paused(&env, &function_name, false);
         crate::events::emit_function_unpaused(&env, function_name);
     }
@@ -579,14 +653,14 @@ impl MarketplaceContract {
     // ── Artist Moderation ────────────────────────────────────
 
     pub fn revoke_artist(env: Env, artist: Address) {
-        Self::require_admin(&env);
+        Self::require_role_auth(&env, RoleType::CollectionAdmin);
         set_artist_revocation_storage(&env, &artist);
         #[allow(deprecated)]
         env.events().publish((crate::events::ARTIST_REVOKED,), artist);
     }
 
     pub fn reinstate_artist(env: Env, artist: Address) {
-        Self::require_admin(&env);
+        Self::require_role_auth(&env, RoleType::CollectionAdmin);
         remove_artist_revocation_storage(&env, &artist);
         #[allow(deprecated)]
         env.events().publish((crate::events::ARTIST_REINSTATED,), artist);
@@ -611,10 +685,7 @@ impl MarketplaceContract {
     /// repeatedly until it returns `0`.  Calling it for a non-revoked artist
     /// does nothing and returns `0`.
     pub fn cancel_artist_listings(env: Env, admin: Address, artist: Address, max_items: u32) -> u64 {
-        admin.require_auth();
-        if admin != Self::get_admin(env.clone()).expect("admin not set") {
-            panic_with_error!(&env, MarketplaceError::Unauthorized);
-        }
+        Self::require_role(&env, &admin, RoleType::CollectionAdmin);
 
         // Only cancel listings if the artist is actually revoked.  A stale
         // cursor from an interrupted sweep is dropped so a later re-revocation
@@ -733,7 +804,7 @@ impl MarketplaceContract {
     // ── Token Whitelist ──────────────────────────────────────
 
     pub fn add_token_to_whitelist(env: Env, token: Address) {
-        Self::require_admin(&env);
+        Self::require_role_auth(&env, RoleType::ProtocolConfig);
         let key = crate::storage::DataKey::TokenWhitelist;
         let mut wl = env.storage().persistent()
             .get::<_, Vec<Address>>(&key).unwrap_or(Vec::new(&env));
@@ -741,7 +812,7 @@ impl MarketplaceContract {
     }
 
     pub fn remove_token_from_whitelist(env: Env, token: Address) {
-        Self::require_admin(&env);
+        Self::require_role_auth(&env, RoleType::ProtocolConfig);
         let key = crate::storage::DataKey::TokenWhitelist;
         let wl = env.storage().persistent()
             .get::<_, Vec<Address>>(&key).unwrap_or(Vec::new(&env));
@@ -1316,10 +1387,7 @@ impl MarketplaceContract {
     // Admin emergency cancellation — works even if bids exist.
     // Refunds the highest bidder before cancelling. (Issue #271)
     pub fn admin_cancel_auction(env: Env, admin: Address, auction_id: u64) {
-        admin.require_auth();
-        if admin != Self::get_admin(env.clone()).expect("admin not set") {
-            panic_with_error!(&env, MarketplaceError::Unauthorized);
-        }
+        Self::require_role(&env, &admin, RoleType::EmergencyPause);
         if !acquire_auction_lock(&env, auction_id) {
             panic_with_error!(&env, MarketplaceError::ReentrancyGuard);
         }
@@ -1725,11 +1793,23 @@ impl MarketplaceContract {
 
     // ── Private helpers ──────────────────────────────────────
 
-    fn require_admin(env: &Env) {
-        let key = crate::storage::DataKey::Admin;
-        let admin = env.storage().persistent()
-            .get::<_, Address>(&key).expect("admin not set");
-        admin.require_auth();
+    /// Require that `caller` both authenticates and holds `role` (its
+    /// explicit holder, or `Admin` when unassigned — see the role block
+    /// above). Used by entry points that take the authority as an explicit
+    /// parameter (mirrors the pre-existing `admin != Self::get_admin(..)`
+    /// check pattern, generalized across roles).
+    fn require_role(env: &Env, caller: &Address, role: RoleType) {
+        caller.require_auth();
+        if *caller != Self::get_role(env.clone(), role) {
+            panic_with_error!(env, MarketplaceError::Unauthorized);
+        }
+    }
+
+    /// Require that the current holder of `role` authorizes this call.
+    /// Used by entry points that (like `require_admin`) don't take the
+    /// authority as an explicit parameter.
+    fn require_role_auth(env: &Env, role: RoleType) {
+        Self::get_role(env.clone(), role).require_auth();
     }
 
     fn require_price_in_bounds(env: &Env, price: i128) {

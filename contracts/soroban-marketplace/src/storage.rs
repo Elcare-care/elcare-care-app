@@ -42,6 +42,22 @@ pub struct PendingAdminProposal {
     pub expires_at: u64,
 }
 
+/// A pending two-step role-authority rotation (Issue #267).
+///
+/// Stored under `DataKey::PendingRole(role)` between `propose_role_transfer`
+/// and `accept_role_transfer`, mirroring [`PendingAdminProposal`]'s semantics:
+/// `expires_at` bounds how long a proposal can sit unaccepted, and the current
+/// holder can clear it early via `cancel_role_proposal`.
+#[contracttype]
+#[derive(Clone)]
+pub struct PendingRoleProposal {
+    /// Address invited to become the new holder of the role.
+    pub candidate: Address,
+    /// Absolute ledger timestamp after which the proposal can no longer be
+    /// accepted.
+    pub expires_at: u64,
+}
+
 /// Resumable progress marker for a versioned storage migration.
 #[contracttype]
 #[derive(Clone)]
@@ -126,6 +142,13 @@ pub enum DataKey {
     /// listing or auction; a double-listing guard reads it and settlement /
     /// cancellation clears it.
     EscrowedToken(Address, u64),
+    /// Explicit holder of a least-privilege role (Issue #267). Absent until
+    /// `migrate_roles` or `accept_role_transfer` sets it; reads fall back to
+    /// `DataKey::Admin` while absent so pre-existing deployments are
+    /// unaffected until an operator opts into role separation.
+    Role(crate::types::RoleType),
+    /// Pending two-step transfer of a role's authority.
+    PendingRole(crate::types::RoleType),
 }
 
 /// Custody record for an NFT held by the marketplace, keyed by
@@ -766,6 +789,51 @@ pub fn get_pending_admin_storage(env: &Env) -> Option<PendingAdminProposal> {
 
 pub fn clear_pending_admin_storage(env: &Env) {
     env.storage().persistent().remove(&DataKey::PendingAdmin);
+}
+
+// ── Role-based authorization (Issue #267) ────────────────────
+
+pub fn get_role_storage(env: &Env, role: &crate::types::RoleType) -> Option<Address> {
+    let key = DataKey::Role(role.clone());
+    let value = env.storage().persistent().get::<DataKey, Address>(&key);
+    if value.is_some() {
+        bump_entry_ttl(env, &key);
+    }
+    value
+}
+
+pub fn set_role_storage(env: &Env, role: &crate::types::RoleType, authority: &Address) {
+    let key = DataKey::Role(role.clone());
+    env.storage().persistent().set(&key, authority);
+    bump_entry_ttl(env, &key);
+}
+
+pub fn set_pending_role_storage(
+    env: &Env,
+    role: &crate::types::RoleType,
+    pending: &PendingRoleProposal,
+) {
+    let key = DataKey::PendingRole(role.clone());
+    env.storage().persistent().set(&key, pending);
+    bump_entry_ttl(env, &key);
+}
+
+pub fn get_pending_role_storage(
+    env: &Env,
+    role: &crate::types::RoleType,
+) -> Option<PendingRoleProposal> {
+    let key = DataKey::PendingRole(role.clone());
+    let value = env.storage().persistent().get::<DataKey, PendingRoleProposal>(&key);
+    if value.is_some() {
+        bump_entry_ttl(env, &key);
+    }
+    value
+}
+
+pub fn clear_pending_role_storage(env: &Env, role: &crate::types::RoleType) {
+    env.storage()
+        .persistent()
+        .remove(&DataKey::PendingRole(role.clone()));
 }
 
 // ── Bid history ──────────────────────────────────────────────

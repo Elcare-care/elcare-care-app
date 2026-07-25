@@ -117,4 +117,9 @@ pub enum DataKey {
     /// Marks a (creator, raw_salt) pair — hashed into the secure salt — as
     /// already consumed by a successful deployment (#277).
     SaltUsed(BytesN<32>),
+    /// Explicit holder of the `EmergencyPause` role (Issue #267). Absent
+    /// until `set_emergency_pauser` is called; `pause`/`unpause` fall back to
+    /// `Admin` while absent so existing single-admin deployments are
+    /// unaffected until an operator opts into a separate emergency signer.
+    EmergencyPauser,
 }

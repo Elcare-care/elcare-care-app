@@ -95,6 +95,55 @@ This contract manages the complete lifecycle of on-chain marketplace listings, a
 
 ---
 
+## Role-Based Authorization (Issue #267)
+
+### Overview
+
+Privileged marketplace control was originally a single `Admin` address with unlimited authority — routine configuration, emergency pause, artist moderation, and irreversible migration all shared one key. That means a compromised or unavailable admin key blocks *every* privileged action, including the emergency pause that would otherwise contain the incident.
+
+The contract now assigns every privileged entry point to exactly one of four **roles**. A role with no explicit holder transparently falls back to whoever holds `Admin`, so **no migration is required** for existing deployments to keep working — role separation is opt-in.
+
+| Role | Scope | Entry points |
+|------|-------|--------------|
+| `ProtocolConfig` | Routine configuration | `set_price_bounds`, `set_treasury`, `set_protocol_fee`, `set_min_bid_increment`, `set_bid_history_cap`, `set_auction_extension_window`, `set_auction_extension_trigger`, `set_auction_max_extensions`, `add_token_to_whitelist`, `remove_token_from_whitelist` |
+| `EmergencyPause` | Incident response | `admin_pause`, `admin_unpause`, `pause_collection`, `unpause_collection`, `pause_function`, `unpause_function`, `admin_cancel_auction` |
+| `CollectionAdmin` | Artist/collection moderation | `revoke_artist`, `reinstate_artist`, `cancel_artist_listings` |
+| `Upgrade` | Irreversible storage/version migration | `migrate`, `migrate_step` |
+
+`Admin` itself is unchanged: it retains the pre-existing two-step `transfer_admin` / `accept_admin` / `cancel_admin_proposal` flow, and is the implicit holder of any role that hasn't been explicitly assigned.
+
+**Why `EmergencyPause` matters most:** it is deliberately kept independent so an incident responder — e.g. a fast 2-of-3 ops multisig — can still halt the marketplace even if the (potentially slower, more heavily-gated) `ProtocolConfig` authority is unavailable, under dispute, or itself the thing being investigated.
+
+**User fund recovery under pause:** cancelling a listing/auction/offer you own, reclaiming an expired offer, and withdrawing from a resolved auction all check `require_not_paused`/`require_not_paused_ctx` on the *creation* side only — they remain callable while any pause axis (global, per-collection, per-function) is active, so a pause can never trap user funds. See `EVENTS.md` and the granular-pause section above for the full per-operation matrix.
+
+### Role management API
+
+| Function | Auth | Description |
+|----------|------|-------------|
+| `get_role(role) → Address` | — | Resolves the current holder of `role` (explicit holder, or `Admin` fallback) |
+| `propose_role_transfer(current_authority, role, candidate)` | current holder of `role` | Step 1 of 2: propose a new holder (7-day expiry, mirrors `transfer_admin`) |
+| `accept_role_transfer(role, candidate)` | proposed candidate | Step 2 of 2: candidate accepts and becomes the explicit holder |
+| `cancel_role_proposal(current_authority, role)` | current holder of `role` | Cancel a still-pending proposal before acceptance/expiry |
+| `get_pending_role(role) → Option<PendingRoleProposal>` | — | View the pending proposal (candidate + `expires_at`), if any |
+| `migrate_roles(admin)` | current `Admin` | One-shot, idempotent: assigns `admin` as the explicit holder of every *unassigned* role — a documented on-ramp for deployments that want distinct role addresses recorded on-chain rather than relying on the implicit fallback |
+
+Every transition emits an event so indexers/frontends never have to poll: `role_transfer_proposed`, `role_transferred`, `role_proposal_cancelled`, `role_migrated` (see `events.rs`).
+
+### Using a multisig or managed account as a role authority
+
+Because every role authority is just a Soroban `Address`, it can be:
+- A regular Stellar account key (simplest; equivalent to today's single-admin model).
+- A **multisig account** — a Stellar account with multiple signers and a signing threshold, so `require_auth()` for that role succeeds only once enough signers co-sign the invocation.
+- A **managed authority contract** — a separate Soroban contract address that implements its own `__check_auth` policy (e.g. an on-chain timelock, an M-of-N contract-signer scheme, or a governance module), so `require_auth()` defers to that contract's custom authorization logic.
+
+**Recommended rollout for an existing single-admin deployment:**
+1. Deploy or designate the multisig/managed-account address(es) you want to hold each role (a single shared multisig for all four roles is a reasonable starting point; splitting `EmergencyPause` out to its own faster-signing multisig is recommended once you have one).
+2. `propose_role_transfer(current_admin, RoleType::EmergencyPause, emergency_multisig)`, then have the multisig call `accept_role_transfer(RoleType::EmergencyPause, emergency_multisig)`.
+3. Repeat per role, or call `migrate_roles(admin)` first to record explicit (admin-held) rows for every role, then transfer each one out individually at your own pace — both paths are safe to interleave since `migrate_roles` never touches a role that already has an explicit holder.
+4. Confirm with `get_role(role)` after each step before revoking or rotating the original admin key.
+
+---
+
 ## Contract Versioning & Migration
 
 ### Overview
@@ -346,6 +395,8 @@ All persistent entries use `extend_ttl` on every read/write (~30-day TTL via `LE
 | `AuctionHasBids` | 30 | `cancel_auction` called on an auction with an active highest bidder |
 | `InvalidAuctionDuration` | 31 | `create_auction` `duration` < `MIN_AUCTION_DURATION` (3 600 s) |
 | `SelfBidNotAllowed` | 32 | `place_bid` called by the auction creator (shill-bid prevention) |
+| `RoleProposalExpired` | 49 | `accept_role_transfer` called after the role proposal's `expires_at` passed |
+| `NoRoleProposalPending` | 50 | `accept_role_transfer` / `cancel_role_proposal` called with no pending proposal for that role |
 
 ---
 

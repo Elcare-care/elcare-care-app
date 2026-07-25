@@ -206,6 +206,34 @@ pub fn require_admin(env: &Env) -> Result<Address, Error> {
     Ok(admin)
 }
 
+// ── Emergency pause role (Issue #267) ──────────────────────────────────────
+//
+// Kept independent of `Admin` so an incident responder can still halt
+// deployments even if the routine admin authority is unavailable.
+
+pub fn set_emergency_pauser(env: &Env, pauser: &Address) {
+    env.storage()
+        .instance()
+        .set(&DataKey::EmergencyPauser, pauser);
+}
+
+pub fn get_emergency_pauser(env: &Env) -> Option<Address> {
+    env.storage().instance().get(&DataKey::EmergencyPauser)
+}
+
+/// Authorize a `pause`/`unpause` call: the explicit `EmergencyPauser` if one
+/// has been configured, otherwise the `Admin` fallback. Returns the
+/// authorizing address for event emission.
+pub fn require_pause_authority(env: &Env) -> Result<Address, Error> {
+    match get_emergency_pauser(env) {
+        Some(pauser) => {
+            pauser.require_auth();
+            Ok(pauser)
+        }
+        None => require_admin(env),
+    }
+}
+
 /// Record a newly deployed collection with full metadata (#37 + #38).
 #[allow(clippy::too_many_arguments)]
 pub fn record_collection(
