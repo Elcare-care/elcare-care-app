@@ -15,6 +15,7 @@ use crate::{
         get_active_listing_ids_range, get_artist_auction_ids,
         get_artist_cancel_cursor, get_artist_listing_ids, get_auction_count,
         get_auction_extension_trigger_storage, get_auction_extension_window_storage,
+        get_auction_max_extensions_storage,
         get_bid_history_cap_storage, get_listing_count, get_max_price_storage,
         get_min_price_storage, get_pending_admin_storage,
         increment_auction_count, increment_listing_count, increment_offer_count,
@@ -23,7 +24,8 @@ use crate::{
         release_listing_lock, remove_artist_revocation_storage, remove_from_active_listings,
         save_auction, save_listing, save_offer,
         set_artist_revocation_storage, set_auction_extension_trigger_storage,
-        set_auction_extension_window_storage, set_max_price_storage, set_migration_done,
+        set_auction_extension_window_storage, set_auction_max_extensions_storage,
+        set_max_price_storage, set_migration_done,
         set_min_price_storage, set_pending_admin_storage, PendingAdminProposal,
     },
     types::{
@@ -470,6 +472,21 @@ impl MarketplaceContract {
         get_auction_extension_trigger_storage(&env).unwrap_or(DEFAULT_EXTENSION_TRIGGER)
     }
 
+    /// Set the global cap on how many times a single auction may be extended by
+    /// the anti-sniping logic.  0 = unlimited (default).
+    /// Snapshotted into each new auction at creation time.
+    pub fn set_auction_max_extensions(env: Env, admin: Address, max: u32) {
+        admin.require_auth();
+        if admin != Self::get_admin(env.clone()).expect("admin not set") {
+            panic_with_error!(&env, MarketplaceError::Unauthorized);
+        }
+        set_auction_max_extensions_storage(&env, max);
+    }
+
+    pub fn get_auction_max_extensions(env: Env) -> u32 {
+        get_auction_max_extensions_storage(&env)
+    }
+
     // ── Pause ────────────────────────────────────────────────
 
     pub fn admin_pause(env: Env, admin: Address) {
@@ -911,6 +928,14 @@ impl MarketplaceContract {
                 }.publish(&env);
             }
         }
+        // Emit royalty settlement snapshot for auditability (Issue #270)
+        RoyaltySettlementEvent {
+            id: listing_id,
+            recipients: listing.recipients.clone(),
+            total_amount: listing.price,
+            token: listing.token.clone(),
+            ledger_sequence: env.ledger().sequence(),
+        }.publish(&env);
         // NFT: from escrow → buyer (CEI: state already Sold)
         escrow::release_nft(&env, &listing.collection, listing.token_id,
             &buyer, env.ledger().sequence(), listing_id);
@@ -980,6 +1005,17 @@ impl MarketplaceContract {
         if !Self::is_token_whitelisted(&env, &token) {
             panic_with_error!(&env, MarketplaceError::TokenNotWhitelisted);
         }
+        // Snapshot protocol fee early so it can be used in recipient validation.
+        let protocol_fee_bps = crate::storage::get_protocol_fee_bps_storage(&env).unwrap_or(0);
+        // Validate recipients using the same rules as create_listing (#270).
+        let recipients_len = recipients.len();
+        if recipients_len == 0 {
+            panic_with_error!(&env, MarketplaceError::InvalidSplit);
+        }
+        if recipients_len > 4 {
+            panic_with_error!(&env, MarketplaceError::TooManyRecipients);
+        }
+        Self::validate_recipients(&env, &recipients, protocol_fee_bps);
         let auction_id = increment_auction_count(&env);
         let end_time = env.ledger().timestamp() + duration;
         let min_increment = crate::storage::get_min_bid_increment_storage(&env)
@@ -990,19 +1026,24 @@ impl MarketplaceContract {
             get_auction_extension_window_storage(&env).unwrap_or(DEFAULT_EXTENSION_WINDOW);
         let extension_trigger =
             get_auction_extension_trigger_storage(&env).unwrap_or(DEFAULT_EXTENSION_TRIGGER);
-        // Snapshot the global protocol fee so settlement math is fixed at
-        // creation time — consistent with how listings work (ISSUE-005 parity).
-        let protocol_fee_bps = crate::storage::get_protocol_fee_bps_storage(&env).unwrap_or(0);
+        // protocol_fee_bps already computed above.
         // Snapshot the global bid-history cap so changing it later never
         // retroactively affects this auction's ring-buffer.
         let bid_history_cap = get_bid_history_cap_storage(&env);
+        // Snapshot the global anti-sniping max-extensions cap.  0 = unlimited.
+        let max_extensions = get_auction_max_extensions_storage(&env);
+        // Validate extension_window when trigger is enabled: must be > 0 to
+        // prevent an auction from being stuck in a non-extending state.
+        if extension_trigger > 0 && extension_window == 0 {
+            panic_with_error!(&env, MarketplaceError::InvalidExtensionWindow);
+        }
         let auction = Auction {
             auction_id, creator: creator.clone(), token: token.clone(),
             collection: collection.clone(), token_id, reserve_price,
             highest_bid: 0, highest_bidder: None, end_time,
             status: AuctionStatus::Active, recipients,
             min_increment, extension_window, extension_trigger, protocol_fee_bps,
-            bid_history_cap,
+            bid_history_cap, max_extensions, extension_count: 0,
         };
         save_auction(&env, &auction);
         add_artist_auction_id(&env, &creator, auction_id);
@@ -1047,21 +1088,51 @@ impl MarketplaceContract {
         let time_remaining = auction.end_time.saturating_sub(now);
         let mut extended = false;
         if auction.extension_trigger > 0 && time_remaining < auction.extension_trigger {
+            // Enforce max-extensions cap (0 = unlimited).
+            if auction.max_extensions > 0 && auction.extension_count >= auction.max_extensions {
+                panic_with_error!(&env, MarketplaceError::MaxExtensionsReached);
+            }
+            // Validate extension_window is non-zero (guard against mis-configuration).
+            if auction.extension_window == 0 {
+                panic_with_error!(&env, MarketplaceError::InvalidExtensionWindow);
+            }
+            let prev_end_time = auction.end_time;
             auction.end_time = now.checked_add(auction.extension_window).unwrap_or(auction.end_time);
+            auction.extension_count = auction.extension_count.saturating_add(1);
             extended = true;
+            save_auction(&env, &auction);
+            append_bid_record(&env, auction_id,
+                &BidRecord { bidder: bidder.clone(), amount, ledger: env.ledger().sequence() },
+                auction.bid_history_cap,
+            );
+            BidPlacedEvent { auction_id, bidder: bidder.clone(), bid_amount: amount }.publish(&env);
+            AuctionExtendedEvent {
+                auction_id,
+                prev_end_time,
+                new_end_time: auction.end_time,
+                extension_count: auction.extension_count,
+            }.publish(&env);
+        } else {
+            save_auction(&env, &auction);
+            append_bid_record(&env, auction_id,
+                &BidRecord { bidder: bidder.clone(), amount, ledger: env.ledger().sequence() },
+                auction.bid_history_cap,
+            );
+            BidPlacedEvent { auction_id, bidder: bidder.clone(), bid_amount: amount }.publish(&env);
         }
-        save_auction(&env, &auction);
-        append_bid_record(&env, auction_id,
-            &BidRecord { bidder: bidder.clone(), amount, ledger: env.ledger().sequence() },
-            auction.bid_history_cap,
-        );
-        BidPlacedEvent { auction_id, bidder: bidder.clone(), bid_amount: amount }.publish(&env);
-        if extended {
-            AuctionExtendedEvent { auction_id, new_end_time: auction.end_time }.publish(&env);
-        }
+        let _ = extended;
         let tc = TokenClient::new(&env, &auction.token);
         if let Some(prev) = previous_bidder {
             tc.transfer(&env.current_contract_address(), &prev, &previous_bid);
+            // Emit refund event so the indexer can reconcile escrow (Issue #271)
+            AuctionBidRefundedEvent {
+                auction_id,
+                bidder: prev,
+                amount: previous_bid,
+                token: auction.token.clone(),
+                reason: Symbol::new(&env, "outbid"),
+                ledger_sequence: env.ledger().sequence(),
+            }.publish(&env);
         }
         tc.transfer(&bidder, &env.current_contract_address(), &amount);
     }
@@ -1107,11 +1178,24 @@ impl MarketplaceContract {
                     }.publish(&env);
                 }
             }
+            // Emit royalty settlement snapshot for auditability (Issue #270)
+            RoyaltySettlementEvent {
+                id: auction_id,
+                recipients: auction.recipients.clone(),
+                total_amount: winning_bid,
+                token: auction.token.clone(),
+                ledger_sequence: env.ledger().sequence(),
+            }.publish(&env);
             // NFT: escrow → winner (CEI: status Finalized already)
             escrow::release_nft(&env, &auction.collection, auction.token_id,
                 w, env.ledger().sequence(), auction_id);
         } else {
-            // No bids — return NFT to creator
+            // No bids — emit cancelled with reason, then return NFT to creator
+            AuctionCancelledEvent {
+                auction_id,
+                cancelled_by: auction.creator.clone(),
+                reason: Symbol::new(&env, "no_bids"),
+            }.publish(&env);
             escrow::release_nft(&env, &auction.collection, auction.token_id,
                 &auction.creator, env.ledger().sequence(), auction_id);
         }
@@ -1134,10 +1218,70 @@ impl MarketplaceContract {
         }
         auction.status = AuctionStatus::Cancelled;
         save_auction(&env, &auction);
-        AuctionCancelledEvent { auction_id, cancelled_by: creator.clone() }.publish(&env);
+        AuctionCancelledEvent {
+            auction_id,
+            cancelled_by: creator.clone(),
+            reason: Symbol::new(&env, "owner"),
+        }.publish(&env);
         // Return NFT to creator
         escrow::release_nft(&env, &auction.collection, auction.token_id,
             &creator, env.ledger().sequence(), auction_id);
+    }
+
+    // ── admin_cancel_auction ─────────────────────────────────
+    // Admin emergency cancellation — works even if bids exist.
+    // Refunds the highest bidder before cancelling. (Issue #271)
+    pub fn admin_cancel_auction(env: Env, admin: Address, auction_id: u64) {
+        admin.require_auth();
+        if admin != Self::get_admin(env.clone()).expect("admin not set") {
+            panic_with_error!(&env, MarketplaceError::Unauthorized);
+        }
+        if !acquire_auction_lock(&env, auction_id) {
+            panic_with_error!(&env, MarketplaceError::ReentrancyGuard);
+        }
+        let mut auction = match load_auction(&env, auction_id) {
+            Some(a) => a,
+            None => {
+                release_auction_lock(&env, auction_id);
+                panic_with_error!(&env, MarketplaceError::AuctionNotFound);
+            }
+        };
+        if auction.status != AuctionStatus::Active {
+            release_auction_lock(&env, auction_id);
+            panic_with_error!(&env, MarketplaceError::InvalidAuctionState);
+        }
+        // Refund the highest bidder (if any) before marking cancelled.
+        let refunded_amount = auction.highest_bid;
+        if let Some(ref bidder) = auction.highest_bidder.clone() {
+            let tc = TokenClient::new(&env, &auction.token);
+            tc.transfer(&env.current_contract_address(), bidder, &refunded_amount);
+            AuctionBidRefundedEvent {
+                auction_id,
+                bidder: bidder.clone(),
+                amount: refunded_amount,
+                token: auction.token.clone(),
+                reason: Symbol::new(&env, "admin_cancel"),
+                ledger_sequence: env.ledger().sequence(),
+            }.publish(&env);
+        }
+        auction.status = AuctionStatus::Cancelled;
+        save_auction(&env, &auction);
+        AuctionCancelledEvent {
+            auction_id,
+            cancelled_by: admin.clone(),
+            reason: Symbol::new(&env, "admin"),
+        }.publish(&env);
+        AuctionAdminCancelledEvent {
+            auction_id,
+            cancelled_by: admin,
+            refunded_amount,
+            token: auction.token.clone(),
+            ledger_sequence: env.ledger().sequence(),
+        }.publish(&env);
+        // Return NFT to creator
+        escrow::release_nft(&env, &auction.collection, auction.token_id,
+            &auction.creator, env.ledger().sequence(), auction_id);
+        release_auction_lock(&env, auction_id);
     }
 
     // ── Offers ───────────────────────────────────────────────
@@ -1337,6 +1481,14 @@ impl MarketplaceContract {
                 }.publish(&env);
             }
         }
+        // Emit royalty settlement snapshot for auditability (Issue #270)
+        RoyaltySettlementEvent {
+            id: listing_id,
+            recipients: listing.recipients.clone(),
+            total_amount: offer.amount,
+            token: offer.token.clone(),
+            ledger_sequence: env.ledger().sequence(),
+        }.publish(&env);
         // NFT: escrow → accepted offerer (CEI: status Sold already)
         escrow::release_nft(&env, &listing.collection, listing.token_id,
             &accepted_offerer, env.ledger().sequence(), listing_id);
@@ -1686,13 +1838,25 @@ impl MarketplaceContract {
     ///
     /// # Invariants checked
     /// * `recipients` must be non-empty (caller responsibility to guard with `InvalidSplit`).
+    /// * Each recipient's `percentage` must be > 0 (ZeroRecipientBps).
+    /// * No duplicate addresses in the recipient list (DuplicateRecipient).
     /// * `sum(r.percentage) + protocol_fee_bps <= 10_000`
     fn validate_recipients(env: &Env, recipients: &Vec<Recipient>, protocol_fee_bps: u32) {
         let len = recipients.len();
         let mut total_bps: u32 = 0;
         for i in 0..len {
-            let bps = recipients.get(i).unwrap().percentage;
-            total_bps = total_bps.checked_add(bps)
+            let r = recipients.get(i).unwrap();
+            // Each recipient must contribute a non-zero share.
+            if r.percentage == 0 {
+                panic_with_error!(env, MarketplaceError::ZeroRecipientBps);
+            }
+            // Duplicate address check: compare against every prior entry.
+            for j in 0..i {
+                if recipients.get(j).unwrap().address == r.address {
+                    panic_with_error!(env, MarketplaceError::DuplicateRecipient);
+                }
+            }
+            total_bps = total_bps.checked_add(r.percentage)
                 .unwrap_or_else(|| panic_with_error!(env, MarketplaceError::RoyaltyExceedsLimit));
         }
         let combined = total_bps.checked_add(protocol_fee_bps)

@@ -120,6 +120,9 @@ pub enum DataKey {
     RevokedVoucher(u64),
     MerkleRoot,      // BytesN<32>
     IsPublicPhase,   // bool
+    /// Network passphrase bound at initialization for cross-network domain
+    /// separation (#273).
+    NetworkPassphrase, // String
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -346,9 +349,10 @@ impl LazyMint1155 {
             TTL_THRESHOLD,
             TTL_BUMP,
         );
+        // Emit detailed redemption event for indexer auditability (#273).
         env.events().publish(
-            (symbol_short!("mint"), creator.clone(), buyer.clone()),
-            (voucher.token_id, amount),
+            (symbol_short!("redeemed"), creator.clone(), buyer.clone()),
+            (voucher.token_id, voucher.nonce, amount),
         );
     }
 }
@@ -358,6 +362,7 @@ impl LazyMint1155 {
     // ── Initializer ───────────────────────────────────────────────────────
 
     /// Issue #38: accepts per-collection platform fee receiver and rate.
+    /// Issue #273: accepts `network_passphrase` for cross-network domain separation.
     pub fn initialize(
         env: Env,
         creator: Address,
@@ -367,6 +372,7 @@ impl LazyMint1155 {
         royalty_receiver: Address,
         platform_fee_receiver: Address,
         platform_fee_bps: u32,
+        network_passphrase: String,
     ) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Initialized) {
             return Err(Error::AlreadyInitialized);
@@ -390,6 +396,10 @@ impl LazyMint1155 {
         env.storage()
             .instance()
             .set(&DataKey::PlatformFeeBps, &platform_fee_bps);
+        // Store the network passphrase for cross-network domain separation (#273).
+        env.storage()
+            .instance()
+            .set(&DataKey::NetworkPassphrase, &network_passphrase);
         env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_BUMP);
         Ok(())
     }
@@ -939,12 +949,22 @@ impl LazyMint1155 {
     }
 
     /// Signed digest:
-    /// sha256(contract_addr ‖ token_id ‖ nonce ‖ buyer_quota ‖ price_per_unit ‖ valid_until ‖ uri_hash ‖ currency_xdr)
+    /// sha256(network_passphrase ‖ contract_addr ‖ token_id ‖ nonce ‖ buyer_quota ‖ price_per_unit ‖ valid_until ‖ uri_hash ‖ currency_xdr)
+    ///
+    /// The network passphrase is stored at initialization and included first so
+    /// a voucher signed on testnet cannot be replayed on mainnet (#273).
     ///
     /// ⚠ Byte layout is STABLE — do not reorder fields.
     #[allow(non_snake_case)]
     pub fn _voucher_digest(env: &Env, v: &MintVoucher1155) -> Bytes {
         let mut raw = Bytes::new(env);
+        // Network passphrase — domain separator for cross-network protection.
+        let passphrase: soroban_sdk::String = env
+            .storage()
+            .instance()
+            .get(&DataKey::NetworkPassphrase)
+            .unwrap_or_else(|| soroban_sdk::String::from_str(env, ""));
+        raw.append(&passphrase.to_xdr(env));
         raw.append(&env.current_contract_address().to_xdr(env));
         raw.extend_from_array(&v.token_id.to_be_bytes());
         raw.extend_from_array(&v.nonce.to_be_bytes());

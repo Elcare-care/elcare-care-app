@@ -122,6 +122,26 @@ pub fn get_wasm_for_kind(env: &Env, kind: &CollectionKind) -> Option<BytesN<32>>
         })
 }
 
+/// True if `secure_salt` has already been consumed by a successful deployment (#277).
+pub fn is_salt_used(env: &Env, secure_salt: &BytesN<32>) -> bool {
+    env.storage()
+        .persistent()
+        .get(&DataKey::SaltUsed(secure_salt.clone()))
+        .unwrap_or(false)
+}
+
+/// Marks `secure_salt` as consumed so it cannot be reused for another deployment (#277).
+pub fn mark_salt_used(env: &Env, secure_salt: &BytesN<32>) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::SaltUsed(secure_salt.clone()), &true);
+    env.storage().persistent().extend_ttl(
+        &DataKey::SaltUsed(secure_salt.clone()),
+        TTL_THRESHOLD,
+        TTL_BUMP,
+    );
+}
+
 pub fn wasm_version(env: &Env) -> u32 {
     env.storage()
         .instance()
