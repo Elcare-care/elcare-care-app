@@ -100,6 +100,10 @@ pub enum DataKey {
     /// Each new auction snapshots this value into `Auction::bid_history_cap`
     /// so changes here never affect in-progress auctions.
     BidHistoryCap,
+    /// Global cap on the number of times any single auction's end time may be
+    /// extended by anti-sniping logic.  0 = unlimited (legacy behaviour).
+    /// Each new auction snapshots this value into `Auction::max_extensions`.
+    AuctionMaxExtensions,
     /// One fixed-capacity page (`Vec<u64>`, at most `INDEX_PAGE_SIZE` entries)
     /// of the identified index.
     IndexPage(IndexId, u32),
@@ -1052,4 +1056,29 @@ pub fn get_escrow_record(env: &Env, collection: &Address, token_id: u64) -> Opti
 pub fn clear_escrow_record(env: &Env, collection: &Address, token_id: u64) {
     let key = EscrowKey::EscrowedToken(collection.clone(), token_id);
     env.storage().persistent().remove(&key);
+}
+
+// ── Auction max-extensions cap ───────────────────────────────
+
+/// Default: 0 = unlimited extensions (legacy behaviour preserved).
+pub const DEFAULT_AUCTION_MAX_EXTENSIONS: u32 = 0;
+
+/// Persist the global auction max-extensions cap.
+pub fn set_auction_max_extensions_storage(env: &Env, max: u32) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::AuctionMaxExtensions, &max);
+    bump_entry_ttl(env, &DataKey::AuctionMaxExtensions);
+}
+
+/// Read the global auction max-extensions cap.
+pub fn get_auction_max_extensions_storage(env: &Env) -> u32 {
+    let value = env
+        .storage()
+        .persistent()
+        .get::<DataKey, u32>(&DataKey::AuctionMaxExtensions);
+    if value.is_some() {
+        bump_entry_ttl(env, &DataKey::AuctionMaxExtensions);
+    }
+    value.unwrap_or(DEFAULT_AUCTION_MAX_EXTENSIONS)
 }
