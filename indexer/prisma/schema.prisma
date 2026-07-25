@@ -75,6 +75,19 @@ model Listing {
   updatedAtLedger Int
   createdAt       DateTime      @default(now())
   updatedAt       DateTime      @updatedAt
+
+  // ── Full-text search fields (populated from IPFS metadata after indexing) ──
+  // Populated asynchronously after a LISTING_CREATED event is processed.
+  // Null until IPFS metadata has been fetched and stored.
+  title           String?
+  description     String?
+  artistName      String?
+  // tsvector updated by the listing_search_vector_trigger in PostgreSQL.
+  // Prisma cannot manage this column natively; it is marked Unsupported so
+  // Prisma skips it in generated client writes — all updates go through the
+  // trigger or raw SQL.
+  searchVector    Unsupported("tsvector")?
+
   @@index([artist])
   @@index([status])
   @@index([updatedAtLedger])
@@ -82,6 +95,8 @@ model Listing {
   @@index([artist, updatedAtLedger])
   @@index([collection])
   @@index([collection, status])
+  // GIN index created via raw SQL in the migration (Prisma cannot express it).
+  // CREATE INDEX "Listing_searchVector_idx" ON "Listing" USING gin("searchVector");
 }
 
 model Auction {
@@ -160,7 +175,43 @@ model Collection {
   symbol          String?
   deployedAtLedger Int
   createdAt       DateTime @default(now())
+  // GIN-indexed tsvector updated by collection_search_vector_trigger.
+  searchVector    Unsupported("tsvector")?
   @@index([creator])
+  // CREATE INDEX "Collection_searchVector_idx" ON "Collection" USING gin("searchVector");
+}
+
+// ── IPFS content cache ────────────────────────────────────────────────────────
+//
+// Stores fetched IPFS artwork metadata keyed by CID.
+// Populated by the background IpfsQueue worker (ipfs-cache.ts).
+
+model IpfsMetadata {
+  cid         String   @id
+  title       String?
+  description String?
+  imageUrl    String?
+  attributes  Json?
+  fetchedAt   DateTime @default(now())
+  raw         Json
+}
+
+// ── Background IPFS fetch queue ───────────────────────────────────────────────
+//
+// Each row represents one pending / in-flight / completed metadata fetch.
+// status: "pending" | "processing" | "done" | "failed"
+
+model IpfsQueue {
+  id          Int       @id @default(autoincrement())
+  cid         String
+  attempts    Int       @default(0)
+  nextRetryAt DateTime?
+  status      String    @default("pending")
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([status, nextRetryAt])
+  @@index([cid])
 }
 
 // ── Backfill subsystem ───────────────────────────────────────────────────────

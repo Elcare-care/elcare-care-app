@@ -1,5 +1,8 @@
 use soroban_sdk::{contracterror, contracttype, Address, BytesN, String};
 
+/// Semantic contract version — bump on every breaking storage change.
+pub const CONTRACT_VERSION: &str = "1.0.0";
+
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -13,6 +16,11 @@ pub enum Error {
     InvalidDeployFee = 7,
     NoPendingAdmin = 8,
     NotPendingAdmin = 9,
+    /// migrate() called for a version already recorded in persistent storage.
+    AlreadyMigrated = 10,
+    /// migrate() called with an unsupported version jump (source → target not
+    /// sequential). Only sequential upgrades (n → n+1) are supported.
+    UnsupportedMigration = 11,
 }
 
 /// Which of the four collection types was deployed.
@@ -76,4 +84,11 @@ pub enum DataKey {
     CreatorCollectionByIndex(Address, u64),
     /// Direct lookup by collection address (#37)
     CollectionByAddress(Address),
+    /// Versioned migration done marker: DataKey::MigrationDone(version_string)
+    MigrationDone(soroban_sdk::String),
+    /// Resumable migration progress cursor: DataKey::MigrationCursor(version_string)
+    MigrationCursor(soroban_sdk::String),
+    /// On-chain target version written at the start of a migration and read by
+    /// `contract_version()` to confirm the upgrade applied correctly.
+    ContractVersion,
 }

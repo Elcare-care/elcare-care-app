@@ -59,6 +59,30 @@ export const stalledGauge = new client.Gauge({
   help: '1 when the indexer has not advanced within the stall threshold, 0 otherwise',
 });
 
+/**
+ * Stall event counter, labelled by level: "warning" | "critical" | "fatal".
+ *
+ * Each counter value reflects the total number of times the stall detector has
+ * fired at that severity since the process started.  A dashboard alert on the
+ * rate of "fatal" or a sustained rise in "warning" signals degraded sync health.
+ */
+export const pollerStallTotal = new client.Counter({
+  name: 'elcarehub_poller_stall_total',
+  help: 'Total number of stall events detected, labelled by severity level',
+  labelNames: ['level'],
+});
+
+/**
+ * Automatic poller restart counter.
+ *
+ * Incremented each time the stall detector triggers a stopPoller()/startPoller()
+ * cycle.  When this counter reaches 3 the process exits with a non-zero code.
+ */
+export const pollerRestartTotal = new client.Counter({
+  name: 'elcarehub_poller_restart_total',
+  help: 'Total number of automatic poller restarts attempted by the stall watchdog',
+});
+
 // ── Business KPI Metrics ──────────────────────────────────────────────────────
 
 /** Total listings created (labelled by NFT collection kind). */

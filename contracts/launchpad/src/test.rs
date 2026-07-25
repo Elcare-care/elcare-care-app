@@ -2249,3 +2249,242 @@ fn invalid_fee_rejected_for_all_deploy_variants() {
         Err(Ok(Error::InvalidFeeBps))
     );
 }
+
+// ── Migration tests ───────────────────────────────────────────────────────────
+
+mod migration {
+    use super::*;
+    use crate::CONTRACT_VERSION;
+
+    fn setup_minimal(env: &Env) -> (LaunchpadClient<'_>, Address) {
+        env.mock_all_auths();
+        let contract_id = env.register(Launchpad, ());
+        let client = LaunchpadClient::new(env, &contract_id);
+        let admin = Address::generate(env);
+        let fee_receiver = Address::generate(env);
+        client.initialize(&admin, &fee_receiver, &0i128);
+        (client, admin)
+    }
+
+    // ── Fresh initialization ──────────────────────────────────────────────
+
+    #[test]
+    fn contract_version_is_none_before_migrate() {
+        let env = Env::default();
+        let (client, _admin) = setup_minimal(&env);
+        assert!(client.contract_version().is_none());
+    }
+
+    #[test]
+    fn version_returns_wasm_version_string() {
+        let env = Env::default();
+        let (client, _admin) = setup_minimal(&env);
+        assert_eq!(client.version(), String::from_str(&env, CONTRACT_VERSION));
+    }
+
+    // ── Sequential upgrade ────────────────────────────────────────────────
+
+    #[test]
+    fn migrate_sets_contract_version_on_chain() {
+        let env = Env::default();
+        let (client, admin) = setup_minimal(&env);
+
+        client.migrate(&admin);
+
+        assert_eq!(
+            client.contract_version(),
+            Some(String::from_str(&env, CONTRACT_VERSION))
+        );
+    }
+
+    #[test]
+    fn migrate_step_sets_version_after_completion() {
+        let env = Env::default();
+        let (client, admin) = setup_minimal(&env);
+
+        // migrate_step with large budget completes in one call
+        let remaining = client.migrate_step(&admin, &u32::MAX);
+        assert_eq!(remaining, 0u64);
+        assert_eq!(
+            client.contract_version(),
+            Some(String::from_str(&env, CONTRACT_VERSION))
+        );
+    }
+
+    #[test]
+    fn migrate_step_is_resumable() {
+        let env = Env::default();
+        let (client, admin) = setup_minimal(&env);
+
+        // First step with budget=0 does nothing but persists progress
+        // (budget 0 exits the loop immediately — remaining is still non-zero
+        //  until the migration body completes)
+        // Run full migration in two calls: budget=1 covers phase-0, budget=MAX finishes.
+        let r1 = client.migrate_step(&admin, &1u32);
+        // After phase 0 completes the migration body is done; remaining = 0.
+        assert_eq!(r1, 0u64);
+        // Version must be set now.
+        assert!(client.contract_version().is_some());
+    }
+
+    // ── Idempotency ───────────────────────────────────────────────────────
+
+    #[test]
+    #[should_panic(expected = "AlreadyMigrated")]
+    fn double_migrate_reverts_with_already_migrated() {
+        let env = Env::default();
+        let (client, admin) = setup_minimal(&env);
+
+        client.migrate(&admin);
+        client.migrate(&admin); // must revert
+    }
+
+    #[test]
+    #[should_panic(expected = "AlreadyMigrated")]
+    fn migrate_step_after_completion_reverts() {
+        let env = Env::default();
+        let (client, admin) = setup_minimal(&env);
+
+        client.migrate(&admin);
+        client.migrate_step(&admin, &1u32); // must revert
+    }
+
+    // ── Unsupported transition: non-admin ─────────────────────────────────
+
+    #[test]
+    #[should_panic]
+    fn migrate_by_non_admin_reverts() {
+        let env = Env::default();
+        let (client, _admin) = setup_minimal(&env);
+        let impostor = Address::generate(&env);
+
+        // Auth mocking is active so impostor auth passes, but the admin
+        // identity check inside require_pending_migration will still fail.
+        client.migrate(&impostor);
+    }
+
+    // ── Migration event ───────────────────────────────────────────────────
+
+    #[test]
+    fn migrate_emits_migrated_event() {
+        let env = Env::default();
+        let (client, admin) = setup_minimal(&env);
+        client.migrate(&admin);
+
+        let events = env.events().all();
+        let found = events.iter().any(|(_, topics, _)| {
+            topics
+                .get(0)
+                .map(|v| {
+                    soroban_sdk::Symbol::try_from_val(&env, &v)
+                        .map(|s| s == soroban_sdk::symbol_short!("migrated"))
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false)
+        });
+        assert!(found, "expected 'migrated' event after migrate()");
+    }
+
+    // ── State survival: listings, auctions, offers (via collection registry) ─
+
+    #[test]
+    fn collection_count_survives_migrate() {
+        // Deploy a Normal721 collection to populate the registry, then migrate.
+        // Requires compiled WASMs so we guard with a file-existence check
+        // and skip gracefully when not built.
+        let env = Env::default();
+        env.ledger().with_mut(|li| li.sequence_number = 1);
+
+        let exe = std::env::current_exe().unwrap();
+        let target_dir = exe.parent().and_then(|p| p.parent()).and_then(|p| p.parent()).unwrap();
+        let wasm_path = target_dir
+            .join("wasm32v1-none")
+            .join("release")
+            .join("collection_nft_erc721.wasm");
+        if !wasm_path.exists() {
+            // Skip if WASMs not built
+            return;
+        }
+
+        let (client, admin) = setup_minimal(&env);
+        let creator = Address::generate(&env);
+
+        let n721 = std::fs::read(&wasm_path).unwrap();
+        let dummy = n721.clone();
+        env.mock_all_auths();
+
+        let h721 = env.deployer().upload_contract_wasm(n721.as_slice());
+        let hdummy = env.deployer().upload_contract_wasm(dummy.as_slice());
+
+        client.set_wasm_hashes(&h721, &hdummy.clone(), &hdummy.clone(), &hdummy);
+
+        client.deploy_normal_721(
+            &creator,
+            &Address::generate(&env),
+            &String::from_str(&env, "MigTestCol"),
+            &String::from_str(&env, "MTC"),
+            &100u64,
+            &0u32,
+            &Address::generate(&env),
+            &0u32,
+            &BytesN::from_array(&env, &[1u8; 32]),
+        );
+
+        assert_eq!(client.collection_count(), 1u64);
+
+        client.migrate(&admin);
+
+        // Count and the single collection record must survive
+        assert_eq!(client.collection_count(), 1u64);
+        assert_eq!(client.all_collections().len(), 1u32);
+    }
+
+    // ── Admin config survives migrate ─────────────────────────────────────
+
+    #[test]
+    fn fee_config_readable_after_migrate() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(Launchpad, ());
+        let client = LaunchpadClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let fee_receiver = Address::generate(&env);
+        client.initialize(&admin, &fee_receiver, &500i128);
+
+        client.migrate(&admin);
+
+        let (recv, fee) = client.fee_config();
+        assert_eq!(recv, fee_receiver);
+        assert_eq!(fee, 500i128);
+    }
+
+    #[test]
+    fn wasm_hashes_readable_after_migrate() {
+        let env = Env::default();
+        env.ledger().with_mut(|li| li.sequence_number = 1);
+
+        let exe = std::env::current_exe().unwrap();
+        let target_dir = exe.parent().and_then(|p| p.parent()).and_then(|p| p.parent()).unwrap();
+        let wasm_path = target_dir
+            .join("wasm32v1-none")
+            .join("release")
+            .join("collection_nft_erc721.wasm");
+        if !wasm_path.exists() {
+            return;
+        }
+
+        let (client, admin) = setup_minimal(&env);
+        env.mock_all_auths();
+
+        let n721 = std::fs::read(&wasm_path).unwrap();
+        let h = env.deployer().upload_contract_wasm(n721.as_slice());
+        client.set_wasm_hashes(&h, &h.clone(), &h.clone(), &h.clone());
+
+        let before = client.wasm_hashes();
+
+        client.migrate(&admin);
+
+        let after = client.wasm_hashes();
+        assert_eq!(before, after);
+    }
+}

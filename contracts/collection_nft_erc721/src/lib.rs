@@ -40,11 +40,15 @@ pub enum Error {
     MaxSupplyReached = 6,
     NotCreator = 7,
     InsufficientBalance = 8,
-    MetadataFrozen = 9,    // base_uri cannot be updated after freeze
-    AlreadyFrozen = 10,    // freeze_metadata called more than once
-    InvalidBps = 11,       // basis points exceed MAX_BPS (10_000)
-    CollectionPaused = 12, // minting is paused
-    ApprovalExpired = 13,  // approval expiry has already passed at set time
+    MetadataFrozen = 9,
+    AlreadyFrozen = 10,
+    InvalidBps = 11,
+    CollectionPaused = 12,
+    ApprovalExpired = 13,
+    /// migrate() called for a version already marked done in persistent storage.
+    AlreadyMigrated = 14,
+    /// Unsupported version jump — only sequential upgrades are permitted.
+    UnsupportedMigration = 15,
 }
 
 // ─── Storage Keys ─────────────────────────────────────────────────────────────
@@ -80,6 +84,13 @@ pub enum DataKey {
     TokenRoyaltyReceiver(u64), // Address
     TokenRoyaltyBps(u64),      // u32
     Paused,                    // bool   — minting paused when true
+    // ── Versioned migration registry ─────────────────────────────────────
+    /// Completion marker: present when migration to `version` is done.
+    MigrationDone(String),
+    /// Resumable progress cursor during an in-flight migration.
+    MigrationCursor(String),
+    /// Version string last written to on-chain storage by `migrate()`.
+    ContractVersion,
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -852,6 +863,69 @@ impl NormalNFT721 {
     /// Returns the stored base URI, or `None` if unset.
     pub fn base_uri(env: Env) -> Option<String> {
         env.storage().instance().get(&DataKey::BaseUri)
+    }
+
+    // ── Versioning & Migration ─────────────────────────────────────────────
+
+    /// Semantic version compiled into this WASM.
+    pub fn version(_env: Env) -> &'static str {
+        "1.0.0"
+    }
+
+    /// On-chain version string last written by `migrate()`, or `None` before
+    /// the first migration.
+    pub fn contract_version(env: Env) -> Option<String> {
+        env.storage().instance().get(&DataKey::ContractVersion)
+    }
+
+    /// Creator-guarded, idempotent storage migration entry point.
+    ///
+    /// Reverts with `AlreadyMigrated` when the "1.0.0" marker is already set.
+    ///
+    /// **v1.0.0 migration**: this is the initial version; the migration body
+    /// is intentionally empty — calling it simply records the completion marker
+    /// and the on-chain version string so operators can verify the upgrade
+    /// script applied correctly.  Future versions will add data-backfill steps
+    /// here following the same idempotent-by-marker pattern.
+    pub fn migrate(env: Env) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
+        Self::only_creator(&env)?;
+
+        let target = String::from_str(&env, "1.0.0");
+        let done_key = DataKey::MigrationDone(target.clone());
+
+        if env
+            .storage()
+            .persistent()
+            .get::<DataKey, bool>(&done_key)
+            .unwrap_or(false)
+        {
+            return Err(Error::AlreadyMigrated);
+        }
+
+        // ── v1.0.0 migration body ─────────────────────────────────────────
+        // Nothing to migrate for the initial version.  Future versions insert
+        // data-backfill logic here before recording the marker.
+        // ─────────────────────────────────────────────────────────────────
+
+        // Record completion marker (persistent so it survives instance bumps).
+        env.storage().persistent().set(&done_key, &true);
+        env.storage().persistent().extend_ttl(
+            &done_key,
+            TTL_THRESHOLD,
+            TTL_BUMP,
+        );
+
+        // Write the version to instance storage for operator verification.
+        env.storage()
+            .instance()
+            .set(&DataKey::ContractVersion, &target);
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("migrated"), target),
+            (),
+        );
+        Ok(())
     }
 
     // ── Private helpers ───────────────────────────────────────────────────

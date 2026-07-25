@@ -95,6 +95,33 @@ export const artistMetricsQuerySchema = z.object({
   range: z.enum(['day', 'week', 'month']).optional(),
 });
 
+// ── /search cross-entity query schema ────────────────────────────────────────
+
+export const searchQuerySchema = z.object({
+  /** The search term. Required. Minimum 1 character. */
+  q: z.string().min(1, 'q must be at least 1 character'),
+  /**
+   * Which entity types to include.
+   * Accepts a comma-separated string or a repeated query param.
+   * Defaults to all: listings, auctions, collections.
+   */
+  types: z
+    .union([
+      z.string().transform((s) => s.split(',').map((t) => t.trim())),
+      z.array(z.string()),
+    ])
+    .optional()
+    .default('listings,auctions,collections')
+    .transform((v) =>
+      (typeof v === 'string' ? v.split(',').map((t) => t.trim()) : v).filter(Boolean)
+    )
+    .pipe(
+      z.array(z.enum(['listings', 'auctions', 'collections'])).min(1)
+    ),
+  /** Max results per entity type (1–50). */
+  limit: positiveInt(50).optional().default(10),
+});
+
 // ── validateQuery middleware factory ─────────────────────────────────────────
 
 /**
