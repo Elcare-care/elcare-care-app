@@ -11,6 +11,7 @@ import { rpc } from '@stellar/stellar-sdk';
 import prisma from './db.js';
 import redis from './redis.js';
 import { logger } from './logger.js';
+import { getCheckpointHealthSummary } from './checkpoint.js';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -152,6 +153,47 @@ export async function checkSyncLag(): Promise<HealthCheckResult & { lagLedgers: 
   }
 }
 
+/**
+ * Check the state of durable ledger checkpoints (Issue #285).
+ * Returns "degraded" when there are failed checkpoints and
+ * "ok" when all are committed or there are no checkpoints yet.
+ */
+export async function checkCheckpoints(): Promise<HealthCheckResult & {
+  incomplete: number;
+  failed: number;
+  oldestIncompleteWindowStart: number | null;
+}> {
+  const start = Date.now();
+  try {
+    const summary = await getCheckpointHealthSummary();
+    const status: CheckStatus =
+      summary.failed > 0 ? 'degraded' :
+      summary.incomplete > 0 ? 'ok' : 'ok';
+    return {
+      status,
+      latencyMs: Date.now() - start,
+      incomplete: summary.incomplete,
+      failed: summary.failed,
+      oldestIncompleteWindowStart: summary.oldestIncompleteWindowStart,
+      message:
+        summary.failed > 0
+          ? `${summary.failed} failed checkpoint(s) require operator attention`
+          : summary.incomplete > 0
+          ? `${summary.incomplete} checkpoint(s) pending replay`
+          : undefined,
+    };
+  } catch (err) {
+    return {
+      status: 'degraded',
+      latencyMs: Date.now() - start,
+      incomplete: -1,
+      failed: -1,
+      oldestIncompleteWindowStart: null,
+      message: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
 // ── Aggregate health ──────────────────────────────────────────────────────────
 
 /**
@@ -162,11 +204,12 @@ export async function checkSyncLag(): Promise<HealthCheckResult & { lagLedgers: 
  *   "down"     — at least one check down
  */
 export async function runAllChecks(): Promise<AggregateHealth> {
-  const [db, redisCheck, stellarRpc, syncLag] = await Promise.all([
+  const [db, redisCheck, stellarRpc, syncLag, checkpoints] = await Promise.all([
     checkDatabase(),
     checkRedis(),
     checkStellarRpc(),
     checkSyncLag(),
+    checkCheckpoints(),
   ]);
 
   const checks: Record<string, HealthCheckResult> = {
@@ -174,6 +217,7 @@ export async function runAllChecks(): Promise<AggregateHealth> {
     redis: redisCheck,
     stellar_rpc: stellarRpc,
     sync_lag: syncLag,
+    checkpoints,
   };
 
   const statuses = Object.values(checks).map((c) => c.status);
