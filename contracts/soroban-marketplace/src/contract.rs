@@ -8,7 +8,7 @@ use crate::events::*;
 use crate::{
     escrow,
     storage::{
-        acquire_auction_lock, acquire_listing_lock, active_listings_len, add_artist_auction_id,
+        active_listings_len, add_artist_auction_id,
         add_artist_listing_id, add_listing_offer_id, add_offerer_offer_id, add_pending_offer,
         add_to_active_listings, append_bid_record, clear_artist_cancel_cursor,
         clear_migration_progress, clear_pending_admin_storage, clear_pending_offers,
@@ -18,8 +18,8 @@ use crate::{
         get_listing_count, get_max_price_storage, get_min_price_storage, get_pending_admin_storage,
         increment_auction_count, increment_listing_count, increment_offer_count,
         is_artist_revoked_storage, is_migration_done, load_auction, load_auction_bids,
-        load_listing, load_listing_offers, load_offer, load_offerer_offers, release_auction_lock,
-        release_listing_lock, remove_artist_revocation_storage, remove_from_active_listings,
+        load_listing, load_listing_offers, load_offer, load_offerer_offers,
+        remove_artist_revocation_storage, remove_from_active_listings,
         save_auction, save_listing, save_listing_offers, save_offer, save_offerer_offers,
         set_artist_revocation_storage, set_auction_extension_trigger_storage,
         set_auction_extension_window_storage, set_max_price_storage, set_migration_done,
@@ -36,6 +36,67 @@ const CONTRACT_VERSION: &str = "1.1.0";
 const DEFAULT_MIN_BID_INCREMENT: i128 = 1;
 const DEFAULT_EXTENSION_WINDOW: u64 = 600;
 const DEFAULT_EXTENSION_TRIGGER: u64 = 0;
+
+// ── Reentrancy RAII scopes (Issue #204) ───────────────────────────────────────
+//
+// These structs acquire the appropriate temporary-storage lock on construction
+// and release it via Drop.  Using RAII ensures the guard is always cleared when
+// the enclosing scope exits — whether via a normal return or a panic — providing
+// defence-in-depth on top of Soroban's atomic rollback guarantee.
+//
+// Usage:
+//   let _guard = ListingReentrancyScope::new(&env, listing_id)?;
+//   // ... function body — guard is released automatically at end of scope ...
+//
+// Both structs hold the `Env` by value (cloned once) because Soroban `Env` is
+// cheaply reference-counted and `Drop` must own everything it needs.
+
+/// RAII guard for per-listing reentrancy protection.
+/// Acquired by `buy_artwork` and `accept_offer`.
+struct ListingReentrancyScope {
+    env: Env,
+    listing_id: u64,
+}
+
+impl ListingReentrancyScope {
+    /// Attempt to acquire the listing lock.
+    /// Returns `Ok(scope)` on success, or panics with `ReentrancyGuard` if the
+    /// lock is already held.
+    fn new(env: &Env, listing_id: u64) -> Self {
+        if !crate::storage::acquire_listing_lock(env, listing_id) {
+            panic_with_error!(env, MarketplaceError::ReentrancyGuard);
+        }
+        Self { env: env.clone(), listing_id }
+    }
+}
+
+impl Drop for ListingReentrancyScope {
+    fn drop(&mut self) {
+        crate::storage::release_listing_lock(&self.env, self.listing_id);
+    }
+}
+
+/// RAII guard for per-auction reentrancy protection.
+/// Acquired by `finalize_auction`.
+struct AuctionReentrancyScope {
+    env: Env,
+    auction_id: u64,
+}
+
+impl AuctionReentrancyScope {
+    fn new(env: &Env, auction_id: u64) -> Self {
+        if !crate::storage::acquire_auction_lock(env, auction_id) {
+            panic_with_error!(env, MarketplaceError::ReentrancyGuard);
+        }
+        Self { env: env.clone(), auction_id }
+    }
+}
+
+impl Drop for AuctionReentrancyScope {
+    fn drop(&mut self) {
+        crate::storage::release_auction_lock(&self.env, self.auction_id);
+    }
+}
 
 /// Lifetime of a pending admin-rotation proposal, in seconds (7 days).
 ///
@@ -781,46 +842,37 @@ impl MarketplaceContract {
     // CEI:
     //   1. lock   2. checks   3. effects (mark Sold, reject offers)
     //   4. emit   5. interactions (payment payout, release_nft, refund offers)
-    //   6. unlock
+    //   6. unlock (automatic via ListingReentrancyScope::drop)
     pub fn buy_artwork(env: Env, buyer: Address, listing_id: u64) -> bool {
         Self::require_not_paused(&env);
         buyer.require_auth();
-        if !acquire_listing_lock(&env, listing_id) {
-            panic_with_error!(&env, MarketplaceError::ReentrancyGuard);
-        }
-        let mut listing = match load_listing(&env, listing_id) {
-            Some(l) => l,
-            None => { release_listing_lock(&env, listing_id);
-                      panic_with_error!(&env, MarketplaceError::ListingNotFound); }
-        };
+        // RAII guard — cleared by Drop whether the function returns normally or panics.
+        let _guard = ListingReentrancyScope::new(&env, listing_id);
+        let mut listing = load_listing(&env, listing_id)
+            .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::ListingNotFound));
         if listing.status == ListingStatus::Sold {
-            release_listing_lock(&env, listing_id);
             panic_with_error!(&env, MarketplaceError::ListingSold);
         }
         if listing.status == ListingStatus::Cancelled {
-            release_listing_lock(&env, listing_id);
             panic_with_error!(&env, MarketplaceError::ListingCancelled);
         }
         if listing.status != ListingStatus::Active {
-            release_listing_lock(&env, listing_id);
             panic_with_error!(&env, MarketplaceError::ListingNotActive);
         }
         if listing.artist == buyer {
-            release_listing_lock(&env, listing_id);
             panic_with_error!(&env, MarketplaceError::SelfPurchaseNotAllowed);
         }
         if let Some(ref o) = listing.owner {
-            if *o == buyer { release_listing_lock(&env, listing_id);
-                             panic_with_error!(&env, MarketplaceError::SelfPurchaseNotAllowed); }
+            if *o == buyer {
+                panic_with_error!(&env, MarketplaceError::SelfPurchaseNotAllowed);
+            }
         }
         if let Some(exp) = listing.expires_at {
             if env.ledger().timestamp() >= exp {
-                release_listing_lock(&env, listing_id);
                 panic_with_error!(&env, MarketplaceError::ListingExpired);
             }
         }
         if !Self::is_token_whitelisted(&env, &listing.token) {
-            release_listing_lock(&env, listing_id);
             panic_with_error!(&env, MarketplaceError::TokenNotWhitelisted);
         }
         // Effects
@@ -876,7 +928,7 @@ impl MarketplaceContract {
                 &p_amounts.get(i).unwrap(),
             );
         }
-        release_listing_lock(&env, listing_id);
+        // _guard dropped here — releases listing lock automatically.
         true
     }
 
@@ -1048,20 +1100,14 @@ impl MarketplaceContract {
     pub fn finalize_auction(env: Env, caller: Address, auction_id: u64) {
         Self::require_not_paused(&env);
         caller.require_auth();
-        if !acquire_auction_lock(&env, auction_id) {
-            panic_with_error!(&env, MarketplaceError::ReentrancyGuard);
-        }
-        let mut auction = match load_auction(&env, auction_id) {
-            Some(a) => a,
-            None => { release_auction_lock(&env, auction_id);
-                      panic_with_error!(&env, MarketplaceError::AuctionNotFound); }
-        };
+        // RAII guard — cleared by Drop whether the function returns normally or panics.
+        let _guard = AuctionReentrancyScope::new(&env, auction_id);
+        let mut auction = load_auction(&env, auction_id)
+            .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::AuctionNotFound));
         if auction.status != AuctionStatus::Active {
-            release_auction_lock(&env, auction_id);
             panic_with_error!(&env, MarketplaceError::AuctionAlreadyFinalized);
         }
         if env.ledger().timestamp() < auction.end_time {
-            release_auction_lock(&env, auction_id);
             panic_with_error!(&env, MarketplaceError::AuctionNotEnded);
         }
         let winner = auction.highest_bidder.clone();
@@ -1091,7 +1137,7 @@ impl MarketplaceContract {
             escrow::release_nft(&env, &auction.collection, auction.token_id,
                 &auction.creator, env.ledger().sequence(), auction_id);
         }
-        release_auction_lock(&env, auction_id);
+        // _guard dropped here — releases auction lock automatically.
     }
 
     // ── cancel_auction ───────────────────────────────────────
@@ -1232,31 +1278,23 @@ impl MarketplaceContract {
         let mut offer = load_offer(&env, offer_id)
             .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::OfferNotFound));
         let listing_id = offer.listing_id;
-        if !acquire_listing_lock(&env, listing_id) {
-            panic_with_error!(&env, MarketplaceError::ReentrancyGuard);
-        }
-        let mut listing = match load_listing(&env, listing_id) {
-            Some(l) => l,
-            None => { release_listing_lock(&env, listing_id);
-                      panic_with_error!(&env, MarketplaceError::ListingNotFound); }
-        };
+        // RAII guard — cleared by Drop whether the function returns normally or panics.
+        let _guard = ListingReentrancyScope::new(&env, listing_id);
+        let mut listing = load_listing(&env, listing_id)
+            .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::ListingNotFound));
         if listing.artist != artist {
-            release_listing_lock(&env, listing_id);
             panic_with_error!(&env, MarketplaceError::Unauthorized);
         }
         if offer.status != OfferStatus::Pending || listing.status != ListingStatus::Active {
-            release_listing_lock(&env, listing_id);
             panic_with_error!(&env, MarketplaceError::InvalidOfferState);
         }
         if let Some(exp) = offer.expires_at {
             if env.ledger().timestamp() >= exp {
-                release_listing_lock(&env, listing_id);
                 panic_with_error!(&env, MarketplaceError::OfferExpired);
             }
         }
         if let Some(exp) = listing.expires_at {
             if env.ledger().timestamp() >= exp {
-                release_listing_lock(&env, listing_id);
                 panic_with_error!(&env, MarketplaceError::ListingExpired);
             }
         }
@@ -1321,7 +1359,7 @@ impl MarketplaceContract {
                 &r_amounts.get(i).unwrap(),
             );
         }
-        release_listing_lock(&env, listing_id);
+        // _guard dropped here — releases listing lock automatically.
     }
 
     pub fn reclaim_offer(env: Env, offer_id: u64) {

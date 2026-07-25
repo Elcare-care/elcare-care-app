@@ -8457,3 +8457,109 @@ fn test_event_catalog_topics() {
     assert_eq!(crate::events::LISTING_CREATED, "listing_created");
     assert_eq!(crate::events::PROTOCOL_FEE_COLLECTED, "protocol_fee_collected");
 }
+
+// ════════════════════════════════════════════════════════════
+// SECTION: ReentrancyScope RAII tests (Issue #204)
+// ════════════════════════════════════════════════════════════
+
+/// Verify the reentrancy guard is cleared after a successful buy_artwork so
+/// that a second purchase attempt on a still-active listing from a different
+/// buyer can acquire the lock (the second buy will fail for other reasons, but
+/// the lock itself must not be stuck).
+#[test]
+fn test_reentrancy_guard_cleared_after_successful_buy() {
+    let (env, client, artist, buyer, token_id, contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let id = client.create_listing(
+        &artist, &5_000_000_i128, &symbol_short!("XLM"),
+        &token_id, &collection_id, &1u64,
+        &valid_recipients(&env, &artist), &None::<u64>,
+    );
+
+    assert!(client.buy_artwork(&buyer, &id));
+
+    // After a successful purchase the listing lock must be released.
+    // We verify this by inspecting storage directly: the lock key must be absent.
+    env.as_contract(&contract_id, || {
+        // acquire_listing_lock returns true only when the lock is NOT held.
+        let acquired = crate::storage::acquire_listing_lock(&env, id);
+        assert!(acquired, "listing lock must be absent after successful buy_artwork");
+        // Clean up the lock we just acquired so later assertions aren't confused.
+        crate::storage::release_listing_lock(&env, id);
+    });
+}
+
+/// Verify the auction reentrancy guard is cleared after a successful
+/// finalize_auction — the lock must not be stuck after normal execution.
+#[test]
+fn test_reentrancy_guard_cleared_after_finalize_auction() {
+    let (env, client, artist, buyer, token_id, contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let aid = client.create_auction(
+        &artist, &token_id, &collection_id, &1u64,
+        &1_000_000_i128, &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+    client.place_bid(&buyer, &aid, &1_000_000_i128);
+    env.ledger().set_timestamp(env.ledger().timestamp() + 3601);
+    client.finalize_auction(&buyer, &aid);
+
+    env.as_contract(&contract_id, || {
+        let acquired = crate::storage::acquire_auction_lock(&env, aid);
+        assert!(acquired, "auction lock must be absent after successful finalize_auction");
+        crate::storage::release_auction_lock(&env, aid);
+    });
+}
+
+/// Verify that holding the listing lock before calling buy_artwork causes it
+/// to return MarketplaceError::ReentrancyGuard (error code 22).
+/// This covers the RAII constructor's rejection path.
+#[test]
+#[should_panic(expected = "Error(Contract, #22)")]
+fn test_reentrancy_scope_buy_artwork_blocks_reentrant_call() {
+    let (env, client, artist, buyer, token_id, contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let id = client.create_listing(
+        &artist, &5_000_000_i128, &symbol_short!("XLM"),
+        &token_id, &collection_id, &1u64,
+        &valid_recipients(&env, &artist), &None::<u64>,
+    );
+
+    // Simulate the lock already being held (as if we are mid-execution).
+    env.as_contract(&contract_id, || {
+        assert!(crate::storage::acquire_listing_lock(&env, id));
+    });
+
+    // Now calling buy_artwork must fail with ReentrancyGuard.
+    client.buy_artwork(&buyer, &id);
+}
+
+/// Same pattern for finalize_auction — holding the auction lock must block
+/// a concurrent finalize call with ReentrancyGuard.
+#[test]
+#[should_panic(expected = "Error(Contract, #22)")]
+fn test_reentrancy_scope_finalize_auction_blocks_reentrant_call() {
+    let (env, client, artist, buyer, token_id, contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let aid = client.create_auction(
+        &artist, &token_id, &collection_id, &1u64,
+        &1_000_000_i128, &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+    client.place_bid(&buyer, &aid, &1_000_000_i128);
+    env.ledger().set_timestamp(env.ledger().timestamp() + 3601);
+
+    env.as_contract(&contract_id, || {
+        assert!(crate::storage::acquire_auction_lock(&env, aid));
+    });
+
+    client.finalize_auction(&buyer, &aid);
+}
