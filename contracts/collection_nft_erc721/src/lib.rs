@@ -25,6 +25,8 @@ use soroban_sdk::{
 const TTL_THRESHOLD: u32 = 50_000;
 const TTL_BUMP: u32 = 100_000;
 const MAX_BPS: u32 = 10_000; // 100% in basis points
+/// Maximum number of items accepted by any single batch call (#274).
+const MAX_BATCH_SIZE: u32 = 200;
 
 // ─── Errors ──────────────────────────────────────────────────────────────────
 
@@ -45,6 +47,10 @@ pub enum Error {
     InvalidBps = 11,       // basis points exceed MAX_BPS (10_000)
     CollectionPaused = 12, // minting is paused
     ApprovalExpired = 13,  // approval expiry has already passed at set time
+    /// batch_mint called with zero items (#274).
+    EmptyBatch = 14,
+    /// batch_mint called with more than MAX_BATCH_SIZE items (#274).
+    BatchTooLarge = 15,
 }
 
 // ─── Storage Keys ─────────────────────────────────────────────────────────────
@@ -210,7 +216,10 @@ impl NormalNFT721 {
 
         let uris_len = uris.len();
         if uris_len == 0 {
-            return Ok(());
+            return Err(Error::EmptyBatch);
+        }
+        if uris_len > MAX_BATCH_SIZE {
+            return Err(Error::BatchTooLarge);
         }
 
         // Read storage ONCE before the loop

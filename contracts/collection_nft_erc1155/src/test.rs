@@ -1171,3 +1171,80 @@ fn balance_of_batch_mismatched_lengths_returns_empty() {
     let result = client.balance_of_batch(&accounts, &ids);
     assert_eq!(result.len(), 0);
 }
+
+// ─── Supply / mint invariants (#274) ───────────────────────────────────────
+
+#[test]
+fn mint_new_zero_amount_returns_error() {
+    let (env, client, _, _) = setup();
+    let alice = Address::generate(&env);
+    let result = client.try_mint_new(&alice, &0u128, &String::from_str(&env, "uri"));
+    assert_eq!(result, Err(Ok(Error::ZeroAmount)));
+}
+
+#[test]
+fn mint_zero_amount_returns_error() {
+    let (env, client, _, _) = setup();
+    let alice = Address::generate(&env);
+    let token_id = client.mint_new(&alice, &10u128, &String::from_str(&env, "uri"));
+    let result = client.try_mint(&alice, &token_id, &0u128, &String::from_str(&env, "uri"));
+    assert_eq!(result, Err(Ok(Error::ZeroAmount)));
+    assert_eq!(client.balance_of(&alice, &token_id), 10u128, "no partial mutation");
+}
+
+#[test]
+fn mint_batch_empty_batch_returns_error() {
+    let (env, client, _, _) = setup();
+    let alice = Address::generate(&env);
+    let ids: Vec<u64> = Vec::new(&env);
+    let amounts: Vec<u128> = Vec::new(&env);
+    let uris: Vec<String> = Vec::new(&env);
+    let result = client.try_mint_batch(&alice, &ids, &amounts, &uris);
+    assert_eq!(result, Err(Ok(Error::EmptyBatch)));
+}
+
+#[test]
+fn mint_batch_zero_amount_item_returns_error() {
+    let (env, client, _, _) = setup();
+    let alice = Address::generate(&env);
+    let ids = Vec::from_array(&env, [0u64, 1u64]);
+    let amounts = Vec::from_array(&env, [10u128, 0u128]);
+    let uris = Vec::from_array(
+        &env,
+        [String::from_str(&env, "u0"), String::from_str(&env, "u1")],
+    );
+    let result = client.try_mint_batch(&alice, &ids, &amounts, &uris);
+    assert_eq!(result, Err(Ok(Error::ZeroAmount)));
+    assert_eq!(client.balance_of(&alice, &0u64), 0, "no partial mutation on rejection");
+}
+
+#[test]
+fn mint_batch_exceeding_max_batch_size_returns_error() {
+    let (env, client, _, _) = setup();
+    let alice = Address::generate(&env);
+    let mut ids: Vec<u64> = Vec::new(&env);
+    let mut amounts: Vec<u128> = Vec::new(&env);
+    let mut uris: Vec<String> = Vec::new(&env);
+    for i in 0..201u64 {
+        ids.push_back(i);
+        amounts.push_back(1u128);
+        uris.push_back(String::from_str(&env, "u"));
+    }
+    let result = client.try_mint_batch(&alice, &ids, &amounts, &uris);
+    assert_eq!(result, Err(Ok(Error::BatchTooLarge)));
+}
+
+#[test]
+fn batch_transfer_exceeding_max_batch_size_returns_error() {
+    let (env, client, _, _) = setup();
+    let owner = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let mut ids: Vec<u64> = Vec::new(&env);
+    let mut amounts: Vec<u128> = Vec::new(&env);
+    for i in 0..201u64 {
+        ids.push_back(i);
+        amounts.push_back(1u128);
+    }
+    let result = client.try_batch_transfer(&owner, &owner, &recipient, &ids, &amounts);
+    assert_eq!(result, Err(Ok(Error::BatchTooLarge)));
+}

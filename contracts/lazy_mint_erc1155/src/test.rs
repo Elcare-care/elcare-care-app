@@ -842,3 +842,91 @@ fn persistent_balance_ttl_extended_on_transfer() {
     });
     assert!(still_has);
 }
+
+// ─── Supply / mint invariants (#274) ───────────────────────────────────────
+
+#[test]
+fn redeem_zero_amount_returns_error() {
+    let (env, client, _creator, _fee) = setup(0);
+    client.set_public_phase();
+    let token_id = 900u64;
+    client.register_edition(&token_id, &1000u128);
+    let buyer = Address::generate(&env);
+    let v = make_voucher(&env, token_id, 900);
+    let sig = sign_voucher(&env, &client.address, &v);
+    let res = client.try_redeem(&buyer, &v, &0u128, &sig, &empty_proof(&env));
+    assert_eq!(res, Err(Ok(Error::ZeroAmount)));
+}
+
+#[test]
+fn redeem_batch_empty_batch_returns_error() {
+    let (env, client, _creator, _fee) = setup(0);
+    client.set_public_phase();
+    let buyer = Address::generate(&env);
+    let items: Vec<BatchVoucherItem1155> = Vec::new(&env);
+    let res = client.try_redeem_batch(&buyer, &items);
+    assert_eq!(res, Err(Ok(Error::EmptyBatch)));
+}
+
+#[test]
+fn redeem_batch_exceeding_max_batch_size_returns_error() {
+    let (env, client, _creator, _fee) = setup(0);
+    client.set_public_phase();
+    for tid in 1000u64..1101u64 {
+        client.register_edition(&tid, &1000u128);
+    }
+    let buyer = Address::generate(&env);
+    let mut items: Vec<BatchVoucherItem1155> = Vec::new(&env);
+    for (i, tid) in (1000u64..1101u64).enumerate() {
+        items.push_back(make_batch_item(&env, &client.address, tid, 1000 + i as u64, 1));
+    }
+    let res = client.try_redeem_batch(&buyer, &items);
+    assert_eq!(res, Err(Ok(Error::BatchTooLarge)));
+    assert_eq!(client.balance_of(&buyer, &1000u64), 0u128, "no partial mutation on rejection");
+}
+
+#[test]
+fn redeem_batch_duplicate_nonce_reverts_entire_batch() {
+    // #274: RedeemedVoucher(nonce) is only set during phase-4 minting, so two
+    // items sharing the same voucher nonce both used to pass phase-1
+    // validation and would double-mint (and double-charge) from a single
+    // voucher. Now rejected up front, before any state mutation.
+    let (env, client, _creator, _fee) = setup(0);
+    client.set_public_phase();
+    let t1 = 1200u64;
+    let t2 = 1201u64;
+    client.register_edition(&t1, &1000u128);
+    client.register_edition(&t2, &1000u128);
+    let buyer = Address::generate(&env);
+    let item_a = make_batch_item(&env, &client.address, t1, 1200, 1);
+    let item_a_dup = make_batch_item(&env, &client.address, t1, 1200, 1); // same nonce
+    let item_b = make_batch_item(&env, &client.address, t2, 1201, 1);
+    let mut items = Vec::new(&env);
+    items.push_back(item_a);
+    items.push_back(item_b);
+    items.push_back(item_a_dup);
+
+    let res = client.try_redeem_batch(&buyer, &items);
+    assert_eq!(res, Err(Ok(Error::DuplicateVoucherInBatch)));
+    assert_eq!(client.balance_of(&buyer, &t1), 0u128);
+    assert_eq!(client.balance_of(&buyer, &t2), 0u128);
+}
+
+#[test]
+fn redeem_batch_zero_amount_item_reverts_entire_batch() {
+    let (env, client, _creator, _fee) = setup(0);
+    client.set_public_phase();
+    let t1 = 1300u64;
+    let t2 = 1301u64;
+    client.register_edition(&t1, &1000u128);
+    client.register_edition(&t2, &1000u128);
+    let buyer = Address::generate(&env);
+    let good = make_batch_item(&env, &client.address, t1, 1300, 1);
+    let zero = make_batch_item(&env, &client.address, t2, 1301, 0);
+    let mut items = Vec::new(&env);
+    items.push_back(good);
+    items.push_back(zero);
+    let res = client.try_redeem_batch(&buyer, &items);
+    assert_eq!(res, Err(Ok(Error::ZeroAmount)));
+    assert_eq!(client.balance_of(&buyer, &t1), 0u128, "no partial mutation on rejection");
+}

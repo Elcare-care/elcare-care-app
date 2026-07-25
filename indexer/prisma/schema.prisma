@@ -160,6 +160,13 @@ model Collection {
   symbol          String?
   deployedAtLedger Int
   createdAt       DateTime @default(now())
+  /// Collection-level supply cap (#274). Stored as a string since it can
+  /// hold u64::MAX (the "unlimited" sentinel used by the collection
+  /// contracts), which overflows a Postgres BigInt. Null = not yet indexed.
+  maxSupply       String?
+  /// Current minted supply as of the last indexed collection event (#274).
+  /// Null = not yet indexed.
+  currentSupply   String?
   @@index([creator])
 }
 

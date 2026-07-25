@@ -1476,3 +1476,55 @@ fn transfer_clears_expiry_key_alongside_approval() {
     });
     assert!(expiry_after.is_none(), "expiry key must be cleared after transfer");
 }
+
+// ─── Supply / mint invariants (#274) ───────────────────────────────────────
+
+#[test]
+fn batch_mint_empty_batch_returns_error() {
+    let (env, client, _, _) = setup();
+    let alice = Address::generate(&env);
+    let uris: soroban_sdk::Vec<String> = soroban_sdk::Vec::new(&env);
+    let result = client.try_batch_mint(&alice, &uris);
+    assert_eq!(result, Err(Ok(Error::EmptyBatch)));
+    assert_eq!(client.total_supply(), 0, "no partial mutation on rejection");
+}
+
+#[test]
+fn batch_mint_exceeding_max_batch_size_returns_error() {
+    let (env, client, _, _) = setup();
+    let alice = Address::generate(&env);
+    let mut uris: soroban_sdk::Vec<String> = soroban_sdk::Vec::new(&env);
+    for i in 0..201u32 {
+        uris.push_back(String::from_str(&env, "u"));
+        let _ = i;
+    }
+    let result = client.try_batch_mint(&alice, &uris);
+    assert_eq!(result, Err(Ok(Error::BatchTooLarge)));
+    assert_eq!(client.total_supply(), 0, "no partial mutation on rejection");
+}
+
+#[test]
+fn batch_mint_at_max_batch_size_boundary_succeeds() {
+    let env = Env::default();
+    env.ledger().with_mut(|li| li.sequence_number = 1);
+    env.mock_all_auths();
+    let contract_id = env.register(NormalNFT721, ());
+    let client = NormalNFT721Client::new(&env, &contract_id);
+    let creator = Address::generate(&env);
+    let royalty_receiver = Address::generate(&env);
+    client.initialize(
+        &creator,
+        &String::from_str(&env, "T"),
+        &String::from_str(&env, "T"),
+        &100_000u64, // enough headroom for a 200-item batch
+        &0u32,
+        &royalty_receiver,
+    );
+    let alice = Address::generate(&env);
+    let mut uris: soroban_sdk::Vec<String> = soroban_sdk::Vec::new(&env);
+    for _ in 0..200u32 {
+        uris.push_back(String::from_str(&env, "u"));
+    }
+    client.batch_mint(&alice, &uris);
+    assert_eq!(client.total_supply(), 200);
+}

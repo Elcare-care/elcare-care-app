@@ -40,6 +40,8 @@ use soroban_sdk::{
 
 const TTL_THRESHOLD: u32 = 50_000;
 const TTL_BUMP: u32 = 100_000;
+/// Maximum number of vouchers accepted by a single redeem_batch call (#274).
+const MAX_BATCH_SIZE: u32 = 100;
 
 // ─── Errors ──────────────────────────────────────────────────────────────────
 
@@ -65,6 +67,17 @@ pub enum Error {
     InvalidMerkleProof = 15,
     /// Voucher nonce has been explicitly revoked by the creator.
     VoucherRevoked = 16,
+    /// redeem_batch called with zero items (#274).
+    EmptyBatch = 17,
+    /// redeem_batch called with more than MAX_BATCH_SIZE items (#274).
+    BatchTooLarge = 18,
+    /// The same voucher nonce appears more than once in a single
+    /// redeem_batch call (#274) — RedeemedVoucher(nonce) is only set during
+    /// minting, so an unchecked duplicate would double-mint and double-charge
+    /// from a single voucher.
+    DuplicateVoucherInBatch = 19,
+    /// redeem/redeem_batch called with a zero amount (#274).
+    ZeroAmount = 20,
 }
 
 // ─── Data types ───────────────────────────────────────────────────────────────
@@ -407,6 +420,10 @@ impl LazyMint1155 {
         Self::extend_instance_ttl(&env);
         buyer.require_auth();
 
+        if amount == 0 {
+            return Err(Error::ZeroAmount);
+        }
+
         // 0. Allowlist
         Self::check_allowlist(&env, &buyer, &merkle_proof)?;
 
@@ -461,6 +478,13 @@ impl LazyMint1155 {
         Self::extend_instance_ttl(&env);
         buyer.require_auth();
 
+        if items.len() == 0 {
+            return Err(Error::EmptyBatch);
+        }
+        if items.len() > MAX_BATCH_SIZE {
+            return Err(Error::BatchTooLarge);
+        }
+
         let pubkey: BytesN<32> = env
             .storage()
             .instance()
@@ -479,7 +503,25 @@ impl LazyMint1155 {
             .unwrap_or(creator.clone());
 
         // Phase 1: validate all items — no state changes yet.
+        //
+        // Duplicate-nonce hardening (#274): RedeemedVoucher(nonce) is only
+        // set during Phase 4 minting, so two items sharing the same voucher
+        // nonce would both pass validation here and get double-minted (and
+        // double-charged) from a single voucher. Reject any in-batch
+        // duplicate before any state mutation.
+        let mut seen_nonces: Vec<u64> = Vec::new(&env);
         for item in items.iter() {
+            if item.amount == 0 {
+                return Err(Error::ZeroAmount);
+            }
+            let nonce = item.voucher.nonce;
+            for i in 0..seen_nonces.len() {
+                if seen_nonces.get(i).unwrap() == nonce {
+                    return Err(Error::DuplicateVoucherInBatch);
+                }
+            }
+            seen_nonces.push_back(nonce);
+
             Self::check_allowlist(&env, &buyer, &item.merkle_proof)?;
             Self::check_voucher(&env, &item.voucher, item.amount, &item.signature, &pubkey, &buyer)?;
         }
