@@ -1,15 +1,16 @@
 import { z } from 'zod';
 import { Request, Response, NextFunction } from 'express';
 import { badRequest } from './errors.js';
+import { isValidStellarAddress, STELLAR_ADDRESS_ERROR } from '../stellar-address.js';
 
 // ── Reusable field schemas ────────────────────────────────────────────────────
 
+/**
+ * Coerces a query-string value to a positive integer capped at `max`.
+ * Returns 400 when the value is not a non-negative integer or exceeds the cap.
+ */
 const positiveInt = (max: number) =>
-  z.coerce
-    .number()
-    .int()
-    .nonnegative()
-    .max(max);
+  z.coerce.number().int().nonnegative().max(max);
 
 const optionalString = z.string().optional();
 
@@ -90,6 +91,19 @@ export const syncGapsQuerySchema = z.object({
   offset: positiveInt(10_000).optional(),
 });
 
+export const artistMetricsQuerySchema = z.object({
+  range: z.enum(['day', 'week', 'month']).optional(),
+});
+
+// ── validateQuery middleware factory ─────────────────────────────────────────
+
+/**
+ * Returns an Express middleware that validates `req.query` against `schema`.
+ *
+ * On success, attaches the coerced + validated values to `req.validatedQuery`.
+ * On failure, calls `next(badRequest(...))` with all Zod issues joined into
+ * a human-readable message — no stack traces are leaked.
+ */
 export function validateQuery<T extends z.ZodTypeAny>(schema: T) {
   return (req: Request, _res: Response, next: NextFunction) => {
     const result = schema.safeParse(req.query);
@@ -99,7 +113,6 @@ export function validateQuery<T extends z.ZodTypeAny>(schema: T) {
         .join('; ');
       return next(badRequest(message));
     }
-    // Replace raw query with coerced, validated values
     (req as any).validatedQuery = result.data;
     next();
   };

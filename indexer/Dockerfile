@@ -45,6 +45,11 @@ EXPOSE 4000
 HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=3 \
   CMD wget -qO- http://localhost:4000/health || exit 1
 
+# Send SIGTERM to allow graceful shutdown (Kubernetes rolling updates, docker stop).
+STOPSIGNAL SIGTERM
+
 USER appuser
 
-CMD ["sh", "-c", "npx prisma migrate deploy && node dist/index.js"]
+# Run migrations then start the indexer as PID 1 (exec form — no sh wrapper).
+# exec ensures SIGTERM is delivered directly to node, not swallowed by a shell.
+CMD ["sh", "-c", "npx prisma migrate deploy && exec node dist/index.js"]

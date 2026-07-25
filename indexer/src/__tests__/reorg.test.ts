@@ -21,6 +21,8 @@ const mockPrisma: any = vi.hoisted(() => {
 });
 
 vi.mock('../db', () => ({ default: mockPrisma }));
+// poller.ts imports from prisma-write; mock it with the same object
+vi.mock('../prisma-write', () => ({ default: mockPrisma }));
 
 vi.mock('dotenv', () => ({ default: { config: vi.fn() } }));
 
