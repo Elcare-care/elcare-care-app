@@ -6,6 +6,7 @@ import {
 } from "@stellar/stellar-sdk";
 import { config } from "./config";
 import { invokeContract } from "./contract";
+import { assertWritePreflight } from "./preflight";
 
 // ── Types ─────────────────────────────────────────────────────
 

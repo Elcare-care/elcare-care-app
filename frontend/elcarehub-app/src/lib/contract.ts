@@ -19,6 +19,7 @@ import {
 import { config } from "./config";
 import { getConnectedPublicKey, signWithFreighter } from "./freighter";
 import { mapSorobanErrorMessage } from "./errors";
+import { assertWritePreflight } from "./preflight";
 import {
   isE2eMockChain,
   e2eMockCreateListing,
@@ -153,6 +154,38 @@ export async function invokeContract(
       .result?.retval;
     if (!retVal) throw new Error("No return value from simulation.");
     return retVal;
+  }
+
+  // ── Preflight guard (Issue #305) ─────────────────────────────────────
+  // Re-validate network and contract config immediately before signing.
+  // Catches mid-flow network switches that happened after the wallet was
+  // initially connected.
+  try {
+    const walletPassphrase = await (async () => {
+      try {
+        // getNetworkPassphrase() returns the app-configured value.
+        // To detect a *live* wallet mismatch we query Freighter directly
+        // when available; if not available we trust the app config.
+        if (typeof window !== "undefined" && (window as any)?.freighter?.getNetworkDetails) {
+          const details = await (window as any).freighter.getNetworkDetails();
+          return details?.networkPassphrase ?? null;
+        }
+      } catch { /* ignore */ }
+      return null; // Magic or unavailable — skip network check
+    })();
+
+    assertWritePreflight({
+      walletPassphrase,
+      isConnected: true,          // we have a callerPublicKey, so connected
+      contractId,
+      skipNetworkCheck: walletPassphrase === null,
+    });
+  } catch (preflightErr) {
+    if (preflightErr instanceof Error && preflightErr.name === "PreflightError") {
+      throw preflightErr;
+    }
+    // Re-throw unexpected errors from the preflight query
+    throw preflightErr;
   }
 
   // Assemble the transaction with the real resource fee.
