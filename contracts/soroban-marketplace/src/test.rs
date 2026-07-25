@@ -1,5 +1,5 @@
 use super::*;
-use crate::types::{AuctionStatus, ListingStatus, OfferStatus, Recipient};
+use crate::types::{AuctionStatus, BatchCreateListingInput, BatchUpdateListingInput, ListingStatus, OfferStatus, Recipient};
 
 // ── Mock NFT collection ──────────────────────────────────────
 // Tracks real ownership so owner_of checks and transfer_from work correctly.
@@ -7374,6 +7374,77 @@ fn test_revoked_artist_existing_auction_still_finalizable() {
     ids.push_back(id1);
     ids.push_back(id2); // not active
     client.cancel_listings(&artist, &ids);
+}
+
+#[test]
+fn test_create_listings_batch_succeeds() {
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let mut requests = soroban_sdk::Vec::new(&env);
+    requests.push_back(BatchCreateListingInput {
+        price: 1_000_000_i128,
+        currency: symbol_short!("XLM"),
+        token: token_id.clone(),
+        collection: collection_id.clone(),
+        token_id: 7u64,
+        recipients: valid_recipients(&env, &artist),
+        expires_at: None,
+    });
+    requests.push_back(BatchCreateListingInput {
+        price: 2_000_000_i128,
+        currency: symbol_short!("XLM"),
+        token: token_id.clone(),
+        collection: collection_id.clone(),
+        token_id: 8u64,
+        recipients: valid_recipients(&env, &artist),
+        expires_at: None,
+    });
+
+    let ids = client.create_listings(&artist, &requests);
+    assert_eq!(ids.len(), 2u32);
+    assert_eq!(client.get_listing(ids.get(0).unwrap()).status, ListingStatus::Active);
+    assert_eq!(client.get_listing(ids.get(1).unwrap()).status, ListingStatus::Active);
+}
+
+#[test]
+fn test_update_listings_batch_succeeds() {
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let id_a = client.create_listing(
+        &artist, &1_000_000_i128, &symbol_short!("XLM"),
+        &token_id, &collection_id, &1u64,
+        &valid_recipients(&env, &artist), &None::<u64>,
+    );
+    let id_b = client.create_listing(
+        &artist, &2_000_000_i128, &symbol_short!("XLM"),
+        &token_id, &collection_id, &2u64,
+        &valid_recipients(&env, &artist), &None::<u64>,
+    );
+
+    let mut requests = soroban_sdk::Vec::new(&env);
+    requests.push_back(BatchUpdateListingInput {
+        listing_id: id_a,
+        new_price: 3_000_000_i128,
+        new_token: token_id.clone(),
+        new_recipients: valid_recipients(&env, &artist),
+    });
+    requests.push_back(BatchUpdateListingInput {
+        listing_id: id_b,
+        new_price: 4_000_000_i128,
+        new_token: token_id.clone(),
+        new_recipients: valid_recipients(&env, &artist),
+    });
+
+    let results = client.update_listings(&artist, &requests);
+    assert_eq!(results.len(), 2u32);
+    assert!(results.get(0).unwrap());
+    assert!(results.get(1).unwrap());
+    assert_eq!(client.get_listing(id_a).price, 3_000_000_i128);
+    assert_eq!(client.get_listing(id_b).price, 4_000_000_i128);
 }
 
 #[test]

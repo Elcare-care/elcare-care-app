@@ -118,6 +118,27 @@ pub struct Recipient {
 
 #[contracttype]
 #[derive(Clone, Debug)]
+pub struct BatchCreateListingInput {
+    pub price: i128,
+    pub currency: Symbol,
+    pub token: Address,
+    pub collection: Address,
+    pub token_id: u64,
+    pub recipients: soroban_sdk::Vec<Recipient>,
+    pub expires_at: Option<u64>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct BatchUpdateListingInput {
+    pub listing_id: u64,
+    pub new_price: i128,
+    pub new_token: Address,
+    pub new_recipients: soroban_sdk::Vec<Recipient>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
 pub struct Listing {
     pub listing_id: u64,
     pub artist: Address,
