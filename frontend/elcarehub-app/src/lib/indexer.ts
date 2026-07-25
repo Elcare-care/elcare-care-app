@@ -458,23 +458,39 @@ export async function fetchArtistListings(
 
 /**
  * Fetch listings from the indexer with optional filters and pagination.
+ * Supports both offset-based (offset/limit) and cursor-based (cursor_ledger) pagination.
  * Throws if the indexer is unreachable so callers can fall back to on-chain.
  */
-export async function fetchListings(options: {
+export interface FetchListingsOptions {
   status?: string;
   limit?: number;
   offset?: number;
+  /** Cursor ledger from X-Next-Cursor header for cursor-based pagination. */
+  cursor_ledger?: number;
+  /** Direction for cursor pagination: "asc" | "desc" (default "desc"). */
+  cursor_direction?: "asc" | "desc";
   minPrice?: string;
   maxPrice?: string;
   search?: string;
   collection?: string[];
   artist?: string;
   sort?: string;
-} = {}): Promise<{ listings: any[]; total?: number }> {
+}
+
+export interface FetchListingsResult {
+  listings: any[];
+  total?: number;
+  /** Ledger sequence of the last returned item — pass as cursor_ledger for next page. */
+  nextCursor?: string;
+}
+
+export async function fetchListings(options: FetchListingsOptions = {}): Promise<FetchListingsResult> {
   const params = new URLSearchParams();
   if (options.status) params.set('status', options.status);
   if (options.limit != null) params.set('limit', String(options.limit));
   if (options.offset != null) params.set('offset', String(options.offset));
+  if (options.cursor_ledger != null) params.set('cursor_ledger', String(options.cursor_ledger));
+  if (options.cursor_direction) params.set('cursor_direction', options.cursor_direction);
   if (options.minPrice) params.set('minPrice', options.minPrice);
   if (options.maxPrice) params.set('maxPrice', options.maxPrice);
   if (options.search) params.set('search', options.search);
@@ -485,16 +501,46 @@ export async function fetchListings(options: {
   }
   const q = params.toString();
 
-  const raw = await fetchWithRetry<unknown>(`/listings${q ? `?${q}` : ''}`);
-  if (raw == null) return { listings: [] };
-  
-  // If paginated, indexer returns { listings, total }
+  const url = `${config.indexerUrl}/listings${q ? `?${q}` : ''}`;
+  const res = await axios.get(url, { timeout: DEFAULT_TIMEOUT_MS, validateStatus: (s) => s < 400 });
+  const raw = res.data;
+  const nextCursor = res.headers?.['x-next-cursor'] ?? '';
+
+  if (raw == null) return { listings: [], nextCursor };
   if (typeof raw === 'object' && (raw as any).listings) {
     const r = raw as any;
-    return { listings: Array.isArray(r.listings) ? r.listings : [], total: r.total };
+    return {
+      listings: Array.isArray(r.listings) ? r.listings : [],
+      total: r.total,
+      nextCursor,
+    };
   }
-  if (Array.isArray(raw)) return { listings: raw };
-  return { listings: [] };
+  if (Array.isArray(raw)) return { listings: raw, nextCursor };
+  return { listings: [], nextCursor };
+}
+
+/**
+ * Fetch the next page of listings using the cursor returned by the previous call.
+ */
+export async function fetchNextListingsPage(
+  cursor: string,
+  options: Omit<FetchListingsOptions, 'cursor_ledger' | 'offset'> = {}
+): Promise<FetchListingsResult> {
+  const ledger = parseInt(cursor, 10);
+  if (!Number.isFinite(ledger)) return { listings: [], nextCursor: '' };
+  return fetchListings({ ...options, cursor_ledger: ledger, cursor_direction: 'desc' });
+}
+
+/**
+ * Fetch the previous page of listings (ascending direction from cursor).
+ */
+export async function fetchPrevListingsPage(
+  cursor: string,
+  options: Omit<FetchListingsOptions, 'cursor_ledger' | 'offset'> = {}
+): Promise<FetchListingsResult> {
+  const ledger = parseInt(cursor, 10);
+  if (!Number.isFinite(ledger)) return { listings: [], nextCursor: '' };
+  return fetchListings({ ...options, cursor_ledger: ledger, cursor_direction: 'asc' });
 }
 
 /**
