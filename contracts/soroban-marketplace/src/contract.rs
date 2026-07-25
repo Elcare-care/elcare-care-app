@@ -17,16 +17,21 @@ use crate::{
         get_auction_extension_trigger_storage, get_auction_extension_window_storage,
         get_auction_max_extensions_storage,
         get_bid_history_cap_storage, get_listing_count, get_max_price_storage,
-        get_min_price_storage, get_pending_admin_storage,
+        get_migration_progress, get_min_price_storage, get_pending_admin_storage,
+        get_ttl_sweep_progress,
         increment_auction_count, increment_listing_count, increment_offer_count,
+        index_append, index_get, index_len,
         is_artist_revoked_storage, is_migration_done, load_auction, load_auction_bids,
-        load_listing, load_listing_offers, load_offer, load_offerer_offers, release_auction_lock,
+        load_listing, load_listing_offers, load_offer, load_offerer_offers,
+        load_pending_offer_ids, release_auction_lock,
         release_listing_lock, remove_artist_revocation_storage, remove_from_active_listings,
         save_auction, save_listing, save_offer,
-        set_artist_revocation_storage, set_auction_extension_trigger_storage,
+        set_artist_cancel_cursor, set_artist_revocation_storage,
+        set_auction_extension_trigger_storage,
         set_auction_extension_window_storage, set_auction_max_extensions_storage,
-        set_max_price_storage, set_migration_done,
-        set_min_price_storage, set_pending_admin_storage, PendingAdminProposal,
+        set_max_price_storage, set_migration_done, set_migration_progress,
+        set_min_price_storage, set_pending_admin_storage, set_ttl_sweep_progress,
+        take_legacy_index_vec, DataKey, IndexId, PendingAdminProposal,
     },
     types::{
         Auction, AuctionStatus, BidRecord, CancelReason, Listing, ListingStatus, MarketplaceError,
@@ -59,6 +64,14 @@ const MIN_AUCTION_DURATION: u64 = 3_600; // 1 hour
 
 /// Maximum number of listing ids accepted by one `cancel_listings` batch.
 const MAX_BATCH_CANCEL: u32 = 10;
+
+/// Hard ceiling on the number of records/ids any single bounded maintenance
+/// call (`extend_active_ttls`, `cleanup_expired_locks`) will touch, applied
+/// on top of (never relaxed by) whatever the caller passes as `max_items` /
+/// however many ids they supply. Keeps a single maintenance transaction's
+/// compute/read footprint bounded no matter what an admin requests.
+/// (Issue #280)
+const MAX_MAINTENANCE_ITEMS: u32 = 100;
 
 const MAX_OFFERS_PER_LISTING: u32 = 50;
 
@@ -728,6 +741,202 @@ impl MarketplaceContract {
         }
 
         listing_ids.len()
+    }
+
+    // ── Bounded storage maintenance (Issue #280) ─────────────
+    //
+    // Two admin-only, bounded-per-call entry points. Neither ever deletes a
+    // Listing, Auction or Offer record — see the retention classification
+    // at the top of `storage.rs` and `docs/guides/storage-retention.md` for
+    // the full policy. Both emit `CleanupSummaryEvent` so an indexer/keeper
+    // can observe how much maintenance work actually happened each call.
+
+    /// Bounded, resumable TTL-refresh sweep over the live (non-terminal)
+    /// record set: Active listings (+ their Pending offers) and Active
+    /// auctions (+ their bid history).
+    ///
+    /// Every read/write this contract performs already re-extends the TTL
+    /// of the record it touches (`storage::bump_entry_ttl` call sites), so a
+    /// frequently-used listing or auction never silently expires. This
+    /// sweep defends against the opposite case: an Active listing or
+    /// auction nobody has read or interacted with recently, whose TTL can
+    /// lapse invisibly and make it unexpectedly unavailable to the indexer
+    /// or frontend even though it is still logically live.
+    ///
+    /// Processes at most `max_items` records this call, hard-capped at
+    /// `MAX_MAINTENANCE_ITEMS` regardless of the argument, and persists a
+    /// `TtlSweepProgress` cursor so repeated calls make forward progress.
+    /// The sweep is a perpetual cycle (phase 0 = `ActiveListings` index,
+    /// phase 1 = sequential auction ids, then wraps back to phase 0) — as
+    /// long as at least one listing or auction is Active, later calls will
+    /// always find something to refresh. Unlike `migrate_step` this is not
+    /// a one-shot drain; it is meant to be invoked periodically forever by
+    /// an operator/keeper process.
+    ///
+    /// Never touches a terminal (Sold/Cancelled/Finalized) record — those
+    /// are deliberately left to fall out of TTL so Soroban's own archival
+    /// mechanism takes over, since the contract never deletes historical
+    /// listing/auction/offer data. If the sweep finds an id still present
+    /// in the `ActiveListings` index or auction id space whose stored
+    /// status is no longer Active (or the record is missing), it emits a
+    /// `TtlAnomalyEvent` instead of silently doing nothing, surfacing the
+    /// index/state drift rather than hiding it.
+    ///
+    /// Returns the number of records actually refreshed this call.
+    pub fn extend_active_ttls(env: Env, admin: Address, max_items: u32) -> u32 {
+        admin.require_auth();
+        if admin != Self::get_admin(env.clone()).expect("admin not set") {
+            panic_with_error!(&env, MarketplaceError::Unauthorized);
+        }
+
+        let budget_cap = max_items.min(MAX_MAINTENANCE_ITEMS);
+        let total_listings = active_listings_len(&env);
+        let total_auctions = get_auction_count(&env);
+        if budget_cap == 0 || (total_listings == 0 && total_auctions == 0) {
+            return 0;
+        }
+
+        let mut progress = get_ttl_sweep_progress(&env);
+        let mut processed: u32 = 0;
+        // Bounds the number of phase-0/phase-1 toggles when one side of the
+        // sweep is empty, so the loop can never spin forever without making
+        // progress (each toggle is O(1); two full toggles are always enough
+        // to reach whichever side has work).
+        let mut toggles: u32 = 0;
+
+        while processed < budget_cap && toggles < 4 {
+            if progress.phase == 0 {
+                if total_listings == 0 || progress.cursor >= total_listings as u64 {
+                    progress.phase = 1;
+                    progress.cursor = 0;
+                    toggles += 1;
+                    continue;
+                }
+                let pos = progress.cursor as u32;
+                if let Some(listing_id) = index_get(&env, &IndexId::ActiveListings, pos) {
+                    match load_listing(&env, listing_id) {
+                        Some(listing) if listing.status == ListingStatus::Active => {
+                            // `load_listing` already bumped the listing's own
+                            // TTL; also refresh every Pending offer hanging
+                            // off it (bounded, ≤ MAX_OFFERS_PER_LISTING).
+                            for offer_id in load_pending_offer_ids(&env, listing_id).iter() {
+                                load_offer(&env, offer_id);
+                            }
+                        }
+                        _ => {
+                            TtlAnomalyEvent {
+                                subject: Symbol::new(&env, "listing"),
+                                id: listing_id,
+                                ledger_sequence: env.ledger().sequence(),
+                            }
+                            .publish(&env);
+                        }
+                    }
+                }
+                progress.cursor += 1;
+                processed += 1;
+            } else {
+                if total_auctions == 0 || progress.cursor >= total_auctions {
+                    progress.phase = 0;
+                    progress.cursor = 0;
+                    toggles += 1;
+                    continue;
+                }
+                let auction_id = progress.cursor + 1; // ids are 1-based
+                match load_auction(&env, auction_id) {
+                    Some(auction) if auction.status == AuctionStatus::Active => {
+                        // `load_auction` already bumped the auction's own
+                        // TTL; also refresh its bid history if any.
+                        load_auction_bids(&env, auction_id);
+                    }
+                    Some(_) => {} // terminal — intentionally left alone
+                    None => {
+                        TtlAnomalyEvent {
+                            subject: Symbol::new(&env, "auction"),
+                            id: auction_id,
+                            ledger_sequence: env.ledger().sequence(),
+                        }
+                        .publish(&env);
+                    }
+                }
+                progress.cursor += 1;
+                processed += 1;
+            }
+        }
+
+        set_ttl_sweep_progress(&env, &progress);
+        CleanupSummaryEvent {
+            kind: Symbol::new(&env, "ttl_extend"),
+            items_processed: processed,
+            ledger_sequence: env.ledger().sequence(),
+        }
+        .publish(&env);
+        processed
+    }
+
+    /// Bounded admin safety-valve that force-clears reentrancy locks for the
+    /// given listing/auction ids.
+    ///
+    /// `ListingLock`/`AuctionLock` live in *temporary* storage with a short
+    /// TTL (`REENTRANCY_LOCK_TTL` ledgers) and are already released on every
+    /// normal exit path of every function that acquires one; a panic
+    /// mid-call rolls back the whole transaction (including the lock
+    /// write), so it can never leak a lock either. Under normal operation
+    /// Soroban's own temporary-storage expiry reclaims any lock this
+    /// contract somehow failed to release. This entry point exists purely
+    /// as an operator-triggered safety valve for a stuck lock spotted
+    /// off-chain — it is a no-op (and safe to retry) for any id whose lock
+    /// is already absent, so calling it again with nothing left to clear
+    /// just returns 0.
+    ///
+    /// `listing_ids` and `auction_ids` are processed in that order up to a
+    /// combined `MAX_MAINTENANCE_ITEMS`; ids past the cap are silently
+    /// ignored rather than causing the whole call to revert. Returns the
+    /// number of locks actually found and cleared.
+    pub fn cleanup_expired_locks(
+        env: Env,
+        admin: Address,
+        listing_ids: Vec<u64>,
+        auction_ids: Vec<u64>,
+    ) -> u32 {
+        admin.require_auth();
+        if admin != Self::get_admin(env.clone()).expect("admin not set") {
+            panic_with_error!(&env, MarketplaceError::Unauthorized);
+        }
+
+        let mut cleared: u32 = 0;
+        let mut budget = MAX_MAINTENANCE_ITEMS;
+
+        for listing_id in listing_ids.iter() {
+            if budget == 0 {
+                break;
+            }
+            budget -= 1;
+            let key = DataKey::ListingLock(listing_id);
+            if env.storage().temporary().has(&key) {
+                release_listing_lock(&env, listing_id);
+                cleared += 1;
+            }
+        }
+        for auction_id in auction_ids.iter() {
+            if budget == 0 {
+                break;
+            }
+            budget -= 1;
+            let key = DataKey::AuctionLock(auction_id);
+            if env.storage().temporary().has(&key) {
+                release_auction_lock(&env, auction_id);
+                cleared += 1;
+            }
+        }
+
+        CleanupSummaryEvent {
+            kind: Symbol::new(&env, "lock_cleanup"),
+            items_processed: cleared,
+            ledger_sequence: env.ledger().sequence(),
+        }
+        .publish(&env);
+        cleared
     }
 
     // ── Token Whitelist ──────────────────────────────────────

@@ -2,6 +2,75 @@
 use crate::types::{Auction, BidRecord, Listing, Offer};
 use soroban_sdk::{contracttype, Address, Env, Vec};
 
+// ── Storage retention classification (Issue #280) ────────────────────────
+//
+// Every `DataKey` variant below falls into exactly one of three retention
+// classes. This classification is the contract's answer to "what happens to
+// this key over time" and drives both the bounded maintenance entry points
+// in `contract.rs` (`extend_active_ttls`, `cleanup_expired_locks`) and what
+// the indexer/operators should expect to still be readable on-chain months
+// or years later. See also `docs/guides/storage-retention.md`.
+//
+// ACTIVE — must never be cleaned up while the referenced record is live.
+//   `Listing(id)` while status == Active, `Auction(id)` while status ==
+//   Active, `Offer(id)` while status == Pending, `ListingPendingOffers(id)`
+//   for such a listing, `ActiveListingPos(id)`, the `ActiveListings` index
+//   pages/length, and the two lock keys while genuinely held mid-transaction
+//   (`ListingLock`/`AuctionLock` — see the Recoverable note below on why
+//   these are not actually a growth risk).  `extend_active_ttls` walks
+//   exactly this set and re-extends its TTL; it never deletes anything.
+//
+// RECOVERABLE — safe to clear once terminal / stale; already bounded today.
+//   - `ListingLock(id)` / `AuctionLock(id)`: written to *temporary* (not
+//     persistent) storage with a short TTL (`REENTRANCY_LOCK_TTL` ledgers,
+//     see `acquire_listing_lock`/`acquire_auction_lock`) and explicitly
+//     released on every normal exit path of every function that acquires
+//     one. A panic mid-call rolls back the whole transaction (including the
+//     lock write), so it can never "leak" a lock either. Net effect: these
+//     keys are not an unbounded persistent-storage growth vector at all —
+//     Soroban's own temporary-entry expiry reclaims them even in the
+//     hypothetical case this contract failed to release one. The
+//     `cleanup_expired_locks` entry point exists as an operator-triggered
+//     safety valve for a stuck lock spotted off-chain, not a routine sweep.
+//   - Legacy pre-1.1.0 monolithic index keys (`ArtistListings(Address)`,
+//     `ArtistAuctions(Address)`, `ListingOffers(u64)`, `OffererOffers
+//     (Address)`, `ActiveListings`): already drained and deleted by the
+//     existing bounded `migrate`/`migrate_step` entry point via
+//     `take_legacy_index_vec`; nothing further to add here.
+//   - `ActiveListingPos(id)`, `ListingPendingOffers(id)`, `IndexPage`/
+//     `IndexLen` pages, `EscrowedToken`: already self-cleaning — each helper
+//     in this file deletes its own key the moment the last element/flag is
+//     removed (see `index_store_page`, `remove_from_active_listings`,
+//     `remove_pending_offer`, `clear_escrow_record`). No batch job needed.
+//   - `ArtistCancelCursor(Address)` / `MigrationCursor`: cleared on
+//     completion (migration) or on reinstatement (cancel cursor); the tiny
+//     residual left for a permanently-revoked artist is a single `u32` and
+//     not considered worth a dedicated sweep.
+//
+// ARCHIVAL — retained indefinitely on-chain for provenance / dispute
+// resolution; never actively deleted by contract code.
+//   `Listing(id)`, `Auction(id)`, `Offer(id)` records themselves, in *any*
+//   status, including terminal ones (Sold/Cancelled/Finalized/Accepted/
+//   Rejected/Withdrawn). The contract does not hard-delete historical
+//   marketplace records: doing so would destroy the provenance trail an
+//   indexer, a dispute, or a future audit needs. Instead, `extend_active_ttls`
+//   deliberately *skips* re-extending a terminal record's TTL, so once it
+//   naturally lapses, Soroban's own archival mechanism takes over (the data
+//   is still restorable on-chain, just no longer "hot"; see
+//   `docs/guides/storage-retention.md` for the operator-facing explanation
+//   of what this means for the indexer). `RevokedArtist`, `MigrationDone`
+//   markers and config keys (`Admin`, `Treasury`, `ProtocolFeeBps`, price
+//   bounds, etc.) are likewise small, permanent, and intentionally never
+//   swept.
+//
+// Bounded maintenance (Issue #280 acceptance criteria #2/#3):
+//   Both `extend_active_ttls` and `cleanup_expired_locks` (contract.rs)
+//   process at most `MAX_MAINTENANCE_ITEMS` entries per call regardless of
+//   the caller-supplied `max_items`, persist a resumable cursor
+//   (`TtlSweepProgress`) or accept an explicit bounded id list, and check
+//   status before touching anything so an Active listing, an Active
+//   auction, or a Pending offer can never be removed by a maintenance call.
+//
 /// Identifies one of the growing id-collections kept by the marketplace.
 ///
 /// Every index is stored as a sequence of fixed-capacity pages
@@ -49,6 +118,23 @@ pub struct MigrationProgress {
     /// Which migration phase is in progress (see `contract::migrate_step`).
     pub phase: u32,
     /// Position within the phase (last fully-processed item id/index).
+    pub cursor: u64,
+}
+
+/// Resumable progress marker for the periodic `contract::extend_active_ttls`
+/// maintenance sweep (Issue #280).
+///
+/// Phase 0 walks the `ActiveListings` index (`cursor` = logical position);
+/// phase 1 walks the sequential auction id space `1..=AuctionCount`
+/// (`cursor` = last-processed auction id). Once phase 1 completes the sweep
+/// wraps back to phase 0 rather than stopping — unlike `MigrationProgress`
+/// this is not expected to ever "finish": TTL upkeep for the live record set
+/// is an ongoing operational task, so as long as at least one listing or
+/// auction is Active, later calls will always find something to refresh.
+#[contracttype]
+#[derive(Clone)]
+pub struct TtlSweepProgress {
+    pub phase: u32,
     pub cursor: u64,
 }
 
@@ -126,6 +212,9 @@ pub enum DataKey {
     /// listing or auction; a double-listing guard reads it and settlement /
     /// cancellation clears it.
     EscrowedToken(Address, u64),
+    /// Singleton resumable cursor for the `extend_active_ttls` maintenance
+    /// sweep (Issue #280). See `TtlSweepProgress`.
+    TtlSweepState,
 }
 
 /// Custody record for an NFT held by the marketplace, keyed by
@@ -975,6 +1064,23 @@ pub fn clear_migration_progress(env: &Env, version: &soroban_sdk::String) {
         .remove(&DataKey::MigrationCursor(version.clone()));
 }
 
+// ── TTL-sweep cursor (Issue #280) ─────────────────────────────
+
+/// Load the resumable progress of the `extend_active_ttls` maintenance
+/// sweep (phase 0 cursor 0 the first time it is ever called).
+pub fn get_ttl_sweep_progress(env: &Env) -> TtlSweepProgress {
+    env.storage()
+        .persistent()
+        .get::<DataKey, TtlSweepProgress>(&DataKey::TtlSweepState)
+        .unwrap_or(TtlSweepProgress { phase: 0, cursor: 0 })
+}
+
+pub fn set_ttl_sweep_progress(env: &Env, progress: &TtlSweepProgress) {
+    let key = DataKey::TtlSweepState;
+    env.storage().persistent().set(&key, progress);
+    bump_entry_ttl(env, &key);
+}
+
 /// Read-and-delete a legacy (pre-1.1.0) monolithic `Vec<u64>` index entry.
 /// Returns `None` when the key does not exist (already migrated or never
 /// written).  Used exclusively by the 1.1.0 storage migration.
@@ -1012,50 +1118,6 @@ pub fn get_bid_history_cap_storage(env: &Env) -> u32 {
         bump_entry_ttl(env, &DataKey::BidHistoryCap);
     }
     value.unwrap_or(DEFAULT_BID_HISTORY_CAP)
-}
-
-// ── Escrow record ────────────────────────────────────────────
-
-/// A lightweight record written when an NFT is pulled into escrow and
-/// deleted when the NFT is released.  Supports the double-listing guard
-/// and the `get_escrow` view function.
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct EscrowRecord {
-    /// `true` → held for a listing; `false` → held for an auction.
-    pub is_listing: bool,
-    /// The listing_id or auction_id holding the token.
-    pub id: u64,
-}
-
-#[contracttype]
-#[derive(Clone)]
-pub enum EscrowKey {
-    EscrowedToken(Address, u64),
-}
-
-pub fn set_escrow_record(env: &Env, collection: &Address, token_id: u64, record: &EscrowRecord) {
-    let key = EscrowKey::EscrowedToken(collection.clone(), token_id);
-    env.storage().persistent().set(&key, record);
-    env.storage()
-        .persistent()
-        .extend_ttl(&key, LEDGER_TTL_THRESHOLD, LEDGER_TTL_BUMP);
-}
-
-pub fn get_escrow_record(env: &Env, collection: &Address, token_id: u64) -> Option<EscrowRecord> {
-    let key = EscrowKey::EscrowedToken(collection.clone(), token_id);
-    let value = env.storage().persistent().get::<EscrowKey, EscrowRecord>(&key);
-    if value.is_some() {
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, LEDGER_TTL_THRESHOLD, LEDGER_TTL_BUMP);
-    }
-    value
-}
-
-pub fn clear_escrow_record(env: &Env, collection: &Address, token_id: u64) {
-    let key = EscrowKey::EscrowedToken(collection.clone(), token_id);
-    env.storage().persistent().remove(&key);
 }
 
 // ── Auction max-extensions cap ───────────────────────────────

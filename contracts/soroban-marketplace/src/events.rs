@@ -40,6 +40,9 @@ pub const ROYALTY_SETTLEMENT: &str = "royalty_settlement";
 // Auction escrow recovery events (Issue #271)
 pub const AUCTION_BID_REFUNDED: &str = "auction_bid_refunded";
 pub const AUCTION_ADMIN_CANCELLED: &str = "auction_admin_cancelled";
+// Bounded maintenance / TTL observability events (Issue #280)
+pub const CLEANUP_SUMMARY: &str = "cleanup_summary";
+pub const TTL_ANOMALY: &str = "ttl_anomaly";
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -587,4 +590,51 @@ pub fn emit_function_paused(env: &Env, function_name: soroban_sdk::Symbol) {
 /// Emit function_unpaused event.
 pub fn emit_function_unpaused(env: &Env, function_name: soroban_sdk::Symbol) {
     FunctionUnpausedEvent { function_name }.publish(env);
+}
+
+// ── Bounded maintenance / TTL observability events (Issue #280) ─────────────
+
+/// Emitted once at the end of every bounded maintenance call
+/// (`extend_active_ttls`, `cleanup_expired_locks`) summarizing how much work
+/// was actually done this invocation, so operators/indexers can track sweep
+/// progress and cadence without polling contract state.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CleanupSummaryEvent {
+    /// Which maintenance operation ran: "ttl_extend" | "lock_cleanup".
+    pub kind: Symbol,
+    /// Number of records/ids actually processed this call (bounded by
+    /// `MAX_MAINTENANCE_ITEMS`; see `contract.rs`).
+    pub items_processed: u32,
+    pub ledger_sequence: u32,
+}
+impl CleanupSummaryEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, CLEANUP_SUMMARY),), self);
+    }
+}
+
+/// Emitted when the `extend_active_ttls` sweep finds an id still present in
+/// a live index/id-space (the `ActiveListings` index, or the sequential
+/// auction id space) whose stored status is no longer Active, or whose
+/// record is missing entirely. This is an index/state consistency signal —
+/// not a routine event — surfaced so a maintenance call that "chose not to"
+/// re-extend a record's TTL is observable rather than silently doing
+/// nothing.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TtlAnomalyEvent {
+    /// "listing" | "auction"
+    pub subject: Symbol,
+    pub id: u64,
+    pub ledger_sequence: u32,
+}
+impl TtlAnomalyEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, TTL_ANOMALY),), self);
+    }
 }
