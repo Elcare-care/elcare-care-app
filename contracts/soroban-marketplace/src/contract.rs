@@ -127,6 +127,11 @@ const MAX_BATCH_CANCEL: u32 = 10;
 
 const MAX_OFFERS_PER_LISTING: u32 = 50;
 
+/// Maximum number of addresses one auction's blocked-bidder registry can hold
+/// (Issue #199).  Bounds the per-auction `AuctionBlockedBidders` entry so the
+/// `place_bid` membership scan and the storage footprint stay small.
+const MAX_BLOCKED_BIDDERS: u32 = 50;
+
 #[contract]
 pub struct MarketplaceContract;
 
@@ -1138,6 +1143,11 @@ impl MarketplaceContract {
             panic_with_error!(&env, MarketplaceError::AuctionExpired);
         }
         if bidder == auction.creator { panic_with_error!(&env, MarketplaceError::SelfBidNotAllowed); }
+        // Anti-shill-bidding registry (Issue #199): addresses the creator or
+        // admin has blocked for this auction may not bid.
+        if is_bidder_blocked(&env, auction_id, &bidder) {
+            panic_with_error!(&env, MarketplaceError::Unauthorized);
+        }
         let required_min = if auction.highest_bid == 0 {
             auction.reserve_price
         } else {
@@ -1852,6 +1862,25 @@ impl MarketplaceContract {
         let admin = env.storage().persistent()
             .get::<_, Address>(&key).expect("admin not set");
         admin.require_auth();
+    }
+
+    /// Authorize `caller` (already `require_auth`ed) as either the auction's
+    /// creator or the contract admin — the two roles allowed to manage a
+    /// blocked-bidder registry (Issue #199).
+    fn require_creator_or_admin(env: &Env, caller: &Address, creator: &Address) {
+        if caller == creator {
+            return;
+        }
+        if let Some(admin) = env
+            .storage()
+            .persistent()
+            .get::<_, Address>(&DataKey::Admin)
+        {
+            if *caller == admin {
+                return;
+            }
+        }
+        panic_with_error!(env, MarketplaceError::Unauthorized);
     }
 
     fn require_price_in_bounds(env: &Env, price: i128) {

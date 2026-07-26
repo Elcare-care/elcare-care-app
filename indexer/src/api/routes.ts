@@ -539,6 +539,45 @@ router.get('/auctions/:id', cacheMiddleware(TTL.AUCTION_DETAIL), async (req: Req
   }
 });
 
+// ── GET /auctions/:id/blocked-bidders ─────────────────────────────────────────
+//
+// Anti-shill-bidding registry (Issue #199).  Replays the auction's
+// AUCTION_BIDDER_BLOCKED / AUCTION_BIDDER_UNBLOCKED events in ledger order to
+// compute the currently-blocked address set, and returns the raw event history
+// alongside it for audit views.
+
+router.get('/auctions/:id/blocked-bidders', async (req: Request, res: Response, next: NextFunction) => {
+  const id = req.params.id as string;
+  if (!/^\d+$/.test(id)) {
+    return next(badRequest('Invalid ID format'));
+  }
+  try {
+    const events = await prisma.marketplaceEvent.findMany({
+      where: {
+        listingId: BigInt(id),
+        eventType: { in: ['AUCTION_BIDDER_BLOCKED', 'AUCTION_BIDDER_UNBLOCKED'] },
+      },
+      orderBy: [{ ledgerSequence: 'asc' }, { id: 'asc' }],
+    });
+
+    const blocked = new Set<string>();
+    for (const ev of events) {
+      const bidder = (ev.data as Record<string, unknown> | null)?.bidder;
+      if (typeof bidder !== 'string') continue;
+      if (ev.eventType === 'AUCTION_BIDDER_BLOCKED') blocked.add(bidder);
+      else blocked.delete(bidder);
+    }
+
+    res.json({
+      auctionId: id,
+      blockedBidders: [...blocked],
+      history: serialize(events),
+    });
+  } catch (err) {
+    next(internalError('Failed to fetch blocked bidders'));
+  }
+});
+
 // ── GET /offers ───────────────────────────────────────────────────────────────
 
 router.get('/offers', validateQuery(offersQuerySchema), async (req: Request, res: Response, next: NextFunction) => {

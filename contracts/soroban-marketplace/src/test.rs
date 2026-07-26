@@ -216,7 +216,7 @@ fn test_create_listing_zero_price() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #36)")]
+#[should_panic(expected = "Error(Contract, #43)")]
 fn test_create_listing_seller_not_owner_fails() {
     let (env, client, artist, buyer, token_id, _, collection_id) = setup();
     client.set_admin(&artist);
@@ -231,7 +231,10 @@ fn test_create_listing_seller_not_owner_fails() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #37)")]
+// Note: after the first listing escrows the token, `owner_of` returns the
+// marketplace, so the ownership check (#43 NotTokenOwner) fires before the
+// double-listing guard (#44 TokenAlreadyEscrowed) can be reached.
+#[should_panic(expected = "Error(Contract, #43)")]
 fn test_create_listing_double_listing_fails() {
     let (env, client, artist, _, token_id, _, collection_id) = setup();
     client.set_admin(&artist);
@@ -469,18 +472,36 @@ fn test_finalize_auction_no_bids_returns_nft_to_creator() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #36)")]
+#[should_panic(expected = "Error(Contract, #43)")]
 fn test_create_auction_seller_not_owner_fails() {
     let (env, client, artist, buyer, token_id, _cid, collection_id) = setup();
     client.set_admin(&artist);
     client.add_token_to_whitelist(&token_id);
-    let treasury = Address::generate(&env);
-    client.set_treasury(&artist, &treasury);
-    let price = 5_i128; // Very small price
-                        // Create listing before setting protocol fee so validate_recipients passes
-    let id = client.create_listing(
+    // buyer does NOT own token #1 — escrow_nft must revert with NotTokenOwner
+    client.create_auction(
+        &buyer,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1_000_000_i128,
+        &3600u64,
+        &valid_recipients(&env, &buyer),
+    );
+}
+
+#[test]
+// Note: expects #43 for the same reason as the double-listing test above —
+// the escrowed token's owner is the marketplace, so create_auction's
+// ownership check fires before the TokenAlreadyEscrowed guard.
+#[should_panic(expected = "Error(Contract, #43)")]
+fn test_create_listing_then_auction_same_token_fails() {
+    let (env, client, artist, _buyer, token_id, _cid, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    // First: list token #1 — it moves into marketplace custody.
+    client.create_listing(
         &artist,
-        &price,
+        &1_000_000_i128,
         &symbol_short!("XLM"),
         &token_id,
         &collection_id,
@@ -488,43 +509,16 @@ fn test_create_auction_seller_not_owner_fails() {
         &valid_recipients(&env, &artist),
         &None::<u64>,
     );
-}
-
-#[test]
-#[should_panic(expected = "Error(Contract, #37)")]
-fn test_create_listing_then_auction_same_token_fails() {
-    let (env, client, artist, buyer, token_id, _cid, collection_id) = setup();
-    client.set_admin(&artist);
-    client.add_token_to_whitelist(&token_id);
-    let treasury = Address::generate(&env);
-    client.set_treasury(&artist, &treasury);
-    client.set_protocol_fee(&artist, &333u32);
-    let price = 100_i128;
-    let recipients = vec![
-        &env,
-        Recipient {
-            address: artist.clone(),
-            percentage: 9_667, // leaves 333 bps of room for the snapshotted fee
-        },
-    ];
-    let id = client.create_listing(
+    // Then: auctioning the same token must fail — it is already escrowed.
+    client.create_auction(
         &artist,
-        &price,
-        &symbol_short!("XLM"),
         &token_id,
         &collection_id,
         &1u64,
-        &recipients,
-        &None::<u64>,
+        &1_000_000_i128,
+        &3600u64,
+        &valid_recipients(&env, &artist),
     );
-    let result = client.buy_artwork(&buyer, &id);
-    assert!(result);
-    let listing = client.get_listing(&id);
-    assert_eq!(listing.status, ListingStatus::Sold);
-    assert_eq!(listing.owner, Some(buyer.clone()));
-    // Fee: 100 * 333 / 10_000 = 3 (integer division), seller gets 97
-    let token = TokenClient::new(&env, &token_id);
-    assert_eq!(token.balance(&treasury), 3_i128);
 }
 
 // ════════════════════════════════════════════════════════════

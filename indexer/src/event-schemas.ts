@@ -209,6 +209,18 @@ export interface AdminProposalCancelledData {
   cancelled_candidate: string;
 }
 
+/** Anti-shill-bidding registry (Issue #199): address barred from an auction. */
+export interface AuctionBidderBlockedData {
+  auction_id: bigint;
+  bidder: string;
+}
+
+/** Anti-shill-bidding registry (Issue #199): address removed from the registry. */
+export interface AuctionBidderUnblockedData {
+  auction_id: bigint;
+  bidder: string;
+}
+
 export interface ContractPausedData {
   paused_by?: string;
 }
@@ -480,6 +492,22 @@ export const ADMIN_PROPOSAL_CANCELLED_SCHEMA: ContractEventSchema = {
   ],
 };
 
+export const AUCTION_BIDDER_BLOCKED_SCHEMA: ContractEventSchema = {
+  type: 'AUCTION_BIDDER_BLOCKED',
+  data: [
+    { name: 'auction_id', type: 'bigint' },
+    { name: 'bidder', type: 'string' },
+  ],
+};
+
+export const AUCTION_BIDDER_UNBLOCKED_SCHEMA: ContractEventSchema = {
+  type: 'AUCTION_BIDDER_UNBLOCKED',
+  data: [
+    { name: 'auction_id', type: 'bigint' },
+    { name: 'bidder', type: 'string' },
+  ],
+};
+
 export const CONTRACT_PAUSED_SCHEMA: ContractEventSchema = {
   type: 'CONTRACT_PAUSED',
   data: [{ name: 'paused_by', type: 'string', optional: true }],
@@ -541,6 +569,8 @@ export const SCHEMA_REGISTRY: Map<string, ContractEventSchema> = new Map([
   ['ADMIN_PROPOSAL_CANCELLED', ADMIN_PROPOSAL_CANCELLED_SCHEMA],
   ['CONTRACT_PAUSED', CONTRACT_PAUSED_SCHEMA],
   ['CONTRACT_UNPAUSED', CONTRACT_UNPAUSED_SCHEMA],
+  ['AUCTION_BIDDER_BLOCKED', AUCTION_BIDDER_BLOCKED_SCHEMA],
+  ['AUCTION_BIDDER_UNBLOCKED', AUCTION_BIDDER_UNBLOCKED_SCHEMA],
   // Deploy events share a common tuple structure; each variant is registered separately.
   ['DEPLOY_NORMAL_721', DEPLOY_SCHEMA],
   ['DEPLOY_NORMAL_1155', DEPLOY_SCHEMA],
