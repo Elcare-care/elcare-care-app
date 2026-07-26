@@ -7,7 +7,7 @@
 import { useState, useCallback, useEffect } from "react";
 import { StrKey } from "@stellar/stellar-sdk";
 import { useWallet } from "@/hooks/useWallet";
-import { useAdminStats, useModeration, useTokenManagement, useAdminCheck, useAdminTransfer } from "@/hooks/useAdmin";
+import { useAdminStats, useModeration, useTokenManagement, useAdminCheck, useAdminTransfer, usePauseControls, PAUSABLE_FUNCTIONS, type PausableFunction } from "@/hooks/useAdmin";
 import { useAdminSession } from "@/hooks/useAdminSession";
 import { AdminConfirmationModal } from "@/components/AdminConfirmationModal";
 import {
@@ -32,9 +32,10 @@ import {
     X,
     ChevronRight,
     AlertTriangle,
-    Percent,
-    Edit2,
-    RotateCcw,
+    ShieldOff,
+    ToggleLeft,
+    ToggleRight,
+    Zap,
 } from "lucide-react";
 import { stroopsToXlm } from "@/lib/contract";
 
@@ -86,6 +87,38 @@ export default function AdminPage() {
         accept: acceptAdminTransfer,
         cancel: cancelAdminTransfer,
     } = useAdminTransfer(publicKey);
+
+    // Granular circuit-breaker (Issue #205)
+    const {
+        state: pauseState,
+        isLoading: isPauseLoading,
+        isProcessing: isPauseProcessing,
+        error: pauseError,
+        refresh: refreshPause,
+        toggleGlobal: toggleGlobalPause,
+        toggleCollection: toggleCollectionPause,
+        toggleFunction: toggleFunctionPause,
+    } = usePauseControls(publicKey);
+
+    // Collection rows for circuit-breaker (loaded from indexer on mount)
+    const [collectionPauseRows, setCollectionPauseRows] = useState<
+        { address: string; paused: boolean }[]
+    >([]);
+    useEffect(() => {
+        const fetchCols = async () => {
+            try {
+                const base = process.env.NEXT_PUBLIC_INDEXER_URL ?? "";
+                const res = await fetch(`${base}/collections?limit=100`);
+                if (!res.ok) return;
+                const json = await res.json();
+                const rows = (Array.isArray(json) ? json : json.collections ?? []).map(
+                    (c: any) => ({ address: c.contractAddress ?? c.contract_address, paused: false })
+                );
+                setCollectionPauseRows(rows);
+            } catch { /* non-fatal */ }
+        };
+        fetchCols();
+    }, []);
 
     const [isWizardOpen, setIsWizardOpen] = useState(false);
     // A once-per-second clock so the proposal countdown ticks live.
@@ -641,128 +674,170 @@ export default function AdminPage() {
                         </div>
                     </section>
 
-                    {/* Collection Fee Overrides Panel (Issue #322) */}
+                    {/* Circuit Breaker Panel (Issue #205) */}
                     <section className="lg:col-span-2 rounded-3xl bg-white p-8 shadow-sm border border-brand-100">
-                        <div className="mb-8 flex flex-col gap-6 sm:flex-row sm:items-center sm:justify-between">
-                            <div className="flex items-center gap-3">
-                                <div className="rounded-xl bg-blue-100 p-2.5">
-                                    <Percent className="h-6 w-6 text-blue-600" />
-                                </div>
-                                <div>
-                                    <h2 className="font-display text-2xl font-bold text-midnight-950">Collection Fee Overrides</h2>
-                                    <p className="mt-1 text-sm text-gray-500">
-                                        Set a custom protocol fee (bps) per collection. Overrides the global fee for new listings and auctions.
-                                    </p>
-                                </div>
+                        <div className="mb-6 flex items-center gap-3">
+                            <div className="rounded-xl bg-red-100 p-2.5">
+                                <ShieldOff className="h-6 w-6 text-red-600" />
                             </div>
-                        </div>
-
-                        {feeError && (
-                            <div className="mb-6 flex items-center gap-2 rounded-xl bg-red-50 p-4 text-sm text-red-600 border border-red-100">
-                                <AlertCircle className="h-4 w-4 shrink-0" />
-                                {feeError}
+                            <div>
+                                <h2 className="font-display text-2xl font-bold text-midnight-950">Circuit Breakers</h2>
+                                <p className="mt-0.5 text-sm text-gray-500">Granular pause controls — global, per-collection, or per-function.</p>
                             </div>
-                        )}
-
-                        {/* Add / update a fee override */}
-                        <div className="mb-8 flex flex-col gap-3 sm:flex-row">
-                            <input
-                                type="text"
-                                placeholder="Collection contract address (C...)"
-                                value={collectionFeeAddress}
-                                onChange={(e) => setCollectionFeeAddress(e.target.value)}
-                                className="flex-1 rounded-xl border border-gray-200 px-4 py-2.5 text-sm focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500 font-mono"
-                            />
-                            <input
-                                type="number"
-                                min={0}
-                                max={10000}
-                                placeholder="BPS (0–10 000)"
-                                value={collectionFeeBps}
-                                onChange={(e) => setCollectionFeeBps(e.target.value)}
-                                className="w-36 rounded-xl border border-gray-200 px-4 py-2.5 text-sm focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
-                            />
                             <button
                                 type="button"
-                                disabled={isFeeProcessing || !collectionFeeAddress || !collectionFeeBps}
-                                onClick={handleSetCollectionFee}
-                                className="flex items-center gap-2 rounded-xl bg-blue-600 px-5 py-2.5 text-sm font-bold text-white transition-all hover:bg-blue-700 disabled:opacity-50 shadow-md shadow-blue-100"
+                                onClick={() => { refreshPause(); }}
+                                className="ml-auto flex items-center gap-1.5 rounded-full bg-gray-50 px-4 py-2 text-xs font-semibold text-gray-500 hover:bg-gray-100 border border-gray-200 transition-all"
                             >
-                                {isFeeProcessing ? <Loader2 className="h-4 w-4 animate-spin" /> : <Edit2 className="h-4 w-4" />}
-                                Set Override
+                                <Loader2 className={`h-3.5 w-3.5 ${isPauseLoading ? "animate-spin" : ""}`} />
+                                Refresh
                             </button>
                         </div>
 
-                        {/* Fee override table */}
-                        {isFeeLoading ? (
-                            <div className="flex items-center justify-center py-10 text-gray-400">
-                                <Loader2 className="h-6 w-6 animate-spin mr-2" />
-                                Loading collections…
-                            </div>
-                        ) : collectionFeeRows.length === 0 ? (
-                            <div className="flex flex-col items-center justify-center py-10 text-center text-gray-400">
-                                <AlertCircle className="mb-2 h-8 w-8 opacity-20" />
-                                <p className="text-sm italic">No collections found. Deploy a collection to begin.</p>
-                            </div>
-                        ) : (
-                            <div className="overflow-x-auto rounded-2xl border border-gray-100">
-                                <table className="w-full text-sm">
-                                    <thead>
-                                        <tr className="border-b border-gray-100 bg-gray-50/60">
-                                            <th className="px-5 py-3 text-left text-xs font-bold uppercase tracking-wider text-gray-400">Collection Address</th>
-                                            <th className="px-5 py-3 text-left text-xs font-bold uppercase tracking-wider text-gray-400">Current Fee</th>
-                                            <th className="px-5 py-3 text-right text-xs font-bold uppercase tracking-wider text-gray-400">Actions</th>
-                                        </tr>
-                                    </thead>
-                                    <tbody className="divide-y divide-gray-50">
-                                        {collectionFeeRows.map((row) => (
-                                            <tr key={row.address} className="hover:bg-gray-50/40 transition-colors">
-                                                <td className="px-5 py-4 font-mono text-xs text-midnight-800 max-w-xs truncate" title={row.address}>
-                                                    {row.address}
-                                                </td>
-                                                <td className="px-5 py-4">
-                                                    {row.fee_bps !== null ? (
-                                                        <span className="inline-flex items-center gap-1.5 rounded-full bg-blue-50 px-3 py-1 text-xs font-bold text-blue-700">
-                                                            <Percent className="h-3 w-3" />
-                                                            {row.fee_bps} bps ({(row.fee_bps / 100).toFixed(2)}%)
-                                                        </span>
-                                                    ) : (
-                                                        <span className="text-xs text-gray-400 italic">Global default</span>
-                                                    )}
-                                                </td>
-                                                <td className="px-5 py-4 text-right">
-                                                    <div className="flex items-center justify-end gap-2">
-                                                        <button
-                                                            type="button"
-                                                            aria-label="Edit fee override"
-                                                            title="Edit fee for this collection"
-                                                            onClick={() => {
-                                                                setCollectionFeeAddress(row.address);
-                                                                setCollectionFeeBps(row.fee_bps !== null ? String(row.fee_bps) : "");
-                                                            }}
-                                                            className="rounded-lg p-2 text-gray-400 hover:bg-blue-50 hover:text-blue-600 transition-all"
-                                                        >
-                                                            <Edit2 className="h-4 w-4" />
-                                                        </button>
-                                                        {row.fee_bps !== null && (
-                                                            <button
-                                                                type="button"
-                                                                aria-label="Clear fee override"
-                                                                title="Restore global default fee"
-                                                                onClick={() => handleClearCollectionFee(row.address)}
-                                                                className="rounded-lg p-2 text-gray-400 hover:bg-orange-50 hover:text-orange-500 transition-all"
-                                                            >
-                                                                <RotateCcw className="h-4 w-4" />
-                                                            </button>
-                                                        )}
-                                                    </div>
-                                                </td>
-                                            </tr>
-                                        ))}
-                                    </tbody>
-                                </table>
+                        {pauseError && (
+                            <div className="mb-4 flex items-center gap-2 rounded-xl bg-red-50 p-3 text-sm text-red-600 border border-red-100">
+                                <AlertCircle className="h-4 w-4 shrink-0" />
+                                {pauseError}
                             </div>
                         )}
+
+                        <div className="space-y-8">
+                            {/* ── 1. Global toggle ── */}
+                            <div className="rounded-2xl border border-gray-100 p-6">
+                                <div className="flex items-center justify-between">
+                                    <div>
+                                        <h3 className="font-bold text-midnight-950">Global Pause</h3>
+                                        <p className="mt-0.5 text-sm text-gray-500">Blocks all state-mutating operations marketplace-wide.</p>
+                                    </div>
+                                    <button
+                                        type="button"
+                                        disabled={isPauseProcessing}
+                                        onClick={toggleGlobalPause}
+                                        aria-label={pauseState.globalPaused ? "Unpause contract" : "Pause contract"}
+                                        className={`flex items-center gap-2 rounded-full px-5 py-2.5 text-sm font-bold transition-all disabled:opacity-50 ${
+                                            pauseState.globalPaused
+                                                ? "bg-red-600 text-white hover:bg-red-700 shadow-md shadow-red-200"
+                                                : "bg-gray-100 text-gray-700 hover:bg-gray-200"
+                                        }`}
+                                    >
+                                        {isPauseProcessing ? (
+                                            <Loader2 className="h-4 w-4 animate-spin" />
+                                        ) : pauseState.globalPaused ? (
+                                            <ToggleRight className="h-4 w-4" />
+                                        ) : (
+                                            <ToggleLeft className="h-4 w-4" />
+                                        )}
+                                        {pauseState.globalPaused ? "PAUSED — Click to Unpause" : "Active — Click to Pause"}
+                                    </button>
+                                </div>
+                            </div>
+
+                            {/* ── 2. Per-function checkboxes ── */}
+                            <div className="rounded-2xl border border-gray-100 p-6">
+                                <div className="mb-4 flex items-center gap-2">
+                                    <Zap className="h-4 w-4 text-amber-500" />
+                                    <h3 className="font-bold text-midnight-950">Function Circuit Breakers</h3>
+                                </div>
+                                <p className="mb-5 text-sm text-gray-500">
+                                    Pause a single entry-point globally — e.g., halt all purchases without stopping new listings.
+                                </p>
+                                <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+                                    {(PAUSABLE_FUNCTIONS as readonly string[]).map((fn) => {
+                                        const paused = pauseState.pausedFunctions[fn as import("@/hooks/useAdmin").PausableFunction];
+                                        return (
+                                            <label
+                                                key={fn}
+                                                className={`flex cursor-pointer items-center justify-between rounded-xl border px-4 py-3 transition-all ${
+                                                    paused
+                                                        ? "border-red-200 bg-red-50"
+                                                        : "border-gray-100 bg-gray-50/50 hover:border-brand-200"
+                                                }`}
+                                            >
+                                                <span className={`text-sm font-mono font-medium ${paused ? "text-red-700" : "text-midnight-800"}`}>
+                                                    {fn}
+                                                </span>
+                                                <input
+                                                    type="checkbox"
+                                                    checked={paused}
+                                                    disabled={isPauseProcessing}
+                                                    onChange={() => toggleFunctionPause(fn as import("@/hooks/useAdmin").PausableFunction)}
+                                                    className="h-4 w-4 rounded accent-red-500"
+                                                    aria-label={`Toggle pause for ${fn}`}
+                                                />
+                                            </label>
+                                        );
+                                    })}
+                                </div>
+                            </div>
+
+                            {/* ── 3. Per-collection table ── */}
+                            <div className="rounded-2xl border border-gray-100 p-6">
+                                <div className="mb-4 flex items-center gap-2">
+                                    <ShieldAlert className="h-4 w-4 text-orange-500" />
+                                    <h3 className="font-bold text-midnight-950">Collection Circuit Breakers</h3>
+                                </div>
+                                <p className="mb-5 text-sm text-gray-500">
+                                    Pause a specific collection — only that collection's listings, auctions, bids, and offers are blocked.
+                                </p>
+                                {collectionPauseRows.length === 0 ? (
+                                    <div className="flex flex-col items-center py-8 text-center text-gray-400">
+                                        <AlertCircle className="mb-2 h-7 w-7 opacity-20" />
+                                        <p className="text-sm italic">No collections indexed yet.</p>
+                                    </div>
+                                ) : (
+                                    <div className="overflow-x-auto rounded-xl border border-gray-100">
+                                        <table className="w-full text-sm">
+                                            <thead>
+                                                <tr className="border-b border-gray-100 bg-gray-50/60">
+                                                    <th className="px-4 py-3 text-left text-xs font-bold uppercase tracking-wider text-gray-400">Collection Address</th>
+                                                    <th className="px-4 py-3 text-left text-xs font-bold uppercase tracking-wider text-gray-400">Status</th>
+                                                    <th className="px-4 py-3 text-right text-xs font-bold uppercase tracking-wider text-gray-400">Action</th>
+                                                </tr>
+                                            </thead>
+                                            <tbody className="divide-y divide-gray-50">
+                                                {collectionPauseRows.map((row) => (
+                                                    <tr key={row.address} className="hover:bg-gray-50/40 transition-colors">
+                                                        <td className="px-4 py-3 font-mono text-xs text-midnight-800 max-w-xs truncate" title={row.address}>
+                                                            {row.address}
+                                                        </td>
+                                                        <td className="px-4 py-3">
+                                                            {row.paused ? (
+                                                                <span className="inline-flex items-center gap-1 rounded-full bg-red-50 px-2.5 py-1 text-xs font-bold text-red-600">
+                                                                    <ShieldOff className="h-3 w-3" /> Paused
+                                                                </span>
+                                                            ) : (
+                                                                <span className="inline-flex items-center gap-1 rounded-full bg-green-50 px-2.5 py-1 text-xs font-bold text-green-600">
+                                                                    <ShieldCheck className="h-3 w-3" /> Active
+                                                                </span>
+                                                            )}
+                                                        </td>
+                                                        <td className="px-4 py-3 text-right">
+                                                            <button
+                                                                type="button"
+                                                                disabled={isPauseProcessing}
+                                                                onClick={async () => {
+                                                                    await toggleCollectionPause(row.address, row.paused);
+                                                                    setCollectionPauseRows(prev =>
+                                                                        prev.map(r => r.address === row.address ? { ...r, paused: !r.paused } : r)
+                                                                    );
+                                                                }}
+                                                                className={`rounded-lg px-3 py-1.5 text-xs font-bold transition-all disabled:opacity-50 ${
+                                                                    row.paused
+                                                                        ? "bg-green-50 text-green-700 hover:bg-green-100"
+                                                                        : "bg-red-50 text-red-700 hover:bg-red-100"
+                                                                }`}
+                                                            >
+                                                                {row.paused ? "Unpause" : "Pause"}
+                                                            </button>
+                                                        </td>
+                                                    </tr>
+                                                ))}
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                )}
+                            </div>
+                        </div>
                     </section>
 
                     {/* Admin Key Rotation Panel (Issue #202) */}

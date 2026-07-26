@@ -60,9 +60,11 @@ const TOPIC_MAP: Record<string, string> = {
   'admin_proposal_cancelled':  'ADMIN_PROPOSAL_CANCELLED',
   'contract_paused':   'CONTRACT_PAUSED',
   'contract_unpaused': 'CONTRACT_UNPAUSED',
-  // Per-collection fee overrides (Issue #322)
-  'collection_fee_set':     'COLLECTION_FEE_SET',
-  'collection_fee_cleared': 'COLLECTION_FEE_CLEARED',
+  // Granular pause events (Issue #205)
+  'collection_paused':   'COLLECTION_PAUSED',
+  'collection_unpaused': 'COLLECTION_UNPAUSED',
+  'function_paused':     'FUNCTION_PAUSED',
+  'function_unpaused':   'FUNCTION_UNPAUSED',
   // Launchpad deploy events (topics[0] = "deploy", topics[1] = kind tag)
   'dep_n721':  'DEPLOY_NORMAL_721',
   'dep_n1155': 'DEPLOY_NORMAL_1155',

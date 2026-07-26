@@ -36,11 +36,17 @@ use soroban_sdk::{
 
 use crate::{
     events, storage,
-    types::{CollectionKind, CollectionRecord, Error, WasmHashes},
+    types::{CollectionKind, CollectionRecord, Error, PreflightResult, WasmHashes},
 };
+use crate::types::DataKey;
+
+/// Semantic version — bump on every breaking storage change.
+const CONTRACT_VERSION: &str = "1.0.0";
 
 /// Maximum allowed platform fee (20 %) — issue #38.
 const MAX_FEE_BPS: u32 = 2000;
+/// Maximum allowed royalty (100 %), matching the collection contracts' own cap — issue #277.
+const MAX_ROYALTY_BPS: u32 = 10_000;
 
 // ─── Cross-contract clients ───────────────────────────────────────────────────
 
@@ -58,6 +64,7 @@ mod iface {
             royalty_bps: u32,
             royalty_receiver: Address,
         );
+        fn upgrade(env: Env, new_wasm_hash: BytesN<32>);
     }
 
     #[contractclient(name = "Normal1155Client")]
@@ -69,6 +76,7 @@ mod iface {
             royalty_bps: u32,
             royalty_receiver: Address,
         );
+        fn upgrade(env: Env, new_wasm_hash: BytesN<32>);
     }
 
     /// Issue #38: lazy mint contracts accept per-collection platform fee at init.
@@ -87,6 +95,7 @@ mod iface {
             platform_fee_receiver: Address,
             platform_fee_bps: u32,
         );
+        fn upgrade(env: Env, new_wasm_hash: BytesN<32>);
     }
 
     #[contractclient(name = "Lazy1155Client")]
@@ -102,6 +111,7 @@ mod iface {
             platform_fee_receiver: Address,
             platform_fee_bps: u32,
         );
+        fn upgrade(env: Env, new_wasm_hash: BytesN<32>);
     }
 }
 
@@ -117,13 +127,6 @@ fn make_secure_salt(env: &Env, creator: &Address, raw_salt: &BytesN<32>) -> Byte
 
 // ─── Shared deploy guards ─────────────────────────────────────────────────────
 
-fn require_not_paused(env: &Env) -> Result<(), Error> {
-    if storage::is_paused(env) {
-        return Err(Error::ContractPaused);
-    }
-    Ok(())
-}
-
 /// Transfers the flat deploy fee (if any) from `creator` to the treasury and
 /// emits `fee_coll`.  Returns the configured fee receiver so lazy deploys can
 /// forward it to the child contract as `platform_fee_receiver`.
@@ -134,6 +137,99 @@ fn collect_deploy_fee(env: &Env, creator: &Address, currency: &Address) -> Addre
         events::publish_deployment_fee_collected(env, creator, &receiver, deploy_fee, currency);
     }
     receiver
+}
+
+// ─── Shared deploy validation (#277) ──────────────────────────────────────────
+//
+// These helpers back both the mutating `deploy_*` functions and the read-only
+// `preflight_deploy_*` functions, so a creator can trust that a clean
+// preflight result means the matching deploy call will succeed, and that
+// every error a deploy call can raise (before it mutates state) is visible
+// ahead of time.
+
+/// Validation shared by the two 721-shaped kinds (Normal721, LazyMint721):
+/// both take `name`, `symbol` and `max_supply`.
+fn validate_721_shape(
+    env: &Env,
+    name: &String,
+    symbol: &String,
+    max_supply: u64,
+    royalty_bps: u32,
+    platform_fee_bps: u32,
+    secure_salt: &BytesN<32>,
+    wasm_set: bool,
+) -> Vec<Error> {
+    let mut errors = Vec::new(env);
+    if storage::is_paused(env) {
+        errors.push_back(Error::ContractPaused);
+    }
+    if platform_fee_bps > MAX_FEE_BPS {
+        errors.push_back(Error::InvalidFeeBps);
+    }
+    if royalty_bps > MAX_ROYALTY_BPS {
+        errors.push_back(Error::InvalidRoyaltyBps);
+    }
+    if name.len() == 0 {
+        errors.push_back(Error::EmptyName);
+    }
+    if symbol.len() == 0 {
+        errors.push_back(Error::EmptySymbol);
+    }
+    if max_supply == 0 {
+        errors.push_back(Error::InvalidMaxSupply);
+    }
+    if !wasm_set {
+        errors.push_back(Error::WasmHashNotSet);
+    }
+    if storage::is_salt_used(env, secure_salt) {
+        errors.push_back(Error::DuplicateSalt);
+    }
+    errors
+}
+
+/// Validation shared by the two 1155-shaped kinds (Normal1155, LazyMint1155):
+/// both take only `name` (no symbol / no collection-level max_supply).
+fn validate_1155_shape(
+    env: &Env,
+    name: &String,
+    royalty_bps: u32,
+    platform_fee_bps: u32,
+    secure_salt: &BytesN<32>,
+    wasm_set: bool,
+) -> Vec<Error> {
+    let mut errors = Vec::new(env);
+    if storage::is_paused(env) {
+        errors.push_back(Error::ContractPaused);
+    }
+    if platform_fee_bps > MAX_FEE_BPS {
+        errors.push_back(Error::InvalidFeeBps);
+    }
+    if royalty_bps > MAX_ROYALTY_BPS {
+        errors.push_back(Error::InvalidRoyaltyBps);
+    }
+    if name.len() == 0 {
+        errors.push_back(Error::EmptyName);
+    }
+    if !wasm_set {
+        errors.push_back(Error::WasmHashNotSet);
+    }
+    if storage::is_salt_used(env, secure_salt) {
+        errors.push_back(Error::DuplicateSalt);
+    }
+    errors
+}
+
+/// Adds `Error::InsufficientFee` to `errors` when `creator`'s balance of
+/// `currency` cannot cover the flat `deploy_fee`. Read-only — used only by
+/// the preflight path, since the real transfer in `collect_deploy_fee`
+/// already fails atomically if the balance is insufficient.
+fn check_sufficient_fee(env: &Env, creator: &Address, currency: &Address, deploy_fee: i128, errors: &mut Vec<Error>) {
+    if deploy_fee > 0 {
+        let balance = token::TokenClient::new(env, currency).balance(creator);
+        if balance < deploy_fee {
+            errors.push_back(Error::InsufficientFee);
+        }
+    }
 }
 
 #[contract]
@@ -159,6 +255,131 @@ impl Launchpad {
         storage::set_admin(&env, &admin);
         storage::set_fee_config(&env, &fee_receiver, deploy_fee);
         Ok(())
+    }
+
+    // ── Versioning & Migration ────────────────────────────────────────────
+
+    /// Returns the semantic version string compiled into this WASM.
+    pub fn version(env: Env) -> soroban_sdk::String {
+        soroban_sdk::String::from_str(&env, crate::types::CONTRACT_VERSION)
+    }
+
+    /// Returns the version string last written to on-chain storage by
+    /// `migrate()`.  `None` before the first migration.
+    pub fn contract_version(env: Env) -> Option<soroban_sdk::String> {
+        storage::get_contract_version(&env)
+    }
+
+    /// Admin-guarded, idempotent storage migration entry point.
+    ///
+    /// # Idempotency
+    /// Records a per-version completion marker the first time it succeeds.
+    /// Subsequent calls for the *same* version revert with `AlreadyMigrated`.
+    ///
+    /// # Unsupported jumps
+    /// Only sequential upgrades (e.g. 1.0.0 → 1.1.0) are accepted.  If no
+    /// prior version is on-chain (fresh install) any version is accepted as the
+    /// first migration.
+    ///
+    /// # 1.0.0 migration
+    /// Migrates legacy monolithic `ByCreator(Address)` Vec<CollectionRecord>
+    /// and `AllCollections` Vec<CollectionRecord> entries into the paged index
+    /// storage introduced in the current build.  Legacy keys are consumed and
+    /// deleted.  The step is idempotent — re-running after a crash finds the
+    /// keys absent and skips them silently.
+    pub fn migrate(env: Env, admin: Address) -> Result<(), Error> {
+        storage::extend_instance_ttl(&env);
+        let version = Self::require_pending_migration(&env, &admin)?;
+        Self::run_migration(&env, &version, u32::MAX);
+        Ok(())
+    }
+
+    /// Bounded, resumable variant of `migrate`.  Returns items still pending.
+    /// Call repeatedly until it returns `0`.
+    pub fn migrate_step(env: Env, admin: Address, max_items: u32) -> Result<u64, Error> {
+        storage::extend_instance_ttl(&env);
+        let version = Self::require_pending_migration(&env, &admin)?;
+        Ok(Self::run_migration(&env, &version, max_items))
+    }
+
+    // ── Internal migration helpers ────────────────────────────────────────
+
+    fn require_pending_migration(env: &Env, admin: &Address) -> Result<soroban_sdk::String, Error> {
+        admin.require_auth();
+        let stored = storage::get_admin(env).ok_or(Error::NotInitialized)?;
+        if *admin != stored {
+            return Err(Error::NotAdmin);
+        }
+        let target = soroban_sdk::String::from_str(env, crate::types::CONTRACT_VERSION);
+        if storage::is_migration_done(env, &target) {
+            return Err(Error::AlreadyMigrated);
+        }
+        Ok(target)
+    }
+
+    fn run_migration(
+        env: &Env,
+        version: &soroban_sdk::String,
+        mut budget: u32,
+    ) -> u64 {
+        let mut p = storage::get_migration_progress(env, version);
+
+        // Phase 0: migrate legacy ByCreator + AllCollections Vec entries into
+        //           the paged index introduced in v1.0.0.
+        // Each legacy ByCreator Vec<CollectionRecord> entry is read-and-deleted
+        // in one step; records are then appended to the per-address paged index.
+        while budget > 0 {
+            match p.phase {
+                0 => {
+                    // Legacy AllCollections is a single entry; consume it.
+                    let legacy_key = DataKey::AllCollections;
+                    if let Some(records) = env
+                        .storage()
+                        .persistent()
+                        .get::<DataKey, soroban_sdk::Vec<crate::types::CollectionRecord>>(
+                            &legacy_key,
+                        )
+                    {
+                        env.storage().persistent().remove(&legacy_key);
+                        let current_count = storage::collection_count(env);
+                        // Re-insert into paged keys without touching per-creator indices
+                        // (those were written by record_collection() at deploy time and
+                        //  only need to survive).
+                        for (i, rec) in records.iter().enumerate() {
+                            let global_idx = current_count + i as u64;
+                            env.storage().persistent().set(
+                                &DataKey::CollectionByIndex(global_idx),
+                                &rec,
+                            );
+                            env.storage().persistent().extend_ttl(
+                                &DataKey::CollectionByIndex(global_idx),
+                                50_000,
+                                100_000,
+                            );
+                        }
+                        let new_total = current_count + records.len() as u64;
+                        env.storage()
+                            .persistent()
+                            .set(&DataKey::CollectionCount, &new_total);
+                    }
+                    p.phase = 1;
+                    budget -= 1;
+                }
+                _ => break,
+            }
+        }
+
+        let remaining: u64 = if p.phase == 0 { 1 } else { 0 };
+
+        if remaining == 0 {
+            storage::clear_migration_progress(env, version);
+            storage::set_migration_done(env, version);
+            storage::set_contract_version(env, version);
+            events::publish_migration_completed(env, version);
+        } else {
+            storage::set_migration_progress(env, version, &p);
+        }
+        remaining
     }
 
     /// Records the four collection WASM hashes, bumps the version counter and
@@ -207,35 +428,29 @@ impl Launchpad {
     ) -> Result<Address, Error> {
         storage::extend_instance_ttl(&env);
         creator.require_auth();
-        require_not_paused(&env)?;
-
-        if platform_fee_bps > MAX_FEE_BPS {
-            return Err(Error::InvalidFeeBps);
-        }
-
-        let (receiver, fee) = storage::get_platform_fee(&env);
-        if fee > 0 {
-            soroban_sdk::token::TokenClient::new(&env, &currency).transfer(
-                &creator,
-                &receiver,
-                &(fee as i128),
-            );
-            events::publish_deployment_fee_collected(
-                &env,
-                &creator,
-                &receiver,
-                fee as i128,
-                &currency,
-            );
-        }
-
-        let wasm = storage::get_wasm_normal_721(&env).ok_or(Error::WasmHashNotSet)?;
-        collect_deploy_fee(&env, &creator, &currency);
 
         let secure_salt = make_secure_salt(&env, &creator, &salt);
+        let wasm_opt = storage::get_wasm_normal_721(&env);
+        let errors = validate_721_shape(
+            &env,
+            &name,
+            &symbol,
+            max_supply,
+            royalty_bps,
+            platform_fee_bps,
+            &secure_salt,
+            wasm_opt.is_some(),
+        );
+        if let Some(first) = errors.get(0) {
+            return Err(first);
+        }
+        let wasm = wasm_opt.unwrap();
+
+        collect_deploy_fee(&env, &creator, &currency);
+
         let addr = env
             .deployer()
-            .with_current_contract(secure_salt)
+            .with_current_contract(secure_salt.clone())
             .deploy_v2(wasm, ());
 
         Normal721Client::new(&env, &addr).initialize(
@@ -247,6 +462,7 @@ impl Launchpad {
             &royalty_receiver,
         );
 
+        storage::mark_salt_used(&env, &secure_salt);
         storage::record_collection(
             &env,
             &creator,
@@ -259,6 +475,52 @@ impl Launchpad {
         );
         events::publish_deploy(&env, symbol_short!("n721"), &creator, &addr);
         Ok(addr)
+    }
+
+    /// Read-only preflight for `deploy_normal_721` (#277). Runs the exact
+    /// same validation the mutating call would run, without requiring
+    /// authorization or touching storage. Returns the predicted deployment
+    /// address, the flat fee that would be charged, and every validation
+    /// failure found.
+    pub fn preflight_deploy_normal_721(
+        env: Env,
+        creator: Address,
+        currency: Address,
+        name: String,
+        symbol: String,
+        max_supply: u64,
+        royalty_bps: u32,
+        platform_fee_bps: u32,
+        salt: BytesN<32>,
+    ) -> PreflightResult {
+        let secure_salt = make_secure_salt(&env, &creator, &salt);
+        let wasm_opt = storage::get_wasm_normal_721(&env);
+        let mut errors = validate_721_shape(
+            &env,
+            &name,
+            &symbol,
+            max_supply,
+            royalty_bps,
+            platform_fee_bps,
+            &secure_salt,
+            wasm_opt.is_some(),
+        );
+
+        let (_, deploy_fee) = storage::get_fee_config(&env);
+        check_sufficient_fee(&env, &creator, &currency, deploy_fee, &mut errors);
+
+        let predicted_address = env
+            .deployer()
+            .with_current_contract(secure_salt)
+            .deployed_address();
+
+        PreflightResult {
+            predicted_address,
+            required_fee: deploy_fee,
+            platform_fee_bps,
+            currency,
+            errors,
+        }
     }
 
     // ── Deploy: Normal ERC-1155 ──────────────────────────────────────────
@@ -274,35 +536,27 @@ impl Launchpad {
     ) -> Result<Address, Error> {
         storage::extend_instance_ttl(&env);
         creator.require_auth();
-        require_not_paused(&env)?;
-
-        if platform_fee_bps > MAX_FEE_BPS {
-            return Err(Error::InvalidFeeBps);
-        }
-
-        let (receiver, fee) = storage::get_platform_fee(&env);
-        if fee > 0 {
-            soroban_sdk::token::TokenClient::new(&env, &currency).transfer(
-                &creator,
-                &receiver,
-                &(fee as i128),
-            );
-            events::publish_deployment_fee_collected(
-                &env,
-                &creator,
-                &receiver,
-                fee as i128,
-                &currency,
-            );
-        }
-
-        let wasm = storage::get_wasm_normal_1155(&env).ok_or(Error::WasmHashNotSet)?;
-        collect_deploy_fee(&env, &creator, &currency);
 
         let secure_salt = make_secure_salt(&env, &creator, &salt);
+        let wasm_opt = storage::get_wasm_normal_1155(&env);
+        let errors = validate_1155_shape(
+            &env,
+            &name,
+            royalty_bps,
+            platform_fee_bps,
+            &secure_salt,
+            wasm_opt.is_some(),
+        );
+        if let Some(first) = errors.get(0) {
+            return Err(first);
+        }
+        let wasm = wasm_opt.unwrap();
+
+        collect_deploy_fee(&env, &creator, &currency);
+
         let addr = env
             .deployer()
-            .with_current_contract(secure_salt)
+            .with_current_contract(secure_salt.clone())
             .deploy_v2(wasm, ());
 
         Normal1155Client::new(&env, &addr).initialize(
@@ -312,6 +566,7 @@ impl Launchpad {
             &royalty_receiver,
         );
 
+        storage::mark_salt_used(&env, &secure_salt);
         let empty_symbol = String::from_str(&env, "");
         storage::record_collection(
             &env,
@@ -325,6 +580,44 @@ impl Launchpad {
         );
         events::publish_deploy(&env, symbol_short!("n1155"), &creator, &addr);
         Ok(addr)
+    }
+
+    /// Read-only preflight for `deploy_normal_1155` (#277).
+    pub fn preflight_deploy_normal_1155(
+        env: Env,
+        creator: Address,
+        currency: Address,
+        name: String,
+        royalty_bps: u32,
+        platform_fee_bps: u32,
+        salt: BytesN<32>,
+    ) -> PreflightResult {
+        let secure_salt = make_secure_salt(&env, &creator, &salt);
+        let wasm_opt = storage::get_wasm_normal_1155(&env);
+        let mut errors = validate_1155_shape(
+            &env,
+            &name,
+            royalty_bps,
+            platform_fee_bps,
+            &secure_salt,
+            wasm_opt.is_some(),
+        );
+
+        let (_, deploy_fee) = storage::get_fee_config(&env);
+        check_sufficient_fee(&env, &creator, &currency, deploy_fee, &mut errors);
+
+        let predicted_address = env
+            .deployer()
+            .with_current_contract(secure_salt)
+            .deployed_address();
+
+        PreflightResult {
+            predicted_address,
+            required_fee: deploy_fee,
+            platform_fee_bps,
+            currency,
+            errors,
+        }
     }
 
     // ── Deploy: LazyMint ERC-721 ──────────────────────────────────────────
@@ -346,35 +639,29 @@ impl Launchpad {
     ) -> Result<Address, Error> {
         storage::extend_instance_ttl(&env);
         creator.require_auth();
-        require_not_paused(&env)?;
-
-        if platform_fee_bps > MAX_FEE_BPS {
-            return Err(Error::InvalidFeeBps);
-        }
-
-        let (platform_fee_receiver, fee) = storage::get_platform_fee(&env);
-        if fee > 0 {
-            soroban_sdk::token::TokenClient::new(&env, &currency).transfer(
-                &creator,
-                &platform_fee_receiver,
-                &(fee as i128),
-            );
-            events::publish_deployment_fee_collected(
-                &env,
-                &creator,
-                &receiver,
-                fee as i128,
-                &currency,
-            );
-        }
-
-        let wasm = storage::get_wasm_lazy_721(&env).ok_or(Error::WasmHashNotSet)?;
-        let platform_fee_receiver = collect_deploy_fee(&env, &creator, &currency);
 
         let secure_salt = make_secure_salt(&env, &creator, &salt);
+        let wasm_opt = storage::get_wasm_lazy_721(&env);
+        let errors = validate_721_shape(
+            &env,
+            &name,
+            &symbol,
+            max_supply,
+            royalty_bps,
+            platform_fee_bps,
+            &secure_salt,
+            wasm_opt.is_some(),
+        );
+        if let Some(first) = errors.get(0) {
+            return Err(first);
+        }
+        let wasm = wasm_opt.unwrap();
+
+        let platform_fee_receiver = collect_deploy_fee(&env, &creator, &currency);
+
         let addr = env
             .deployer()
-            .with_current_contract(secure_salt)
+            .with_current_contract(secure_salt.clone())
             .deploy_v2(wasm, ());
 
         Lazy721Client::new(&env, &addr).initialize(
@@ -389,6 +676,7 @@ impl Launchpad {
             &platform_fee_bps,
         );
 
+        storage::mark_salt_used(&env, &secure_salt);
         storage::record_collection(
             &env,
             &creator,
@@ -401,6 +689,48 @@ impl Launchpad {
         );
         events::publish_deploy(&env, symbol_short!("l721"), &creator, &addr);
         Ok(addr)
+    }
+
+    /// Read-only preflight for `deploy_lazy_721` (#277).
+    pub fn preflight_deploy_lazy_721(
+        env: Env,
+        creator: Address,
+        currency: Address,
+        name: String,
+        symbol: String,
+        max_supply: u64,
+        royalty_bps: u32,
+        platform_fee_bps: u32,
+        salt: BytesN<32>,
+    ) -> PreflightResult {
+        let secure_salt = make_secure_salt(&env, &creator, &salt);
+        let wasm_opt = storage::get_wasm_lazy_721(&env);
+        let mut errors = validate_721_shape(
+            &env,
+            &name,
+            &symbol,
+            max_supply,
+            royalty_bps,
+            platform_fee_bps,
+            &secure_salt,
+            wasm_opt.is_some(),
+        );
+
+        let (_, deploy_fee) = storage::get_fee_config(&env);
+        check_sufficient_fee(&env, &creator, &currency, deploy_fee, &mut errors);
+
+        let predicted_address = env
+            .deployer()
+            .with_current_contract(secure_salt)
+            .deployed_address();
+
+        PreflightResult {
+            predicted_address,
+            required_fee: deploy_fee,
+            platform_fee_bps,
+            currency,
+            errors,
+        }
     }
 
     // ── Deploy: LazyMint ERC-1155 ─────────────────────────────────────────
@@ -417,35 +747,27 @@ impl Launchpad {
     ) -> Result<Address, Error> {
         storage::extend_instance_ttl(&env);
         creator.require_auth();
-        require_not_paused(&env)?;
-
-        if platform_fee_bps > MAX_FEE_BPS {
-            return Err(Error::InvalidFeeBps);
-        }
-
-        let (platform_fee_receiver, fee) = storage::get_platform_fee(&env);
-        if fee > 0 {
-            soroban_sdk::token::TokenClient::new(&env, &currency).transfer(
-                &creator,
-                &platform_fee_receiver,
-                &(fee as i128),
-            );
-            events::publish_deployment_fee_collected(
-                &env,
-                &creator,
-                &receiver,
-                fee as i128,
-                &currency,
-            );
-        }
-
-        let wasm = storage::get_wasm_lazy_1155(&env).ok_or(Error::WasmHashNotSet)?;
-        let platform_fee_receiver = collect_deploy_fee(&env, &creator, &currency);
 
         let secure_salt = make_secure_salt(&env, &creator, &salt);
+        let wasm_opt = storage::get_wasm_lazy_1155(&env);
+        let errors = validate_1155_shape(
+            &env,
+            &name,
+            royalty_bps,
+            platform_fee_bps,
+            &secure_salt,
+            wasm_opt.is_some(),
+        );
+        if let Some(first) = errors.get(0) {
+            return Err(first);
+        }
+        let wasm = wasm_opt.unwrap();
+
+        let platform_fee_receiver = collect_deploy_fee(&env, &creator, &currency);
+
         let addr = env
             .deployer()
-            .with_current_contract(secure_salt)
+            .with_current_contract(secure_salt.clone())
             .deploy_v2(wasm, ());
 
         Lazy1155Client::new(&env, &addr).initialize(
@@ -458,6 +780,7 @@ impl Launchpad {
             &platform_fee_bps,
         );
 
+        storage::mark_salt_used(&env, &secure_salt);
         let empty_symbol = String::from_str(&env, "");
         storage::record_collection(
             &env,
@@ -471,6 +794,44 @@ impl Launchpad {
         );
         events::publish_deploy(&env, symbol_short!("l1155"), &creator, &addr);
         Ok(addr)
+    }
+
+    /// Read-only preflight for `deploy_lazy_1155` (#277).
+    pub fn preflight_deploy_lazy_1155(
+        env: Env,
+        creator: Address,
+        currency: Address,
+        name: String,
+        royalty_bps: u32,
+        platform_fee_bps: u32,
+        salt: BytesN<32>,
+    ) -> PreflightResult {
+        let secure_salt = make_secure_salt(&env, &creator, &salt);
+        let wasm_opt = storage::get_wasm_lazy_1155(&env);
+        let mut errors = validate_1155_shape(
+            &env,
+            &name,
+            royalty_bps,
+            platform_fee_bps,
+            &secure_salt,
+            wasm_opt.is_some(),
+        );
+
+        let (_, deploy_fee) = storage::get_fee_config(&env);
+        check_sufficient_fee(&env, &creator, &currency, deploy_fee, &mut errors);
+
+        let predicted_address = env
+            .deployer()
+            .with_current_contract(secure_salt)
+            .deployed_address();
+
+        PreflightResult {
+            predicted_address,
+            required_fee: deploy_fee,
+            platform_fee_bps,
+            currency,
+            errors,
+        }
     }
 
     // ── Admin management (two-step transfer) ──────────────────────────────
@@ -526,6 +887,50 @@ impl Launchpad {
         let admin = storage::require_admin(&env)?;
         storage::set_paused(&env, false);
         events::publish_paused(&env, &admin, false);
+        Ok(())
+    }
+
+    pub fn update_collection_wasm(
+        env: Env,
+        kind: CollectionKind,
+        new_wasm_hash: BytesN<32>,
+    ) -> Result<(), Error> {
+        storage::extend_instance_ttl(&env);
+        storage::require_admin(&env)?;
+        let old_wasm = storage::get_wasm_for_kind(&env, &kind).unwrap_or_else(|| {
+            BytesN::from_array(&env, &[0u8; 32])
+        });
+        storage::set_wasm_hash_for_kind(&env, &kind, &new_wasm_hash);
+        events::publish_collection_wasm_updated(&env, &kind, &old_wasm, &new_wasm_hash);
+        Ok(())
+    }
+
+    pub fn upgrade_collection(env: Env, collection_address: Address) -> Result<(), Error> {
+        storage::extend_instance_ttl(&env);
+        storage::require_admin(&env)?;
+
+        let record = storage::get_collection_by_address(&env, &collection_address)
+            .ok_or(Error::CollectionNotFound)?;
+        let new_wasm = storage::get_wasm_for_kind(&env, &record.kind)
+            .ok_or(Error::WasmHashNotSet)?;
+        let from_wasm = new_wasm.clone();
+
+        match record.kind {
+            CollectionKind::Normal721 => {
+                Normal721Client::new(&env, &collection_address).upgrade(&new_wasm);
+            }
+            CollectionKind::Normal1155 => {
+                Normal1155Client::new(&env, &collection_address).upgrade(&new_wasm);
+            }
+            CollectionKind::LazyMint721 => {
+                Lazy721Client::new(&env, &collection_address).upgrade(&new_wasm);
+            }
+            CollectionKind::LazyMint1155 => {
+                Lazy1155Client::new(&env, &collection_address).upgrade(&new_wasm);
+            }
+        }
+
+        events::publish_collection_upgraded(&env, &collection_address, &from_wasm, &new_wasm);
         Ok(())
     }
 
@@ -600,5 +1005,10 @@ impl Launchpad {
 
     pub fn wasm_version(env: Env) -> u32 {
         storage::wasm_version(&env)
+    }
+
+    /// Semantic version string for this contract.
+    pub fn version(env: Env) -> soroban_sdk::String {
+        soroban_sdk::String::from_str(&env, CONTRACT_VERSION)
     }
 }

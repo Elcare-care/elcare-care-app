@@ -79,6 +79,12 @@ pub enum DataKey {
     ListingLock(u64),
     AuctionLock(u64),
     IsPaused,
+    /// Per-collection pause flag. When present, operations on this collection
+    /// are blocked regardless of the global pause state.
+    CollectionPaused(Address),
+    /// Per-function pause flag. Stored as a Symbol key; when present, the named
+    /// entry-point is blocked regardless of global or collection pause state.
+    FunctionPaused(soroban_sdk::Symbol),
     PendingAdmin,
     /// LEGACY (pre-1.1.0): monolithic active-listings index (see above).
     ActiveListings,
@@ -89,6 +95,15 @@ pub enum DataKey {
     MinPrice,
     MaxPrice,
     MigrationDone(soroban_sdk::String),
+    /// Global admin-configurable bid-history ring-buffer capacity.
+    /// Default: 50.  Valid range: 1 – 200.
+    /// Each new auction snapshots this value into `Auction::bid_history_cap`
+    /// so changes here never affect in-progress auctions.
+    BidHistoryCap,
+    /// Global cap on the number of times any single auction's end time may be
+    /// extended by anti-sniping logic.  0 = unlimited (legacy behaviour).
+    /// Each new auction snapshots this value into `Auction::max_extensions`.
+    AuctionMaxExtensions,
     /// One fixed-capacity page (`Vec<u64>`, at most `INDEX_PAGE_SIZE` entries)
     /// of the identified index.
     IndexPage(IndexId, u32),
@@ -111,11 +126,11 @@ pub enum DataKey {
     /// listing or auction; a double-listing guard reads it and settlement /
     /// cancellation clears it.
     EscrowedToken(Address, u64),
-    /// Per-collection protocol fee override (in basis points).  When present,
-    /// new listings and auctions for this collection snapshot this value
-    /// instead of the global `ProtocolFeeBps`.  Cleared by
-    /// `clear_collection_fee_bps` to restore global-fee fallback behaviour.
-    CollectionFeeBps(Address),
+    /// Bounded (≤ MAX_BLOCKED_BIDDERS) list of addresses barred from bidding
+    /// on this auction (anti-shill-bidding registry, Issue #199).  Kept as a
+    /// separate per-auction key — not a field on `Auction` — so auctions that
+    /// never block anyone pay no extra storage.
+    AuctionBlockedBidders(u64),
 }
 
 /// Custody record for an NFT held by the marketplace, keyed by
@@ -792,6 +807,36 @@ pub fn load_auction_bids(env: &Env, auction_id: u64) -> soroban_sdk::Vec<BidReco
     value
 }
 
+// ── Blocked bidders (Issue #199) ─────────────────────────────
+
+pub fn load_blocked_bidders(env: &Env, auction_id: u64) -> Vec<Address> {
+    let key = DataKey::AuctionBlockedBidders(auction_id);
+    let value = env
+        .storage()
+        .persistent()
+        .get::<DataKey, Vec<Address>>(&key)
+        .unwrap_or_else(|| Vec::new(env));
+    if !value.is_empty() {
+        bump_entry_ttl(env, &key);
+    }
+    value
+}
+
+pub fn save_blocked_bidders(env: &Env, auction_id: u64, list: &Vec<Address>) {
+    let key = DataKey::AuctionBlockedBidders(auction_id);
+    if list.is_empty() {
+        // Drop the entry entirely so an emptied registry costs nothing.
+        env.storage().persistent().remove(&key);
+    } else {
+        env.storage().persistent().set(&key, list);
+        bump_entry_ttl(env, &key);
+    }
+}
+
+pub fn is_bidder_blocked(env: &Env, auction_id: u64, bidder: &Address) -> bool {
+    load_blocked_bidders(env, auction_id).contains(bidder)
+}
+
 pub fn set_paused(env: &Env, paused: bool) {
     env.storage().persistent().set(&DataKey::IsPaused, &paused);
     bump_entry_ttl(env, &DataKey::IsPaused);
@@ -802,6 +847,97 @@ pub fn is_paused(env: &Env) -> bool {
         .persistent()
         .get::<DataKey, bool>(&DataKey::IsPaused)
         .unwrap_or(false)
+}
+
+// ── Granular pause helpers (Issue #205) ──────────────────────────────────────
+//
+// Three independent circuit-breaker axes:
+//   1. Global flag           — DataKey::IsPaused (existing)
+//   2. Per-collection flag   — DataKey::CollectionPaused(address)
+//   3. Per-function flag     — DataKey::FunctionPaused(symbol)
+//
+// is_paused_for() returns true when ANY of the three axes fires.
+
+/// Pause a specific collection.
+pub fn set_collection_paused(env: &Env, collection: &Address, paused: bool) {
+    let key = DataKey::CollectionPaused(collection.clone());
+    if paused {
+        env.storage().persistent().set(&key, &true);
+        bump_entry_ttl(env, &key);
+    } else {
+        env.storage().persistent().remove(&key);
+    }
+}
+
+/// Return whether the given collection is individually paused.
+pub fn is_collection_paused(env: &Env, collection: &Address) -> bool {
+    let key = DataKey::CollectionPaused(collection.clone());
+    let paused = env
+        .storage()
+        .persistent()
+        .get::<DataKey, bool>(&key)
+        .unwrap_or(false);
+    if paused {
+        bump_entry_ttl(env, &key);
+    }
+    paused
+}
+
+/// Pause a specific entry-point function by its symbol name.
+pub fn set_function_paused(env: &Env, func: &soroban_sdk::Symbol, paused: bool) {
+    let key = DataKey::FunctionPaused(func.clone());
+    if paused {
+        env.storage().persistent().set(&key, &true);
+        bump_entry_ttl(env, &key);
+    } else {
+        env.storage().persistent().remove(&key);
+    }
+}
+
+/// Return whether the given function symbol is individually paused.
+pub fn is_function_paused(env: &Env, func: &soroban_sdk::Symbol) -> bool {
+    let key = DataKey::FunctionPaused(func.clone());
+    let paused = env
+        .storage()
+        .persistent()
+        .get::<DataKey, bool>(&key)
+        .unwrap_or(false);
+    if paused {
+        bump_entry_ttl(env, &key);
+    }
+    paused
+}
+
+/// Composite pause check: returns true when ANY of the three circuit-breakers
+/// is active for the given (optional) collection and function context.
+///
+/// Call sites:
+///   - Global-only check:           is_paused_for(env, None, None)
+///   - Collection-scoped check:     is_paused_for(env, Some(&col), None)
+///   - Function-scoped check:       is_paused_for(env, None, Some(&func))
+///   - Full context check:          is_paused_for(env, Some(&col), Some(&func))
+pub fn is_paused_for(
+    env: &Env,
+    collection: Option<&Address>,
+    func: Option<&soroban_sdk::Symbol>,
+) -> bool {
+    // Global flag (cheapest read — check first).
+    if is_paused(env) {
+        return true;
+    }
+    // Per-function flag.
+    if let Some(f) = func {
+        if is_function_paused(env, f) {
+            return true;
+        }
+    }
+    // Per-collection flag.
+    if let Some(c) = collection {
+        if is_collection_paused(env, c) {
+            return true;
+        }
+    }
+    false
 }
 
 // ── Price bounds ─────────────────────────────────────────────
@@ -885,47 +1021,55 @@ pub fn take_legacy_index_vec(env: &Env, key: &DataKey) -> Option<Vec<u64>> {
     value
 }
 
-// ── Per-collection fee overrides (Issue #322) ────────────────────────────────
-//
-// When a `CollectionFeeBps` entry exists for a collection address, new
-// listings and auctions for that collection snapshot the override instead of
-// the global `ProtocolFeeBps` value.  The override is optional (`Option<u32>`)
-// in the storage layer so callers can distinguish "no override" from "override
-// is 0 bps".
+// ── Bid-history cap ──────────────────────────────────────────
 
-/// Persist a per-collection fee override.
-pub fn set_collection_fee_bps_storage(env: &Env, collection: &Address, bps: u32) {
-    let key = DataKey::CollectionFeeBps(collection.clone());
-    env.storage().persistent().set(&key, &bps);
-    bump_entry_ttl(env, &key);
+/// Default bid-history ring-buffer capacity.
+pub const DEFAULT_BID_HISTORY_CAP: u32 = 50;
+/// Maximum allowed bid-history cap.  Kept at 200 so the O(n) eviction
+/// shift (see `append_bid_record`) stays within acceptable compute limits.
+pub const MAX_BID_HISTORY_CAP: u32 = 200;
+
+/// Persist the global bid-history cap.
+pub fn set_bid_history_cap_storage(env: &Env, cap: u32) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::BidHistoryCap, &cap);
+    bump_entry_ttl(env, &DataKey::BidHistoryCap);
 }
 
-/// Return the per-collection fee override, or `None` when no override is set.
-pub fn get_collection_fee_bps_storage(env: &Env, collection: &Address) -> Option<u32> {
-    let key = DataKey::CollectionFeeBps(collection.clone());
+/// Read the global bid-history cap, defaulting to `DEFAULT_BID_HISTORY_CAP`.
+pub fn get_bid_history_cap_storage(env: &Env) -> u32 {
     let value = env
         .storage()
         .persistent()
-        .get::<DataKey, u32>(&key);
+        .get::<DataKey, u32>(&DataKey::BidHistoryCap);
     if value.is_some() {
-        bump_entry_ttl(env, &key);
+        bump_entry_ttl(env, &DataKey::BidHistoryCap);
     }
-    value
+    value.unwrap_or(DEFAULT_BID_HISTORY_CAP)
 }
 
-/// Remove the per-collection fee override so the global fee takes effect again.
-pub fn clear_collection_fee_bps_storage(env: &Env, collection: &Address) {
+// ── Auction max-extensions cap ───────────────────────────────
+
+/// Default: 0 = unlimited extensions (legacy behaviour preserved).
+pub const DEFAULT_AUCTION_MAX_EXTENSIONS: u32 = 0;
+
+/// Persist the global auction max-extensions cap.
+pub fn set_auction_max_extensions_storage(env: &Env, max: u32) {
     env.storage()
         .persistent()
-        .remove(&DataKey::CollectionFeeBps(collection.clone()));
+        .set(&DataKey::AuctionMaxExtensions, &max);
+    bump_entry_ttl(env, &DataKey::AuctionMaxExtensions);
 }
 
-/// Resolve the effective protocol fee for `collection`:
-/// returns the collection-level override if set, otherwise falls back to the
-/// global `ProtocolFeeBps` (defaulting to 0 when neither is configured).
-pub fn resolve_fee_bps(env: &Env, collection: &Address) -> u32 {
-    if let Some(bps) = get_collection_fee_bps_storage(env, collection) {
-        return bps;
+/// Read the global auction max-extensions cap.
+pub fn get_auction_max_extensions_storage(env: &Env) -> u32 {
+    let value = env
+        .storage()
+        .persistent()
+        .get::<DataKey, u32>(&DataKey::AuctionMaxExtensions);
+    if value.is_some() {
+        bump_entry_ttl(env, &DataKey::AuctionMaxExtensions);
     }
-    get_protocol_fee_bps_storage(env).unwrap_or(0)
+    value.unwrap_or(DEFAULT_AUCTION_MAX_EXTENSIONS)
 }

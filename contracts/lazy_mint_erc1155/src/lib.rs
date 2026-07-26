@@ -59,12 +59,14 @@ pub enum Error {
     EditionAlreadyRegistered = 10,
     InvalidSignature = 11,
     MaxSupplyReached = 12,
-    /// Voucher nonce already redeemed (#39).
     VoucherAlreadyRedeemed = 13,
     NotAllowlisted = 14,
     InvalidMerkleProof = 15,
-    /// Voucher nonce has been explicitly revoked by the creator.
     VoucherRevoked = 16,
+    /// migrate() called for a version already marked done.
+    AlreadyMigrated = 17,
+    /// Unsupported version jump.
+    UnsupportedMigration = 18,
 }
 
 // ─── Data types ───────────────────────────────────────────────────────────────
@@ -99,6 +101,7 @@ pub enum DataKey {
     Initialized,
     Creator,
     CreatorPubkey,
+    CurrentWasmHash,
     Name,
     RoyaltyBps,
     RoyaltyReceiver,
@@ -119,6 +122,9 @@ pub enum DataKey {
     RevokedVoucher(u64),
     MerkleRoot,      // BytesN<32>
     IsPublicPhase,   // bool
+    /// Network passphrase bound at initialization for cross-network domain
+    /// separation (#273).
+    NetworkPassphrase, // String
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -345,9 +351,10 @@ impl LazyMint1155 {
             TTL_THRESHOLD,
             TTL_BUMP,
         );
+        // Emit detailed redemption event for indexer auditability (#273).
         env.events().publish(
-            (symbol_short!("mint"), creator.clone(), buyer.clone()),
-            (voucher.token_id, amount),
+            (symbol_short!("redeemed"), creator.clone(), buyer.clone()),
+            (voucher.token_id, voucher.nonce, amount),
         );
     }
 }
@@ -357,6 +364,7 @@ impl LazyMint1155 {
     // ── Initializer ───────────────────────────────────────────────────────
 
     /// Issue #38: accepts per-collection platform fee receiver and rate.
+    /// Issue #273: accepts `network_passphrase` for cross-network domain separation.
     pub fn initialize(
         env: Env,
         creator: Address,
@@ -366,12 +374,14 @@ impl LazyMint1155 {
         royalty_receiver: Address,
         platform_fee_receiver: Address,
         platform_fee_bps: u32,
+        network_passphrase: String,
     ) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Initialized) {
             return Err(Error::AlreadyInitialized);
         }
         env.storage().instance().set(&DataKey::Initialized, &true);
         env.storage().instance().set(&DataKey::Creator, &creator);
+        env.storage().instance().set(&DataKey::CurrentWasmHash, &BytesN::from_array(&env, &[0u8; 32]));
         env.storage()
             .instance()
             .set(&DataKey::CreatorPubkey, &creator_pubkey);
@@ -388,7 +398,29 @@ impl LazyMint1155 {
         env.storage()
             .instance()
             .set(&DataKey::PlatformFeeBps, &platform_fee_bps);
+        // Store the network passphrase for cross-network domain separation (#273).
+        env.storage()
+            .instance()
+            .set(&DataKey::NetworkPassphrase, &network_passphrase);
         env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_BUMP);
+        Ok(())
+    }
+
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
+        let old_wasm_hash: BytesN<32> = env
+            .storage()
+            .instance()
+            .get(&DataKey::CurrentWasmHash)
+            .unwrap_or(BytesN::from_array(&env, &[0u8; 32]));
+        env.storage()
+            .instance()
+            .set(&DataKey::CurrentWasmHash, &new_wasm_hash);
+        env.deployer().update_current_contract_wasm(&new_wasm_hash);
+        env.events().publish(
+            (symbol_short!("upgraded"),),
+            (old_wasm_hash, new_wasm_hash),
+        );
         Ok(())
     }
 
@@ -626,6 +658,52 @@ impl LazyMint1155 {
     pub fn merkle_root(env: Env) -> Option<BytesN<32>> {
         env.storage().instance().get(&DataKey::MerkleRoot)
     }
+
+    // ── Versioning & Migration ─────────────────────────────────────────────
+
+    pub fn version(_env: Env) -> &'static str {
+        "1.0.0"
+    }
+
+    pub fn contract_version(env: Env) -> Option<String> {
+        env.storage().instance().get(&DataKey::ContractVersion)
+    }
+
+    /// Creator-guarded idempotent migration entry point.
+    /// v1.0.0: records the completion marker and on-chain version string.
+    pub fn migrate(env: Env) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
+        Self::only_creator(&env)?;
+
+        let target = String::from_str(&env, "1.0.0");
+        let done_key = DataKey::MigrationDone(target.clone());
+
+        if env
+            .storage()
+            .persistent()
+            .get::<DataKey, bool>(&done_key)
+            .unwrap_or(false)
+        {
+            return Err(Error::AlreadyMigrated);
+        }
+
+        // v1.0.0 migration body: nothing to migrate for the initial version.
+        // EditionMaxSupply, Balance, TotalSupply, RedeemedVoucher, and
+        // RevokedVoucher entries are already in persistent storage and remain
+        // readable as-is.
+
+        env.storage().persistent().set(&done_key, &true);
+        env.storage()
+            .persistent()
+            .extend_ttl(&done_key, TTL_THRESHOLD, TTL_BUMP);
+        env.storage()
+            .instance()
+            .set(&DataKey::ContractVersion, &target);
+        env.events()
+            .publish((soroban_sdk::symbol_short!("migrated"), target), ());
+        Ok(())
+    }
+
     // ── Transfers ─────────────────────────────────────────────────────────
 
     pub fn transfer(
@@ -919,12 +997,22 @@ impl LazyMint1155 {
     }
 
     /// Signed digest:
-    /// sha256(contract_addr ‖ token_id ‖ nonce ‖ buyer_quota ‖ price_per_unit ‖ valid_until ‖ uri_hash ‖ currency_xdr)
+    /// sha256(network_passphrase ‖ contract_addr ‖ token_id ‖ nonce ‖ buyer_quota ‖ price_per_unit ‖ valid_until ‖ uri_hash ‖ currency_xdr)
+    ///
+    /// The network passphrase is stored at initialization and included first so
+    /// a voucher signed on testnet cannot be replayed on mainnet (#273).
     ///
     /// ⚠ Byte layout is STABLE — do not reorder fields.
     #[allow(non_snake_case)]
     pub fn _voucher_digest(env: &Env, v: &MintVoucher1155) -> Bytes {
         let mut raw = Bytes::new(env);
+        // Network passphrase — domain separator for cross-network protection.
+        let passphrase: soroban_sdk::String = env
+            .storage()
+            .instance()
+            .get(&DataKey::NetworkPassphrase)
+            .unwrap_or_else(|| soroban_sdk::String::from_str(env, ""));
+        raw.append(&passphrase.to_xdr(env));
         raw.append(&env.current_contract_address().to_xdr(env));
         raw.extend_from_array(&v.token_id.to_be_bytes());
         raw.extend_from_array(&v.nonce.to_be_bytes());
