@@ -36,6 +36,7 @@ import { calculateSettlementPreview, isPreviewStillValid, SettlementPreview } fr
 import { useFreshListing, preflightConflictMessage } from "@/hooks/useFreshListing";
 import posthog from "posthog-js";
 import { useModalA11y } from "@/hooks/useModalA11y";
+import { StatusAnnouncer } from "@/components/a11y/StatusAnnouncer";
 
 interface CheckoutModalProps {
   isOpen: boolean;
@@ -71,6 +72,7 @@ export function CheckoutModal({
   // Checkout flow state
   const [step, setStep] = useState<CheckoutStep>("preview");
   const [conflictMessage, setConflictMessage] = useState<string | null>(null);
+  const [purchaseError, setPurchaseError] = useState<string | null>(null);
 
   // Preflight hook
   const { preflight, isChecking: isPreflighting, conflict, freshListing, reset: resetPreflight } = useFreshListing();
@@ -81,6 +83,7 @@ export function CheckoutModal({
       setStep("preview");
       setConflictMessage(null);
       setPreviewError(null);
+      setPurchaseError(null);
       resetPreflight();
     }
   }, [isOpen, resetPreflight]);
@@ -172,6 +175,7 @@ export function CheckoutModal({
       }
 
       setStep("processing");
+      setPurchaseError(null);
       const success = await onCryptoPurchase();
       if (success) {
         posthog.capture("Purchase Successful", {
@@ -184,12 +188,27 @@ export function CheckoutModal({
         onClose();
         setStep("preview");
       } else {
+        setPurchaseError("Purchase could not be completed. Check your wallet for a rejected or failed signature, then try again.");
         setStep("confirm");
       }
     }
   }, [preview, selectedToken, step, listing, preflight, conflict, freshListing, onCryptoPurchase, onPurchased, onClose]);
 
   if (!isOpen || !selectedToken) return null;
+
+  const statusMessage = conflictMessage
+    ? `Conflict: ${conflictMessage}`
+    : purchaseError
+    ? `Error: ${purchaseError}`
+    : previewError
+    ? `Error: ${previewError}`
+    : isPreflighting
+    ? "Verifying listing is still available…"
+    : step === "processing" || isBuyingCrypto
+    ? "Processing your purchase. Please check your wallet for a signature request."
+    : "";
+  const statusPoliteness =
+    (conflictMessage || purchaseError || previewError) && !isPreflighting ? "assertive" : "polite";
 
   const buttonLabel = () => {
     if (step === "processing" || isBuyingCrypto) return "Processing…";
@@ -215,6 +234,8 @@ export function CheckoutModal({
         tabIndex={-1}
         className="relative w-full max-w-md overflow-hidden rounded-3xl bg-white shadow-2xl animate-scale-in outline-none"
       >
+        <StatusAnnouncer message={statusMessage} politeness={statusPoliteness} />
+
         {/* Header */}
         <div className="flex items-center justify-between border-b border-gray-100 p-6">
           <h2 id={titleId} className="font-display text-xl font-bold text-gray-900">
@@ -262,6 +283,14 @@ export function CheckoutModal({
             <div role="alert" className="flex items-center gap-3 rounded-xl border border-red-200 bg-red-50 p-4">
               <AlertTriangle size={18} className="text-red-600 shrink-0" aria-hidden="true" />
               <p className="text-sm text-red-800">{previewError}</p>
+            </div>
+          )}
+
+          {/* Purchase failure */}
+          {purchaseError && (
+            <div role="alert" className="flex items-start gap-3 rounded-xl border border-red-200 bg-red-50 p-4">
+              <AlertTriangle size={18} className="text-red-600 shrink-0 mt-0.5" aria-hidden="true" />
+              <p className="text-sm text-red-800">{purchaseError}</p>
             </div>
           )}
 

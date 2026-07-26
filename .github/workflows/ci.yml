@@ -152,6 +152,8 @@ jobs:
       - name: Run Lint
         run: npm run lint
         working-directory: frontend/elcarehub-app
+      - name: Validate Contract Error Coverage
+        run: node scripts/contract-errors/validate-error-coverage.mjs
       - name: Run Build
         run: npm run build
         working-directory: frontend/elcarehub-app
