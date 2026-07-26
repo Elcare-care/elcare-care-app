@@ -25,6 +25,8 @@ use soroban_sdk::{
 const TTL_THRESHOLD: u32 = 50_000;
 const TTL_BUMP: u32 = 100_000;
 const MAX_BPS: u32 = 10_000; // 100% in basis points
+/// Maximum number of items accepted by any single batch call (#274).
+const MAX_BATCH_SIZE: u32 = 200;
 
 // ─── Errors ──────────────────────────────────────────────────────────────────
 
@@ -221,7 +223,10 @@ impl NormalNFT721 {
 
         let uris_len = uris.len();
         if uris_len == 0 {
-            return Ok(());
+            return Err(Error::EmptyBatch);
+        }
+        if uris_len > MAX_BATCH_SIZE {
+            return Err(Error::BatchTooLarge);
         }
 
         // Read storage ONCE before the loop

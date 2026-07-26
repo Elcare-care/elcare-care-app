@@ -29,6 +29,8 @@ use soroban_sdk::{
 const TTL_THRESHOLD: u32 = 50_000;
 const TTL_BUMP: u32 = 100_000;
 const MAX_BPS: u32 = 10_000; // 100 % in basis points
+/// Maximum number of items accepted by any single batch call (#274).
+const MAX_BATCH_SIZE: u32 = 200;
 
 // ─── Errors ──────────────────────────────────────────────────────────────────
 
@@ -415,6 +417,9 @@ impl NormalNFT1155 {
         Self::extend_instance_ttl(&env);
         Self::only_creator(&env)?;
         Self::require_not_paused(&env)?;
+        if amount == 0 {
+            return Err(Error::ZeroAmount);
+        }
         let token_id: u64 = env
             .storage()
             .instance()
@@ -442,6 +447,9 @@ impl NormalNFT1155 {
         Self::extend_instance_ttl(&env);
         Self::only_creator(&env)?;
         Self::require_not_paused(&env)?;
+        if amount == 0 {
+            return Err(Error::ZeroAmount);
+        }
         Self::_check_supply_cap(&env, token_id, amount)?;
         Self::_check_wallet_limit(&env, &to, token_id, amount)?;
         Self::_mint(&env, &to, token_id, amount, &uri);
@@ -467,7 +475,10 @@ impl NormalNFT1155 {
 
         let len = token_ids.len();
         if len == 0 {
-            return Ok(());
+            return Err(Error::EmptyBatch);
+        }
+        if len > MAX_BATCH_SIZE {
+            return Err(Error::BatchTooLarge);
         }
         if token_ids.len() != amounts.len() || token_ids.len() != uris.len() {
             return Err(Error::LengthMismatch);
@@ -484,6 +495,9 @@ impl NormalNFT1155 {
         for i in 0..len {
             let tid = token_ids.get(i).unwrap();
             let amt = amounts.get(i).unwrap();
+            if amt == 0 {
+                return Err(Error::ZeroAmount);
+            }
 
             // Find whether `tid` was already seen in this batch.
             let mut found = false;
@@ -643,6 +657,9 @@ impl NormalNFT1155 {
 
         if token_ids.len() != amounts.len() {
             return Err(Error::LengthMismatch);
+        }
+        if token_ids.len() > MAX_BATCH_SIZE {
+            return Err(Error::BatchTooLarge);
         }
 
         for i in 0..token_ids.len() {
