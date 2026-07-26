@@ -41,19 +41,17 @@ pub enum Error {
     NotApproved = 3,
     InsufficientBalance = 4,
     LengthMismatch = 5,
-    NotCreator = 6, // kept for ABI stability; not used internally
-    /// Mint would exceed the per-token max supply.
+    NotCreator = 6,
     MaxSupplyReached = 7,
-    /// Mint would exceed the per-wallet cap.
     WalletLimitReached = 8,
-    /// Collection is paused; state-mutating calls are blocked.
     CollectionPaused = 9,
-    /// base_uri cannot be updated after metadata is frozen.
     MetadataFrozen = 10,
-    /// freeze_metadata called more than once.
     AlreadyFrozen = 11,
-    /// basis points exceed MAX_BPS (10_000).
     InvalidBps = 12,
+    /// migrate() called for a version already marked done.
+    AlreadyMigrated = 13,
+    /// Unsupported version jump.
+    UnsupportedMigration = 14,
 }
 
 // ─── Storage Keys ─────────────────────────────────────────────────────────────
@@ -89,6 +87,10 @@ pub enum DataKey {
     TokenRoyaltyReceiver(u64),
     /// Per-token royalty override — bps.
     TokenRoyaltyBps(u64),
+    // ── Versioned migration registry ─────────────────────────────────────
+    MigrationDone(String),
+    MigrationCursor(String),
+    ContractVersion,
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -797,6 +799,48 @@ impl NormalNFT1155 {
         env.storage()
             .instance()
             .set(&DataKey::Creator, &new_creator);
+        Ok(())
+    }
+
+    // ── Versioning & Migration ─────────────────────────────────────────────
+
+    pub fn version(_env: Env) -> &'static str {
+        "1.0.0"
+    }
+
+    pub fn contract_version(env: Env) -> Option<String> {
+        env.storage().instance().get(&DataKey::ContractVersion)
+    }
+
+    /// Creator-guarded idempotent migration entry point.
+    /// v1.0.0: records the completion marker and on-chain version string.
+    pub fn migrate(env: Env) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
+        Self::only_creator(&env)?;
+
+        let target = String::from_str(&env, "1.0.0");
+        let done_key = DataKey::MigrationDone(target.clone());
+
+        if env
+            .storage()
+            .persistent()
+            .get::<DataKey, bool>(&done_key)
+            .unwrap_or(false)
+        {
+            return Err(Error::AlreadyMigrated);
+        }
+
+        // v1.0.0 migration body: nothing to migrate for the initial version.
+
+        env.storage().persistent().set(&done_key, &true);
+        env.storage()
+            .persistent()
+            .extend_ttl(&done_key, TTL_THRESHOLD, TTL_BUMP);
+        env.storage()
+            .instance()
+            .set(&DataKey::ContractVersion, &target);
+        env.events()
+            .publish((soroban_sdk::symbol_short!("migrated"), target), ());
         Ok(())
     }
 

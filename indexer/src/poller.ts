@@ -22,7 +22,13 @@ import {
   syncLagLedgersGauge,
   eventProcessingDurationHistogram,
 } from './metrics.js';
-import { recordProgress } from './stall.js';
+import {
+  recordProgress,
+  recordDbWrite,
+  recordRpcFailure,
+  registerPollerLifecycle,
+  startWatchdog,
+} from './stall.js';
 import { collectMarketplaceEvents, MAX_LEDGER_WINDOW } from './event-sync.js';
 import { withRpcRetry } from './retry.js';
 import { logger } from './logger.js';
@@ -111,6 +117,14 @@ export function stopPoller(): void {
   }
 }
 
+/**
+ * Reset the shutdown flag so startPolling() can be called again after a
+ * watchdog-triggered restart.  Called internally by startPolling().
+ */
+function resetPollerShutdownFlag(): void {
+  shuttingDown = false;
+  shutdownStarted = false;
+}
 function getContractIds(): string[] {
   return parseTrackedContracts().map((c) => c.id).filter(Boolean);
 }
@@ -356,6 +370,10 @@ async function pollContract(
         () => server.getLatestLedger().then((r) => r.sequence),
         { operation: 'getLatestLedger', maxAttempts: 5, baseDelayMs: 1_000 }
       );
+      // Successful RPC response — the consecutive-failure counter is reset by
+      // recordProgress() on every successful ledger advance.  We do NOT reset
+      // it here explicitly so that a run of empty batches (no new events) does
+      // not mask a lingering RPC instability signal.
 
       networkLatestLedgerGauge.set(networkLatestLedger);
 
@@ -435,6 +453,7 @@ async function pollContract(
             });
             return { newEvents: toInsert };
           });
+          recordDbWrite();
           for (const ev of newEvents) emitSSEEvent(ev);
         }
 
@@ -446,6 +465,7 @@ async function pollContract(
             ...(syncData.lastLedgerHash ? { lastLedgerHash: syncData.lastLedgerHash } : {}),
           },
         });
+        recordDbWrite();
 
         latestLedgerProcessedGauge.set(advanceTo);
         syncLatencyGauge.set(Math.max(0, networkLatestLedger - advanceTo));
@@ -467,6 +487,7 @@ async function pollContract(
       localErrors = 0;
     } catch (error) {
       localErrors += 1;
+      recordRpcFailure();
       const backoff = Math.min(BASE_BACKOFF_MS * Math.pow(2, localErrors - 1), MAX_BACKOFF_MS);
       logger.error('pollContract: error in loop', {
         contractId: contractRow.contractId,
@@ -486,6 +507,10 @@ async function pollContract(
 export async function startPolling() {
   const config = loadConfig();
 
+  // Reset shutdown state so this function is safe to call again after a
+  // watchdog-triggered stopPoller() + startPolling() restart cycle.
+  resetPollerShutdownFlag();
+
   const activeContracts = await seedTrackedContracts();
   if (activeContracts.length === 0) {
     throw new Error('No active tracked contracts found. Set TRACKED_CONTRACTS or MARKETPLACE_CONTRACT_ID.');
@@ -500,6 +525,16 @@ export async function startPolling() {
     pollIntervalMs: config.pollIntervalMs,
     maxLedgersPerCycle: config.maxLedgersPerCycle,
   });
+
+  // Register lifecycle hooks so the stall watchdog can restart the poller.
+  // Uses a lazy-import pattern to avoid a circular dep (startPolling ← stall ← routes ← poller).
+  registerPollerLifecycle({
+    stopPoller,
+    startPoller: startPolling,
+  });
+
+  // Start the watchdog after registering lifecycle so it can act on FATAL stalls.
+  startWatchdog();
 
   // Run one loop per contract concurrently; propagate first fatal failure
   await Promise.all(
@@ -524,6 +559,66 @@ export async function startPolling() {
 
 async function fetchListingFromChain(_listingId: bigint): Promise<any | null> {
   return null;
+}
+
+/**
+ * Attempt to read already-fetched IPFS metadata for `cid` from the
+ * IpfsMetadata cache and write the human-readable fields (title, description,
+ * artistName) back onto the Listing row so the PostgreSQL tsvector trigger
+ * keeps the search index current.
+ *
+ * This runs fire-and-forget in the background immediately after a
+ * LISTING_CREATED event is processed.  If the IPFS metadata has not been
+ * fetched yet (cold start / first-ever listing for this CID) the function
+ * exits silently; the IpfsQueue worker will call this path again once the
+ * metadata lands.
+ *
+ * The function is idempotent — re-running it when the fields are already
+ * populated is a no-op thanks to the conditional check.
+ */
+export async function backfillListingMetadata(listingId: bigint, cid: string): Promise<void> {
+  if (!cid) return;
+
+  const metadata = await prisma.ipfsMetadata.findUnique({ where: { cid } });
+  if (!metadata) return; // not yet cached — queue worker will handle it
+
+  // Only update if at least one metadata field is present
+  const title       = typeof metadata.title       === 'string' ? metadata.title       : null;
+  const description = typeof metadata.description === 'string' ? metadata.description : null;
+  // artistName is not stored directly in IpfsMetadata; it may appear under
+  // common IPFS metadata keys like "artist", "creator", or "by".
+  const raw = metadata.raw as Record<string, unknown> | null;
+  const artistName: string | null =
+    (typeof raw?.artist  === 'string' ? raw.artist  : null) ??
+    (typeof raw?.creator === 'string' ? raw.creator : null) ??
+    (typeof raw?.by      === 'string' ? raw.by      : null) ??
+    null;
+
+  if (!title && !description && !artistName) return; // nothing to update
+
+  await prisma.listing.updateMany({
+    where: {
+      listingId,
+      // Only overwrite nulls — avoid clobbering manually-set values.
+      OR: [
+        { title:       null },
+        { description: null },
+        { artistName:  null },
+      ],
+    },
+    data: {
+      ...(title       !== null ? { title }       : {}),
+      ...(description !== null ? { description } : {}),
+      ...(artistName  !== null ? { artistName }  : {}),
+    },
+  });
+
+  logger.debug('[backfillListingMetadata] Updated listing search fields', {
+    listingId: listingId.toString(),
+    cid,
+    title,
+    artistName,
+  });
 }
 
 async function fetchAuctionFromChain(_auctionId: bigint): Promise<any | null> {
@@ -638,8 +733,21 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
         .then((n) => activeListingsGauge.set(n)).catch(() => {});
 
       if (token) {
+        // Enqueue background IPFS fetch for the artwork CID.  When it
+        // completes, backfillListingMetadata() will update the Listing row's
+        // title/description/artistName columns so that full-text search picks
+        // them up on the next tsvector trigger update.
         enqueueIpfsFetch(token).catch((err) => {
           logger.warn('[processEvent] Failed to enqueue IPFS fetch', {
+            listingId: listingId?.toString(), token, err: err instanceof Error ? err.message : String(err),
+          });
+        });
+
+        // Attempt an immediate metadata population in the background so that
+        // listings indexed on a cold start get their search fields filled
+        // without waiting for the queue worker's next cycle.
+        backfillListingMetadata(listingId, token).catch((err) => {
+          logger.debug('[processEvent] Background metadata backfill failed (will retry via queue)', {
             listingId: listingId?.toString(), token, err: err instanceof Error ? err.message : String(err),
           });
         });

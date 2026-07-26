@@ -38,6 +38,7 @@ use crate::{
     events, storage,
     types::{CollectionKind, CollectionRecord, Error, PreflightResult, WasmHashes},
 };
+use crate::types::DataKey;
 
 /// Semantic version — bump on every breaking storage change.
 const CONTRACT_VERSION: &str = "1.0.0";
@@ -250,6 +251,131 @@ impl Launchpad {
         storage::set_admin(&env, &admin);
         storage::set_fee_config(&env, &fee_receiver, deploy_fee);
         Ok(())
+    }
+
+    // ── Versioning & Migration ────────────────────────────────────────────
+
+    /// Returns the semantic version string compiled into this WASM.
+    pub fn version(env: Env) -> soroban_sdk::String {
+        soroban_sdk::String::from_str(&env, crate::types::CONTRACT_VERSION)
+    }
+
+    /// Returns the version string last written to on-chain storage by
+    /// `migrate()`.  `None` before the first migration.
+    pub fn contract_version(env: Env) -> Option<soroban_sdk::String> {
+        storage::get_contract_version(&env)
+    }
+
+    /// Admin-guarded, idempotent storage migration entry point.
+    ///
+    /// # Idempotency
+    /// Records a per-version completion marker the first time it succeeds.
+    /// Subsequent calls for the *same* version revert with `AlreadyMigrated`.
+    ///
+    /// # Unsupported jumps
+    /// Only sequential upgrades (e.g. 1.0.0 → 1.1.0) are accepted.  If no
+    /// prior version is on-chain (fresh install) any version is accepted as the
+    /// first migration.
+    ///
+    /// # 1.0.0 migration
+    /// Migrates legacy monolithic `ByCreator(Address)` Vec<CollectionRecord>
+    /// and `AllCollections` Vec<CollectionRecord> entries into the paged index
+    /// storage introduced in the current build.  Legacy keys are consumed and
+    /// deleted.  The step is idempotent — re-running after a crash finds the
+    /// keys absent and skips them silently.
+    pub fn migrate(env: Env, admin: Address) -> Result<(), Error> {
+        storage::extend_instance_ttl(&env);
+        let version = Self::require_pending_migration(&env, &admin)?;
+        Self::run_migration(&env, &version, u32::MAX);
+        Ok(())
+    }
+
+    /// Bounded, resumable variant of `migrate`.  Returns items still pending.
+    /// Call repeatedly until it returns `0`.
+    pub fn migrate_step(env: Env, admin: Address, max_items: u32) -> Result<u64, Error> {
+        storage::extend_instance_ttl(&env);
+        let version = Self::require_pending_migration(&env, &admin)?;
+        Ok(Self::run_migration(&env, &version, max_items))
+    }
+
+    // ── Internal migration helpers ────────────────────────────────────────
+
+    fn require_pending_migration(env: &Env, admin: &Address) -> Result<soroban_sdk::String, Error> {
+        admin.require_auth();
+        let stored = storage::get_admin(env).ok_or(Error::NotInitialized)?;
+        if *admin != stored {
+            return Err(Error::NotAdmin);
+        }
+        let target = soroban_sdk::String::from_str(env, crate::types::CONTRACT_VERSION);
+        if storage::is_migration_done(env, &target) {
+            return Err(Error::AlreadyMigrated);
+        }
+        Ok(target)
+    }
+
+    fn run_migration(
+        env: &Env,
+        version: &soroban_sdk::String,
+        mut budget: u32,
+    ) -> u64 {
+        let mut p = storage::get_migration_progress(env, version);
+
+        // Phase 0: migrate legacy ByCreator + AllCollections Vec entries into
+        //           the paged index introduced in v1.0.0.
+        // Each legacy ByCreator Vec<CollectionRecord> entry is read-and-deleted
+        // in one step; records are then appended to the per-address paged index.
+        while budget > 0 {
+            match p.phase {
+                0 => {
+                    // Legacy AllCollections is a single entry; consume it.
+                    let legacy_key = DataKey::AllCollections;
+                    if let Some(records) = env
+                        .storage()
+                        .persistent()
+                        .get::<DataKey, soroban_sdk::Vec<crate::types::CollectionRecord>>(
+                            &legacy_key,
+                        )
+                    {
+                        env.storage().persistent().remove(&legacy_key);
+                        let current_count = storage::collection_count(env);
+                        // Re-insert into paged keys without touching per-creator indices
+                        // (those were written by record_collection() at deploy time and
+                        //  only need to survive).
+                        for (i, rec) in records.iter().enumerate() {
+                            let global_idx = current_count + i as u64;
+                            env.storage().persistent().set(
+                                &DataKey::CollectionByIndex(global_idx),
+                                &rec,
+                            );
+                            env.storage().persistent().extend_ttl(
+                                &DataKey::CollectionByIndex(global_idx),
+                                50_000,
+                                100_000,
+                            );
+                        }
+                        let new_total = current_count + records.len() as u64;
+                        env.storage()
+                            .persistent()
+                            .set(&DataKey::CollectionCount, &new_total);
+                    }
+                    p.phase = 1;
+                    budget -= 1;
+                }
+                _ => break,
+            }
+        }
+
+        let remaining: u64 = if p.phase == 0 { 1 } else { 0 };
+
+        if remaining == 0 {
+            storage::clear_migration_progress(env, version);
+            storage::set_migration_done(env, version);
+            storage::set_contract_version(env, version);
+            events::publish_migration_completed(env, version);
+        } else {
+            storage::set_migration_progress(env, version, &p);
+        }
+        remaining
     }
 
     /// Records the four collection WASM hashes, bumps the version counter and
