@@ -1,0 +1,112 @@
+{
+  "title": "Reentrancy Guard Triggered — High Rate",
+  "description": "Fires when the elcarehub_reentrancy_guard_triggered_total counter increases by more than 3 in any 5-minute window. This indicates repeated ReentrancyGuard (error #22) rejections on the marketplace contract, which may signal a probing or exploitation attempt.",
+  "uid": "elcarehub-reentrancy-guard-alert",
+  "orgId": 1,
+  "condition": "C",
+  "data": [
+    {
+      "refId": "A",
+      "queryType": "",
+      "relativeTimeRange": {
+        "from": 300,
+        "to": 0
+      },
+      "datasourceUid": "${datasource}",
+      "model": {
+        "expr": "increase(elcarehub_reentrancy_guard_triggered_total[5m])",
+        "intervalMs": 1000,
+        "maxDataPoints": 43200,
+        "refId": "A"
+      }
+    },
+    {
+      "refId": "B",
+      "queryType": "",
+      "relativeTimeRange": {
+        "from": 300,
+        "to": 0
+      },
+      "datasourceUid": "__expr__",
+      "model": {
+        "conditions": [
+          {
+            "evaluator": {
+              "params": [],
+              "type": "gt"
+            },
+            "operator": {
+              "type": "and"
+            },
+            "query": {
+              "params": ["A"]
+            },
+            "reducer": {
+              "params": [],
+              "type": "last"
+            },
+            "type": "query"
+          }
+        ],
+        "datasource": {
+          "type": "__expr__",
+          "uid": "__expr__"
+        },
+        "expression": "A",
+        "reducer": "last",
+        "refId": "B",
+        "type": "reduce"
+      }
+    },
+    {
+      "refId": "C",
+      "queryType": "",
+      "relativeTimeRange": {
+        "from": 300,
+        "to": 0
+      },
+      "datasourceUid": "__expr__",
+      "model": {
+        "conditions": [
+          {
+            "evaluator": {
+              "params": [3],
+              "type": "gt"
+            },
+            "operator": {
+              "type": "and"
+            },
+            "query": {
+              "params": ["B"]
+            },
+            "reducer": {
+              "params": [],
+              "type": "last"
+            },
+            "type": "query"
+          }
+        ],
+        "datasource": {
+          "type": "__expr__",
+          "uid": "__expr__"
+        },
+        "expression": "B",
+        "refId": "C",
+        "type": "threshold"
+      }
+    }
+  ],
+  "noDataState": "OK",
+  "execErrState": "Error",
+  "for": "0s",
+  "labels": {
+    "severity": "warning",
+    "team": "elcarehub-platform"
+  },
+  "annotations": {
+    "summary": "Reentrancy guard triggered {{ $values.B.Value | printf \"%.0f\" }} times in the last 5 minutes",
+    "description": "The marketplace contract is returning ReentrancyGuard (error #22) at an elevated rate. Check for bot probing, recursive call exploits, or a stuck lock. Runbook: https://github.com/Hydrax117/elcare-care-app/blob/main/docs/INCIDENT_RUNBOOK.md",
+    "runbook_url": "https://github.com/Hydrax117/elcare-care-app/blob/main/docs/INCIDENT_RUNBOOK.md"
+  },
+  "isPaused": false
+}

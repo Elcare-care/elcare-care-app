@@ -44,6 +44,19 @@ export const duplicateEventsCounter = new client.Counter({
   help: 'Total number of duplicate on-chain events skipped during idempotent processing',
 });
 
+// ── Reentrancy guard monitoring (Issue #204) ──────────────────────────────────
+
+/**
+ * Incremented whenever the indexer observes a contract invocation result that
+ * contains the ReentrancyGuard error (code 22).  A sustained rate of this
+ * counter is a signal that something is probing or exploiting the guard and
+ * warrants operator investigation.
+ */
+export const reentrancyGuardTriggeredTotal = new client.Counter({
+  name: 'elcarehub_reentrancy_guard_triggered_total',
+  help: 'Total number of times a ReentrancyGuard rejection (error #22) was observed in contract invocation results',
+});
+
 export const httpRequestDurationMicroseconds = new client.Histogram({
   name: 'http_request_duration_seconds',
   help: 'Duration of HTTP requests in seconds',
