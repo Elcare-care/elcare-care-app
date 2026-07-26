@@ -58,6 +58,22 @@ export interface Listing {
   expires_at?: number;
 }
 
+export interface BatchCreateListingInput {
+  price: number;
+  tokenAddress?: string;
+  collectionAddress: string;
+  nftTokenId: number;
+  recipients?: Array<{ address: string; percentage: number }>;
+  expiresAt?: number | null;
+}
+
+export interface BatchUpdateListingInput {
+  listingId: number;
+  newPrice: number;
+  newTokenAddress: string;
+  newRecipients?: Array<{ address: string; percentage: number }>;
+}
+
 export type AuctionStatus = "Active" | "Finalized" | "Cancelled";
 
 export interface Auction {
@@ -242,6 +258,16 @@ function parseAuctionFromScVal(raw: unknown): Auction {
   };
 }
 
+function toScRecipientVec(recipients: Array<{ address: string; percentage: number }>): xdr.ScVal {
+  return nativeToScVal(
+    recipients.map((r) => ({
+      address: new Address(r.address),
+      percentage: r.percentage,
+    })),
+    { type: "vec" }
+  );
+}
+
 // ── Listing contract methods ──────────────────────────────────
 
 /**
@@ -281,10 +307,7 @@ export async function createListing(
     new Address(selectedToken.address).toScVal(),
     new Address(collectionAddress).toScVal(),
     nativeToScVal(nftTokenId, { type: "u64" }),
-    nativeToScVal(finalRecipients.map(r => ({
-        address: new Address(r.address),
-        percentage: r.percentage
-    })), { type: "vec" }),
+    toScRecipientVec(finalRecipients),
   ];
 
   const retVal = await invokeContract(artistPublicKey, "create_listing", args);
@@ -328,6 +351,64 @@ export async function cancelListing(
   return true;
 }
 
+export async function createListings(
+  artistPublicKey: string,
+  requests: BatchCreateListingInput[]
+): Promise<number[]> {
+  if (isE2eMockChain()) {
+    if (typeof window !== "undefined") registerE2eMockListingsOnWindow();
+    return requests.map((request) => e2eMockCreateListing(
+      artistPublicKey,
+      request.price,
+      request.tokenAddress ?? DEFAULT_TOKEN.address,
+      request.collectionAddress,
+      request.nftTokenId
+    ));
+  }
+
+  const payload = requests.map((request) => {
+    const priceStroops = xlmToStroops(request.price);
+    const selectedToken = resolveConfiguredToken(request.tokenAddress ?? DEFAULT_TOKEN.address);
+    const finalRecipients = (request.recipients && request.recipients.length > 0)
+      ? request.recipients
+      : [{ address: artistPublicKey, percentage: 100 }];
+
+    return {
+      price: priceStroops,
+      currency: selectedToken.symbol,
+      token: new Address(selectedToken.address),
+      collection: new Address(request.collectionAddress),
+      token_id: request.nftTokenId,
+      recipients: finalRecipients.map((r) => ({
+        address: new Address(r.address),
+        percentage: r.percentage,
+      })),
+      expires_at: request.expiresAt ?? null,
+    };
+  });
+
+  const args: xdr.ScVal[] = [
+    new Address(artistPublicKey).toScVal(),
+    nativeToScVal(payload, { type: "vec" }),
+  ];
+
+  const retVal = await invokeContract(artistPublicKey, "create_listings", args);
+  return (scValToNative(retVal) as bigint[]).map(Number);
+}
+
+export async function cancelListings(
+  artistPublicKey: string,
+  listingIds: number[]
+): Promise<boolean> {
+  const args: xdr.ScVal[] = [
+    new Address(artistPublicKey).toScVal(),
+    nativeToScVal(listingIds.map((id) => BigInt(id)), { type: "vec" }),
+  ];
+
+  await invokeContract(artistPublicKey, "cancel_listings", args);
+  return true;
+}
+
 /**
  * update_listing — Artist updates an active listing with new metadata or price.
  */
@@ -345,16 +426,38 @@ export async function updateListing(
   const args: xdr.ScVal[] = [
     new Address(artistPublicKey).toScVal(),
     nativeToScVal(BigInt(listingId), { type: "u64" }),
-    nativeToScVal(Buffer.from(newMetadataCid, "utf-8"), { type: "bytes" }),
     nativeToScVal(priceStroops, { type: "i128" }),
     new Address(selectedToken.address).toScVal(),
-    nativeToScVal(newRecipients.map(r => ({
-        address: new Address(r.address),
-        percentage: r.percentage
-    })), { type: "vec" }),
+    toScRecipientVec(newRecipients),
   ];
 
   await invokeContract(artistPublicKey, "update_listing", args);
+  return true;
+}
+
+export async function updateListings(
+  artistPublicKey: string,
+  requests: BatchUpdateListingInput[]
+): Promise<boolean> {
+  const payload = requests.map((request) => ({
+    listing_id: BigInt(request.listingId),
+    new_price: xlmToStroops(request.newPrice),
+    new_token: new Address(request.newTokenAddress),
+    new_recipients: (request.newRecipients && request.newRecipients.length > 0
+      ? request.newRecipients
+      : [{ address: artistPublicKey, percentage: 100 }]
+    ).map((r) => ({
+      address: new Address(r.address),
+      percentage: r.percentage,
+    })),
+  }));
+
+  const args: xdr.ScVal[] = [
+    new Address(artistPublicKey).toScVal(),
+    nativeToScVal(payload, { type: "vec" }),
+  ];
+
+  await invokeContract(artistPublicKey, "update_listings", args);
   return true;
 }
 
@@ -450,12 +553,18 @@ export interface Offer {
   token: string;
   status: OfferStatus;
   created_at: number;
+  /** Unix seconds after which the offer expires and can be reclaimed. Absent when the offer never expires. */
+  expires_at?: number;
 }
 
 // ── Offer ScVal parsing ──────────────────────────────────────
 
 function parseOfferFromScVal(raw: unknown): Offer {
   const obj = scValToNative(raw as xdr.ScVal) as Record<string, unknown>;
+
+  const expiresAtRaw = obj["expires_at"];
+  const expires_at =
+    expiresAtRaw != null ? Number(expiresAtRaw) : undefined;
 
   return {
     offer_id: Number(obj["offer_id"]),
@@ -465,6 +574,7 @@ function parseOfferFromScVal(raw: unknown): Offer {
     token: (obj["token"] as Address).toString(),
     status: String(obj["status"]) as OfferStatus,
     created_at: Number(obj["created_at"]),
+    ...(expires_at !== undefined && { expires_at }),
   };
 }
 
@@ -490,6 +600,15 @@ export async function makeOffer(
 export async function withdrawOffer(offererPublicKey: string, offerId: number): Promise<boolean> {
   const args = [new Address(offererPublicKey).toScVal(), nativeToScVal(BigInt(offerId), { type: "u64" })];
   await invokeContract(offererPublicKey, "withdraw_offer", args);
+  return true;
+}
+
+// Reclaim the escrowed funds of an expired offer. The contract call is
+// permissionless (only the offer_id is passed); the refund always goes to the
+// original offerer. `signerPublicKey` is just the source account paying fees.
+export async function reclaimOffer(signerPublicKey: string, offerId: number): Promise<boolean> {
+  const args = [nativeToScVal(BigInt(offerId), { type: "u64" })];
+  await invokeContract(signerPublicKey, "reclaim_offer", args);
   return true;
 }
 
@@ -862,5 +981,179 @@ export async function getAdmin(): Promise<string | null> {
     return (native as Address).toString();
   } catch {
     return null;
+  }
+}
+
+// ── Admin key rotation (two-step propose → accept, Issue #202) ─────────────────
+
+/** A pending admin-rotation proposal read from `get_pending_admin`. */
+export interface PendingAdminProposal {
+  /** Address invited to become the new admin. */
+  candidate: string;
+  /** Absolute unix timestamp (seconds) after which the proposal can no longer be accepted. */
+  expiresAt: number;
+}
+
+/**
+ * transfer_admin — Step 1: the current admin proposes a new admin.
+ *
+ * The on-chain entry point is `transfer_admin(current_admin, new_admin)`; it
+ * stamps the proposal with a 7-day acceptance deadline.
+ */
+export async function proposeAdmin(
+  currentAdminPublicKey: string,
+  candidatePublicKey: string
+): Promise<boolean> {
+  const args: xdr.ScVal[] = [
+    new Address(currentAdminPublicKey).toScVal(),
+    new Address(candidatePublicKey).toScVal(),
+  ];
+  await invokeContract(currentAdminPublicKey, "transfer_admin", args);
+  return true;
+}
+
+/**
+ * accept_admin — Step 2: the proposed candidate accepts and becomes admin.
+ * Fails on-chain if the proposal has expired or the caller is not the candidate.
+ */
+export async function acceptAdmin(candidatePublicKey: string): Promise<boolean> {
+  const args: xdr.ScVal[] = [new Address(candidatePublicKey).toScVal()];
+  await invokeContract(candidatePublicKey, "accept_admin", args);
+  return true;
+}
+
+/**
+ * cancel_admin_proposal — the current admin cancels a still-pending proposal.
+ */
+export async function cancelAdminProposal(
+  currentAdminPublicKey: string
+): Promise<boolean> {
+  const args: xdr.ScVal[] = [new Address(currentAdminPublicKey).toScVal()];
+  await invokeContract(currentAdminPublicKey, "cancel_admin_proposal", args);
+  return true;
+}
+
+/**
+ * get_pending_admin — read the currently-pending admin proposal, or null.
+ * Returns `Option<PendingAdminProposal { candidate, expires_at }>`.
+ */
+export async function getPendingAdmin(): Promise<PendingAdminProposal | null> {
+  const callerPublicKey = await getReadOnlyCallerPublicKey();
+  try {
+    const retVal = await invokeContract(callerPublicKey, "get_pending_admin", [], true);
+    const native = scValToNative(retVal) as
+      | { candidate: unknown; expires_at: unknown }
+      | null
+      | undefined;
+    if (!native) return null;
+    return {
+      candidate: (native.candidate as Address).toString(),
+      expiresAt: Number(native.expires_at),
+    };
+  } catch {
+    return null;
+  }
+}
+
+// ── Granular pause controls (Issue #205) ─────────────────────────────────────
+
+/** admin_pause — global circuit-breaker ON. */
+export async function adminPause(adminPublicKey: string): Promise<boolean> {
+  const args: xdr.ScVal[] = [new Address(adminPublicKey).toScVal()];
+  await invokeContract(adminPublicKey, "admin_pause", args);
+  return true;
+}
+
+/** admin_unpause — global circuit-breaker OFF. */
+export async function adminUnpause(adminPublicKey: string): Promise<boolean> {
+  const args: xdr.ScVal[] = [new Address(adminPublicKey).toScVal()];
+  await invokeContract(adminPublicKey, "admin_unpause", args);
+  return true;
+}
+
+/** is_paused — read global pause flag. */
+export async function getIsContractPaused(): Promise<boolean> {
+  const callerPublicKey = await getReadOnlyCallerPublicKey();
+  try {
+    const retVal = await invokeContract(callerPublicKey, "is_paused", [], true);
+    return scValToNative(retVal) as boolean;
+  } catch {
+    return false;
+  }
+}
+
+/** pause_collection — pause all operations for a specific collection. */
+export async function pauseCollection(
+  adminPublicKey: string,
+  collectionAddress: string
+): Promise<boolean> {
+  const args: xdr.ScVal[] = [
+    new Address(adminPublicKey).toScVal(),
+    new Address(collectionAddress).toScVal(),
+  ];
+  await invokeContract(adminPublicKey, "pause_collection", args);
+  return true;
+}
+
+/** unpause_collection — resume a paused collection. */
+export async function unpauseCollection(
+  adminPublicKey: string,
+  collectionAddress: string
+): Promise<boolean> {
+  const args: xdr.ScVal[] = [
+    new Address(adminPublicKey).toScVal(),
+    new Address(collectionAddress).toScVal(),
+  ];
+  await invokeContract(adminPublicKey, "unpause_collection", args);
+  return true;
+}
+
+/** is_collection_paused — read the pause flag for a specific collection. */
+export async function isCollectionPaused(collectionAddress: string): Promise<boolean> {
+  const callerPublicKey = await getReadOnlyCallerPublicKey();
+  try {
+    const args: xdr.ScVal[] = [new Address(collectionAddress).toScVal()];
+    const retVal = await invokeContract(callerPublicKey, "is_collection_paused", args, true);
+    return scValToNative(retVal) as boolean;
+  } catch {
+    return false;
+  }
+}
+
+/** pause_function — block a specific entry-point by name. */
+export async function pauseFunction(
+  adminPublicKey: string,
+  functionName: string
+): Promise<boolean> {
+  const args: xdr.ScVal[] = [
+    new Address(adminPublicKey).toScVal(),
+    nativeToScVal(functionName, { type: "symbol" }),
+  ];
+  await invokeContract(adminPublicKey, "pause_function", args);
+  return true;
+}
+
+/** unpause_function — unblock a previously paused entry-point. */
+export async function unpauseFunction(
+  adminPublicKey: string,
+  functionName: string
+): Promise<boolean> {
+  const args: xdr.ScVal[] = [
+    new Address(adminPublicKey).toScVal(),
+    nativeToScVal(functionName, { type: "symbol" }),
+  ];
+  await invokeContract(adminPublicKey, "unpause_function", args);
+  return true;
+}
+
+/** is_function_paused — read the pause flag for a specific function. */
+export async function isFunctionPaused(functionName: string): Promise<boolean> {
+  const callerPublicKey = await getReadOnlyCallerPublicKey();
+  try {
+    const args: xdr.ScVal[] = [nativeToScVal(functionName, { type: "symbol" })];
+    const retVal = await invokeContract(callerPublicKey, "is_function_paused", args, true);
+    return scValToNative(retVal) as boolean;
+  } catch {
+    return false;
   }
 }

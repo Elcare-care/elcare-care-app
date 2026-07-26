@@ -25,6 +25,7 @@ const mockTx = vi.hoisted(() => ({
   offer: {
     upsert: vi.fn().mockResolvedValue({}),
     update: vi.fn().mockResolvedValue({}),
+    updateMany: vi.fn().mockResolvedValue({ count: 1 }),
   },
   collection: { deleteMany: vi.fn().mockResolvedValue({}), upsert: vi.fn().mockResolvedValue({}) },
   syncState: { update: vi.fn().mockResolvedValue({}) },
@@ -49,6 +50,7 @@ const mockPrisma = vi.hoisted(() => ({
   offer: {
     upsert: vi.fn().mockResolvedValue({}),
     update: vi.fn().mockResolvedValue({}),
+    updateMany: vi.fn().mockResolvedValue({ count: 1 }),
   },
   bid: {
     upsert: vi.fn().mockResolvedValue({}),
@@ -79,7 +81,9 @@ const mockPrisma = vi.hoisted(() => ({
   $transaction: vi.fn((fn: (tx: typeof mockTx) => Promise<void>) => fn(mockTx)),
 }));
 
-vi.mock('../db', () => ({ default: mockPrisma }));
+// poller.ts now imports from prisma-write (write pool) not db (read pool)
+vi.mock('../db',           () => ({ default: mockPrisma }));
+vi.mock('../prisma-write', () => ({ default: mockPrisma }));
 vi.mock('../metrics.js', () => ({
   latestLedgerProcessedGauge: { set: vi.fn() },
   networkLatestLedgerGauge:   { set: vi.fn() },
@@ -373,6 +377,49 @@ describe('processEvent — OFFER_MADE', () => {
       token: 'CTOKEN',
       status: 'Pending',
       createdAtLedger: 630,
+    });
+  });
+
+  it('captures the offer expires_at when present', async () => {
+    const data = {
+      offer_id: 2, listing_id: 42, offerer: 'GA_OFFERER',
+      amount: '30000000', token: 'CTOKEN', expires_at: 1735689600,
+    };
+    await processEvent(makeEvent('OFFER_MADE', 42n, 'GA_OFFERER', data, 631));
+    const call = mockPrisma.offer.upsert.mock.calls[0][0];
+    expect(call.create.expiresAt).toBe(1735689600n);
+    expect(call.update.expiresAt).toBe(1735689600n);
+  });
+
+  it('stores null expiry when the offer never expires', async () => {
+    const data = {
+      offer_id: 3, listing_id: 42, offerer: 'GA_OFFERER',
+      amount: '30000000', token: 'CTOKEN',
+    };
+    await processEvent(makeEvent('OFFER_MADE', 42n, 'GA_OFFERER', data, 632));
+    const call = mockPrisma.offer.upsert.mock.calls[0][0];
+    expect(call.create.expiresAt).toBeNull();
+  });
+});
+
+// ── OFFER_RECLAIMED ─────────────────────────────────────────────────────────────
+
+describe('processEvent — OFFER_RECLAIMED', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it('moves a reclaimed offer to its Withdrawn terminal state', async () => {
+    const data = {
+      offer_id: 7, listing_id: 42, offerer: 'GA_OFFERER', amount: '30000000',
+    };
+    await processEvent(makeEvent('OFFER_RECLAIMED', 42n, 'GA_OFFERER', data, 650));
+
+    expect(mockPrisma.offer.updateMany).toHaveBeenCalledOnce();
+    expect(mockPrisma.offer.updateMany).toHaveBeenCalledWith({
+      where: { offerId: 7n },
+      data: {
+        status: 'Withdrawn',
+        updatedAtLedger: 650,
+      },
     });
   });
 });

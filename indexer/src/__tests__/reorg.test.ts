@@ -68,6 +68,8 @@ const mockPrisma = vi.hoisted(() => ({
 }));
 
 vi.mock('../db', () => ({ default: mockPrisma }));
+// poller.ts imports from prisma-write; mock it with the same object
+vi.mock('../prisma-write', () => ({ default: mockPrisma }));
 
 vi.mock('../metrics.js', () => ({
   latestLedgerProcessedGauge: { set: vi.fn() },

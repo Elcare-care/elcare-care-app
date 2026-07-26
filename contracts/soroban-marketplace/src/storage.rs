@@ -24,6 +24,24 @@ pub enum IndexId {
     ListingOffers(u64),
 }
 
+/// A pending two-step admin rotation.
+///
+/// Stored under `DataKey::PendingAdmin` between `transfer_admin` (propose) and
+/// `accept_admin`.  `expires_at` is an absolute ledger timestamp (seconds); once
+/// `env.ledger().timestamp()` passes it, `accept_admin` reverts with
+/// `AdminProposalExpired` so a proposal can never leave governance half-locked
+/// forever.  The current admin can clear a live proposal early via
+/// `cancel_admin_proposal`.
+#[contracttype]
+#[derive(Clone)]
+pub struct PendingAdminProposal {
+    /// Address invited to become the new admin.
+    pub candidate: Address,
+    /// Absolute ledger timestamp after which the proposal can no longer be
+    /// accepted.
+    pub expires_at: u64,
+}
+
 /// Resumable progress marker for a versioned storage migration.
 #[contracttype]
 #[derive(Clone)]
@@ -61,6 +79,12 @@ pub enum DataKey {
     ListingLock(u64),
     AuctionLock(u64),
     IsPaused,
+    /// Per-collection pause flag. When present, operations on this collection
+    /// are blocked regardless of the global pause state.
+    CollectionPaused(Address),
+    /// Per-function pause flag. Stored as a Symbol key; when present, the named
+    /// entry-point is blocked regardless of global or collection pause state.
+    FunctionPaused(soroban_sdk::Symbol),
     PendingAdmin,
     /// LEGACY (pre-1.1.0): monolithic active-listings index (see above).
     ActiveListings,
@@ -71,6 +95,15 @@ pub enum DataKey {
     MinPrice,
     MaxPrice,
     MigrationDone(soroban_sdk::String),
+    /// Global admin-configurable bid-history ring-buffer capacity.
+    /// Default: 50.  Valid range: 1 – 200.
+    /// Each new auction snapshots this value into `Auction::bid_history_cap`
+    /// so changes here never affect in-progress auctions.
+    BidHistoryCap,
+    /// Global cap on the number of times any single auction's end time may be
+    /// extended by anti-sniping logic.  0 = unlimited (legacy behaviour).
+    /// Each new auction snapshots this value into `Auction::max_extensions`.
+    AuctionMaxExtensions,
     /// One fixed-capacity page (`Vec<u64>`, at most `INDEX_PAGE_SIZE` entries)
     /// of the identified index.
     IndexPage(IndexId, u32),
@@ -88,6 +121,23 @@ pub enum DataKey {
     ArtistCancelCursor(Address),
     /// Resumable progress of the versioned `migrate`/`migrate_step` operation.
     MigrationCursor(soroban_sdk::String),
+    /// Escrow record for a `(collection, token_id)` currently held in
+    /// marketplace custody.  Exists iff the token is escrowed for an active
+    /// listing or auction; a double-listing guard reads it and settlement /
+    /// cancellation clears it.
+    EscrowedToken(Address, u64),
+}
+
+/// Custody record for an NFT held by the marketplace, keyed by
+/// `DataKey::EscrowedToken(collection, token_id)`.  Written by `escrow_nft`
+/// and removed by `release_nft`.
+#[contracttype]
+#[derive(Clone)]
+pub struct EscrowRecord {
+    /// True if the token backs a fixed-price listing; false for an auction.
+    pub is_listing: bool,
+    /// The listing_id or auction_id the escrow is bound to.
+    pub id: u64,
 }
 
 pub const LEDGER_TTL_BUMP: u32 = 432_000;
@@ -504,6 +554,33 @@ pub fn clear_pending_offers(env: &Env, listing_id: u64) {
         .remove(&DataKey::ListingPendingOffers(listing_id));
 }
 
+// ── NFT escrow records ───────────────────────────────────────
+//
+// One persistent entry per `(collection, token_id)` in marketplace custody.
+// `escrow_nft` writes it (after a double-listing guard read); `release_nft`
+// removes it once the token leaves custody.
+
+pub fn get_escrow_record(env: &Env, collection: &Address, token_id: u64) -> Option<EscrowRecord> {
+    let key = DataKey::EscrowedToken(collection.clone(), token_id);
+    let res = env.storage().persistent().get::<DataKey, EscrowRecord>(&key);
+    if res.is_some() {
+        bump_entry_ttl(env, &key);
+    }
+    res
+}
+
+pub fn set_escrow_record(env: &Env, collection: &Address, token_id: u64, record: &EscrowRecord) {
+    let key = DataKey::EscrowedToken(collection.clone(), token_id);
+    env.storage().persistent().set(&key, record);
+    bump_entry_ttl(env, &key);
+}
+
+pub fn clear_escrow_record(env: &Env, collection: &Address, token_id: u64) {
+    env.storage()
+        .persistent()
+        .remove(&DataKey::EscrowedToken(collection.clone(), token_id));
+}
+
 // ── Batched cancel_artist_listings cursor ────────────────────
 
 pub fn get_artist_cancel_cursor(env: &Env, artist: &Address) -> u32 {
@@ -669,15 +746,18 @@ pub fn release_auction_lock(env: &Env, auction_id: u64) {
 
 // ── Admin transfer ───────────────────────────────────────────
 
-pub fn set_pending_admin_storage(env: &Env, pending: &Address) {
+pub fn set_pending_admin_storage(env: &Env, pending: &PendingAdminProposal) {
     env.storage()
         .persistent()
         .set(&DataKey::PendingAdmin, pending);
     bump_entry_ttl(env, &DataKey::PendingAdmin);
 }
 
-pub fn get_pending_admin_storage(env: &Env) -> Option<Address> {
-    let value = env.storage().persistent().get(&DataKey::PendingAdmin);
+pub fn get_pending_admin_storage(env: &Env) -> Option<PendingAdminProposal> {
+    let value = env
+        .storage()
+        .persistent()
+        .get::<DataKey, PendingAdminProposal>(&DataKey::PendingAdmin);
     if value.is_some() {
         bump_entry_ttl(env, &DataKey::PendingAdmin);
     }
@@ -732,6 +812,97 @@ pub fn is_paused(env: &Env) -> bool {
         .persistent()
         .get::<DataKey, bool>(&DataKey::IsPaused)
         .unwrap_or(false)
+}
+
+// ── Granular pause helpers (Issue #205) ──────────────────────────────────────
+//
+// Three independent circuit-breaker axes:
+//   1. Global flag           — DataKey::IsPaused (existing)
+//   2. Per-collection flag   — DataKey::CollectionPaused(address)
+//   3. Per-function flag     — DataKey::FunctionPaused(symbol)
+//
+// is_paused_for() returns true when ANY of the three axes fires.
+
+/// Pause a specific collection.
+pub fn set_collection_paused(env: &Env, collection: &Address, paused: bool) {
+    let key = DataKey::CollectionPaused(collection.clone());
+    if paused {
+        env.storage().persistent().set(&key, &true);
+        bump_entry_ttl(env, &key);
+    } else {
+        env.storage().persistent().remove(&key);
+    }
+}
+
+/// Return whether the given collection is individually paused.
+pub fn is_collection_paused(env: &Env, collection: &Address) -> bool {
+    let key = DataKey::CollectionPaused(collection.clone());
+    let paused = env
+        .storage()
+        .persistent()
+        .get::<DataKey, bool>(&key)
+        .unwrap_or(false);
+    if paused {
+        bump_entry_ttl(env, &key);
+    }
+    paused
+}
+
+/// Pause a specific entry-point function by its symbol name.
+pub fn set_function_paused(env: &Env, func: &soroban_sdk::Symbol, paused: bool) {
+    let key = DataKey::FunctionPaused(func.clone());
+    if paused {
+        env.storage().persistent().set(&key, &true);
+        bump_entry_ttl(env, &key);
+    } else {
+        env.storage().persistent().remove(&key);
+    }
+}
+
+/// Return whether the given function symbol is individually paused.
+pub fn is_function_paused(env: &Env, func: &soroban_sdk::Symbol) -> bool {
+    let key = DataKey::FunctionPaused(func.clone());
+    let paused = env
+        .storage()
+        .persistent()
+        .get::<DataKey, bool>(&key)
+        .unwrap_or(false);
+    if paused {
+        bump_entry_ttl(env, &key);
+    }
+    paused
+}
+
+/// Composite pause check: returns true when ANY of the three circuit-breakers
+/// is active for the given (optional) collection and function context.
+///
+/// Call sites:
+///   - Global-only check:           is_paused_for(env, None, None)
+///   - Collection-scoped check:     is_paused_for(env, Some(&col), None)
+///   - Function-scoped check:       is_paused_for(env, None, Some(&func))
+///   - Full context check:          is_paused_for(env, Some(&col), Some(&func))
+pub fn is_paused_for(
+    env: &Env,
+    collection: Option<&Address>,
+    func: Option<&soroban_sdk::Symbol>,
+) -> bool {
+    // Global flag (cheapest read — check first).
+    if is_paused(env) {
+        return true;
+    }
+    // Per-function flag.
+    if let Some(f) = func {
+        if is_function_paused(env, f) {
+            return true;
+        }
+    }
+    // Per-collection flag.
+    if let Some(c) = collection {
+        if is_collection_paused(env, c) {
+            return true;
+        }
+    }
+    false
 }
 
 // ── Price bounds ─────────────────────────────────────────────
@@ -813,4 +984,57 @@ pub fn take_legacy_index_vec(env: &Env, key: &DataKey) -> Option<Vec<u64>> {
         env.storage().persistent().remove(key);
     }
     value
+}
+
+// ── Bid-history cap ──────────────────────────────────────────
+
+/// Default bid-history ring-buffer capacity.
+pub const DEFAULT_BID_HISTORY_CAP: u32 = 50;
+/// Maximum allowed bid-history cap.  Kept at 200 so the O(n) eviction
+/// shift (see `append_bid_record`) stays within acceptable compute limits.
+pub const MAX_BID_HISTORY_CAP: u32 = 200;
+
+/// Persist the global bid-history cap.
+pub fn set_bid_history_cap_storage(env: &Env, cap: u32) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::BidHistoryCap, &cap);
+    bump_entry_ttl(env, &DataKey::BidHistoryCap);
+}
+
+/// Read the global bid-history cap, defaulting to `DEFAULT_BID_HISTORY_CAP`.
+pub fn get_bid_history_cap_storage(env: &Env) -> u32 {
+    let value = env
+        .storage()
+        .persistent()
+        .get::<DataKey, u32>(&DataKey::BidHistoryCap);
+    if value.is_some() {
+        bump_entry_ttl(env, &DataKey::BidHistoryCap);
+    }
+    value.unwrap_or(DEFAULT_BID_HISTORY_CAP)
+}
+
+// ── Auction max-extensions cap ───────────────────────────────
+
+/// Default: 0 = unlimited extensions (legacy behaviour preserved).
+pub const DEFAULT_AUCTION_MAX_EXTENSIONS: u32 = 0;
+
+/// Persist the global auction max-extensions cap.
+pub fn set_auction_max_extensions_storage(env: &Env, max: u32) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::AuctionMaxExtensions, &max);
+    bump_entry_ttl(env, &DataKey::AuctionMaxExtensions);
+}
+
+/// Read the global auction max-extensions cap.
+pub fn get_auction_max_extensions_storage(env: &Env) -> u32 {
+    let value = env
+        .storage()
+        .persistent()
+        .get::<DataKey, u32>(&DataKey::AuctionMaxExtensions);
+    if value.is_some() {
+        bump_entry_ttl(env, &DataKey::AuctionMaxExtensions);
+    }
+    value.unwrap_or(DEFAULT_AUCTION_MAX_EXTENSIONS)
 }

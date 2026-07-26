@@ -69,6 +69,7 @@ export const OfferSchema = registry.register(
     amount:          z.string().openapi({ example: '8.0000000', description: 'Offered amount as a decimal string' }),
     token:           z.string().openapi({ example: 'CABC...DEF', description: 'Payment token contract address' }),
     status:          z.enum(['Pending', 'Accepted', 'Rejected', 'Withdrawn']).openapi({ example: 'Pending' }),
+    expiresAt:       bigIntString.optional().openapi({ description: 'Ledger timestamp after which the offer can be reclaimed; absent when it never expires', example: '1735689600' }),
     createdAtLedger: z.number().int().openapi({ example: 50000000 }),
     updatedAtLedger: z.number().int().openapi({ example: 50000001 }),
     createdAt:       isoDateTime,
@@ -113,6 +114,30 @@ export const RoyaltyStatsSchema = registry.register(
     payoutCount: z.number().int().openapi({ example: 5, description: 'Number of secondary sales that generated royalties' }),
     lastPayout:  z.number().int().openapi({ example: 1705320000000, description: 'Unix timestamp (ms) of the most recent royalty payout, 0 if none' }),
   }).openapi('RoyaltyStats'),
+);
+
+export const RoyaltyPaymentSchema = registry.register(
+  'RoyaltyPayment',
+  z.object({
+    id:             z.number().int().openapi({ example: 1 }),
+    listingId:      z.string().nullable().openapi({ example: '7', description: 'Listing id for fixed-price / offer settlements, null for auctions' }),
+    auctionId:      z.string().nullable().openapi({ example: null, description: 'Auction id for auction settlements, null otherwise' }),
+    recipient:      z.string().openapi({ example: 'GABC...XYZ' }),
+    amount:         z.string().openapi({ example: '6650000.0000000', description: 'Amount this recipient received (decimal string)' }),
+    salePrice:      z.string().openapi({ example: '10000000.0000000', description: 'Total sale price of the settlement' }),
+    ledgerSequence: z.number().int().openapi({ example: 50000000 }),
+    createdAt:      isoDateTime,
+  }).openapi('RoyaltyPayment'),
+);
+
+export const RoyaltyBreakdownSchema = registry.register(
+  'RoyaltyBreakdown',
+  z.object({
+    payments: z.array(RoyaltyPaymentSchema),
+    total:    z.number().int().openapi({ example: 12, description: 'Total matching rows (independent of pagination)' }),
+    limit:    z.number().int().openapi({ example: 50 }),
+    offset:   z.number().int().openapi({ example: 0 }),
+  }).openapi('RoyaltyBreakdown'),
 );
 
 export const StatsSchema = registry.register(
@@ -362,6 +387,27 @@ registry.registerPath({
   request: { params: z.object({ address: z.string().openapi({ description: 'Artist Stellar address' }) }) },
   responses: {
     200: { description: 'Royalty statistics', content: { 'application/json': { schema: RoyaltyStatsSchema } } },
+  },
+});
+
+// GET /wallets/:address/royalty-breakdown
+registry.registerPath({
+  method: 'get',
+  path: '/wallets/{address}/royalty-breakdown',
+  tags: ['Wallets'],
+  summary: 'Get the per-sale royalty payout audit trail for a recipient',
+  description: 'Paginated RoyaltyPayment rows sourced from on-chain ROYALTY_PAID events, newest-first. Supports an inclusive ledger-sequence window via `from`/`to`. Cached for 60 seconds.',
+  request: {
+    params: z.object({ address: z.string().openapi({ description: 'Recipient Stellar address' }) }),
+    query: z.object({
+      from:   z.number().int().optional().openapi({ description: 'Inclusive lower ledger-sequence bound' }),
+      to:     z.number().int().optional().openapi({ description: 'Inclusive upper ledger-sequence bound' }),
+      limit:  z.number().int().optional().openapi({ description: 'Page size (default 50, max 1000)' }),
+      offset: z.number().int().optional().openapi({ description: 'Rows to skip (max 10000)' }),
+    }),
+  },
+  responses: {
+    200: { description: 'Royalty payout breakdown', content: { 'application/json': { schema: RoyaltyBreakdownSchema } } },
   },
 });
 

@@ -32,9 +32,29 @@ export const decodeErrorsCounter = new client.Counter({
   help: 'Total number of XDR event decode errors encountered during sync',
 });
 
+/** Per-event-type decode error counter (labeled). */
+export const eventDecodeErrorsCounter = new client.Counter({
+  name: 'indexer_decode_errors_by_type_total',
+  help: 'Total XDR event decode errors by event type',
+  labelNames: ['event_type'],
+});
+
 export const duplicateEventsCounter = new client.Counter({
   name: 'elcarehub_duplicate_events_total',
   help: 'Total number of duplicate on-chain events skipped during idempotent processing',
+});
+
+// ── Reentrancy guard monitoring (Issue #204) ──────────────────────────────────
+
+/**
+ * Incremented whenever the indexer observes a contract invocation result that
+ * contains the ReentrancyGuard error (code 22).  A sustained rate of this
+ * counter is a signal that something is probing or exploiting the guard and
+ * warrants operator investigation.
+ */
+export const reentrancyGuardTriggeredTotal = new client.Counter({
+  name: 'elcarehub_reentrancy_guard_triggered_total',
+  help: 'Total number of times a ReentrancyGuard rejection (error #22) was observed in contract invocation results',
 });
 
 export const httpRequestDurationMicroseconds = new client.Histogram({
@@ -42,6 +62,120 @@ export const httpRequestDurationMicroseconds = new client.Histogram({
   help: 'Duration of HTTP requests in seconds',
   labelNames: ['method', 'route', 'status'],
   buckets: [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10],
+});
+
+// ── Stall gauge ───────────────────────────────────────────────────────────────
+
+/** Set to 1 when the indexer has stalled (no ledger progress), 0 otherwise. */
+export const stalledGauge = new client.Gauge({
+  name: 'indexer_stalled',
+  help: '1 when the indexer has not advanced within the stall threshold, 0 otherwise',
+});
+
+/**
+ * Stall event counter, labelled by level: "warning" | "critical" | "fatal".
+ *
+ * Each counter value reflects the total number of times the stall detector has
+ * fired at that severity since the process started.  A dashboard alert on the
+ * rate of "fatal" or a sustained rise in "warning" signals degraded sync health.
+ */
+export const pollerStallTotal = new client.Counter({
+  name: 'elcarehub_poller_stall_total',
+  help: 'Total number of stall events detected, labelled by severity level',
+  labelNames: ['level'],
+});
+
+/**
+ * Automatic poller restart counter.
+ *
+ * Incremented each time the stall detector triggers a stopPoller()/startPoller()
+ * cycle.  When this counter reaches 3 the process exits with a non-zero code.
+ */
+export const pollerRestartTotal = new client.Counter({
+  name: 'elcarehub_poller_restart_total',
+  help: 'Total number of automatic poller restarts attempted by the stall watchdog',
+});
+
+// ── Business KPI Metrics ──────────────────────────────────────────────────────
+
+/** Total listings created (labelled by NFT collection kind). */
+export const listingsCreatedTotal = new client.Counter({
+  name: 'elcarehub_listings_created_total',
+  help: 'Total number of listings created, by NFT collection kind',
+  labelNames: ['collection_kind'],
+});
+
+/** Total sales (labelled by payment token type). */
+export const salesTotalCounter = new client.Counter({
+  name: 'elcarehub_sales_total',
+  help: 'Total number of artwork sales, by token type',
+  labelNames: ['token_type'],
+});
+
+/** Total auction finalizations. */
+export const auctionFinalizationsTotal = new client.Counter({
+  name: 'elcarehub_auction_finalizations_total',
+  help: 'Total number of auctions finalized',
+});
+
+/** Total offers made. */
+export const offersMadeTotal = new client.Counter({
+  name: 'elcarehub_offers_made_total',
+  help: 'Total number of offers submitted',
+});
+
+/** Total offers accepted. */
+export const offersAcceptedTotal = new client.Counter({
+  name: 'elcarehub_offers_accepted_total',
+  help: 'Total number of offers accepted',
+});
+
+/** Total SSE connections opened (ever). */
+export const sseConnectionsTotal = new client.Counter({
+  name: 'elcarehub_sse_connections_total',
+  help: 'Total SSE connections opened since the indexer started',
+});
+
+/** Current number of active listings. */
+export const activeListingsGauge = new client.Gauge({
+  name: 'elcarehub_active_listings',
+  help: 'Current number of active listings in the marketplace',
+});
+
+/** Current number of active auctions. */
+export const activeAuctionsGauge = new client.Gauge({
+  name: 'elcarehub_active_auctions',
+  help: 'Current number of active auctions in the marketplace',
+});
+
+/** Current number of live SSE connections. */
+export const sseActiveConnectionsGauge = new client.Gauge({
+  name: 'elcarehub_sse_active_connections',
+  help: 'Current number of active SSE client connections',
+});
+
+/** Sync lag in ledgers (alias of syncLatencyGauge for business-facing dashboards). */
+export const syncLagLedgersGauge = new client.Gauge({
+  name: 'elcarehub_sync_lag_ledgers',
+  help: 'Number of ledgers the indexer is behind the network tip',
+});
+
+// ── Per-endpoint and per-event histograms ─────────────────────────────────────
+
+/** Per-route API request duration (with method, route, status_code labels). */
+export const apiRequestDurationHistogram = new client.Histogram({
+  name: 'elcarehub_api_request_duration_seconds',
+  help: 'HTTP API request duration in seconds, labelled by method, route, and status code',
+  labelNames: ['method', 'route', 'status_code'],
+  buckets: [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10],
+});
+
+/** Per-event-type processing duration. */
+export const eventProcessingDurationHistogram = new client.Histogram({
+  name: 'elcarehub_event_processing_duration_seconds',
+  help: 'Time spent processing each on-chain event, labelled by event_type',
+  labelNames: ['event_type'],
+  buckets: [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1],
 });
 
 // Request logging middleware
@@ -199,6 +333,49 @@ export const backfillBatchInserted = new client.Histogram({
 export const backfillLockContentions = new client.Counter({
   name: 'indexer_backfill_lock_contentions_total',
   help: 'Number of times a BackfillJob advisory lock was already held by another worker',
+});
+
+// ── Dead-letter metrics (#287) ────────────────────────────────────────────────
+
+/** Total events that failed to parse and were persisted to dead-letter storage. */
+export const deadLetterCreatedTotal = new client.Counter({
+  name: 'indexer_dead_letter_created_total',
+  help: 'Total events persisted to dead-letter storage, by error code',
+  labelNames: ['error_code'],
+});
+
+/** Current number of Pending (unresolved) dead-letter records. */
+export const deadLetterPendingGauge = new client.Gauge({
+  name: 'indexer_dead_letter_pending',
+  help: 'Current number of dead-letter records in Pending status',
+});
+
+/** Age in seconds of the oldest Pending dead-letter record (0 when none). */
+export const deadLetterOldestAgeSeconds = new client.Gauge({
+  name: 'indexer_dead_letter_oldest_age_seconds',
+  help: 'Age in seconds of the oldest unresolved (Pending) dead-letter event',
+});
+
+// ── Reconciliation metrics (#288) ─────────────────────────────────────────────
+
+/** Total field-level discrepancies found per reconciliation run, by model and field. */
+export const reconcilerDiscrepanciesTotal = new client.Counter({
+  name: 'indexer_reconciler_discrepancies_total',
+  help: 'Total discrepancies detected during reconciliation, by model and field',
+  labelNames: ['model', 'field'],
+});
+
+/** Total deterministic repairs applied (or logged in dry-run), by model. */
+export const reconcilerRepairsTotal = new client.Counter({
+  name: 'indexer_reconciler_repairs_total',
+  help: 'Total repairs applied (or dry-run) by the reconciler, by model',
+  labelNames: ['model', 'dry_run'],
+});
+
+/** Number of records with detected drift in the last reconciliation run. */
+export const reconcilerDriftGauge = new client.Gauge({
+  name: 'indexer_reconciler_drift_records',
+  help: 'Number of records with detected drift in the most recent reconciliation run',
 });
 
 // ── Expose metrics handler ────────────────────────────────────────────────────

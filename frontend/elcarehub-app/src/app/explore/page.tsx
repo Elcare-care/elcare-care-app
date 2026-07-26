@@ -2,24 +2,17 @@
 // app/explore/page.tsx — Browse / Explore All Listings
 //
 // Full catalogue page with search, filtering, sorting, and
-// pagination for discovering marketplace listings at scale.
+// cursor-based pagination for discovering marketplace listings at scale.
 // ─────────────────────────────────────────────────────────────
 
 "use client";
 
-import { useState, useMemo, useCallback, useEffect, useRef, useReducer } from "react";
-import { Listing, stroopsToXlm } from "@/lib/contract";
+import { useState, useCallback, useEffect, useRef, useReducer } from "react";
+import { Listing } from "@/lib/contract";
 import { ListingCard } from "@/components/ListingCard";
 import { ListingCardSkeleton } from "@/components/Skeletons";
-import {
-  ChevronLeft,
-  ChevronRight,
-  Search,
-  SlidersHorizontal,
-  ArrowUpDown
-} from "lucide-react";
+import { ChevronLeft, ChevronRight, Search, SlidersHorizontal, ArrowUpDown } from "lucide-react";
 import { FilterSidebar, filterReducer, SortOption } from "@/components/FilterSidebar";
-import { fetchMetadata, ArtworkMetadata } from "@/lib/ipfs";
 import { fetchListings } from "@/lib/indexer";
 import { getAllListings } from "@/lib/contract";
 import { useFilterUrlSync } from "@/hooks/useFilterUrlSync";
@@ -35,18 +28,21 @@ const SORT_OPTIONS: { value: SortOption; label: string }[] = [
 ];
 
 export default function ExplorePage() {
-  const [allListings, setAllListings] = useState<Listing[]>([]);
+  const [listings, setListings] = useState<Listing[]>([]);
+  const [totalCount, setTotalCount] = useState(0);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // URL-synced filters
-  const { initialFilters, initialPage, syncToUrl } = useFilterUrlSync();
+  // cursorStack[i] = X-Next-Cursor value returned after fetching page i.
+  // currentCursorIdx = index of the page currently displayed (0 = first page).
+  const [cursorStack, setCursorStack] = useState<string[]>([]);
+  const [currentCursorIdx, setCurrentCursorIdx] = useState(0);
 
+  const { initialFilters, initialPage, syncToUrl } = useFilterUrlSync();
   const [filters, dispatch] = useReducer(filterReducer, initialFilters);
-  const [page, setPage] = useState(initialPage);
   const [showFilters, setShowFilters] = useState(false);
 
-  // Debounce search so we don't fire on every keystroke
+  // Debounce search input
   const [debouncedSearch, setDebouncedSearch] = useState(initialFilters.search);
   const searchTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => {
@@ -55,12 +51,22 @@ export default function ExplorePage() {
     return () => { if (searchTimer.current) clearTimeout(searchTimer.current); };
   }, [filters.search]);
 
-  // Debounced indexer fetch
-  const load = useCallback(async () => {
+  // Reset cursor stack on every filter change
+  useEffect(() => {
+    setCursorStack([]);
+    setCurrentCursorIdx(0);
+  }, [filters.status, filters.minPrice, filters.maxPrice, filters.search,
+      filters.collection, filters.artist, filters.sort]);
+
+  const fetchPage = useCallback(async (cursorLedger?: number): Promise<string> => {
     setIsLoading(true);
     setError(null);
     try {
-      const opts: Parameters<typeof fetchListings>[0] = { limit: 1000 };
+      const opts: Parameters<typeof fetchListings>[0] = {
+        limit: PAGE_SIZE,
+        cursor_direction: "desc",
+      };
+      if (cursorLedger != null) opts.cursor_ledger = cursorLedger;
       if (filters.status !== "All") opts.status = filters.status;
       if (filters.minPrice) opts.minPrice = filters.minPrice;
       if (filters.maxPrice) opts.maxPrice = filters.maxPrice;
@@ -71,86 +77,87 @@ export default function ExplorePage() {
 
       const res = await fetchListings(opts);
       const rows = Array.isArray(res.listings) ? (res.listings as Listing[]) : [];
+
       if (rows.length > 0) {
-        setAllListings(rows);
-      } else {
-        // Fallback to on-chain scan when indexer returns nothing
-        const all = await getAllListings();
-        setAllListings(all);
+        setListings(rows);
+        setTotalCount(res.total ?? rows.length);
+        return res.nextCursor ?? "";
       }
+
+      // Fallback to on-chain scan
+      const all = await getAllListings();
+      setListings(all.slice(0, PAGE_SIZE));
+      setTotalCount(all.length);
+      return "";
     } catch {
       try {
         const all = await getAllListings();
-        setAllListings(all);
+        setListings(all.slice(0, PAGE_SIZE));
+        setTotalCount(all.length);
       } catch (e: unknown) {
         setError(e instanceof Error ? e.message : "Failed to load listings");
       }
+      return "";
     } finally {
       setIsLoading(false);
     }
-  }, [filters.status, filters.minPrice, filters.maxPrice, debouncedSearch, filters.collection, filters.artist, filters.sort]);
+  }, [filters.status, filters.minPrice, filters.maxPrice, debouncedSearch,
+      filters.collection, filters.artist, filters.sort]);
 
-  const debouncedLoadRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Load first page whenever filters change (debounced)
+  const loadTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => {
-    if (debouncedLoadRef.current) clearTimeout(debouncedLoadRef.current);
-    debouncedLoadRef.current = setTimeout(load, 300);
-    return () => {
-      if (debouncedLoadRef.current) clearTimeout(debouncedLoadRef.current);
-    };
-  }, [load]);
+    if (loadTimerRef.current) clearTimeout(loadTimerRef.current);
+    loadTimerRef.current = setTimeout(async () => {
+      const next = await fetchPage(undefined);
+      setCursorStack(next ? [next] : []);
+      setCurrentCursorIdx(0);
+    }, 300);
+    return () => { if (loadTimerRef.current) clearTimeout(loadTimerRef.current); };
+  }, [fetchPage]);
 
-  // Sync filters & page to URL
+  // Sync URL
   useEffect(() => {
-    syncToUrl(filters, page);
-  }, [filters, page, syncToUrl]);
+    syncToUrl(filters, currentCursorIdx + 1);
+  }, [filters, currentCursorIdx, syncToUrl]);
 
-  // Reset to page 1 on filter changes
-  useEffect(() => {
-    setPage(1);
-  }, [filters.status, filters.minPrice, filters.maxPrice, filters.search, filters.collection, filters.artist, filters.sort]);
+  const goNext = useCallback(async () => {
+    const nextCursor = cursorStack[currentCursorIdx];
+    if (!nextCursor) return;
+    const cursorLedger = parseInt(nextCursor, 10);
+    if (!Number.isFinite(cursorLedger)) return;
+    const newNext = await fetchPage(cursorLedger);
+    setCurrentCursorIdx((idx: number) => {
+      const newIdx = idx + 1;
+      setCursorStack((stack: string[]) => {
+        const copy = [...stack];
+        copy[newIdx] = newNext;
+        return copy;
+      });
+      return newIdx;
+    });
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  }, [cursorStack, currentCursorIdx, fetchPage]);
 
-  // Client-side sort fallback (if the indexer is down and we hit on-chain data)
-  const filtered = useMemo(() => {
-    const result = [...allListings];
-    // Since we applied sorting at the indexer level, this is mostly a fallback.
-    switch (filters.sort) {
-      case "newest":
-        result.sort((a, b) => b.created_at - a.created_at);
-        break;
-      case "oldest":
-        result.sort((a, b) => a.created_at - b.created_at);
-        break;
-      case "price-low":
-        result.sort((a, b) => Number(a.price - b.price));
-        break;
-      case "price-high":
-        result.sort((a, b) => Number(b.price - a.price));
-        break;
-    }
-    return result;
-  }, [allListings, filters.sort]);
+  const goPrev = useCallback(async () => {
+    if (currentCursorIdx === 0) return;
+    const newIdx = currentCursorIdx - 1;
+    const prevCursor = newIdx === 0 ? undefined : parseInt(cursorStack[newIdx - 1], 10);
+    await fetchPage(Number.isFinite(prevCursor) ? prevCursor : undefined);
+    setCurrentCursorIdx(newIdx);
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  }, [currentCursorIdx, cursorStack, fetchPage]);
 
-  // Pagination
-  const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
-  const paginatedListings = useMemo(() => {
-    const start = (page - 1) * PAGE_SIZE;
-    return filtered.slice(start, start + PAGE_SIZE);
-  }, [filtered, page]);
-
-  const goToPage = useCallback(
-    (p: number) => {
-      setPage(Math.max(1, Math.min(p, totalPages)));
-      window.scrollTo({ top: 0, behavior: "smooth" });
-    },
-    [totalPages]
-  );
-
-  const activeCnt = allListings.filter((l) => l.status === "Active").length;
-  const soldCnt = allListings.filter((l) => l.status === "Sold").length;
+  const hasNext = !!cursorStack[currentCursorIdx] && listings.length === PAGE_SIZE;
+  const hasPrev = currentCursorIdx > 0;
+  const currentPage = currentCursorIdx + 1;
+  const totalPages = totalCount > 0 ? Math.ceil(totalCount / PAGE_SIZE) : 1;
+  const activeCnt = listings.filter((l: Listing) => l.status === "Active").length;
+  const soldCnt = listings.filter((l: Listing) => l.status === "Sold").length;
 
   return (
     <div className="min-h-screen bg-gray-50 flex flex-col" data-testid="explore-page">
-      {/* Header Info */}
+      {/* Header */}
       <div className="bg-midnight-900 pt-32 pb-16">
         <div className="mx-auto max-w-7xl px-4 sm:px-6">
           <div className="flex flex-col md:flex-row md:items-end md:justify-between gap-8">
@@ -164,17 +171,13 @@ export default function ExplorePage() {
             </div>
             <div className="flex flex-wrap gap-8 md:gap-12">
               {[
-                { label: "Total Art", value: allListings.length },
+                { label: "Total Art", value: totalCount },
                 { label: "Active", value: activeCnt },
                 { label: "Sold", value: soldCnt },
               ].map(({ label, value }) => (
                 <div key={label} className="relative">
-                  <span className="text-3xl font-display font-bold text-white block">
-                    {value}
-                  </span>
-                  <span className="text-sm font-bold uppercase tracking-widest text-brand-500">
-                    {label}
-                  </span>
+                  <span className="text-3xl font-display font-bold text-white block">{value}</span>
+                  <span className="text-sm font-bold uppercase tracking-widest text-brand-500">{label}</span>
                 </div>
               ))}
             </div>
@@ -182,17 +185,16 @@ export default function ExplorePage() {
         </div>
       </div>
 
-      {/* Header Controls Bar */}
+      {/* Controls Bar */}
       <div className="sticky top-16 z-30 border-b border-gray-200 bg-white/95 backdrop-blur-sm shadow-sm">
         <div className="mx-auto max-w-7xl px-4 sm:px-6 py-4 flex flex-col sm:flex-row items-center gap-4">
           <button
             onClick={() => setShowFilters(true)}
             className="flex items-center gap-2 rounded-xl border border-gray-200 px-4 py-3 text-sm font-semibold text-gray-600 hover:bg-gray-50 lg:hidden w-full sm:w-auto"
           >
-            <SlidersHorizontal size={16} />
-            Filters
+            <SlidersHorizontal size={16} /> Filters
           </button>
-          
+
           <div className="relative flex-1 w-full max-w-xl">
             <Search size={18} className="absolute left-4 top-1/2 -translate-y-1/2 text-gray-400" />
             <input
@@ -220,103 +222,77 @@ export default function ExplorePage() {
       </div>
 
       <div className="mx-auto flex w-full max-w-7xl flex-1 gap-8 px-4 sm:px-6 py-8">
-        {/* Sidebar */}
         <FilterSidebar
           filters={filters}
           dispatch={dispatch}
           isOpen={showFilters}
           setIsOpen={setShowFilters}
-          // Assuming recentArtists logic will be filled from indexer or fallback
-          recentArtists={[]} 
+          recentArtists={[]}
         />
 
-        {/* Content area */}
         <div className="flex-1">
-          {!isLoading && !error && (
+          {!isLoading && !error && totalCount > 0 && (
             <p className="mb-6 text-sm text-gray-500">
-              Showing{" "}
-              <span className="font-semibold text-gray-700">
-                {filtered.length > 0 ? Math.min((page - 1) * PAGE_SIZE + 1, filtered.length) : 0}
-                {" - "}
-                {Math.min(page * PAGE_SIZE, filtered.length)}
-              </span>{" "}
-              of{" "}
-              <span className="font-semibold text-gray-700">
-                {filtered.length}
-              </span>{" "}
-              {filtered.length === 1 ? "artwork" : "artworks"}
+              Page <span className="font-semibold text-gray-700">{currentPage}</span>
+              {totalPages > 1 && <> of <span className="font-semibold text-gray-700">{totalPages}</span></>}
+              {" · "}<span className="font-semibold text-gray-700">{totalCount}</span>{" "}
+              {totalCount === 1 ? "artwork" : "artworks"}
             </p>
           )}
 
-          {error && <div className="text-red-500 p-4 border border-red-200 bg-red-50 rounded-lg">{error}</div>}
+          {error && (
+            <div className="text-red-500 p-4 border border-red-200 bg-red-50 rounded-lg">{error}</div>
+          )}
 
-          {isLoading && !error && (
+          {isLoading && (
             <div className="grid gap-6 sm:grid-cols-2 lg:grid-cols-3">
-              {Array.from({ length: PAGE_SIZE }).map((_, i) => (
-                <ListingCardSkeleton key={i} />
-              ))}
+              {Array.from({ length: PAGE_SIZE }).map((_, i) => <ListingCardSkeleton key={i} />)}
             </div>
           )}
 
-          {!isLoading && !error && filtered.length === 0 && (
+          {!isLoading && !error && listings.length === 0 && (
             <div className="py-20 text-center">
               <h3 className="text-xl font-bold text-gray-900 mb-2">No artworks found</h3>
               <p className="text-gray-500">Try adjusting your filters or search criteria.</p>
-              <button onClick={() => dispatch({ type: "CLEAR_ALL" })} className="mt-4 text-brand-600 font-medium hover:underline">
+              <button
+                onClick={() => dispatch({ type: "CLEAR_ALL" })}
+                className="mt-4 text-brand-600 font-medium hover:underline"
+              >
                 Clear all filters
               </button>
             </div>
           )}
 
-          {!isLoading && !error && filtered.length > 0 && (
+          {!isLoading && !error && listings.length > 0 && (
             <>
               <div className="grid gap-6 sm:grid-cols-2 lg:grid-cols-3">
-                {paginatedListings.map((listing: Listing) => (
+                {listings.map((listing: Listing) => (
                   <ListingCard
                     key={listing.listing_id}
                     listing={listing}
-                    onPurchased={load}
+                    onPurchased={() => fetchPage(undefined)}
                   />
                 ))}
               </div>
 
-              {totalPages > 1 && (
-                <div className="mt-10 flex items-center justify-center gap-2">
+              {(hasPrev || hasNext) && (
+                <div className="mt-10 flex items-center justify-center gap-4">
                   <button
-                    onClick={() => goToPage(page - 1)}
-                    disabled={page <= 1}
-                    className="flex items-center gap-1 rounded-xl border border-gray-200 px-3 py-2 text-sm text-gray-600 hover:bg-gray-50 disabled:opacity-40 disabled:cursor-not-allowed transition-all"
+                    onClick={goPrev}
+                    disabled={!hasPrev || isLoading}
+                    aria-label="Previous page"
+                    className="flex items-center gap-1 rounded-xl border border-gray-200 px-4 py-2 text-sm text-gray-600 hover:bg-gray-50 disabled:opacity-40 disabled:cursor-not-allowed transition-all"
                   >
-                    <ChevronLeft size={16} /> Prev
+                    <ChevronLeft size={16} /> Previous
                   </button>
-                  {Array.from({ length: totalPages }, (_, i) => i + 1)
-                    .filter((p) => p === 1 || p === totalPages || Math.abs(p - page) <= 1)
-                    .reduce<(number | "...")[]>((acc, p, idx, arr) => {
-                      if (idx > 0 && p - (arr[idx - 1] as number) > 1) acc.push("...");
-                      acc.push(p);
-                      return acc;
-                    }, [])
-                    .map((item, idx) =>
-                      item === "..." ? (
-                        <span key={`dots-${idx}`} className="px-1 text-gray-400">...</span>
-                      ) : (
-                        <button
-                          key={item}
-                          onClick={() => goToPage(item as number)}
-                          className={`min-w-[36px] rounded-xl px-3 py-2 text-sm font-medium transition-all ${
-                            page === item
-                              ? "bg-brand-500 text-white shadow-md shadow-brand-500/20"
-                              : "border border-gray-200 text-gray-600 hover:bg-gray-50"
-                          }`}
-                        >
-                          {item}
-                        </button>
-                      )
-                    )}
+                  <span className="text-sm text-gray-500">
+                    Page {currentPage}{totalPages > 1 ? ` of ${totalPages}` : ""}
+                  </span>
                   <button
-                    onClick={() => goToPage(page + 1)}
-                    disabled={page >= totalPages}
-                    className="flex items-center gap-1 rounded-xl border border-gray-200 px-3 py-2 text-sm text-gray-600 hover:bg-gray-50 disabled:opacity-40 disabled:cursor-not-allowed transition-all"
+                    onClick={goNext}
+                    disabled={!hasNext || isLoading}
+                    aria-label="Next page"
+                    className="flex items-center gap-1 rounded-xl border border-gray-200 px-4 py-2 text-sm text-gray-600 hover:bg-gray-50 disabled:opacity-40 disabled:cursor-not-allowed transition-all"
                   >
                     Next <ChevronRight size={16} />
                   </button>
