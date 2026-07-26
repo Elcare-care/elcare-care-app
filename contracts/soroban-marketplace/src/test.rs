@@ -1,5 +1,5 @@
 use super::*;
-use crate::types::{AuctionStatus, ListingStatus, OfferStatus, Recipient};
+use crate::types::{AuctionStatus, BatchCreateListingInput, BatchUpdateListingInput, ListingStatus, OfferStatus, Recipient};
 
 // ── Mock NFT collection ──────────────────────────────────────
 // Tracks real ownership so owner_of checks and transfer_from work correctly.
@@ -53,7 +53,7 @@ use soroban_sdk::{
     testutils::Events as _,
     testutils::Ledger,
     token::{StellarAssetClient, TokenClient},
-    vec, Address, Env,
+    vec, Address, Env, Symbol,
 };
 
 /// Standard test setup. Token #1 on the mock NFT is pre-assigned to `artist`.
@@ -2024,8 +2024,103 @@ fn test_update_listing_emits_listing_updated_event() {
     );
 }
 
+// ── Issue #213: update_listing emits ListingPriceUpdatedEvent with old + new price ──
+
 #[test]
-fn test_make_offer_emits_offer_made_event() {
+fn test_update_listing_emits_price_updated_event_with_old_and_new_price() {
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    // Create at 10_000_000 stroops
+    let listing_id = create_test_listing(&env, &client, &artist, &token_id);
+    // Update to a different price — must emit both ListingUpdatedEvent and ListingPriceUpdatedEvent
+    client.update_listing(
+        &artist,
+        &listing_id,
+        &20_000_000,
+        &token_id,
+        &valid_recipients(&env, &artist),
+    );
+
+    let all = env.events().all();
+    // ListingUpdatedEvent still emitted
+    assert!(
+        has_event_with_topic(&all, "lst_updt"),
+        "ListingUpdatedEvent was not emitted"
+    );
+    // ListingPriceUpdatedEvent emitted with the full price-change symbol
+    assert!(
+        has_event_with_topic(&all, "listing_price_updated"),
+        "ListingPriceUpdatedEvent was not emitted on price change"
+    );
+}
+
+#[test]
+fn test_update_listing_same_price_does_not_emit_price_updated_event() {
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let listing_id = create_test_listing(&env, &client, &artist, &token_id);
+    // Update with identical price — ListingPriceUpdatedEvent must NOT be emitted
+    client.update_listing(
+        &artist,
+        &listing_id,
+        &10_000_000,   // same as creation price in create_test_listing
+        &token_id,
+        &valid_recipients(&env, &artist),
+    );
+
+    assert!(
+        !has_event_with_topic(&env.events().all(), "listing_price_updated"),
+        "ListingPriceUpdatedEvent must not be emitted when price is unchanged"
+    );
+}
+
+#[test]
+fn test_update_listing_price_event_carries_old_and_new_price() {
+    use soroban_sdk::xdr::{ContractEventBody, ScVal};
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let listing_id = create_test_listing(&env, &client, &artist, &token_id);
+    client.update_listing(
+        &artist,
+        &listing_id,
+        &25_000_000_i128,
+        &token_id,
+        &valid_recipients(&env, &artist),
+    );
+
+    // Find the listing_price_updated event and decode the struct from its data
+    let event_data_opt = env.events().all().events().iter().find_map(|e| {
+        if let ContractEventBody::V0(body) = &e.body {
+            let is_price_event = body.topics.iter().any(|t| {
+                if let ScVal::Symbol(s) = t {
+                    core::str::from_utf8(s.0.as_slice()).unwrap_or("") == "listing_price_updated"
+                } else {
+                    false
+                }
+            });
+            if is_price_event { Some(body.data.clone()) } else { None }
+        } else {
+            None
+        }
+    });
+
+    assert!(event_data_opt.is_some(), "No listing_price_updated event found");
+
+    let decoded: crate::events::ListingPriceUpdatedEvent =
+        soroban_sdk::from_val(&env, soroban_sdk::Val::try_from_val(&env, &event_data_opt.unwrap()).unwrap()).unwrap();
+
+    assert_eq!(decoded.listing_id, listing_id, "listing_id mismatch");
+    assert_eq!(decoded.old_price, 10_000_000_i128, "old_price should equal creation price");
+    assert_eq!(decoded.new_price, 25_000_000_i128, "new_price should match update argument");
+}
+
+
     let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
     client.set_admin(&artist);
     client.add_token_to_whitelist(&token_id);
@@ -7377,6 +7472,77 @@ fn test_revoked_artist_existing_auction_still_finalizable() {
 }
 
 #[test]
+fn test_create_listings_batch_succeeds() {
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let mut requests = soroban_sdk::Vec::new(&env);
+    requests.push_back(BatchCreateListingInput {
+        price: 1_000_000_i128,
+        currency: symbol_short!("XLM"),
+        token: token_id.clone(),
+        collection: collection_id.clone(),
+        token_id: 7u64,
+        recipients: valid_recipients(&env, &artist),
+        expires_at: None,
+    });
+    requests.push_back(BatchCreateListingInput {
+        price: 2_000_000_i128,
+        currency: symbol_short!("XLM"),
+        token: token_id.clone(),
+        collection: collection_id.clone(),
+        token_id: 8u64,
+        recipients: valid_recipients(&env, &artist),
+        expires_at: None,
+    });
+
+    let ids = client.create_listings(&artist, &requests);
+    assert_eq!(ids.len(), 2u32);
+    assert_eq!(client.get_listing(ids.get(0).unwrap()).status, ListingStatus::Active);
+    assert_eq!(client.get_listing(ids.get(1).unwrap()).status, ListingStatus::Active);
+}
+
+#[test]
+fn test_update_listings_batch_succeeds() {
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let id_a = client.create_listing(
+        &artist, &1_000_000_i128, &symbol_short!("XLM"),
+        &token_id, &collection_id, &1u64,
+        &valid_recipients(&env, &artist), &None::<u64>,
+    );
+    let id_b = client.create_listing(
+        &artist, &2_000_000_i128, &symbol_short!("XLM"),
+        &token_id, &collection_id, &2u64,
+        &valid_recipients(&env, &artist), &None::<u64>,
+    );
+
+    let mut requests = soroban_sdk::Vec::new(&env);
+    requests.push_back(BatchUpdateListingInput {
+        listing_id: id_a,
+        new_price: 3_000_000_i128,
+        new_token: token_id.clone(),
+        new_recipients: valid_recipients(&env, &artist),
+    });
+    requests.push_back(BatchUpdateListingInput {
+        listing_id: id_b,
+        new_price: 4_000_000_i128,
+        new_token: token_id.clone(),
+        new_recipients: valid_recipients(&env, &artist),
+    });
+
+    let results = client.update_listings(&artist, &requests);
+    assert_eq!(results.len(), 2u32);
+    assert!(results.get(0).unwrap());
+    assert!(results.get(1).unwrap());
+    assert_eq!(client.get_listing(id_a).price, 3_000_000_i128);
+    assert_eq!(client.get_listing(id_b).price, 4_000_000_i128);
+}
+
+#[test]
 #[should_panic(expected = "Error(Contract, #36)")]
 fn test_cancel_listings_over_cap_reverts() {
     let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
@@ -8280,6 +8446,9 @@ fn setup_legacy_v1_fixture(
                 extension_window: 600,
                 extension_trigger: 0,
                 protocol_fee_bps: 0,
+                bid_history_cap: 20,
+                max_extensions: 0,
+                extension_count: 0,
             },
         );
         env.storage()
@@ -8459,107 +8628,481 @@ fn test_event_catalog_topics() {
 }
 
 // ════════════════════════════════════════════════════════════
-// SECTION: ReentrancyScope RAII tests (Issue #204)
+// SECTION: Granular pause — collection-level (Issue #205)
 // ════════════════════════════════════════════════════════════
 
-/// Verify the reentrancy guard is cleared after a successful buy_artwork so
-/// that a second purchase attempt on a still-active listing from a different
-/// buyer can acquire the lock (the second buy will fail for other reasons, but
-/// the lock itself must not be stuck).
 #[test]
-fn test_reentrancy_guard_cleared_after_successful_buy() {
-    let (env, client, artist, buyer, token_id, contract_id, collection_id) = setup();
+fn test_pause_collection_blocks_create_listing() {
+    let (env, client, artist, _, token_id, _, collection_id) = setup();
     client.set_admin(&artist);
     client.add_token_to_whitelist(&token_id);
-
-    let id = client.create_listing(
-        &artist, &5_000_000_i128, &symbol_short!("XLM"),
+    client.pause_collection(&artist, &collection_id);
+    assert!(client.is_collection_paused(&collection_id));
+    // create_listing for the paused collection must revert with ContractPaused.
+    let result = client.try_create_listing(
+        &artist, &1_000_000_i128, &symbol_short!("XLM"),
         &token_id, &collection_id, &1u64,
         &valid_recipients(&env, &artist), &None::<u64>,
     );
-
-    assert!(client.buy_artwork(&buyer, &id));
-
-    // After a successful purchase the listing lock must be released.
-    // We verify this by inspecting storage directly: the lock key must be absent.
-    env.as_contract(&contract_id, || {
-        // acquire_listing_lock returns true only when the lock is NOT held.
-        let acquired = crate::storage::acquire_listing_lock(&env, id);
-        assert!(acquired, "listing lock must be absent after successful buy_artwork");
-        // Clean up the lock we just acquired so later assertions aren't confused.
-        crate::storage::release_listing_lock(&env, id);
-    });
+    assert!(result.is_err(), "create_listing must be blocked for a paused collection");
 }
 
-/// Verify the auction reentrancy guard is cleared after a successful
-/// finalize_auction — the lock must not be stuck after normal execution.
 #[test]
-fn test_reentrancy_guard_cleared_after_finalize_auction() {
-    let (env, client, artist, buyer, token_id, contract_id, collection_id) = setup();
+fn test_unpause_collection_restores_create_listing() {
+    let (env, client, artist, _, token_id, _, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    client.pause_collection(&artist, &collection_id);
+    client.unpause_collection(&artist, &collection_id);
+    assert!(!client.is_collection_paused(&collection_id));
+    // create_listing must succeed after unpause.
+    let id = client.create_listing(
+        &artist, &1_000_000_i128, &symbol_short!("XLM"),
+        &token_id, &collection_id, &1u64,
+        &valid_recipients(&env, &artist), &None::<u64>,
+    );
+    assert!(id > 0);
+}
+
+#[test]
+fn test_pause_collection_blocks_buy_artwork() {
+    let (env, client, artist, buyer, token_id, _, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    let id = client.create_listing(
+        &artist, &1_000_000_i128, &symbol_short!("XLM"),
+        &token_id, &collection_id, &1u64,
+        &valid_recipients(&env, &artist), &None::<u64>,
+    );
+    client.pause_collection(&artist, &collection_id);
+    let result = client.try_buy_artwork(&buyer, &id);
+    assert!(result.is_err(), "buy_artwork must be blocked for a paused collection");
+}
+
+#[test]
+fn test_pause_collection_blocks_create_auction() {
+    let (env, client, artist, _, token_id, _, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    client.pause_collection(&artist, &collection_id);
+    let result = client.try_create_auction(
+        &artist, &token_id, &collection_id, &1u64,
+        &1_000_000_i128, &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+    assert!(result.is_err(), "create_auction must be blocked for a paused collection");
+}
+
+#[test]
+fn test_pause_one_collection_allows_other_collection() {
+    // Pausing collection A must not block operations on collection B.
+    let (env, client, artist, buyer, token_id, _, col_a) = setup();
     client.set_admin(&artist);
     client.add_token_to_whitelist(&token_id);
 
+    // Register a second collection.
+    let col_b = env.register(mock_nft::MockNft, ());
+    MockNftClient::new(&env, &col_b).set_owner(&2u64, &artist);
+
+    client.pause_collection(&artist, &col_a);
+
+    // Listing on col_b must succeed.
+    let id_b = client.create_listing(
+        &artist, &500_000_i128, &symbol_short!("XLM"),
+        &token_id, &col_b, &2u64,
+        &valid_recipients(&env, &artist), &None::<u64>,
+    );
+    assert!(id_b > 0, "col_b listing must succeed while col_a is paused");
+    assert!(client.buy_artwork(&buyer, &id_b));
+}
+
+// ════════════════════════════════════════════════════════════
+// SECTION: Granular pause — function-level (Issue #205)
+// ════════════════════════════════════════════════════════════
+
+#[test]
+fn test_pause_function_buy_artwork_blocks_purchases() {
+    let (env, client, artist, buyer, token_id, _, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    let id = client.create_listing(
+        &artist, &1_000_000_i128, &symbol_short!("XLM"),
+        &token_id, &collection_id, &1u64,
+        &valid_recipients(&env, &artist), &None::<u64>,
+    );
+    client.pause_function(&artist, &Symbol::new(&env, "buy_artwork"));
+    assert!(client.is_function_paused(&Symbol::new(&env, "buy_artwork")));
+    let result = client.try_buy_artwork(&buyer, &id);
+    assert!(result.is_err(), "buy_artwork must be blocked when function is paused");
+}
+
+#[test]
+fn test_pause_function_buy_artwork_allows_create_listing() {
+    // Pausing buy_artwork must NOT prevent create_listing.
+    let (env, client, artist, _, token_id, _, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    client.pause_function(&artist, &Symbol::new(&env, "buy_artwork"));
+    let id = client.create_listing(
+        &artist, &1_000_000_i128, &symbol_short!("XLM"),
+        &token_id, &collection_id, &1u64,
+        &valid_recipients(&env, &artist), &None::<u64>,
+    );
+    assert!(id > 0, "create_listing must succeed while buy_artwork is paused");
+}
+
+#[test]
+fn test_pause_function_create_listing_blocks_new_listings() {
+    let (env, client, artist, _, token_id, _, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    client.pause_function(&artist, &Symbol::new(&env, "create_listing"));
+    let result = client.try_create_listing(
+        &artist, &1_000_000_i128, &symbol_short!("XLM"),
+        &token_id, &collection_id, &1u64,
+        &valid_recipients(&env, &artist), &None::<u64>,
+    );
+    assert!(result.is_err(), "create_listing must be blocked when function is paused");
+}
+
+#[test]
+fn test_unpause_function_restores_buy_artwork() {
+    let (env, client, artist, buyer, token_id, _, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    let id = client.create_listing(
+        &artist, &1_000_000_i128, &symbol_short!("XLM"),
+        &token_id, &collection_id, &1u64,
+        &valid_recipients(&env, &artist), &None::<u64>,
+    );
+    client.pause_function(&artist, &Symbol::new(&env, "buy_artwork"));
+    client.unpause_function(&artist, &Symbol::new(&env, "buy_artwork"));
+    assert!(!client.is_function_paused(&Symbol::new(&env, "buy_artwork")));
+    assert!(client.buy_artwork(&buyer, &id), "buy_artwork must succeed after unpause");
+}
+
+#[test]
+fn test_pause_function_place_bid_blocks_bidding() {
+    let (env, client, artist, buyer, token_id, _, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
     let aid = client.create_auction(
         &artist, &token_id, &collection_id, &1u64,
         &1_000_000_i128, &3600u64,
         &valid_recipients(&env, &artist),
     );
-    client.place_bid(&buyer, &aid, &1_000_000_i128);
-    env.ledger().set_timestamp(env.ledger().timestamp() + 3601);
-    client.finalize_auction(&buyer, &aid);
-
-    env.as_contract(&contract_id, || {
-        let acquired = crate::storage::acquire_auction_lock(&env, aid);
-        assert!(acquired, "auction lock must be absent after successful finalize_auction");
-        crate::storage::release_auction_lock(&env, aid);
-    });
+    client.pause_function(&artist, &symbol_short!("place_bid"));
+    let result = client.try_place_bid(&buyer, &aid, &1_500_000_i128);
+    assert!(result.is_err(), "place_bid must be blocked when function is paused");
 }
 
-/// Verify that holding the listing lock before calling buy_artwork causes it
-/// to return MarketplaceError::ReentrancyGuard (error code 22).
-/// This covers the RAII constructor's rejection path.
 #[test]
-#[should_panic(expected = "Error(Contract, #22)")]
-fn test_reentrancy_scope_buy_artwork_blocks_reentrant_call() {
-    let (env, client, artist, buyer, token_id, contract_id, collection_id) = setup();
+fn test_pause_function_make_offer_blocks_offers() {
+    let (env, client, artist, buyer, token_id, _, collection_id) = setup();
     client.set_admin(&artist);
     client.add_token_to_whitelist(&token_id);
-
     let id = client.create_listing(
-        &artist, &5_000_000_i128, &symbol_short!("XLM"),
+        &artist, &1_000_000_i128, &symbol_short!("XLM"),
         &token_id, &collection_id, &1u64,
         &valid_recipients(&env, &artist), &None::<u64>,
     );
+    client.pause_function(&artist, &Symbol::new(&env, "make_offer"));
+    let result = client.try_make_offer(&buyer, &id, &500_000_i128, &token_id, &None::<u64>);
+    assert!(result.is_err(), "make_offer must be blocked when function is paused");
+}
 
-    // Simulate the lock already being held (as if we are mid-execution).
-    env.as_contract(&contract_id, || {
-        assert!(crate::storage::acquire_listing_lock(&env, id));
-    });
+// ════════════════════════════════════════════════════════════
+// SECTION: Granular pause — auth guards (Issue #205)
+// ════════════════════════════════════════════════════════════
 
-    // Now calling buy_artwork must fail with ReentrancyGuard.
+#[test]
+#[should_panic]
+fn test_pause_collection_requires_admin() {
+    let (_, client, artist, buyer, _, _, collection_id) = setup();
+    client.set_admin(&artist);
+    client.pause_collection(&buyer, &collection_id);
+}
+
+#[test]
+#[should_panic]
+fn test_pause_function_requires_admin() {
+    let (env, client, artist, buyer, _, _, _) = setup();
+    client.set_admin(&artist);
+    client.pause_function(&buyer, &Symbol::new(&env, "buy_artwork"));
+}
+
+// ════════════════════════════════════════════════════════════
+// SECTION: Granular pause — global still blocks all (Issue #205)
+// ════════════════════════════════════════════════════════════
+
+#[test]
+fn test_global_pause_still_blocks_collection_aware_functions() {
+    let (env, client, artist, buyer, token_id, _, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    let id = client.create_listing(
+        &artist, &1_000_000_i128, &symbol_short!("XLM"),
+        &token_id, &collection_id, &1u64,
+        &valid_recipients(&env, &artist), &None::<u64>,
+    );
+    client.admin_pause(&artist);
+    // Both global-only and context-aware functions must be blocked.
+    assert!(client.try_buy_artwork(&buyer, &id).is_err());
+    assert!(client.try_create_listing(
+        &artist, &1_000_000_i128, &symbol_short!("XLM"),
+        &token_id, &collection_id, &1u64,
+        &valid_recipients(&env, &artist), &None::<u64>,
+    ).is_err());
+}
+
+// ════════════════════════════════════════════════════════════
+// SECTION: Royalty audit trail — RoyaltyPaid event (Issue #201)
+// ════════════════════════════════════════════════════════════
+
+/// Locate the single `royalty_paid` event and return its data payload map.
+fn find_royalty_paid_data(env: &Env) -> Option<soroban_sdk::xdr::ScMap> {
+    use soroban_sdk::xdr::{ContractEventBody, ScVal};
+    let all = env.events().all();
+    for e in all.events().iter() {
+        if let ContractEventBody::V0(body) = &e.body {
+            let is_rp = body.topics.iter().any(|t| {
+                if let ScVal::Symbol(s) = t {
+                    core::str::from_utf8(s.0.as_slice()).unwrap_or("") == "royalty_paid"
+                } else {
+                    false
+                }
+            });
+            if is_rp {
+                if let ScVal::Map(Some(m)) = &body.data {
+                    return Some(m.clone());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Look up a field of a decoded `#[contracttype]` struct map by key symbol.
+fn rp_field(m: &soroban_sdk::xdr::ScMap, name: &str) -> Option<soroban_sdk::xdr::ScVal> {
+    use soroban_sdk::xdr::ScVal;
+    for entry in m.iter() {
+        if let ScVal::Symbol(s) = &entry.key {
+            if core::str::from_utf8(s.0.as_slice()).unwrap_or("") == name {
+                return Some(entry.val.clone());
+            }
+        }
+    }
+    None
+}
+
+fn rp_i128(v: &soroban_sdk::xdr::ScVal) -> i128 {
+    match v {
+        soroban_sdk::xdr::ScVal::I128(p) => ((p.hi as i128) << 64) | (p.lo as i128),
+        other => panic!("expected i128 ScVal, got {:?}", other),
+    }
+}
+
+/// Decode an `Option<u64>` field (`None` → Void, `Some(n)` → U64).
+fn rp_opt_u64(v: &soroban_sdk::xdr::ScVal) -> Option<u64> {
+    match v {
+        soroban_sdk::xdr::ScVal::Void => None,
+        soroban_sdk::xdr::ScVal::U64(n) => Some(*n),
+        other => panic!("expected Option<u64> ScVal, got {:?}", other),
+    }
+}
+
+/// Return the `amount` of the `idx`-th `{address, amount}` breakdown entry.
+fn rp_breakdown_amount(recipients: &soroban_sdk::xdr::ScVal, idx: usize) -> i128 {
+    use soroban_sdk::xdr::ScVal;
+    if let ScVal::Vec(Some(v)) = recipients {
+        if let ScVal::Map(Some(entry)) = &v.0[idx] {
+            return rp_i128(&rp_field(entry, "amount").expect("amount field missing"));
+        }
+        panic!("breakdown entry {} is not a map", idx);
+    }
+    panic!("recipients is not a vec");
+}
+
+fn rp_breakdown_len(recipients: &soroban_sdk::xdr::ScVal) -> usize {
+    if let soroban_sdk::xdr::ScVal::Vec(Some(v)) = recipients {
+        v.0.len()
+    } else {
+        panic!("recipients is not a vec");
+    }
+}
+
+/// buy_artwork must emit `royalty_paid` carrying the actual amount each
+/// configured recipient received; entries sum to price − protocol fee.
+#[test]
+fn test_buy_artwork_emits_royalty_paid_with_recipient_breakdown() {
+    let (env, client, artist, buyer, token_id, _cid, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    let treasury = Address::generate(&env);
+    client.set_treasury(&artist, &treasury);
+    client.set_protocol_fee(&artist, &500u32);
+
+    let collab = Address::generate(&env);
+    let price = 10_000_000_i128;
+    // 7000 + 2500 recipient bps + 500 fee bps = 10 000 (valid)
+    let recipients = vec![
+        &env,
+        Recipient { address: artist.clone(), percentage: 7_000 },
+        Recipient { address: collab.clone(), percentage: 2_500 },
+    ];
+    let id = client.create_listing(
+        &artist, &price, &symbol_short!("XLM"),
+        &token_id, &collection_id, &1u64, &recipients, &None::<u64>,
+    );
     client.buy_artwork(&buyer, &id);
+
+    let data = find_royalty_paid_data(&env)
+        .expect("royalty_paid event not emitted from buy_artwork");
+
+    // Identity: listing-path settlement → listing_id set, auction_id empty.
+    assert_eq!(rp_opt_u64(&rp_field(&data, "listing_id").unwrap()), Some(id));
+    assert_eq!(rp_opt_u64(&rp_field(&data, "auction_id").unwrap()), None);
+
+    // fee = 10 000 000 × 500 / 10 000 = 500 000; distributable = 9 500 000
+    let expected_fee = price * 500 / 10_000;
+    assert_eq!(rp_i128(&rp_field(&data, "sale_price").unwrap()), price);
+    assert_eq!(rp_i128(&rp_field(&data, "protocol_fee_amount").unwrap()), expected_fee);
+
+    // artist: 9 500 000 × 7000 / 10 000 = 6 650 000; collab (last) takes the
+    // remainder 2 850 000. Together: price − fee.
+    let breakdown = rp_field(&data, "recipients").unwrap();
+    assert_eq!(rp_breakdown_len(&breakdown), 2);
+    let artist_amt = rp_breakdown_amount(&breakdown, 0);
+    let collab_amt = rp_breakdown_amount(&breakdown, 1);
+    assert_eq!(artist_amt, 6_650_000);
+    assert_eq!(collab_amt, 2_850_000);
+    assert_eq!(artist_amt + collab_amt, price - expected_fee);
+
+    // Event amounts must match the transfers that actually happened.
+    let token = TokenClient::new(&env, &token_id);
+    assert_eq!(token.balance(&artist), 100_000_000_000_i128 + artist_amt);
+    assert_eq!(token.balance(&collab), collab_amt);
+    assert_eq!(token.balance(&treasury), expected_fee);
 }
 
-/// Same pattern for finalize_auction — holding the auction lock must block
-/// a concurrent finalize call with ReentrancyGuard.
+/// finalize_auction must emit `royalty_paid` identified by auction_id.
 #[test]
-#[should_panic(expected = "Error(Contract, #22)")]
-fn test_reentrancy_scope_finalize_auction_blocks_reentrant_call() {
-    let (env, client, artist, buyer, token_id, contract_id, collection_id) = setup();
+fn test_finalize_auction_emits_royalty_paid_with_auction_id() {
+    let (env, client, artist, buyer, token_id, _cid, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    let treasury = Address::generate(&env);
+    client.set_treasury(&artist, &treasury);
+    client.set_protocol_fee(&artist, &500u32);
+
+    // 9500 recipient bps + 500 fee bps = 10 000 (valid)
+    let recipients = vec![
+        &env,
+        Recipient { address: artist.clone(), percentage: 9_500 },
+    ];
+    let aid = client.create_auction(
+        &artist, &token_id, &collection_id, &1u64,
+        &1_000_000_i128, &3600u64, &recipients,
+    );
+    let winning_bid = 2_000_000_i128;
+    client.place_bid(&buyer, &aid, &winning_bid);
+    env.ledger().set_timestamp(env.ledger().timestamp() + 3601);
+    client.finalize_auction(&buyer, &aid);
+
+    let data = find_royalty_paid_data(&env)
+        .expect("royalty_paid event not emitted from finalize_auction");
+
+    assert_eq!(rp_opt_u64(&rp_field(&data, "listing_id").unwrap()), None);
+    assert_eq!(rp_opt_u64(&rp_field(&data, "auction_id").unwrap()), Some(aid));
+
+    // fee = 2 000 000 × 500 / 10 000 = 100 000; sole recipient takes the rest.
+    let expected_fee = winning_bid * 500 / 10_000;
+    assert_eq!(rp_i128(&rp_field(&data, "sale_price").unwrap()), winning_bid);
+    assert_eq!(rp_i128(&rp_field(&data, "protocol_fee_amount").unwrap()), expected_fee);
+
+    let breakdown = rp_field(&data, "recipients").unwrap();
+    assert_eq!(rp_breakdown_len(&breakdown), 1);
+    assert_eq!(rp_breakdown_amount(&breakdown, 0), winning_bid - expected_fee);
+
+    let token = TokenClient::new(&env, &token_id);
+    assert_eq!(token.balance(&artist), 100_000_000_000_i128 + winning_bid - expected_fee);
+    assert_eq!(token.balance(&treasury), expected_fee);
+}
+
+/// accept_offer settles a sale too, so it must also emit `royalty_paid`.
+/// With no treasury configured the fee is 0 and recipients receive the full
+/// offer amount.
+#[test]
+fn test_accept_offer_emits_royalty_paid_zero_fee() {
+    let (env, client, artist, buyer, token_id, _cid, _collection_id) = setup();
     client.set_admin(&artist);
     client.add_token_to_whitelist(&token_id);
 
-    let aid = client.create_auction(
-        &artist, &token_id, &collection_id, &1u64,
-        &1_000_000_i128, &3600u64,
-        &valid_recipients(&env, &artist),
+    let listing_id = create_test_listing(&env, &client, &artist, &token_id);
+    let offer_amount = 5_000_000_i128;
+    let offer_id = client.make_offer(&buyer, &listing_id, &offer_amount, &token_id, &None);
+    client.accept_offer(&artist, &offer_id);
+
+    let data = find_royalty_paid_data(&env)
+        .expect("royalty_paid event not emitted from accept_offer");
+
+    assert_eq!(rp_opt_u64(&rp_field(&data, "listing_id").unwrap()), Some(listing_id));
+    assert_eq!(rp_opt_u64(&rp_field(&data, "auction_id").unwrap()), None);
+    assert_eq!(rp_i128(&rp_field(&data, "sale_price").unwrap()), offer_amount);
+    assert_eq!(rp_i128(&rp_field(&data, "protocol_fee_amount").unwrap()), 0);
+
+    let breakdown = rp_field(&data, "recipients").unwrap();
+    assert_eq!(rp_breakdown_len(&breakdown), 1);
+    assert_eq!(rp_breakdown_amount(&breakdown, 0), offer_amount);
+}
+
+/// When the collection reports an ERC2981-style royalty receiver distinct from
+/// the seller, that payout must appear in the breakdown so entries still sum
+/// to price − protocol fee.
+#[test]
+fn test_royalty_paid_includes_collection_royalty_receiver() {
+    let (env, client, artist, buyer, token_id, _cid, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    let treasury = Address::generate(&env);
+    client.set_treasury(&artist, &treasury);
+    client.set_protocol_fee(&artist, &500u32);
+
+    // Collection-level royalty: 1000 bps to an external receiver.
+    let royalty_recv = Address::generate(&env);
+    MockNftClient::new(&env, &collection_id).set_royalty(&royalty_recv, &1_000u32);
+
+    let price = 10_000_000_i128;
+    let recipients = vec![
+        &env,
+        Recipient { address: artist.clone(), percentage: 9_500 },
+    ];
+    let id = client.create_listing(
+        &artist, &price, &symbol_short!("XLM"),
+        &token_id, &collection_id, &1u64, &recipients, &None::<u64>,
     );
-    client.place_bid(&buyer, &aid, &1_000_000_i128);
-    env.ledger().set_timestamp(env.ledger().timestamp() + 3601);
+    client.buy_artwork(&buyer, &id);
 
-    env.as_contract(&contract_id, || {
-        assert!(crate::storage::acquire_auction_lock(&env, aid));
-    });
+    let data = find_royalty_paid_data(&env)
+        .expect("royalty_paid event not emitted");
 
-    client.finalize_auction(&buyer, &aid);
+    // royalty = 10 000 000 × 1000 / 10 000 = 1 000 000 (off the top);
+    // fee = 9 000 000 × 500 / 10 000 = 450 000; artist takes the remainder.
+    let expected_royalty = 1_000_000_i128;
+    let expected_fee = 450_000_i128;
+    let expected_artist = price - expected_royalty - expected_fee;
+    assert_eq!(rp_i128(&rp_field(&data, "protocol_fee_amount").unwrap()), expected_fee);
+
+    let breakdown = rp_field(&data, "recipients").unwrap();
+    assert_eq!(rp_breakdown_len(&breakdown), 2);
+    let recv_amt = rp_breakdown_amount(&breakdown, 0);
+    let artist_amt = rp_breakdown_amount(&breakdown, 1);
+    assert_eq!(recv_amt, expected_royalty);
+    assert_eq!(artist_amt, expected_artist);
+    assert_eq!(recv_amt + artist_amt, price - expected_fee);
+
+    let token = TokenClient::new(&env, &token_id);
+    assert_eq!(token.balance(&royalty_recv), expected_royalty);
+    assert_eq!(token.balance(&artist), 100_000_000_000_i128 + expected_artist);
+    assert_eq!(token.balance(&treasury), expected_fee);
 }

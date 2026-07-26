@@ -9,6 +9,11 @@ node_modules/
 .next/
 out/
 
+# TypeScript build artifacts
+*.tsbuildinfo
+tsconfig.tsbuildinfo
+**/tsconfig.tsbuildinfo
+
 # Environment files — NEVER commit secrets
 .env.local
 .env.*.local
@@ -16,6 +21,10 @@ out/
 scripts/deploy/.env.deploy
 .stellar/
 scripts/deploy/.stellar/
+
+# Vercel deployment metadata
+.vercel/
+**/.vercel/
 
 # OS
 .DS_Store
@@ -31,12 +40,32 @@ Thumbs.db
 
 # Generated test snapshots
 **/test_snapshots/
+**/__snapshots__/
 **/issues.md
 
+# Loose helper / one-off scripts at repo root
+update_parser.js
+update_events.js
+append_test.js
+
 # PR description files (gitignored — saved locally for reference)
+PR_DESCRIPTION.md
 PR_ISSUE_322.md
 PR_ISSUE_206.md
 PR_ISSUE_204.md
+PR_ISSUE_205.md
+PR_ISSUE_211.md
+PR_ISSUE_212.md
+PR_ISSUE_213.md
+
+# Issue notes (local reference only)
+ISSUE_068_NOTES.md
+IMPLEMENTATION_SUMMARY.md
+SECURITY_SCANNING_TRIAGE.md
 
 # Kiro AI workspace
 .kiro/
+
+# Playwright test results / reports
+playwright-report/
+test-results/

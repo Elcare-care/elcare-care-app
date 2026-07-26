@@ -81,7 +81,9 @@ const mockPrisma = vi.hoisted(() => ({
   $transaction: vi.fn((fn: (tx: typeof mockTx) => Promise<void>) => fn(mockTx)),
 }));
 
-vi.mock('../db', () => ({ default: mockPrisma }));
+// poller.ts now imports from prisma-write (write pool) not db (read pool)
+vi.mock('../db',           () => ({ default: mockPrisma }));
+vi.mock('../prisma-write', () => ({ default: mockPrisma }));
 vi.mock('../metrics.js', () => ({
   latestLedgerProcessedGauge: { set: vi.fn() },
   networkLatestLedgerGauge:   { set: vi.fn() },
