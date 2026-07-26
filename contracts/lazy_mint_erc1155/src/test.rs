@@ -842,3 +842,113 @@ fn persistent_balance_ttl_extended_on_transfer() {
     });
     assert!(still_has);
 }
+
+// ── Migration tests ───────────────────────────────────────────────────────────
+
+mod migration {
+    use super::*;
+
+    #[test]
+    fn fresh_install_migrate_records_version() {
+        let (env, client, _creator, _fee_receiver) = setup(0);
+
+        assert!(client.contract_version().is_none());
+        client.migrate();
+        assert_eq!(
+            client.contract_version(),
+            Some(String::from_str(&env, "1.0.0"))
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "AlreadyMigrated")]
+    fn double_migrate_reverts() {
+        let (_env, client, _creator, _fee_receiver) = setup(0);
+        client.migrate();
+        client.migrate();
+    }
+
+    #[test]
+    fn migrate_emits_migrated_event() {
+        let (env, client, _creator, _fee_receiver) = setup(0);
+        client.migrate();
+
+        let events = env.events().all();
+        let found = events.iter().any(|(_, topics, _)| {
+            topics
+                .get(0)
+                .map(|v| {
+                    soroban_sdk::Symbol::try_from_val(&env, &v)
+                        .map(|s| s == soroban_sdk::symbol_short!("migrated"))
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false)
+        });
+        assert!(found, "expected 'migrated' event");
+    }
+
+    #[test]
+    fn edition_max_supply_readable_after_migrate() {
+        let (_env, client, _creator, _fee_receiver) = setup(0);
+
+        client.register_edition(&7u64, &1000u128);
+        client.migrate();
+
+        assert_eq!(client.edition_max_supply(&7u64), 1000u128);
+    }
+
+    #[test]
+    fn redeemed_voucher_readable_after_migrate() {
+        let (env, client, _creator, _fee_receiver) = setup(0);
+        let contract_id = env.register(crate::LazyMint1155, ());
+
+        // Register an edition and redeem a voucher pre-migration
+        client.register_edition(&0u64, &500u128);
+        client.set_public_phase();
+
+        let voucher = make_voucher(&env, 0u64, 1u64);
+        let sig = sign_voucher(&env, &contract_id, &voucher);
+        let buyer = Address::generate(&env);
+
+        client.redeem(&buyer, &voucher, &1u128, &sig, &empty_proof(&env));
+
+        assert!(client.is_voucher_redeemed(&1u64));
+
+        client.migrate();
+
+        assert!(client.is_voucher_redeemed(&1u64));
+    }
+
+    #[test]
+    fn balance_readable_after_migrate() {
+        let (env, client, _creator, _fee_receiver) = setup(0);
+        let contract_id = env.register(crate::LazyMint1155, ());
+
+        client.register_edition(&0u64, &500u128);
+        client.set_public_phase();
+
+        let voucher = make_voucher(&env, 0u64, 10u64);
+        let sig = sign_voucher(&env, &contract_id, &voucher);
+        let buyer = Address::generate(&env);
+
+        client.redeem(&buyer, &voucher, &5u128, &sig, &empty_proof(&env));
+        assert_eq!(client.balance_of(&buyer, &0u64), 5u128);
+
+        client.migrate();
+
+        assert_eq!(client.balance_of(&buyer, &0u64), 5u128);
+        assert_eq!(client.total_supply(&0u64), 5u128);
+    }
+
+    #[test]
+    fn revoked_voucher_readable_after_migrate() {
+        let (_env, client, _creator, _fee_receiver) = setup(0);
+
+        client.revoke_voucher(&88u64);
+        assert!(client.is_voucher_revoked(&88u64));
+
+        client.migrate();
+
+        assert!(client.is_voucher_revoked(&88u64));
+    }
+}

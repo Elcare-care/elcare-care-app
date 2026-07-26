@@ -163,10 +163,25 @@ export interface ProtocolFeeCollectedData {
   treasury: string;
 }
 
-export interface RoyaltyPaidData {
-  listing_id?: bigint;
-  recipient: string;
+/** One `{address, amount}` payout entry of a ROYALTY_PAID breakdown. */
+export interface RoyaltyRecipientPayout {
+  address: string;
   amount: bigint;
+}
+
+/**
+ * Per-sale royalty distribution breakdown (Issue #201). Exactly one of
+ * listing_id / auction_id is set. Recipient amounts sum to
+ * sale_price - protocol_fee_amount.
+ */
+export interface RoyaltyPaidData {
+  listing_id?: bigint | null;
+  auction_id?: bigint | null;
+  sale_price: bigint;
+  protocol_fee_amount: bigint;
+  token: string;
+  recipients: RoyaltyRecipientPayout[];
+  ledger_sequence?: bigint;
 }
 
 export interface ArtistRevokedData {
@@ -408,9 +423,13 @@ export const OFFER_RECLAIMED_SCHEMA: ContractEventSchema = {
 export const ROYALTY_PAID_SCHEMA: ContractEventSchema = {
   type: 'ROYALTY_PAID',
   data: [
-    { name: 'recipient', type: 'string' },
-    { name: 'amount', type: 'bigint' },
     { name: 'listing_id', type: 'bigint', optional: true },
+    { name: 'auction_id', type: 'bigint', optional: true },
+    { name: 'sale_price', type: 'bigint' },
+    { name: 'protocol_fee_amount', type: 'bigint' },
+    { name: 'token', type: 'string' },
+    { name: 'recipients', type: 'array' },
+    { name: 'ledger_sequence', type: 'bigint', optional: true },
   ],
 };
 
