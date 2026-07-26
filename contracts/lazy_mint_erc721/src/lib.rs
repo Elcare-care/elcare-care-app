@@ -60,8 +60,11 @@ pub enum Error {
     InvalidSignature = 10,
     NotAllowlisted = 11,
     InvalidMerkleProof = 12,
-    /// Voucher nonce has been explicitly revoked by the creator.
     VoucherRevoked = 13,
+    /// migrate() called for a version already marked done.
+    AlreadyMigrated = 14,
+    /// Unsupported version jump.
+    UnsupportedMigration = 15,
 }
 
 // ─── Data types ───────────────────────────────────────────────────────────────
@@ -861,6 +864,50 @@ impl LazyMint721 {
     /// Return the current Merkle root (None if unset).
     pub fn merkle_root(env: Env) -> Option<BytesN<32>> {
         env.storage().instance().get(&DataKey::MerkleRoot)
+    }
+
+    // ── Versioning & Migration ─────────────────────────────────────────────
+
+    pub fn version(_env: Env) -> &'static str {
+        "1.0.0"
+    }
+
+    pub fn contract_version(env: Env) -> Option<String> {
+        env.storage().instance().get(&DataKey::ContractVersion)
+    }
+
+    /// Creator-guarded idempotent migration entry point.
+    /// v1.0.0: records the completion marker and on-chain version string.
+    pub fn migrate(env: Env) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
+        Self::only_creator(&env)?;
+
+        let target = String::from_str(&env, "1.0.0");
+        let done_key = DataKey::MigrationDone(target.clone());
+
+        if env
+            .storage()
+            .persistent()
+            .get::<DataKey, bool>(&done_key)
+            .unwrap_or(false)
+        {
+            return Err(Error::AlreadyMigrated);
+        }
+
+        // v1.0.0 migration body: nothing to migrate for the initial version.
+        // UsedVoucher entries are already in persistent storage and remain
+        // readable as-is.  RevokedVoucher entries are likewise unaffected.
+
+        env.storage().persistent().set(&done_key, &true);
+        env.storage()
+            .persistent()
+            .extend_ttl(&done_key, TTL_THRESHOLD, TTL_BUMP);
+        env.storage()
+            .instance()
+            .set(&DataKey::ContractVersion, &target);
+        env.events()
+            .publish((soroban_sdk::symbol_short!("migrated"), target), ());
+        Ok(())
     }
 
     // ── Private helpers ───────────────────────────────────────────────────

@@ -1,5 +1,8 @@
 use soroban_sdk::{contracterror, contracttype, Address, BytesN, String, Vec};
 
+/// Semantic contract version — bump on every breaking storage change.
+pub const CONTRACT_VERSION: &str = "1.0.0";
+
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
