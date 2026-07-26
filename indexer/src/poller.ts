@@ -420,12 +420,34 @@ export async function seedTrackedContracts() {
 /**
  * Poll a single tracked contract indefinitely.
  * Each contract maintains its own lastLedger / lastLedgerHash in TrackedContract.
+ *
+ * Checkpoint protocol (Issue #285):
+ *   1. openCheckpoint()  — record window in DB as "fetched" (RPC data retrieved)
+ *   2. markApplying()    — record window as "applying" before opening DB transaction
+ *   3. commitCheckpoint() inside the domain transaction — atomically advances cursor
+ *      and marks "committed"; if the process crashes the checkpoint stays "applying"
+ *      and startup recovery replays the window idempotently.
  */
 async function pollContract(
   contractRow: { id: number; contractId: string; lastLedger: number; lastLedgerHash: string | null },
   config: ReturnType<typeof loadConfig>
 ): Promise<void> {
   let localErrors = 0;
+
+  // ── Startup recovery: replay any incomplete checkpoints ───────────────────
+  const stale = await findIncompleteCheckpoints(contractRow.contractId);
+  for (const cp of stale) {
+    if (cp.status === 'applying') {
+      await resetApplyingCheckpoint(cp);
+    }
+    logger.info('pollContract: replaying incomplete checkpoint on startup', {
+      contractId: contractRow.contractId,
+      checkpointId: cp.id,
+      windowStart: cp.windowStart,
+      windowEnd: cp.windowEnd,
+      status: cp.status,
+    });
+  }
 
   while (!shuttingDown) {
     // If the poller has been halted due to a critical re-org, pause and wait for
@@ -546,6 +568,7 @@ async function pollContract(
         startLedger + config.maxLedgersPerCycle - 1
       );
 
+      // ── Step 1: Fetch events from RPC ─────────────────────────────────────
       const decodedEvents = await collectMarketplaceEvents(
         server,
         [contract.contractId],
@@ -553,7 +576,7 @@ async function pollContract(
         batchEndLedger
       );
 
-      let latestHash: string | null = null;
+      // ── Step 2: Determine the window end and its hash ─────────────────────
       const advanceTo =
         decodedEvents.length > 0
           ? Math.max(...decodedEvents.map((e) => e.ledgerSequence))
@@ -562,6 +585,7 @@ async function pollContract(
           : null;
 
       if (advanceTo !== null) {
+        let latestHash: string | null = null;
         try {
           const ledgersRes = await server.getLedgers({
             startLedger: advanceTo,
@@ -578,16 +602,34 @@ async function pollContract(
           });
         }
 
-        if (decodedEvents.length > 0) {
-          const { newEvents } = await prisma.$transaction(async (tx) => {
-            const toInsert = await applyDecodedEvents(decodedEvents, tx);
-            // Keep the shared SyncState in sync with the most-advanced contract
-            await tx.syncState.upsert({
-              where: { id: 1 },
-              create: { id: 1, lastLedger: advanceTo, lastLedgerHash: latestHash },
-              update: buildSyncStateLedgerData(advanceTo, latestHash),
-            });
-            return { newEvents: toInsert };
+        // ── Step 3: Open checkpoint (fetched) ─────────────────────────────
+        const checkpoint = await openCheckpoint(
+          contract.contractId,
+          startLedger,
+          advanceTo,
+        );
+
+        // ── Step 4: Mark applying before opening the DB transaction ───────
+        await markApplying(checkpoint);
+
+        // ── Step 5: Commit domain writes + cursor in ONE transaction ───────
+        let newEvents: any[] = [];
+        try {
+          newEvents = await prisma.$transaction(async (tx) => {
+            const inserted = decodedEvents.length > 0
+              ? await applyDecodedEvents(decodedEvents, tx)
+              : [];
+
+            // Atomically advance cursor + mark checkpoint committed.
+            await commitCheckpoint(
+              checkpoint,
+              inserted.length,
+              latestHash,
+              contract.id,
+              tx,
+            );
+
+            return inserted;
           });
           recordDbWrite();
           for (const ev of newEvents) emitSSEEvent(ev);
