@@ -11,6 +11,7 @@ import { rpc } from '@stellar/stellar-sdk';
 import prisma from './db.js';
 import redis from './redis.js';
 import { logger } from './logger.js';
+import { VERSION } from './config.js';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -28,6 +29,15 @@ export interface AggregateHealth {
   checks: Record<string, HealthCheckResult>;
   /** Unix timestamp (ms) when this snapshot was taken. */
   timestamp: number;
+  /** Component version metadata for runtime identification. */
+  version: {
+    app: string;
+    api: string;
+    eventSchema: string;
+    dbMigration: string;
+    gitSha: string;
+    buildTime: string;
+  };
 }
 
 // ── Thresholds ────────────────────────────────────────────────────────────────
@@ -152,6 +162,43 @@ export async function checkSyncLag(): Promise<HealthCheckResult & { lagLedgers: 
   }
 }
 
+/**
+ * Issue #286: Report confirmation depth configuration and pending-confirmation
+ * event count. This tells operators how many events are still provisional and
+ * the configured depth threshold.
+ */
+export async function checkConfirmationDepth(): Promise<HealthCheckResult & {
+  confirmationDepth: number;
+  pendingConfirmationCount: number;
+  oldestProvisionalLedger: number | null;
+}> {
+  const start = Date.now();
+  const confirmationDepth = parseInt(process.env.CONFIRMATION_DEPTH || '10', 10);
+  try {
+    const summary = await getConfirmationHealthSummary(confirmationDepth);
+    return {
+      status: 'ok',
+      latencyMs: Date.now() - start,
+      confirmationDepth: summary.confirmationDepth,
+      pendingConfirmationCount: summary.pendingConfirmationCount,
+      oldestProvisionalLedger: summary.oldestProvisionalLedger,
+      message:
+        summary.pendingConfirmationCount > 0
+          ? `${summary.pendingConfirmationCount} event(s) pending confirmation (depth=${summary.confirmationDepth})`
+          : undefined,
+    };
+  } catch (err) {
+    return {
+      status: 'degraded',
+      latencyMs: Date.now() - start,
+      confirmationDepth,
+      pendingConfirmationCount: -1,
+      oldestProvisionalLedger: null,
+      message: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
 // ── Aggregate health ──────────────────────────────────────────────────────────
 
 /**
@@ -162,11 +209,12 @@ export async function checkSyncLag(): Promise<HealthCheckResult & { lagLedgers: 
  *   "down"     — at least one check down
  */
 export async function runAllChecks(): Promise<AggregateHealth> {
-  const [db, redisCheck, stellarRpc, syncLag] = await Promise.all([
+  const [db, redisCheck, stellarRpc, syncLag, confirmationDepth] = await Promise.all([
     checkDatabase(),
     checkRedis(),
     checkStellarRpc(),
     checkSyncLag(),
+    checkConfirmationDepth(),
   ]);
 
   const checks: Record<string, HealthCheckResult> = {
@@ -174,6 +222,7 @@ export async function runAllChecks(): Promise<AggregateHealth> {
     redis: redisCheck,
     stellar_rpc: stellarRpc,
     sync_lag: syncLag,
+    confirmation_depth: confirmationDepth,
   };
 
   const statuses = Object.values(checks).map((c) => c.status);
@@ -181,7 +230,19 @@ export async function runAllChecks(): Promise<AggregateHealth> {
     statuses.includes('down')     ? 'down' :
     statuses.includes('degraded') ? 'degraded' : 'ok';
 
-  return { status: overall, checks, timestamp: Date.now() };
+  return {
+    status: overall,
+    checks,
+    timestamp: Date.now(),
+    version: {
+      app: VERSION.app,
+      api: VERSION.api,
+      eventSchema: VERSION.eventSchema,
+      dbMigration: VERSION.dbMigration,
+      gitSha: VERSION.gitSha,
+      buildTime: VERSION.buildTime,
+    },
+  };
 }
 
 /**

@@ -1014,50 +1014,6 @@ pub fn get_bid_history_cap_storage(env: &Env) -> u32 {
     value.unwrap_or(DEFAULT_BID_HISTORY_CAP)
 }
 
-// ── Escrow record ────────────────────────────────────────────
-
-/// A lightweight record written when an NFT is pulled into escrow and
-/// deleted when the NFT is released.  Supports the double-listing guard
-/// and the `get_escrow` view function.
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct EscrowRecord {
-    /// `true` → held for a listing; `false` → held for an auction.
-    pub is_listing: bool,
-    /// The listing_id or auction_id holding the token.
-    pub id: u64,
-}
-
-#[contracttype]
-#[derive(Clone)]
-pub enum EscrowKey {
-    EscrowedToken(Address, u64),
-}
-
-pub fn set_escrow_record(env: &Env, collection: &Address, token_id: u64, record: &EscrowRecord) {
-    let key = EscrowKey::EscrowedToken(collection.clone(), token_id);
-    env.storage().persistent().set(&key, record);
-    env.storage()
-        .persistent()
-        .extend_ttl(&key, LEDGER_TTL_THRESHOLD, LEDGER_TTL_BUMP);
-}
-
-pub fn get_escrow_record(env: &Env, collection: &Address, token_id: u64) -> Option<EscrowRecord> {
-    let key = EscrowKey::EscrowedToken(collection.clone(), token_id);
-    let value = env.storage().persistent().get::<EscrowKey, EscrowRecord>(&key);
-    if value.is_some() {
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, LEDGER_TTL_THRESHOLD, LEDGER_TTL_BUMP);
-    }
-    value
-}
-
-pub fn clear_escrow_record(env: &Env, collection: &Address, token_id: u64) {
-    let key = EscrowKey::EscrowedToken(collection.clone(), token_id);
-    env.storage().persistent().remove(&key);
-}
-
 // ── Auction max-extensions cap ───────────────────────────────
 
 /// Default: 0 = unlimited extensions (legacy behaviour preserved).
