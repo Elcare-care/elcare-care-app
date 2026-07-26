@@ -116,6 +116,20 @@ fn u64_to_string(env: &Env, mut n: u64) -> String {
     String::from_bytes(env, &buf[..len])
 }
 
+/// Rejects empty or oversized metadata URIs (#276). Applied to every mint
+/// path and to `set_base_uri` so boundary/malformed values are caught
+/// consistently regardless of entry point.
+fn validate_uri(uri: &String) -> Result<(), Error> {
+    let len = uri.len();
+    if len == 0 {
+        return Err(Error::EmptyUri);
+    }
+    if len > MAX_URI_LEN {
+        return Err(Error::UriTooLong);
+    }
+    Ok(())
+}
+
 // ─── Contract ─────────────────────────────────────────────────────────────────
 
 #[contract]
@@ -182,6 +196,8 @@ impl NormalNFT721 {
             return Err(Error::CollectionPaused);
         }
 
+        validate_uri(&uri)?;
+
         let token_id: u64 = env
             .storage()
             .instance()
@@ -227,6 +243,12 @@ impl NormalNFT721 {
         }
         if uris_len > MAX_BATCH_SIZE {
             return Err(Error::BatchTooLarge);
+        }
+
+        // Validate every URI up front (#276) — before any storage mutation,
+        // so a single malformed entry can't leave a partially-minted batch.
+        for uri in uris.iter() {
+            validate_uri(&uri)?;
         }
 
         // Read storage ONCE before the loop
@@ -825,7 +847,7 @@ impl NormalNFT721 {
     /// Callable only by creator.
     pub fn set_base_uri(env: Env, base_uri: String) -> Result<(), Error> {
         Self::extend_instance_ttl(&env);
-        Self::only_creator(&env)?;
+        let creator = Self::only_creator(&env)?;
         if env
             .storage()
             .instance()
@@ -834,7 +856,13 @@ impl NormalNFT721 {
         {
             return Err(Error::MetadataFrozen);
         }
+        validate_uri(&base_uri)?;
+        let old_uri: Option<String> = env.storage().instance().get(&DataKey::BaseUri);
         env.storage().instance().set(&DataKey::BaseUri, &base_uri);
+        env.events().publish(
+            (symbol_short!("meta_upd"), creator),
+            (old_uri, base_uri),
+        );
         Ok(())
     }
 
@@ -842,7 +870,7 @@ impl NormalNFT721 {
     /// revert with `AlreadyFrozen`.  Callable only by creator.
     pub fn freeze_metadata(env: Env) -> Result<(), Error> {
         Self::extend_instance_ttl(&env);
-        Self::only_creator(&env)?;
+        let creator = Self::only_creator(&env)?;
         if env
             .storage()
             .instance()
@@ -854,6 +882,8 @@ impl NormalNFT721 {
         env.storage()
             .instance()
             .set(&DataKey::MetadataFrozen, &true);
+        env.events()
+            .publish((symbol_short!("meta_frz"),), creator);
         Ok(())
     }
 

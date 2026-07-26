@@ -755,6 +755,15 @@ impl LazyMint721 {
             .ok_or(Error::TokenNotFound)
     }
 
+    /// Always `true` — a lazy-minted token's URI comes from its signed
+    /// voucher and is set once at redemption; there is no setter to change
+    /// it afterwards (#276). Exposed as a method (rather than left implicit)
+    /// so every collection type — normal and lazy — exposes the same
+    /// `is_metadata_frozen()` query for frontend/indexer consumers.
+    pub fn is_metadata_frozen(_env: Env) -> bool {
+        true
+    }
+
     pub fn balance_of(env: Env, owner: Address) -> u64 {
         env.storage()
             .persistent()

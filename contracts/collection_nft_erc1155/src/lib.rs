@@ -117,6 +117,20 @@ fn u64_to_string(env: &Env, mut n: u64) -> String {
     String::from_bytes(env, &buf[..len])
 }
 
+/// Rejects empty or oversized metadata URIs (#276). Applied to every mint
+/// path and to `set_base_uri` so boundary/malformed values are caught
+/// consistently regardless of entry point.
+fn validate_uri(uri: &String) -> Result<(), Error> {
+    let len = uri.len();
+    if len == 0 {
+        return Err(Error::EmptyUri);
+    }
+    if len > MAX_URI_LEN {
+        return Err(Error::UriTooLong);
+    }
+    Ok(())
+}
+
 // ─── Contract ─────────────────────────────────────────────────────────────────
 
 #[contract]
@@ -261,7 +275,7 @@ impl NormalNFT1155 {
     /// Callable only by creator.
     pub fn set_base_uri(env: Env, base_uri: String) -> Result<(), Error> {
         Self::extend_instance_ttl(&env);
-        Self::only_creator(&env)?;
+        let creator = Self::only_creator(&env)?;
         if env
             .storage()
             .instance()
@@ -270,7 +284,13 @@ impl NormalNFT1155 {
         {
             return Err(Error::MetadataFrozen);
         }
+        validate_uri(&base_uri)?;
+        let old_uri: Option<String> = env.storage().instance().get(&DataKey::BaseUri);
         env.storage().instance().set(&DataKey::BaseUri, &base_uri);
+        env.events().publish(
+            (symbol_short!("meta_upd"), creator),
+            (old_uri, base_uri),
+        );
         Ok(())
     }
 
@@ -283,7 +303,7 @@ impl NormalNFT1155 {
     /// After this, `set_base_uri` reverts forever. Callable only by creator.
     pub fn freeze_metadata(env: Env) -> Result<(), Error> {
         Self::extend_instance_ttl(&env);
-        Self::only_creator(&env)?;
+        let creator = Self::only_creator(&env)?;
         if env
             .storage()
             .instance()
@@ -295,6 +315,8 @@ impl NormalNFT1155 {
         env.storage()
             .instance()
             .set(&DataKey::MetadataFrozen, &true);
+        env.events()
+            .publish((symbol_short!("meta_frz"),), creator);
         Ok(())
     }
 
@@ -482,6 +504,11 @@ impl NormalNFT1155 {
         }
         if token_ids.len() != amounts.len() || token_ids.len() != uris.len() {
             return Err(Error::LengthMismatch);
+        }
+
+        // Validate every URI up front (#276) — before any storage mutation.
+        for uri in uris.iter() {
+            validate_uri(&uri)?;
         }
 
         // ── Invariant hardening: accumulate amounts per-id within the batch ──
