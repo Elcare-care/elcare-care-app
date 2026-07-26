@@ -12,6 +12,7 @@ import {
   createListing,
   buyArtwork,
   cancelListing,
+  cancelListings,
   updateListing,
   Listing,
   stroopsToXlm,
@@ -267,6 +268,24 @@ export function useCancelListing(artistPublicKey: string | null) {
   );
 
   return { cancel, isCancelling, error: null };
+}
+
+export function useCancelListings(artistPublicKey: string | null) {
+  const { run, isRunning: isCancelling } = useTxToast();
+
+  const cancelMany = useCallback(
+    async (listingIds: number[]): Promise<boolean> => {
+      if (!artistPublicKey || listingIds.length === 0) return false;
+      const result = await run(
+        () => cancelListings(artistPublicKey, listingIds),
+        { action: "Cancel listings" }
+      );
+      return result !== null;
+    },
+    [artistPublicKey, run],
+  );
+
+  return { cancelMany, isCancelling, error: null };
 }
 
 // ── useUpdateListing ──────────────────────────────────────────

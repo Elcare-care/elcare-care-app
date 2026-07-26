@@ -63,6 +63,7 @@ pub enum DataKey {
     Initialized,
     Creator,
     Name,
+    CurrentWasmHash,
     NextTokenId,
     RoyaltyBps,
     RoyaltyReceiver,
@@ -136,6 +137,7 @@ impl NormalNFT1155 {
         env.storage().instance().set(&DataKey::Initialized, &true);
         env.storage().instance().set(&DataKey::Creator, &creator);
         env.storage().instance().set(&DataKey::Name, &name);
+        env.storage().instance().set(&DataKey::CurrentWasmHash, &BytesN::from_array(&env, &[0u8; 32]));
         env.storage().instance().set(&DataKey::NextTokenId, &0u64);
         env.storage()
             .instance()
@@ -151,6 +153,24 @@ impl NormalNFT1155 {
 
     /// Set the maximum mintable supply for a specific token_id.
     /// Pass 0 to remove the cap.
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
+        let old_wasm_hash: BytesN<32> = env
+            .storage()
+            .instance()
+            .get(&DataKey::CurrentWasmHash)
+            .unwrap_or(BytesN::from_array(&env, &[0u8; 32]));
+        env.storage()
+            .instance()
+            .set(&DataKey::CurrentWasmHash, &new_wasm_hash);
+        env.deployer().update_current_contract_wasm(&new_wasm_hash);
+        env.events().publish(
+            (symbol_short!("upgraded"),),
+            (old_wasm_hash, new_wasm_hash),
+        );
+        Ok(())
+    }
+
     pub fn set_token_max_supply(env: Env, token_id: u64, max_supply: u128) -> Result<(), Error> {
         Self::extend_instance_ttl(&env);
         Self::only_creator(&env)?;

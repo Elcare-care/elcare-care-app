@@ -6,7 +6,7 @@
 
 import { useState, useEffect } from "react";
 import { useWalletContext } from "@/context/WalletContext";
-import { useArtistListings, useCancelListing } from "@/hooks/useMarketplace";
+import { useArtistListings, useCancelListing, useCancelListings } from "@/hooks/useMarketplace";
 import { ListingForm } from "@/components/ListingForm";
 import { AuctionForm } from "@/components/AuctionForm";
 import { stroopsToXlm, Listing } from "@/lib/contract";
@@ -299,12 +299,39 @@ export default function DashboardPage() {
   const { publicKey } = useWalletContext();
   const { listings, isLoading, refresh } = useArtistListings(publicKey);
   const { cancel, isCancelling } = useCancelListing(publicKey);
+  const { cancelMany, isCancelling: isBatchCancelling } = useCancelListings(publicKey);
   const [tab, setTab] = useState<Tab>("listings");
-  const [editingListing, setEditingListing] = useState<Listing | null>(null);  const activeCnt = listings.filter((l: Listing) => l.status === "Active").length;
+  const [editingListing, setEditingListing] = useState<Listing | null>(null);
+  const [selectedIds, setSelectedIds] = useState<number[]>([]);
+  const activeCnt = listings.filter((l: Listing) => l.status === "Active").length;
   const soldCnt = listings.filter((l: Listing) => l.status === "Sold").length;
+  const activeListings = listings.filter((l: Listing) => l.status === "Active");
 
   const getTokenSymbol = (address: string) => {
     return SUPPORTED_TOKENS.find(t => t.address === address)?.symbol || "Tokens";
+  };
+
+  const toggleSelection = (listingId: number) => {
+    setSelectedIds((current) =>
+      current.includes(listingId)
+        ? current.filter((id) => id !== listingId)
+        : [...current, listingId]
+    );
+  };
+
+  const handleBatchCancel = async () => {
+    if (selectedIds.length === 0) return;
+    await cancelMany(selectedIds);
+    setSelectedIds([]);
+    refresh();
+  };
+
+  const selectAllActive = () => {
+    setSelectedIds(activeListings.map((listing) => listing.listing_id));
+  };
+
+  const clearSelection = () => {
+    setSelectedIds([]);
   };
 
   return (
@@ -529,10 +556,53 @@ export default function DashboardPage() {
                     </button>
                   </div>
                 ) : (
-                  <div className="grid gap-6">
-                    {listings.map((l: Listing) => (
-                      <div key={l.listing_id} className="group relative flex flex-col sm:flex-row items-center justify-between gap-6 rounded-[2.5rem] bg-white/[0.03] hover:bg-white/[0.07] hover:border-white/10 transition-all duration-500 border border-white/5 p-6 shadow-2xl">
-                        <div className="flex items-center gap-6 w-full sm:w-auto">
+                  <div className="space-y-4">
+                    {selectedIds.length > 0 && (
+                      <div className="flex flex-wrap items-center justify-between gap-3 rounded-[2rem] border border-white/10 bg-white/[0.04] px-4 py-3">
+                        <p className="text-sm text-white/70">{selectedIds.length} selected</p>
+                        <div className="flex flex-wrap gap-2">
+                          <button
+                            onClick={selectAllActive}
+                            className="rounded-xl bg-white/5 px-3 py-2 text-sm font-semibold text-white/70 hover:bg-white/10"
+                          >
+                            Select all active
+                          </button>
+                          <button
+                            onClick={clearSelection}
+                            className="rounded-xl bg-white/5 px-3 py-2 text-sm font-semibold text-white/70 hover:bg-white/10"
+                          >
+                            Clear
+                          </button>
+                          <button
+                            onClick={handleBatchCancel}
+                            disabled={isBatchCancelling}
+                            className="flex items-center gap-2 rounded-xl bg-terracotta-500/20 px-3 py-2 text-sm font-semibold text-terracotta-400 border border-terracotta-500/20 hover:bg-terracotta-500/30 disabled:opacity-50"
+                          >
+                            <XCircle size={16} />
+                            Cancel selected
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                    <div className="grid gap-6">
+                    {listings.map((l: Listing) => {
+                      const isSelected = selectedIds.includes(l.listing_id);
+                      const canSelect = l.status === "Active";
+                      return (
+                        <div key={l.listing_id} className="group relative flex flex-col sm:flex-row items-center justify-between gap-6 rounded-[2.5rem] bg-white/[0.03] hover:bg-white/[0.07] hover:border-white/10 transition-all duration-500 border border-white/5 p-6 shadow-2xl">
+                        <div className="flex items-center gap-4 w-full sm:w-auto">
+                          {canSelect ? (
+                            <button
+                              type="button"
+                              onClick={() => toggleSelection(l.listing_id)}
+                              className="rounded-lg border border-white/10 bg-white/5 p-2 text-white/60"
+                              aria-label={`Toggle selection for listing ${l.listing_id}`}
+                            >
+                              {isSelected ? <CheckSquare2 size={18} className="text-brand-400" /> : <Square size={18} />}
+                            </button>
+                          ) : (
+                            <div className="h-9 w-9" />
+                          )}
                           <div className="h-16 w-16 rounded-[1.2rem] bg-brand-500/10 flex items-center justify-center text-brand-400 border border-brand-500/20 shadow-inner">
                             <span className="font-bold text-xl">#{l.listing_id}</span>
                           </div>
@@ -586,8 +656,10 @@ export default function DashboardPage() {
                           </div>
                         </div>
                       </div>
-                    ))}
+                    );
+                    })}
                   </div>
+                </div>
                 )}
               </>
             )}

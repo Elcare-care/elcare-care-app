@@ -1,5 +1,5 @@
 use super::*;
-use crate::types::{AuctionStatus, ListingStatus, OfferStatus, Recipient};
+use crate::types::{AuctionStatus, BatchCreateListingInput, BatchUpdateListingInput, ListingStatus, OfferStatus, Recipient};
 
 // ── Mock NFT collection ──────────────────────────────────────
 // Tracks real ownership so owner_of checks and transfer_from work correctly.
@@ -2024,8 +2024,103 @@ fn test_update_listing_emits_listing_updated_event() {
     );
 }
 
+// ── Issue #213: update_listing emits ListingPriceUpdatedEvent with old + new price ──
+
 #[test]
-fn test_make_offer_emits_offer_made_event() {
+fn test_update_listing_emits_price_updated_event_with_old_and_new_price() {
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    // Create at 10_000_000 stroops
+    let listing_id = create_test_listing(&env, &client, &artist, &token_id);
+    // Update to a different price — must emit both ListingUpdatedEvent and ListingPriceUpdatedEvent
+    client.update_listing(
+        &artist,
+        &listing_id,
+        &20_000_000,
+        &token_id,
+        &valid_recipients(&env, &artist),
+    );
+
+    let all = env.events().all();
+    // ListingUpdatedEvent still emitted
+    assert!(
+        has_event_with_topic(&all, "lst_updt"),
+        "ListingUpdatedEvent was not emitted"
+    );
+    // ListingPriceUpdatedEvent emitted with the full price-change symbol
+    assert!(
+        has_event_with_topic(&all, "listing_price_updated"),
+        "ListingPriceUpdatedEvent was not emitted on price change"
+    );
+}
+
+#[test]
+fn test_update_listing_same_price_does_not_emit_price_updated_event() {
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let listing_id = create_test_listing(&env, &client, &artist, &token_id);
+    // Update with identical price — ListingPriceUpdatedEvent must NOT be emitted
+    client.update_listing(
+        &artist,
+        &listing_id,
+        &10_000_000,   // same as creation price in create_test_listing
+        &token_id,
+        &valid_recipients(&env, &artist),
+    );
+
+    assert!(
+        !has_event_with_topic(&env.events().all(), "listing_price_updated"),
+        "ListingPriceUpdatedEvent must not be emitted when price is unchanged"
+    );
+}
+
+#[test]
+fn test_update_listing_price_event_carries_old_and_new_price() {
+    use soroban_sdk::xdr::{ContractEventBody, ScVal};
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let listing_id = create_test_listing(&env, &client, &artist, &token_id);
+    client.update_listing(
+        &artist,
+        &listing_id,
+        &25_000_000_i128,
+        &token_id,
+        &valid_recipients(&env, &artist),
+    );
+
+    // Find the listing_price_updated event and decode the struct from its data
+    let event_data_opt = env.events().all().events().iter().find_map(|e| {
+        if let ContractEventBody::V0(body) = &e.body {
+            let is_price_event = body.topics.iter().any(|t| {
+                if let ScVal::Symbol(s) = t {
+                    core::str::from_utf8(s.0.as_slice()).unwrap_or("") == "listing_price_updated"
+                } else {
+                    false
+                }
+            });
+            if is_price_event { Some(body.data.clone()) } else { None }
+        } else {
+            None
+        }
+    });
+
+    assert!(event_data_opt.is_some(), "No listing_price_updated event found");
+
+    let decoded: crate::events::ListingPriceUpdatedEvent =
+        soroban_sdk::from_val(&env, soroban_sdk::Val::try_from_val(&env, &event_data_opt.unwrap()).unwrap()).unwrap();
+
+    assert_eq!(decoded.listing_id, listing_id, "listing_id mismatch");
+    assert_eq!(decoded.old_price, 10_000_000_i128, "old_price should equal creation price");
+    assert_eq!(decoded.new_price, 25_000_000_i128, "new_price should match update argument");
+}
+
+
     let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
     client.set_admin(&artist);
     client.add_token_to_whitelist(&token_id);
@@ -7374,6 +7469,77 @@ fn test_revoked_artist_existing_auction_still_finalizable() {
     ids.push_back(id1);
     ids.push_back(id2); // not active
     client.cancel_listings(&artist, &ids);
+}
+
+#[test]
+fn test_create_listings_batch_succeeds() {
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let mut requests = soroban_sdk::Vec::new(&env);
+    requests.push_back(BatchCreateListingInput {
+        price: 1_000_000_i128,
+        currency: symbol_short!("XLM"),
+        token: token_id.clone(),
+        collection: collection_id.clone(),
+        token_id: 7u64,
+        recipients: valid_recipients(&env, &artist),
+        expires_at: None,
+    });
+    requests.push_back(BatchCreateListingInput {
+        price: 2_000_000_i128,
+        currency: symbol_short!("XLM"),
+        token: token_id.clone(),
+        collection: collection_id.clone(),
+        token_id: 8u64,
+        recipients: valid_recipients(&env, &artist),
+        expires_at: None,
+    });
+
+    let ids = client.create_listings(&artist, &requests);
+    assert_eq!(ids.len(), 2u32);
+    assert_eq!(client.get_listing(ids.get(0).unwrap()).status, ListingStatus::Active);
+    assert_eq!(client.get_listing(ids.get(1).unwrap()).status, ListingStatus::Active);
+}
+
+#[test]
+fn test_update_listings_batch_succeeds() {
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let id_a = client.create_listing(
+        &artist, &1_000_000_i128, &symbol_short!("XLM"),
+        &token_id, &collection_id, &1u64,
+        &valid_recipients(&env, &artist), &None::<u64>,
+    );
+    let id_b = client.create_listing(
+        &artist, &2_000_000_i128, &symbol_short!("XLM"),
+        &token_id, &collection_id, &2u64,
+        &valid_recipients(&env, &artist), &None::<u64>,
+    );
+
+    let mut requests = soroban_sdk::Vec::new(&env);
+    requests.push_back(BatchUpdateListingInput {
+        listing_id: id_a,
+        new_price: 3_000_000_i128,
+        new_token: token_id.clone(),
+        new_recipients: valid_recipients(&env, &artist),
+    });
+    requests.push_back(BatchUpdateListingInput {
+        listing_id: id_b,
+        new_price: 4_000_000_i128,
+        new_token: token_id.clone(),
+        new_recipients: valid_recipients(&env, &artist),
+    });
+
+    let results = client.update_listings(&artist, &requests);
+    assert_eq!(results.len(), 2u32);
+    assert!(results.get(0).unwrap());
+    assert!(results.get(1).unwrap());
+    assert_eq!(client.get_listing(id_a).price, 3_000_000_i128);
+    assert_eq!(client.get_listing(id_b).price, 4_000_000_i128);
 }
 
 #[test]

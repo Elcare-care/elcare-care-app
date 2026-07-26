@@ -1052,10 +1052,16 @@ export function subscribeToMarketplaceEvents(
 // ─────────────────────────────────────────────────────────────
 
 export interface PriceHistoryPoint {
-  /** Unix timestamp (ms) */
+  /** Unix timestamp (ms) derived from changedAt */
   timestamp: number;
-  /** Price as a string (in stroops or XLM — caller formats) */
+  /** New price as a string in stroops */
   price: string;
+  /** Previous price as a string in stroops (undefined for the seed point) */
+  oldPrice?: string;
+  /** Address of the artist who made the change */
+  changedBy?: string;
+  /** Ledger sequence at which the change was recorded */
+  ledger?: number;
 }
 
 /**
@@ -1078,17 +1084,33 @@ export async function getListingPriceHistory(
       )
       .map((item) => ({
         timestamp:
-          typeof item.timestamp === "number"
+          typeof item.changedAt === "string"
+            ? new Date(item.changedAt).getTime()
+            : typeof item.timestamp === "number"
             ? item.timestamp
             : typeof item.ledgerTimestamp === "string"
             ? new Date(item.ledgerTimestamp).getTime()
             : Date.now(),
         price:
-          item.price != null
-            ? String(item.price)
+          item.newPrice != null
+            ? String(item.newPrice)
             : item.new_price != null
             ? String(item.new_price)
+            : item.price != null
+            ? String(item.price)
             : "0",
+        oldPrice:
+          item.oldPrice != null
+            ? String(item.oldPrice)
+            : item.old_price != null
+            ? String(item.old_price)
+            : undefined,
+        changedBy:
+          typeof item.changedBy === "string" ? item.changedBy : undefined,
+        ledger:
+          typeof item.changedAtLedger === "number"
+            ? item.changedAtLedger
+            : undefined,
       }));
   } catch (e) {
     console.warn(

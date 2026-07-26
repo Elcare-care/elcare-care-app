@@ -309,6 +309,25 @@ enum KeeperTargetType {
   ReclaimOffer
 }
 
+// ── Price history (Issue #213) ────────────────────────────────────────────────
+//
+// One row per ListingPriceUpdatedEvent.  Populated by the indexer whenever
+// update_listing or update_listing_price emits that event, giving collectors
+// a complete, auditable record of every price change for a listing.
+
+model PriceHistory {
+  id               Int      @id @default(autoincrement())
+  listingId        BigInt
+  oldPrice         Decimal  @db.Decimal(32, 7)
+  newPrice         Decimal  @db.Decimal(32, 7)
+  changedBy        String   @default("")
+  changedAtLedger  Int
+  changedAt        DateTime @default(now())
+
+  @@index([listingId])
+  @@index([listingId, changedAtLedger])
+}
+
 model KeeperAction {
   id          Int                 @id @default(autoincrement())
   targetType  KeeperTargetType

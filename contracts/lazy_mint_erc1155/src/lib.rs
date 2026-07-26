@@ -101,6 +101,7 @@ pub enum DataKey {
     Initialized,
     Creator,
     CreatorPubkey,
+    CurrentWasmHash,
     Name,
     RoyaltyBps,
     RoyaltyReceiver,
@@ -380,6 +381,7 @@ impl LazyMint1155 {
         }
         env.storage().instance().set(&DataKey::Initialized, &true);
         env.storage().instance().set(&DataKey::Creator, &creator);
+        env.storage().instance().set(&DataKey::CurrentWasmHash, &BytesN::from_array(&env, &[0u8; 32]));
         env.storage()
             .instance()
             .set(&DataKey::CreatorPubkey, &creator_pubkey);
@@ -401,6 +403,24 @@ impl LazyMint1155 {
             .instance()
             .set(&DataKey::NetworkPassphrase, &network_passphrase);
         env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_BUMP);
+        Ok(())
+    }
+
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
+        let old_wasm_hash: BytesN<32> = env
+            .storage()
+            .instance()
+            .get(&DataKey::CurrentWasmHash)
+            .unwrap_or(BytesN::from_array(&env, &[0u8; 32]));
+        env.storage()
+            .instance()
+            .set(&DataKey::CurrentWasmHash, &new_wasm_hash);
+        env.deployer().update_current_contract_wasm(&new_wasm_hash);
+        env.events().publish(
+            (symbol_short!("upgraded"),),
+            (old_wasm_hash, new_wasm_hash),
+        );
         Ok(())
     }
 
