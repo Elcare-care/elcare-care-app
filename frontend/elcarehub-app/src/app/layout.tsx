@@ -20,6 +20,11 @@ export const metadata: Metadata = {
     description: "Decentralized marketplace for African art on Stellar",
     type: "website",
   },
+  other: {
+    "elcarehub:version": process.env.NEXT_PUBLIC_APP_VERSION || "unknown",
+    "elcarehub:api-version": process.env.NEXT_PUBLIC_INDEXER_API_VERSION || "unknown",
+    "elcarehub:event-schema": process.env.NEXT_PUBLIC_EVENT_SCHEMA_VERSION || "unknown",
+  },
 };
 
 export default function RootLayout({
@@ -83,6 +88,11 @@ export default function RootLayout({
                     </p>
                     <p className="mt-3 text-xs text-white/15">
                       Celebrating African art and heritage through blockchain technology.
+                      {process.env.NEXT_PUBLIC_APP_VERSION && (
+                        <span className="ml-2 text-white/10">
+                          v{process.env.NEXT_PUBLIC_APP_VERSION}
+                        </span>
+                      )}
                     </p>
                   </div>
                 </footer>

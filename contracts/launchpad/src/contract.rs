@@ -40,6 +40,9 @@ use crate::{
 };
 use crate::types::DataKey;
 
+/// Semantic version — bump on every breaking storage change.
+const CONTRACT_VERSION: &str = "1.0.0";
+
 /// Maximum allowed platform fee (20 %) — issue #38.
 const MAX_FEE_BPS: u32 = 2000;
 /// Maximum allowed royalty (100 %), matching the collection contracts' own cap — issue #277.
@@ -954,5 +957,10 @@ impl Launchpad {
 
     pub fn wasm_version(env: Env) -> u32 {
         storage::wasm_version(&env)
+    }
+
+    /// Semantic version string for this contract.
+    pub fn version(env: Env) -> soroban_sdk::String {
+        soroban_sdk::String::from_str(&env, CONTRACT_VERSION)
     }
 }

@@ -15,11 +15,13 @@ import {
   offersQuerySchema,
   walletActivityQuerySchema,
   collectionsQuerySchema,
+  creatorCollectionsQuerySchema,
   statsQuerySchema,
   syncGapsQuerySchema,
   artistMetricsQuerySchema,
-  searchQuerySchema,
+  royaltyBreakdownQuerySchema,
 } from './query-schemas.js';
+import { isValidStellarAddress, STELLAR_ADDRESS_ERROR } from '../stellar-address.js';
 import {
   getOverviewStats,
   getDailyStats,
@@ -374,7 +376,12 @@ router.get('/listings/:id/history', async (req: Request, res: Response, next: Ne
   const offset = offsetParsed;
 
   try {
-    const where = { listingId: BigInt(id) };
+    const where: any = { listingId: BigInt(id) };
+    // Issue #286: optional filter for confirmed-only events
+    const confirmedOnly = (req.query as any).confirmed === 'true';
+    if (confirmedOnly) {
+      where.confirmed = true;
+    }
     const [results, total] = await Promise.all([
       prisma.marketplaceEvent.findMany({
         where,
@@ -579,13 +586,29 @@ router.get('/collections', cacheMiddleware(TTL.COLLECTIONS), validateQuery(colle
 
 // ── GET /creators/:address/collections ───────────────────────────────────────
 
-router.get('/creators/:address/collections', async (req: Request, res: Response, next: NextFunction) => {
-  const { address } = req.params;
+router.get('/creators/:address/collections', validateQuery(creatorCollectionsQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
+  const address = req.params.address as string;
+  if (!isValidStellarAddress(address)) {
+    return next(badRequest('Invalid creator address: must be a valid 56-character Stellar G-address'));
+  }
+  const { limit, offset, cursor_ledger, cursor_direction } = (req as any).validatedQuery;
   try {
-    const results = await prisma.collection.findMany({
-      where: { creator: address as string },
-      orderBy: { deployedAtLedger: 'desc' },
-    });
+    const direction: 'asc' | 'desc' = cursor_direction ?? 'desc';
+    const where: any = { creator: address };
+    if (cursor_ledger !== undefined) {
+      where.deployedAtLedger = direction === 'desc' ? { lt: cursor_ledger } : { gt: cursor_ledger };
+    }
+    const take = limit ?? 20;
+    const skip = cursor_ledger !== undefined ? 0 : (offset ?? 0);
+
+    const [results, total] = await Promise.all([
+      prisma.collection.findMany({ where, orderBy: { deployedAtLedger: direction }, take, skip }),
+      prisma.collection.count({ where: { creator: address } }),
+    ]);
+
+    const nextCursor = results.length === take ? String(results[results.length - 1].deployedAtLedger) : '';
+    res.setHeader('X-Next-Cursor', nextCursor);
+    res.setHeader('X-Total-Count', String(total));
     res.json(serialize(results));
   } catch (err) {
     next(internalError('Failed to fetch creator collections'));
@@ -669,6 +692,49 @@ router.get('/wallets/:address/royalty-stats', strictRateLimiter, async (req: Req
     });
   } catch (err) {
     next(internalError('Failed to fetch royalty stats'));
+  }
+});
+
+// ── GET /wallets/:address/royalty-breakdown ───────────────────────────────────
+// Per-sale royalty audit trail (Issue #201): paginated RoyaltyPayment rows for
+// the given recipient address, newest-first, optionally bounded to the
+// inclusive ledger-sequence window [from, to]. Cached for 60 seconds.
+
+router.get('/wallets/:address/royalty-breakdown', cacheMiddleware(60), validateQuery(royaltyBreakdownQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
+  const address = req.params.address as string;
+  if (!isValidStellarAddress(address)) {
+    return next(badRequest(STELLAR_ADDRESS_ERROR));
+  }
+  const { from, to, limit, offset } = (req as any).validatedQuery;
+  try {
+    const where: any = { recipient: address };
+    if (from !== undefined || to !== undefined) {
+      where.ledgerSequence = {};
+      if (from !== undefined) where.ledgerSequence.gte = from;
+      if (to !== undefined)   where.ledgerSequence.lte = to;
+    }
+
+    const take = limit ?? 50;
+    const skip = offset ?? 0;
+    const [payments, total] = await Promise.all([
+      prisma.royaltyPayment.findMany({
+        where,
+        orderBy: { ledgerSequence: 'desc' },
+        take,
+        skip,
+      }),
+      prisma.royaltyPayment.count({ where }),
+    ]);
+
+    res.setHeader('X-Total-Count', String(total));
+    res.json({
+      payments: serialize(payments),
+      total,
+      limit: take,
+      offset: skip,
+    });
+  } catch (err) {
+    next(internalError('Failed to fetch royalty breakdown'));
   }
 });
 

@@ -35,6 +35,7 @@ import { logger } from './logger.js';
 import redis, { invalidatePattern, invalidateKey } from './redis.js';
 import { loadConfig, parseTrackedContracts } from './config.js';
 import { enqueueIpfsFetch } from './ipfs-cache.js';
+import { promoteConfirmedEvents, rollbackReorg } from './reorg.js';
 
 dotenv.config();
 
@@ -214,6 +215,9 @@ export async function revertLedgers(safeAtLedger: number): Promise<void> {
       where: { id: 1 },
       data: { lastLedger: safeAtLedger, lastLedgerHash: null },
     });
+
+    // Issue #286: also rollback offer and bid state inside the transaction
+    await rollbackReorg(safeAtLedger, tx);
   });
   logger.info('Reorg: rollback complete', { resumeFromLedger: safeAtLedger + 1 });
 }
@@ -466,6 +470,15 @@ async function pollContract(
         latestLedgerProcessedGauge.set(advanceTo);
         syncLatencyGauge.set(Math.max(0, networkLatestLedger - advanceTo));
         recordProgress();
+
+        // Issue #286: promote events that are now CONFIRMATION_DEPTH ledgers old.
+        // Non-fatal — confirmation promotion failures must never crash the poller.
+        promoteConfirmedEvents(networkLatestLedger, config.confirmationDepth).catch((err) => {
+          logger.error('pollContract: failed to promote confirmed events', {
+            contractId: contract.contractId,
+            err: err instanceof Error ? err.message : String(err),
+          });
+        });
       } else {
         latestLedgerProcessedGauge.set(contract.lastLedger);
         syncLatencyGauge.set(Math.max(0, networkLatestLedger - contract.lastLedger));
@@ -615,45 +628,16 @@ async function fetchAuctionFromChain(_auctionId: bigint): Promise<any | null> {
 export async function applyDecodedEvents(decodedEvents: any[], tx: any) {
   if (decodedEvents.length === 0) return [];
 
-  const toInsert: any[] = [];
+  // Use the idempotent batch writer — DB-level unique constraints ensure that
+  // concurrent workers or replayed windows cannot create duplicate rows.
+  // Any duplicate is counted as a benign replay (not an error).
+  const { newEvents } = await upsertEvents(decodedEvents, tx);
 
-  for (const event of decodedEvents) {
-    const eventHash: string = event.eventHash ?? '';
-
-    // Upsert on eventHash — the unique identity of this on-chain event.
-    // On conflict (duplicate) the update is a no-op; we detect it by checking
-    // whether the row's id changed (Prisma returns the upserted row).
-    const existing = eventHash
-      ? await tx.marketplaceEvent.findUnique({ where: { eventHash }, select: { id: true } })
-      : null;
-
-    if (existing) {
-      duplicateEventsCounter.inc();
-      logger.debug('[Dedup] Skipping duplicate event', {
-        eventHash,
-        eventType: event.eventType,
-        ledger: event.ledgerSequence,
-      });
-      continue;
-    }
-
-    await tx.marketplaceEvent.create({
-      data: {
-        listingId: event.listingId ?? null,
-        eventType: event.eventType,
-        actor: event.actor,
-        data: event.data,
-        ledgerSequence: event.ledgerSequence,
-        eventHash,
-        contractId: event.contractId ?? '',
-      },
-    });
-
-    toInsert.push(event);
+  for (const event of newEvents) {
     await processEvent(event, tx, true);
   }
 
-  return toInsert;
+  return newEvents;
 }
 
 export async function processEvent(event: any, tx?: any, skipInsert = false) {
@@ -668,17 +652,12 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
   };
 
   if (!skipInsert) {
-    await db.marketplaceEvent.create({
-      data: {
-        listingId,
-        eventType,
-        actor,
-        ledgerSequence,
-        data,
-        eventHash: event.eventHash ?? '',
-        contractId: event.contractId ?? '',
-      },
-    });
+    const { skipped } = await (upsertEvents as any)([event], db);
+    if (skipped > 0) {
+      // This is a duplicate — all domain state is already correct from the prior write.
+      // Return early rather than double-applying business logic.
+      return;
+    }
   }
 
   // Handle deploy events (no listingId — collection deployments)
@@ -812,6 +791,33 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
       invalidateKey(`cache:/listings/${listingId.toString()}`).catch(() => {});
       prisma.listing.count({ where: { status: 'Active' } })
         .then((n) => activeListingsGauge.set(n)).catch(() => {});
+      break;
+    }
+
+    case 'ROYALTY_PAID': {
+      // Royalty audit trail (Issue #201): one RoyaltyPayment row per
+      // breakdown entry, written in a single atomic createMany. Field values
+      // arrive as strings via convertBigInts.
+      const isListing = data.listing_id !== undefined && data.listing_id !== null;
+      const isAuction = data.auction_id !== undefined && data.auction_id !== null;
+      const entries: Array<{ address: string; amount: string }> = Array.isArray(data.recipients)
+        ? data.recipients
+        : [];
+      if (entries.length > 0) {
+        await db.royaltyPayment.createMany({
+          data: entries.map((r) => ({
+            listingId: isListing ? BigInt(data.listing_id) : null,
+            auctionId: isAuction ? BigInt(data.auction_id) : null,
+            recipient: String(r.address),
+            amount: String(r.amount),
+            salePrice: String(data.sale_price),
+            ledgerSequence,
+          })),
+        });
+      }
+      for (const r of entries) {
+        invalidatePattern(`cache:*/wallets/${r.address}/royalty-breakdown*`).catch(() => {});
+      }
       break;
     }
 
