@@ -300,3 +300,150 @@ export function useAdminCheck(currentPublicKey: string | null) {
 
     return { isAdmin, isLoading };
 }
+
+// ── Granular pause controls hook (Issue #205) ─────────────────────────────────
+
+import {
+    adminPause,
+    adminUnpause,
+    getIsContractPaused,
+    pauseCollection,
+    unpauseCollection,
+    pauseFunction,
+    unpauseFunction,
+    isFunctionPaused,
+} from "@/lib/contract";
+
+/** The five entry-points that can be individually paused. */
+export const PAUSABLE_FUNCTIONS = [
+    "buy_artwork",
+    "create_listing",
+    "place_bid",
+    "create_auction",
+    "make_offer",
+] as const;
+export type PausableFunction = typeof PAUSABLE_FUNCTIONS[number];
+
+export interface PauseState {
+    globalPaused: boolean;
+    pausedFunctions: Record<PausableFunction, boolean>;
+}
+
+/**
+ * Hook for the three-section circuit-breaker panel in the admin page.
+ *
+ * Exposes:
+ *  - `state`       — current pause state (global + per-function)
+ *  - `refresh()`   — re-read all pause flags from the chain
+ *  - `toggleGlobal()` — toggle the global pause
+ *  - `toggleCollection(address)` — pause/unpause a single collection
+ *  - `toggleFunction(name)` — pause/unpause a single entry-point
+ */
+export function usePauseControls(adminPublicKey: string | null) {
+    const [state, setState] = useState<PauseState>({
+        globalPaused: false,
+        pausedFunctions: {
+            buy_artwork: false,
+            create_listing: false,
+            place_bid: false,
+            create_auction: false,
+            make_offer: false,
+        },
+    });
+    const [isLoading, setIsLoading] = useState(false);
+    const [isProcessing, setIsProcessing] = useState(false);
+    const [error, setError] = useState<string | null>(null);
+
+    const refresh = useCallback(async () => {
+        setIsLoading(true);
+        setError(null);
+        try {
+            const [globalPaused, ...fnStates] = await Promise.all([
+                getIsContractPaused(),
+                ...PAUSABLE_FUNCTIONS.map((fn) => isFunctionPaused(fn)),
+            ]);
+            const pausedFunctions = Object.fromEntries(
+                PAUSABLE_FUNCTIONS.map((fn, i) => [fn, fnStates[i]])
+            ) as Record<PausableFunction, boolean>;
+            setState({ globalPaused, pausedFunctions });
+        } catch (err: unknown) {
+            setError(err instanceof Error ? err.message : "Failed to load pause state");
+        } finally {
+            setIsLoading(false);
+        }
+    }, []);
+
+    useEffect(() => {
+        refresh();
+    }, [refresh]);
+
+    const toggleGlobal = useCallback(async () => {
+        if (!adminPublicKey) return;
+        setIsProcessing(true);
+        setError(null);
+        try {
+            if (state.globalPaused) {
+                await adminUnpause(adminPublicKey);
+            } else {
+                await adminPause(adminPublicKey);
+            }
+            await refresh();
+        } catch (err: unknown) {
+            setError(err instanceof Error ? err.message : "Toggle failed");
+        } finally {
+            setIsProcessing(false);
+        }
+    }, [adminPublicKey, state.globalPaused, refresh]);
+
+    const toggleCollection = useCallback(async (collectionAddress: string, currentlyPaused: boolean) => {
+        if (!adminPublicKey) return;
+        setIsProcessing(true);
+        setError(null);
+        try {
+            if (currentlyPaused) {
+                await unpauseCollection(adminPublicKey, collectionAddress);
+            } else {
+                await pauseCollection(adminPublicKey, collectionAddress);
+            }
+        } catch (err: unknown) {
+            setError(err instanceof Error ? err.message : "Collection toggle failed");
+        } finally {
+            setIsProcessing(false);
+        }
+    }, [adminPublicKey]);
+
+    const toggleFunction = useCallback(async (fn: PausableFunction) => {
+        if (!adminPublicKey) return;
+        setIsProcessing(true);
+        setError(null);
+        // Optimistic update
+        setState(prev => ({
+            ...prev,
+            pausedFunctions: { ...prev.pausedFunctions, [fn]: !prev.pausedFunctions[fn] },
+        }));
+        try {
+            if (state.pausedFunctions[fn]) {
+                await unpauseFunction(adminPublicKey, fn);
+            } else {
+                await pauseFunction(adminPublicKey, fn);
+            }
+            await refresh();
+        } catch (err: unknown) {
+            setError(err instanceof Error ? err.message : "Function toggle failed");
+            await refresh(); // rollback optimistic update
+        } finally {
+            setIsProcessing(false);
+        }
+    }, [adminPublicKey, state.pausedFunctions, refresh]);
+
+    return {
+        state,
+        isLoading,
+        isProcessing,
+        error,
+        refresh,
+        toggleGlobal,
+        toggleCollection,
+        toggleFunction,
+    };
+}
