@@ -9,6 +9,74 @@ const DEFAULT_TIMEOUT_MS = 12_000;
 const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 500;
 
+// ─────────────────────────────────────────────────────────────
+// Issue #309 / #44 — Freshness metadata
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * Freshness metadata attached to every indexed response.
+ * Consumers use this to determine whether data is stale and
+ * to show a non-blocking stale banner to the user.
+ */
+export interface FreshnessMetadata {
+  /** Last indexed ledger sequence number */
+  lastIndexedLedger: number;
+  /** Unix ms timestamp when the client fetched this response */
+  fetchedAt: number;
+  /** Unix ms timestamp when the indexer last processed a new ledger */
+  indexerUpdatedAt: number | null;
+  /** Whether the SSE stream is currently connected */
+  sseConnected: boolean;
+}
+
+/**
+ * Per-resource stale thresholds in milliseconds.
+ * A resource is considered stale when
+ *   (Date.now() - fetchedAt) > threshold  OR
+ *   (Date.now() - indexerUpdatedAt) > threshold
+ */
+export const STALE_THRESHOLDS_MS: Record<"listing" | "auction" | "offer" | "default", number> = {
+  listing: 30_000,   // 30 s — listings can sell fast
+  auction:  15_000,  // 15 s — bids change frequently
+  offer:    45_000,  // 45 s — offers are less time-critical
+  default:  30_000,
+};
+
+/**
+ * Returns true when the resource should be considered stale
+ * and a refresh should be prompted before sensitive actions.
+ */
+export function isDataStale(
+  freshness: FreshnessMetadata,
+  resourceType: keyof typeof STALE_THRESHOLDS_MS = "default"
+): boolean {
+  const threshold = STALE_THRESHOLDS_MS[resourceType];
+  const now = Date.now();
+  const ageSinceFetch = now - freshness.fetchedAt;
+  if (ageSinceFetch > threshold) return true;
+  if (freshness.indexerUpdatedAt !== null) {
+    const ageSinceIndexer = now - freshness.indexerUpdatedAt;
+    if (ageSinceIndexer > threshold) return true;
+  }
+  return false;
+}
+
+/**
+ * Creates a freshness snapshot at the current moment.
+ * `lastIndexedLedger` and `indexerUpdatedAt` are populated from
+ * the indexer /health response when available.
+ */
+export function makeFreshness(
+  opts: Partial<Pick<FreshnessMetadata, "lastIndexedLedger" | "indexerUpdatedAt" | "sseConnected">> = {}
+): FreshnessMetadata {
+  return {
+    lastIndexedLedger: opts.lastIndexedLedger ?? 0,
+    fetchedAt: Date.now(),
+    indexerUpdatedAt: opts.indexerUpdatedAt ?? null,
+    sseConnected: opts.sseConnected ?? false,
+  };
+}
+
 export interface ActivityEvent {
   id: string;
   type: "PURCHASE" | "LISTED" | "CANCELLED" | "SALE" | "ROYALTY" | "OFFER_SUBMITTED" | "OFFER_ACCEPTED" | "TRANSFER";
