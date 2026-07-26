@@ -30,6 +30,8 @@ const mockRedis = vi.hoisted(() => ({
 }));
 
 vi.mock('../db', () => ({ default: mockPrisma }));
+// routes.ts → poller.ts → prisma-write; provide same mock to avoid real DB init
+vi.mock('../prisma-write', () => ({ default: mockPrisma }));
 vi.mock('../redis.js', () => ({ default: mockRedis }));
 
 import router from '../api/routes';

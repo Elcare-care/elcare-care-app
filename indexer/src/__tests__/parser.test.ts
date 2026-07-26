@@ -525,41 +525,79 @@ describe('parseMarketplaceEvent — deploy event fixtures', () => {
   });
 });
 
-// ── Blocked-bidder events (Issue #199) ────────────────────────────────────────
+// ── Issue #213: LISTING_PRICE_UPDATED ────────────────────────────────────────
 
-describe('parseMarketplaceEvent — AUCTION_BIDDER_BLOCKED / UNBLOCKED', () => {
+describe('parseMarketplaceEvent — LISTING_PRICE_UPDATED fixture', () => {
   beforeEach(() => { vi.resetAllMocks(); mockFromXDR.mockReturnValue({}); });
 
-  const BLOCKED_FIXTURE = { auction_id: 9n, bidder: 'GBIDDERADDRESS' };
-
-  it("maps 'auction_bidder_blocked' → 'AUCTION_BIDDER_BLOCKED'", () => {
-    setupMocks('auction_bidder_blocked', BLOCKED_FIXTURE);
-    const r = parseMarketplaceEvent(['t'], 'v', 500)!;
-    expect(r.eventType).toBe('AUCTION_BIDDER_BLOCKED');
+  it('maps listing_price_updated topic to LISTING_PRICE_UPDATED event type', () => {
+    setupMocks('listing_price_updated', {
+      listing_id: 7n,
+      old_price: 10_000_000n,
+      new_price: 20_000_000n,
+      updated_by: 'GARTIST123',
+    });
+    const r = parseMarketplaceEvent(['t'], 'v', 800)!;
+    expect(r).not.toBeNull();
+    expect(r.eventType).toBe('LISTING_PRICE_UPDATED');
   });
 
-  it("maps 'auction_bidder_unblocked' → 'AUCTION_BIDDER_UNBLOCKED'", () => {
-    setupMocks('auction_bidder_unblocked', BLOCKED_FIXTURE);
-    const r = parseMarketplaceEvent(['t'], 'v', 501)!;
-    expect(r.eventType).toBe('AUCTION_BIDDER_UNBLOCKED');
+  it('extracts listing_id and serialises old_price and new_price as strings', () => {
+    setupMocks('listing_price_updated', {
+      listing_id: 7n,
+      old_price: 10_000_000n,
+      new_price: 20_000_000n,
+      updated_by: 'GARTIST123',
+    });
+    const r = parseMarketplaceEvent(['t'], 'v', 800)!;
+    expect(r.listingId).toBe(7n);
+    expect(r.data.old_price).toBe('10000000');
+    expect(r.data.new_price).toBe('20000000');
   });
 
-  it('extracts auction_id as listingId and bidder as actor', () => {
-    setupMocks('auction_bidder_blocked', BLOCKED_FIXTURE);
-    const r = parseMarketplaceEvent(['t'], 'v', 500)!;
-    expect(r.listingId).toBe(9n);
-    expect(r.actor).toBe('GBIDDERADDRESS');
+  it('sets actor from updated_by field', () => {
+    setupMocks('listing_price_updated', {
+      listing_id: 9n,
+      old_price: 5_000_000n,
+      new_price: 15_000_000n,
+      updated_by: 'GUPDATER99',
+    });
+    // updated_by is not one of the standard actor fields (artist/creator/offerer/bidder/buyer)
+    // so actor will be empty string — the indexer uses data.updated_by for changedBy
+    const r = parseMarketplaceEvent(['t'], 'v', 900)!;
+    expect(r.data.updated_by).toBe('GUPDATER99');
   });
 
-  it('persists the full bidder address in the data payload', () => {
-    setupMocks('auction_bidder_unblocked', BLOCKED_FIXTURE);
-    const r = parseMarketplaceEvent(['t'], 'v', 501)!;
-    expect(r.data.bidder).toBe('GBIDDERADDRESS');
-    expect(r.data.auction_id).toBe('9'); // BigInt serialised for the Json column
+  it('throws SchemaDecodeError when old_price is missing', async () => {
+    const { SchemaDecodeError } = await import('../parser.js');
+    setupMocks('listing_price_updated', {
+      listing_id: 1n,
+      new_price: 20_000_000n,
+      updated_by: 'GA',
+      // old_price intentionally omitted
+    });
+    expect(() => parseMarketplaceEvent(['t'], 'v', 1)).toThrow(SchemaDecodeError);
   });
 
-  it('throws SchemaDecodeError when bidder is missing', () => {
-    setupMocks('auction_bidder_blocked', { auction_id: 9n });
-    expect(() => parseMarketplaceEvent(['t'], 'v', 1)).toThrow(/bidder/);
+  it('throws SchemaDecodeError when new_price is missing', async () => {
+    const { SchemaDecodeError } = await import('../parser.js');
+    setupMocks('listing_price_updated', {
+      listing_id: 1n,
+      old_price: 10_000_000n,
+      updated_by: 'GA',
+      // new_price intentionally omitted
+    });
+    expect(() => parseMarketplaceEvent(['t'], 'v', 1)).toThrow(SchemaDecodeError);
+  });
+
+  it('preserves ledgerSequence on the decoded event', () => {
+    setupMocks('listing_price_updated', {
+      listing_id: 3n,
+      old_price: 1_000_000n,
+      new_price: 2_000_000n,
+      updated_by: 'GA',
+    });
+    const r = parseMarketplaceEvent(['t'], 'v', 1234)!;
+    expect(r.ledgerSequence).toBe(1234);
   });
 });

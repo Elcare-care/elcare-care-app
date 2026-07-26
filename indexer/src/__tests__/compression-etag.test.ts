@@ -13,6 +13,8 @@ const mockPrisma = vi.hoisted(() => ({
 }));
 
 vi.mock('../db', () => ({ default: mockPrisma }));
+// routes.ts → poller.ts → prisma-write
+vi.mock('../prisma-write', () => ({ default: mockPrisma }));
 vi.mock('../redis.js', () => ({ 
   default: {
     isOpen: false,

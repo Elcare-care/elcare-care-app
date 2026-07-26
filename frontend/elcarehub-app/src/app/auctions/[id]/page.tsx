@@ -19,9 +19,10 @@ import {
 import { StrKey } from "@stellar/stellar-sdk";
 import { fetchMetadata, cidToGatewayUrl, ArtworkMetadata } from "@/lib/ipfs";
 import {
-  getListingActivity,
-  ActivityEvent,
   subscribeToMarketplaceEvents,
+  getAuctionBidHistory,
+  recordAuctionBidCount,
+  type BidHistoryRecord,
 } from "@/lib/indexer";
 import { getReadableErrorMessage } from "@/lib/errors";
 import { useWalletContext } from "@/context/WalletContext";
@@ -44,8 +45,8 @@ import {
   Hash,
   Hammer,
   Flag,
-  Ban,
-  X,
+  ChevronLeft,
+  ChevronRight,
 } from "lucide-react";
 
 // ── useAuctionCountdown ──────────────────────────────────────
@@ -146,28 +147,166 @@ export function Countdown({ endTime, onExtend }: CountdownProps) {
 
 // ── Bid history row ──────────────────────────────────────────
 
-function BidHistoryRow({ event }: { event: ActivityEvent }) {
-  const amountXlm = (Number(event.price) / 10_000_000).toLocaleString(
-    undefined,
-    { maximumFractionDigits: 4 }
-  );
+function BidHistoryRow({ bid }: { bid: BidHistoryRecord }) {
+  const amountXlm = (Number(bid.amount) / 10_000_000).toLocaleString(undefined, {
+    maximumFractionDigits: 4,
+  });
+
   const shortAddr = (addr: string) =>
     addr.length > 12 ? `${addr.slice(0, 6)}…${addr.slice(-4)}` : addr;
 
+  const formattedTime = bid.timestamp
+    ? new Date(bid.timestamp).toLocaleString(undefined, {
+        month: "short",
+        day: "numeric",
+        hour: "2-digit",
+        minute: "2-digit",
+      })
+    : `Ledger ${bid.ledger}`;
+
   return (
-    <div className="flex items-center justify-between rounded-xl border border-gray-100 bg-white px-4 py-3 text-sm">
+    <div className="grid grid-cols-[1fr_auto_auto] items-center gap-3 rounded-xl border border-gray-100 bg-white px-4 py-3 text-sm">
+      {/* Bidder */}
       <div className="flex items-center gap-2 text-gray-700 min-w-0">
         <User size={13} className="shrink-0 text-gray-400" />
-        <span className="truncate font-mono text-xs">
-          {shortAddr(event.from)}
-        </span>
+        <span className="truncate font-mono text-xs">{shortAddr(bid.bidder)}</span>
       </div>
-      <div className="flex items-center gap-3">
-        <span className="font-semibold text-brand-600">{amountXlm} XLM</span>
-        <span className="text-xs text-gray-400">
-          Ledger {event.tx_hash.replace("ledger_", "")}
-        </span>
+      {/* Amount */}
+      <span className="font-semibold text-brand-600 whitespace-nowrap">{amountXlm} XLM</span>
+      {/* Time */}
+      <span className="text-xs text-gray-400 whitespace-nowrap text-right">{formattedTime}</span>
+    </div>
+  );
+}
+
+// ── Paginated bid history table ──────────────────────────────
+
+const BID_PAGE_SIZE = 10;
+
+interface BidHistoryTableProps {
+  auctionId: number;
+  /** Called once we know the total stored bid count — feeds the histogram. */
+  onTotalKnown?: (total: number) => void;
+}
+
+function BidHistoryTable({ auctionId, onTotalKnown }: BidHistoryTableProps) {
+  const [bids, setBids] = useState<BidHistoryRecord[]>([]);
+  const [total, setTotal] = useState(0);
+  const [offset, setOffset] = useState(0);
+  const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const fetchPage = useCallback(
+    async (pageOffset: number) => {
+      setIsLoading(true);
+      setError(null);
+      try {
+        const page = await getAuctionBidHistory(auctionId, pageOffset, BID_PAGE_SIZE);
+        setBids(page.bids);
+        setTotal(page.total);
+        onTotalKnown?.(page.total);
+      } catch (e) {
+        setError(getReadableErrorMessage(e, "Failed to load bid history"));
+      } finally {
+        setIsLoading(false);
+      }
+    },
+    [auctionId, onTotalKnown]
+  );
+
+  // Initial load
+  useEffect(() => {
+    fetchPage(0);
+  }, [fetchPage]);
+
+  const totalPages = Math.max(1, Math.ceil(total / BID_PAGE_SIZE));
+  const currentPage = Math.floor(offset / BID_PAGE_SIZE) + 1;
+
+  const goToPrev = () => {
+    const newOffset = Math.max(0, offset - BID_PAGE_SIZE);
+    setOffset(newOffset);
+    fetchPage(newOffset);
+  };
+
+  const goToNext = () => {
+    const newOffset = offset + BID_PAGE_SIZE;
+    if (newOffset < total) {
+      setOffset(newOffset);
+      fetchPage(newOffset);
+    }
+  };
+
+  if (isLoading) {
+    return (
+      <div className="space-y-2 animate-pulse">
+        {Array.from({ length: 4 }).map((_, i) => (
+          <div key={i} className="h-12 rounded-xl bg-gray-100" />
+        ))}
       </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="flex items-center gap-2 rounded-xl bg-red-50 px-4 py-3 text-sm text-red-600">
+        <AlertCircle size={14} />
+        {error}
+      </div>
+    );
+  }
+
+  if (bids.length === 0) {
+    return (
+      <div className="flex flex-col items-center justify-center rounded-2xl border border-gray-100 bg-white py-16">
+        <History size={32} className="text-gray-300 mb-3" />
+        <p className="text-sm text-gray-500">No bids placed yet</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-3">
+      {/* Column headers */}
+      <div className="grid grid-cols-[1fr_auto_auto] gap-3 px-4 text-[10px] uppercase tracking-wide text-gray-400 font-semibold">
+        <span>Bidder</span>
+        <span>Amount</span>
+        <span className="text-right">Time</span>
+      </div>
+
+      {/* Rows */}
+      <div className="space-y-2">
+        {bids.map((bid, i) => (
+          <BidHistoryRow key={`${bid.ledger}-${bid.bidder}-${i}`} bid={bid} />
+        ))}
+      </div>
+
+      {/* Pagination controls */}
+      {totalPages > 1 && (
+        <div className="flex items-center justify-between pt-2">
+          <button
+            onClick={goToPrev}
+            disabled={offset === 0}
+            aria-label="Previous page"
+            className="flex items-center gap-1 rounded-lg border border-gray-200 px-3 py-1.5 text-sm text-gray-600 hover:bg-gray-50 disabled:opacity-40 disabled:cursor-not-allowed transition-all"
+          >
+            <ChevronLeft size={14} /> Prev
+          </button>
+
+          <span className="text-xs text-gray-500">
+            Page {currentPage} of {totalPages}
+            <span className="ml-1 text-gray-400">({total} total)</span>
+          </span>
+
+          <button
+            onClick={goToNext}
+            disabled={offset + BID_PAGE_SIZE >= total}
+            aria-label="Next page"
+            className="flex items-center gap-1 rounded-lg border border-gray-200 px-3 py-1.5 text-sm text-gray-600 hover:bg-gray-50 disabled:opacity-40 disabled:cursor-not-allowed transition-all"
+          >
+            Next <ChevronRight size={14} />
+          </button>
+        </div>
+      )}
     </div>
   );
 }
@@ -418,7 +557,6 @@ export default function AuctionDetailPage() {
 
   const [auction, setAuction] = useState<Auction | null>(null);
   const [metadata, setMetadata] = useState<ArtworkMetadata | null>(null);
-  const [bidHistory, setBidHistory] = useState<ActivityEvent[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<"details" | "bids">("details");
@@ -428,6 +566,9 @@ export default function AuctionDetailPage() {
 
   // Tracks the live end time — may be updated by an SSE AUCTION_EXTENDED event.
   const [liveEndTime, setLiveEndTime] = useState<number>(0);
+
+  // Total bid count received from BidHistoryTable — fed to the histogram.
+  const [bidTotal, setBidTotal] = useState<number | null>(null);
 
   const { bid, isBidding, error: bidError } = usePlaceBid(publicKey);
   const { finalize, isFinalizing, error: finalizeError } =
@@ -444,12 +585,8 @@ export default function AuctionDetailPage() {
       setAuction(auctionData);
       setLiveEndTime(auctionData.end_time);
 
-      const [meta, history] = await Promise.all([
-        fetchMetadata(auctionData.metadata_cid).catch(() => null),
-        getListingActivity(Number(id)).catch(() => [] as ActivityEvent[]),
-      ]);
+      const meta = await fetchMetadata(auctionData.metadata_cid).catch(() => null);
       setMetadata(meta);
-      setBidHistory(history);
     } catch (err) {
       setError(getReadableErrorMessage(err, "Failed to load auction"));
     } finally {
@@ -849,10 +986,8 @@ export default function AuctionDetailPage() {
                 }`}
               >
                 {t === "details" ? "Details" : "Bid History"}
-                {t === "bids" && (
-                  <span className="ml-1.5 text-xs opacity-70">
-                    ({bidHistory.length})
-                  </span>
+                {t === "bids" && bidTotal !== null && bidTotal > 0 && (
+                  <span className="ml-1.5 text-xs opacity-70">({bidTotal})</span>
                 )}
               </button>
             ))}
@@ -895,21 +1030,16 @@ export default function AuctionDetailPage() {
             </div>
           )}
 
-          {activeTab === "bids" && (
-            <div className="space-y-2">
-              {bidHistory.length === 0 ? (
-                <div className="flex flex-col items-center justify-center rounded-2xl border border-gray-100 bg-white py-16">
-                  <History size={32} className="text-gray-300 mb-3" />
-                  <p className="text-sm text-gray-500">
-                    No bid history available
-                  </p>
-                </div>
-              ) : (
-                bidHistory.map((event) => (
-                  <BidHistoryRow key={event.id} event={event} />
-                ))
-              )}
-            </div>
+          {activeTab === "bids" && auction && (
+            <BidHistoryTable
+              auctionId={auction.auction_id}
+              onTotalKnown={(total) => {
+                setBidTotal(total);
+                // Record into the Prometheus histogram whenever we learn the
+                // bid count for this auction (fires on every page load/refresh).
+                recordAuctionBidCount(total, config.indexerUrl);
+              }}
+            />
           )}
         </div>
 
