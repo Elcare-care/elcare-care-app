@@ -17,7 +17,7 @@ import {
   Listing,
   stroopsToXlm,
 } from "@/lib/contract";
-import { fetchListings, fetchArtistListings } from "@/lib/indexer";
+import { fetchListings, fetchArtistListings, FreshnessMetadata, makeFreshness } from "@/lib/indexer";
 import {
   uploadImageToIPFS,
   uploadMetadataToIPFS,
@@ -42,6 +42,9 @@ export function useMarketplace(opts?: { page?: number; limit?: number }) {
   const [listings, setListings] = useState<Listing[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Issue #44 — freshness metadata & SSE state
+  const [freshness, setFreshness] = useState<FreshnessMetadata>(() => makeFreshness());
+  const [sseConnected, setSseConnected] = useState(false);
   useTransientErrorToast(error);
 
   const refresh = useCallback(async () => {
@@ -79,31 +82,44 @@ export function useMarketplace(opts?: { page?: number; limit?: number }) {
         const sorted = [...all].sort((a, b) => b.created_at - a.created_at);
         setListings(sorted);
       }
+      // Record freshness snapshot after successful load
+      setFreshness(makeFreshness({ sseConnected }));
     } catch (err: unknown) {
       setError(getReadableErrorMessage(err, "Failed to load listings"));
     } finally {
       setIsLoading(false);
     }
-  }, [opts?.page, opts?.limit]);
+  }, [opts?.page, opts?.limit, sseConnected]);
 
   useEffect(() => {
     refresh();
   }, [refresh]);
 
-  // Subscribe to real-time updates via SSE (issue #161).
+  // Subscribe to real-time updates via SSE and track connection state (issue #44).
   useEffect(() => {
     if (typeof window === "undefined" || !config.indexerUrl) return;
     const es = new EventSource(`${config.indexerUrl}/events/stream`);
+
+    es.onopen = () => {
+      setSseConnected(true);
+    };
+
     es.onmessage = () => {
       refresh();
     };
+
     es.onerror = () => {
+      setSseConnected(false);
       es.close();
     };
-    return () => es.close();
+
+    return () => {
+      setSseConnected(false);
+      es.close();
+    };
   }, [refresh]);
 
-  return { listings, isLoading, error, refresh };
+  return { listings, isLoading, error, refresh, freshness, sseConnected };
 }
 
 // ── useArtistListings ─────────────────────────────────────────
