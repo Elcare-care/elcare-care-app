@@ -143,8 +143,15 @@ model MarketplaceEvent {
   data            Json
   ledgerSequence  Int
   ledgerTimestamp DateTime @default(now())
-  eventHash       String   @unique @default("")  // SHA256(contractId:ledger:txHash:eventIndex)
+  /// Canonical event identity: SHA256(contractId:ledger:txHash:eventIndex).
+  /// NULL only for legacy rows ingested before this field was introduced.
+  eventHash       String?  @unique               // nullable — no @default("") to prevent degenerate collisions
   contractId      String   @default("")          // source contract address
+  /// Issue #286: provisional (false) vs confirmed (true) event state.
+  /// Events are promoted to confirmed once they are CONFIRMATION_DEPTH ledgers
+  /// behind the network tip.  On reorg, events past the safe ledger are
+  /// hard-deleted (provisional by definition).
+  confirmed       Boolean  @default(false)
   @@index([actor])
   @@index([eventType])
   @@index([listingId])
