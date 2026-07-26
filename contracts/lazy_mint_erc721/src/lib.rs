@@ -54,14 +54,17 @@ pub enum Error {
     TokenNotFound = 5,
     MaxSupplyReached = 6,
     VoucherExpired = 7,
-    /// Voucher nonce (token_id) already redeemed (#39).
+    /// Voucher nonce already redeemed (#273).
     VoucherAlreadyRedeemed = 8,
     NotCreator = 9,
     InvalidSignature = 10,
     NotAllowlisted = 11,
     InvalidMerkleProof = 12,
-    /// Voucher nonce has been explicitly revoked by the creator.
     VoucherRevoked = 13,
+    /// migrate() called for a version already marked done.
+    AlreadyMigrated = 14,
+    /// Unsupported version jump.
+    UnsupportedMigration = 15,
 }
 
 // ─── Data types ───────────────────────────────────────────────────────────────
@@ -70,10 +73,23 @@ pub enum Error {
 ///
 /// `uri_hash` = sha256(uri_string) computed off-chain; included in the signed
 /// digest so a relayer cannot swap the URI while keeping the signature valid.
+///
+/// # Issue #273 — nonce-based replay protection
+/// `nonce` is the unique per-voucher identifier used for replay protection and
+/// revocation.  It is intentionally separate from `token_id` so that:
+///   * A creator can issue multiple vouchers for the same token at different
+///     prices / recipients without one redemption invalidating the others.
+///   * The nonce can be incremented independently of the on-chain mint counter.
+///
+/// The signed digest now also includes the network passphrase bound at
+/// initialization, preventing cross-deployment and cross-network replay.
 #[contracttype]
 #[derive(Clone)]
 pub struct MintVoucher {
     pub token_id: u64,
+    /// Unique per-voucher identifier used for replay protection (#273).
+    /// Must be unique across all vouchers for this contract instance.
+    pub nonce: u64,
     pub price: i128,          // 0 = free
     pub currency: Address,    // SAC address (ignored when price == 0)
     pub uri: String,          // IPFS / HTTPS metadata URI
@@ -96,6 +112,7 @@ pub enum DataKey {
     Initialized,
     Creator,
     CreatorPubkey,
+    CurrentWasmHash,
     Name,
     Symbol,
     MaxSupply,
@@ -112,10 +129,13 @@ pub enum DataKey {
     Approved(u64),
     BalanceOf(Address),
     ApprovedForAll(Address, Address),
-    UsedVoucher(u64),    // token_id → bool  (redeemed)
-    RevokedVoucher(u64), // token_id → bool  (creator-revoked, per-nonce)
+    UsedVoucher(u64),    // nonce → bool  (redeemed)
+    RevokedVoucher(u64), // nonce → bool  (creator-revoked, per-nonce)
     MerkleRoot,          // BytesN<32> — root of allowlist Merkle tree
     IsPublicPhase,       // bool — true once public minting is enabled
+    /// Network passphrase bound at initialization.
+    /// Included in the signed digest to prevent cross-network replay (#273).
+    NetworkPassphrase,   // String
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -201,18 +221,19 @@ impl LazyMint721 {
         if voucher.valid_until != 0 && env.ledger().sequence() > voucher.valid_until as u32 {
             return Err(Error::VoucherExpired);
         }
-        // Replay before revocation: if already redeemed, surface that error.
+        // Replay protection uses the voucher's nonce (not token_id) so the same
+        // token can be covered by multiple vouchers with independent lifetimes.
         if env
             .storage()
             .persistent()
-            .has(&DataKey::UsedVoucher(voucher.token_id))
+            .has(&DataKey::UsedVoucher(voucher.nonce))
         {
             return Err(Error::VoucherAlreadyRedeemed);
         }
         if env
             .storage()
             .persistent()
-            .has(&DataKey::RevokedVoucher(voucher.token_id))
+            .has(&DataKey::RevokedVoucher(voucher.nonce))
         {
             return Err(Error::VoucherRevoked);
         }
@@ -252,17 +273,18 @@ impl LazyMint721 {
     }
 
     /// Mint a single token after all checks have passed.
-    /// Updates Owner, TokenUri, UsedVoucher, BalanceOf, TotalSupply, NextTokenId.
-    fn mint_token(env: &Env, buyer: &Address, token_id: u64, uri: &String, next_id: u64) {
+    /// Updates Owner, TokenUri, UsedVoucher (keyed by nonce), BalanceOf, TotalSupply, NextTokenId.
+    fn mint_token(env: &Env, buyer: &Address, token_id: u64, nonce: u64, uri: &String, next_id: u64) {
         env.storage()
             .persistent()
             .set(&DataKey::Owner(token_id), buyer);
         env.storage()
             .persistent()
             .set(&DataKey::TokenUri(token_id), uri);
+        // Replay protection: mark the voucher nonce as consumed (not token_id).
         env.storage()
             .persistent()
-            .set(&DataKey::UsedVoucher(token_id), &true);
+            .set(&DataKey::UsedVoucher(nonce), &true);
         env.storage()
             .persistent()
             .extend_ttl(&DataKey::Owner(token_id), TTL_THRESHOLD, TTL_BUMP);
@@ -271,7 +293,7 @@ impl LazyMint721 {
             .extend_ttl(&DataKey::TokenUri(token_id), TTL_THRESHOLD, TTL_BUMP);
         env.storage()
             .persistent()
-            .extend_ttl(&DataKey::UsedVoucher(token_id), TTL_THRESHOLD, TTL_BUMP);
+            .extend_ttl(&DataKey::UsedVoucher(nonce), TTL_THRESHOLD, TTL_BUMP);
 
         let bal: u64 = env
             .storage()
@@ -308,6 +330,7 @@ impl LazyMint721 {
 
     /// Issue #38: accepts `platform_fee_receiver` and `platform_fee_bps` so
     /// the launchpad can configure per-collection fee splits at deployment time.
+    /// Issue #273: accepts `network_passphrase` for cross-network domain separation.
     pub fn initialize(
         env: Env,
         creator: Address,
@@ -319,12 +342,14 @@ impl LazyMint721 {
         royalty_receiver: Address,
         platform_fee_receiver: Address,
         platform_fee_bps: u32,
+        network_passphrase: String,
     ) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Initialized) {
             return Err(Error::AlreadyInitialized);
         }
         env.storage().instance().set(&DataKey::Initialized, &true);
         env.storage().instance().set(&DataKey::Creator, &creator);
+        env.storage().instance().set(&DataKey::CurrentWasmHash, &BytesN::from_array(&env, &[0u8; 32]));
         env.storage()
             .instance()
             .set(&DataKey::CreatorPubkey, &creator_pubkey);
@@ -347,7 +372,29 @@ impl LazyMint721 {
         env.storage()
             .instance()
             .set(&DataKey::PlatformFeeBps, &platform_fee_bps);
+        // Store the network passphrase for cross-network domain separation (#273).
+        env.storage()
+            .instance()
+            .set(&DataKey::NetworkPassphrase, &network_passphrase);
         env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_BUMP);
+        Ok(())
+    }
+
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
+        let old_wasm_hash: BytesN<32> = env
+            .storage()
+            .instance()
+            .get(&DataKey::CurrentWasmHash)
+            .unwrap_or(BytesN::from_array(&env, &[0u8; 32]));
+        env.storage()
+            .instance()
+            .set(&DataKey::CurrentWasmHash, &new_wasm_hash);
+        env.deployer().update_current_contract_wasm(&new_wasm_hash);
+        env.events().publish(
+            (symbol_short!("upgraded"),),
+            (old_wasm_hash, new_wasm_hash),
+        );
         Ok(())
     }
 
@@ -410,11 +457,12 @@ impl LazyMint721 {
 
         // 7. Mint
         let token_id = voucher.token_id;
-        Self::mint_token(&env, &buyer, token_id, &voucher.uri, next_id);
+        Self::mint_token(&env, &buyer, token_id, voucher.nonce, &voucher.uri, next_id);
 
+        // Emit detailed redemption event for indexer auditability (#273).
         env.events().publish(
-            (symbol_short!("mint"), creator, buyer.clone()),
-            (token_id, 1u128),
+            (symbol_short!("redeemed"), creator, buyer.clone()),
+            (token_id, voucher.nonce, 1u128),
         );
         Ok(token_id)
     }
@@ -527,13 +575,14 @@ impl LazyMint721 {
         let mut next_id = next_id_start;
         for item in items.iter() {
             let token_id = item.voucher.token_id;
-            Self::mint_token(&env, &buyer, token_id, &item.voucher.uri, next_id);
+            Self::mint_token(&env, &buyer, token_id, item.voucher.nonce, &item.voucher.uri, next_id);
             if token_id >= next_id {
                 next_id = token_id + 1;
             }
+            // Emit detailed redemption event for each item (#273).
             env.events().publish(
-                (symbol_short!("mint"), creator.clone(), buyer.clone()),
-                (token_id, 1u128),
+                (symbol_short!("redeemed"), creator.clone(), buyer.clone()),
+                (token_id, item.voucher.nonce, 1u128),
             );
             minted_ids.push_back(token_id);
         }
@@ -696,11 +745,12 @@ impl LazyMint721 {
             .unwrap_or(0)
     }
 
-    /// Returns true if the voucher nonce (token_id) has already been redeemed.
-    pub fn is_voucher_redeemed(env: Env, token_id: u64) -> bool {
+    /// Returns true if the voucher nonce has already been redeemed.
+    /// Uses the voucher's `nonce` field (not token_id) for lookup (#273).
+    pub fn is_voucher_redeemed(env: Env, nonce: u64) -> bool {
         env.storage()
             .persistent()
-            .has(&DataKey::UsedVoucher(token_id))
+            .has(&DataKey::UsedVoucher(nonce))
     }
 
     pub fn name(env: Env) -> String {
@@ -816,6 +866,50 @@ impl LazyMint721 {
         env.storage().instance().get(&DataKey::MerkleRoot)
     }
 
+    // ── Versioning & Migration ─────────────────────────────────────────────
+
+    pub fn version(_env: Env) -> &'static str {
+        "1.0.0"
+    }
+
+    pub fn contract_version(env: Env) -> Option<String> {
+        env.storage().instance().get(&DataKey::ContractVersion)
+    }
+
+    /// Creator-guarded idempotent migration entry point.
+    /// v1.0.0: records the completion marker and on-chain version string.
+    pub fn migrate(env: Env) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
+        Self::only_creator(&env)?;
+
+        let target = String::from_str(&env, "1.0.0");
+        let done_key = DataKey::MigrationDone(target.clone());
+
+        if env
+            .storage()
+            .persistent()
+            .get::<DataKey, bool>(&done_key)
+            .unwrap_or(false)
+        {
+            return Err(Error::AlreadyMigrated);
+        }
+
+        // v1.0.0 migration body: nothing to migrate for the initial version.
+        // UsedVoucher entries are already in persistent storage and remain
+        // readable as-is.  RevokedVoucher entries are likewise unaffected.
+
+        env.storage().persistent().set(&done_key, &true);
+        env.storage()
+            .persistent()
+            .extend_ttl(&done_key, TTL_THRESHOLD, TTL_BUMP);
+        env.storage()
+            .instance()
+            .set(&DataKey::ContractVersion, &target);
+        env.events()
+            .publish((soroban_sdk::symbol_short!("migrated"), target), ());
+        Ok(())
+    }
+
     // ── Private helpers ───────────────────────────────────────────────────
 
     fn extend_instance_ttl(env: &Env) {
@@ -835,18 +929,34 @@ impl LazyMint721 {
     /// Build the 32-byte digest that the creator must sign off-chain.
     ///
     /// Layout (all big-endian / XDR where noted):
-    ///   N   bytes  contract_address XDR  (binds signature to this instance)
-    ///   8   bytes  token_id  (u64 BE)
-    ///  16   bytes  price     (i128 BE)
-    ///   8   bytes  valid_until (u64 BE)
+    ///   N   bytes  network_passphrase bytes  (binds to this network)
+    ///   N   bytes  contract_address XDR      (binds to this deployment)
+    ///   8   bytes  nonce             (u64 BE) — unique per voucher (#273)
+    ///   8   bytes  token_id          (u64 BE)
+    ///  16   bytes  price             (i128 BE)
+    ///   8   bytes  valid_until       (u64 BE)
     ///  32   bytes  uri_hash
     ///   N   bytes  currency address XDR
+    ///
+    /// The network passphrase is stored at initialization and bound here so a
+    /// voucher signed on testnet cannot be replayed on mainnet even if the
+    /// contract address happens to be the same.
     ///
     /// ⚠ Byte layout is STABLE — do not reorder fields.
     #[allow(non_snake_case)]
     pub fn _voucher_digest(env: &Env, v: &MintVoucher) -> Bytes {
         let mut raw = Bytes::new(env);
+        // Network passphrase — domain separator for cross-network protection.
+        let passphrase: String = env
+            .storage()
+            .instance()
+            .get(&DataKey::NetworkPassphrase)
+            .unwrap_or_else(|| String::from_str(env, ""));
+        raw.append(&passphrase.to_xdr(env));
+        // Contract address — binds signature to this specific deployment.
         raw.append(&env.current_contract_address().to_xdr(env));
+        // Unique per-voucher nonce.
+        raw.extend_from_array(&v.nonce.to_be_bytes());
         raw.extend_from_array(&v.token_id.to_be_bytes());
         raw.extend_from_array(&v.price.to_be_bytes());
         raw.extend_from_array(&v.valid_until.to_be_bytes());

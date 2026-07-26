@@ -1,11 +1,12 @@
 /**
- * PriceHistoryChart — SVG sparkline showing price changes over time.
+ * PriceHistoryChart — SVG sparkline + price-change table for a listing.
  *
  * Renders without any external charting library: pure SVG path
- * constructed from normalised (x, y) coordinates.
+ * constructed from normalised (x, y) coordinates, plus an accessible
+ * HTML table of all historical price changes with dates and delta badges.
  *
  * Props:
- *  - points     Array of { timestamp, price } data points
+ *  - points     Array of PriceHistoryPoint data points from the indexer
  *  - isLoading  Show a skeleton whilst data is loading
  *  - error      Error message to display
  *  - className  Optional extra Tailwind classes for the wrapper
@@ -13,13 +14,19 @@
 
 "use client";
 
-import React, { useMemo } from "react";
-import { TrendingUp, TrendingDown, Minus, Loader2 } from "lucide-react";
+import React, { useMemo, useState } from "react";
+import {
+  TrendingUp,
+  TrendingDown,
+  Minus,
+  Loader2,
+  ChevronDown,
+  ChevronUp,
+} from "lucide-react";
 import { PriceHistoryPoint } from "@/lib/indexer";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/** Convert raw price string (stroops) to a displayable XLM number */
 function stroopStringToXlm(s: string): number {
   const n = Number(s);
   return Number.isFinite(n) ? n / 10_000_000 : 0;
@@ -35,6 +42,7 @@ function formatDate(ts: number): string {
   return new Date(ts).toLocaleDateString(undefined, {
     month: "short",
     day: "numeric",
+    year: "numeric",
   });
 }
 
@@ -74,12 +82,16 @@ function buildSparkline(
   });
 
   const path = coords
-    .map((c, i) => `${i === 0 ? "M" : "L"} ${c.x.toFixed(2)},${c.y.toFixed(2)}`)
+    .map(
+      (c, i) => `${i === 0 ? "M" : "L"} ${c.x.toFixed(2)},${c.y.toFixed(2)}`
+    )
     .join(" ");
 
   const fillPath = [
     path,
-    `L ${coords[coords.length - 1].x.toFixed(2)},${(height - padding).toFixed(2)}`,
+    `L ${coords[coords.length - 1].x.toFixed(2)},${(
+      height - padding
+    ).toFixed(2)}`,
     `L ${coords[0].x.toFixed(2)},${(height - padding).toFixed(2)}`,
     "Z",
   ].join(" ");
@@ -114,6 +126,7 @@ interface PriceHistoryChartProps {
 const SVG_W = 320;
 const SVG_H = 80;
 const PADDING = 8;
+const TABLE_PREVIEW_ROWS = 5;
 
 export function PriceHistoryChart({
   points,
@@ -121,6 +134,8 @@ export function PriceHistoryChart({
   error = null,
   className = "",
 }: PriceHistoryChartProps) {
+  const [tableExpanded, setTableExpanded] = useState(false);
+
   const sparkline = useMemo(
     () => buildSparkline(points, SVG_W, SVG_H, PADDING),
     [points]
@@ -128,23 +143,42 @@ export function PriceHistoryChart({
 
   const trendColor =
     sparkline?.trend === "up"
-      ? { stroke: "#68d9b3", fill: "url(#sparkGradientUp)", text: "text-mint-400" }
+      ? {
+          stroke: "#68d9b3",
+          fill: "url(#sparkGradientUp)",
+          text: "text-mint-400",
+        }
       : sparkline?.trend === "down"
-      ? { stroke: "#e27d60", fill: "url(#sparkGradientDown)", text: "text-terracotta-400" }
-      : { stroke: "#9ca3af", fill: "url(#sparkGradientFlat)", text: "text-white/40" };
+      ? {
+          stroke: "#e27d60",
+          fill: "url(#sparkGradientDown)",
+          text: "text-terracotta-400",
+        }
+      : {
+          stroke: "#9ca3af",
+          fill: "url(#sparkGradientFlat)",
+          text: "text-white/40",
+        };
 
   const pctChange =
     sparkline && sparkline.firstPrice > 0
-      ? (((sparkline.lastPrice - sparkline.firstPrice) / sparkline.firstPrice) * 100).toFixed(1)
+      ? (
+          ((sparkline.lastPrice - sparkline.firstPrice) /
+            sparkline.firstPrice) *
+          100
+        ).toFixed(1)
       : null;
+
+  const visibleRows = tableExpanded ? points : points.slice(0, TABLE_PREVIEW_ROWS);
+  const hasMoreRows = points.length > TABLE_PREVIEW_ROWS;
 
   return (
     <div
-      className={`rounded-2xl bg-white/5 border border-white/5 p-4 ${className}`}
+      className={`rounded-2xl bg-white/5 border border-white/5 p-4 space-y-4 ${className}`}
       data-testid="price-history-chart"
     >
-      {/* Header */}
-      <div className="flex items-center justify-between mb-3">
+      {/* ── Header ── */}
+      <div className="flex items-center justify-between">
         <span className="text-[10px] uppercase tracking-[0.25em] font-bold text-white/40">
           Price History
         </span>
@@ -166,7 +200,7 @@ export function PriceHistoryChart({
         )}
       </div>
 
-      {/* Chart area */}
+      {/* ── Chart area ── */}
       {isLoading ? (
         <div
           className="flex items-center justify-center"
@@ -202,15 +236,33 @@ export function PriceHistoryChart({
             className="overflow-visible"
           >
             <defs>
-              <linearGradient id="sparkGradientUp" x1="0" y1="0" x2="0" y2="1">
+              <linearGradient
+                id="sparkGradientUp"
+                x1="0"
+                y1="0"
+                x2="0"
+                y2="1"
+              >
                 <stop offset="0%" stopColor="#68d9b3" stopOpacity="0.25" />
                 <stop offset="100%" stopColor="#68d9b3" stopOpacity="0" />
               </linearGradient>
-              <linearGradient id="sparkGradientDown" x1="0" y1="0" x2="0" y2="1">
+              <linearGradient
+                id="sparkGradientDown"
+                x1="0"
+                y1="0"
+                x2="0"
+                y2="1"
+              >
                 <stop offset="0%" stopColor="#e27d60" stopOpacity="0.25" />
                 <stop offset="100%" stopColor="#e27d60" stopOpacity="0" />
               </linearGradient>
-              <linearGradient id="sparkGradientFlat" x1="0" y1="0" x2="0" y2="1">
+              <linearGradient
+                id="sparkGradientFlat"
+                x1="0"
+                y1="0"
+                x2="0"
+                y2="1"
+              >
                 <stop offset="0%" stopColor="#9ca3af" stopOpacity="0.15" />
                 <stop offset="100%" stopColor="#9ca3af" stopOpacity="0" />
               </linearGradient>
@@ -234,21 +286,24 @@ export function PriceHistoryChart({
               data-testid="sparkline-path"
             />
 
-            {/* Data dots — show only first and last to keep it clean */}
-            {[sparkline.dots[0], sparkline.dots[sparkline.dots.length - 1]].map(
-              (dot, i) => (
-                <circle
-                  key={i}
-                  cx={dot.cx}
-                  cy={dot.cy}
-                  r={3}
-                  fill={trendColor.stroke}
-                  stroke="rgba(0,0,0,0.3)"
-                  strokeWidth={1}
-                  data-testid={i === 0 ? "sparkline-dot-first" : "sparkline-dot-last"}
-                />
-              )
-            )}
+            {/* Dots — first and last only */}
+            {[
+              sparkline.dots[0],
+              sparkline.dots[sparkline.dots.length - 1],
+            ].map((dot, i) => (
+              <circle
+                key={i}
+                cx={dot.cx}
+                cy={dot.cy}
+                r={3}
+                fill={trendColor.stroke}
+                stroke="rgba(0,0,0,0.3)"
+                strokeWidth={1}
+                data-testid={
+                  i === 0 ? "sparkline-dot-first" : "sparkline-dot-last"
+                }
+              />
+            ))}
           </svg>
 
           {/* Min / Max labels */}
@@ -263,7 +318,7 @@ export function PriceHistoryChart({
             </div>
           </div>
 
-          {/* First / last date labels */}
+          {/* Date range */}
           <div className="flex justify-between mt-1">
             <span className="text-[9px] text-white/20 font-mono">
               {formatDate(sparkline.dots[0].ts)}
@@ -273,6 +328,105 @@ export function PriceHistoryChart({
             </span>
           </div>
         </>
+      )}
+
+      {/* ── Price change table ── */}
+      {!isLoading && !error && points.length > 0 && (
+        <div
+          className="border-t border-white/5 pt-3"
+          data-testid="price-history-table"
+        >
+          <table
+            className="w-full text-[11px]"
+            aria-label="Price change history"
+          >
+            <thead>
+              <tr className="text-white/30 uppercase tracking-wider">
+                <th className="text-left font-bold pb-2">Date</th>
+                <th className="text-right font-bold pb-2">Old Price</th>
+                <th className="text-right font-bold pb-2">New Price</th>
+                <th className="text-right font-bold pb-2">Change</th>
+              </tr>
+            </thead>
+            <tbody>
+              {visibleRows.map((pt, i) => {
+                const newXlm = stroopStringToXlm(pt.price);
+                const oldXlm = pt.oldPrice
+                  ? stroopStringToXlm(pt.oldPrice)
+                  : null;
+                const delta =
+                  oldXlm !== null && oldXlm > 0
+                    ? ((newXlm - oldXlm) / oldXlm) * 100
+                    : null;
+                const isUp = delta !== null && delta > 0.001;
+                const isDown = delta !== null && delta < -0.001;
+
+                return (
+                  <tr
+                    key={i}
+                    className="border-t border-white/5 hover:bg-white/5 transition-colors"
+                    data-testid="price-history-row"
+                  >
+                    <td className="py-2 text-white/50 font-mono">
+                      {formatDate(pt.timestamp)}
+                    </td>
+                    <td className="py-2 text-right text-white/40 font-mono">
+                      {oldXlm !== null ? `${formatXlm(oldXlm)} XLM` : "—"}
+                    </td>
+                    <td className="py-2 text-right text-white font-mono font-semibold">
+                      {formatXlm(newXlm)} XLM
+                    </td>
+                    <td className="py-2 text-right">
+                      {delta !== null ? (
+                        <span
+                          className={`inline-flex items-center gap-0.5 font-bold ${
+                            isUp
+                              ? "text-mint-400"
+                              : isDown
+                              ? "text-terracotta-400"
+                              : "text-white/30"
+                          }`}
+                          data-testid="price-delta-badge"
+                        >
+                          {isUp ? (
+                            <TrendingUp size={10} />
+                          ) : isDown ? (
+                            <TrendingDown size={10} />
+                          ) : (
+                            <Minus size={10} />
+                          )}
+                          {isUp ? "+" : ""}
+                          {delta.toFixed(1)}%
+                        </span>
+                      ) : (
+                        <span className="text-white/20">—</span>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+
+          {hasMoreRows && (
+            <button
+              onClick={() => setTableExpanded((v) => !v)}
+              className="mt-2 w-full flex items-center justify-center gap-1 text-[10px] text-white/30 hover:text-white/60 transition-colors py-1"
+              aria-expanded={tableExpanded}
+              data-testid="price-table-expand-btn"
+            >
+              {tableExpanded ? (
+                <>
+                  <ChevronUp size={12} /> Show less
+                </>
+              ) : (
+                <>
+                  <ChevronDown size={12} /> Show {points.length - TABLE_PREVIEW_ROWS} more
+                </>
+              )}
+            </button>
+          )}
+        </div>
       )}
     </div>
   );

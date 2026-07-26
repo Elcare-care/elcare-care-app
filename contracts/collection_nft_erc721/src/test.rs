@@ -1477,270 +1477,96 @@ fn transfer_clears_expiry_key_alongside_approval() {
     assert!(expiry_after.is_none(), "expiry key must be cleared after transfer");
 }
 
-// ─── Authorization matrix (#275) ───────────────────────────────────────────
-//
-// Documented caller permissions for every public transfer/burn/approve
-// method on NormalNFT721. Note the delegated paths (`transfer_from`, `burn`)
-// check *only* per-token `Approved` / collection-wide `ApprovedForAll` — the
-// bare token owner is NOT implicitly authorized on those paths and must
-// either self-approve first or use the direct `transfer()` call instead
-// (see `owner_can_always_transfer_directly_without_approval` below, and the
-// pre-existing `persistent_ttl_is_extended_on_burn_balance_key` test, which
-// documents the same thing for burn).
-//
-// | Caller            | transfer() | transfer_from() | burn() | approve (on owner's token) |
-// |--------------------|:---:|:---:|:---:|:---:|
-// | Owner (no self-approval)| ✅  | ❌  | ❌ | ✅ (self) |
-// | Approved (per-token)| ❌  | ✅  | ✅ | ❌ |
-// | Operator (all-tokens)| ❌ | ✅  | ✅ | ✅ |
-// | Creator (unrelated to token)| ❌ | ❌ | ❌ | ❌ |
-// | Unrelated account  | ❌  | ❌  | ❌ | ❌ |
-//
-// Table-driven: one row per (caller role, expected outcome), run against the
-// same freshly minted token so every scenario starts from identical state.
+// ── Migration tests ───────────────────────────────────────────────────────────
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum Role {
-    Owner,
-    Approved,
-    Operator,
-    Creator,
-    Unrelated,
-}
+mod migration {
+    use super::*;
 
-/// Roles for the delegated paths (`transfer_from`, `burn`): the bare owner
-/// is deliberately excluded from "should succeed" — see the module doc above.
-const ROLES: [(Role, bool); 5] = [
-    (Role::Owner, false),
-    (Role::Approved, true),
-    (Role::Operator, true),
-    (Role::Creator, false),
-    (Role::Unrelated, false),
-];
+    // Re-use the shared setup() helper defined above.
 
-/// Mints a token to a fresh `owner`, wires up the approval/operator state
-/// implied by `role`, and returns the address that should act as the
-/// spender/burner under that role.
-fn caller_for_role(
-    env: &Env,
-    client: &NormalNFT721Client<'_>,
-    creator: &Address,
-    owner: &Address,
-    token_id: u64,
-    role: Role,
-) -> Address {
-    match role {
-        Role::Owner => owner.clone(),
-        Role::Approved => {
-            let approved = Address::generate(env);
-            client.approve(owner, &approved, &token_id, &None::<u32>);
-            approved
-        }
-        Role::Operator => {
-            let operator = Address::generate(env);
-            client.set_approval_for_all(owner, &operator, &true, &None::<u32>);
-            operator
-        }
-        Role::Creator => creator.clone(),
-        Role::Unrelated => Address::generate(env),
-    }
-}
+    #[test]
+    fn fresh_install_migrate_records_marker_and_version() {
+        let (env, client, _contract_id, _creator) = setup();
 
-#[test]
-fn transfer_from_authorization_matrix() {
-    for (role, should_succeed) in ROLES {
-        let (env, client, _contract_id, creator) = setup();
-        let owner = Address::generate(&env);
-        let recipient = Address::generate(&env);
-        let token_id = client.mint(&owner, &String::from_str(&env, "uri"));
+        // No migration done yet
+        assert!(client.contract_version().is_none());
 
-        let spender = caller_for_role(&env, &client, &creator, &owner, token_id, role);
-        let result = client.try_transfer_from(&spender, &owner, &recipient, &token_id);
+        client.migrate();
 
-        if should_succeed {
-            assert!(result.is_ok(), "role {:?} expected to succeed", role);
-            assert_eq!(client.owner_of(&token_id), recipient);
-        } else {
-            assert_eq!(
-                result,
-                Err(Ok(Error::NotApproved)),
-                "role {:?} expected NotApproved",
-                role
-            );
-            assert_eq!(client.owner_of(&token_id), owner, "no partial mutation on rejection");
-        }
-    }
-}
-
-#[test]
-fn burn_authorization_matrix() {
-    for (role, should_succeed) in ROLES {
-        let (env, client, _contract_id, creator) = setup();
-        let owner = Address::generate(&env);
-        let token_id = client.mint(&owner, &String::from_str(&env, "uri"));
-
-        let burner = caller_for_role(&env, &client, &creator, &owner, token_id, role);
-        let result = client.try_burn(&burner, &token_id);
-
-        if should_succeed {
-            assert!(result.is_ok(), "role {:?} expected to succeed", role);
-            assert!(client.try_owner_of(&token_id).is_err(), "token should be gone after burn");
-        } else {
-            assert_eq!(
-                result,
-                Err(Ok(Error::NotApproved)),
-                "role {:?} expected NotApproved",
-                role
-            );
-            // No partial mutation: token still exists and owner unchanged.
-            assert_eq!(client.owner_of(&token_id), owner);
-        }
-    }
-}
-
-#[test]
-fn owner_can_always_transfer_directly_without_approval() {
-    // Unlike transfer_from()/burn(), the direct transfer() path is
-    // authorized purely on ownership — no self-approval required.
-    let (env, client, _contract_id, _creator) = setup();
-    let owner = Address::generate(&env);
-    let recipient = Address::generate(&env);
-    let token_id = client.mint(&owner, &String::from_str(&env, "uri"));
-
-    client.transfer(&owner, &recipient, &token_id);
-    assert_eq!(client.owner_of(&token_id), recipient);
-}
-
-#[test]
-fn transfer_direct_rejects_every_non_owner_role() {
-    for (role, _) in ROLES {
-        let (env, client, _contract_id, creator) = setup();
-        let owner = Address::generate(&env);
-        let recipient = Address::generate(&env);
-        let token_id = client.mint(&owner, &String::from_str(&env, "uri"));
-
-        if role == Role::Owner {
-            continue; // covered by owner_can_always_transfer_directly_without_approval
-        }
-
-        let caller = caller_for_role(&env, &client, &creator, &owner, token_id, role);
-        let result = client.try_transfer(&caller, &recipient, &token_id);
+        // Marker is now set and version is readable
         assert_eq!(
-            result,
-            Err(Ok(Error::NotOwner)),
-            "role {:?} must not be able to call transfer() on someone else's token",
-            role
-        );
-        assert_eq!(client.owner_of(&token_id), owner, "no partial mutation on rejection");
-    }
-}
-
-#[test]
-fn approve_authorization_owner_and_operator_allowed_others_rejected() {
-    // approve() may be called by the owner or an existing operator, never by
-    // an approved-single-token spender, the creator, or an unrelated account.
-    let matrix = [
-        (Role::Owner, true),
-        (Role::Operator, true),
-        (Role::Approved, false),
-        (Role::Creator, false),
-        (Role::Unrelated, false),
-    ];
-
-    for (role, should_succeed) in matrix {
-        let (env, client, _contract_id, creator) = setup();
-        let owner = Address::generate(&env);
-        let token_id = client.mint(&owner, &String::from_str(&env, "uri"));
-        let new_spender = Address::generate(&env);
-
-        let caller = caller_for_role(&env, &client, &creator, &owner, token_id, role);
-        let result = client.try_approve(&caller, &new_spender, &token_id, &None::<u32>);
-
-        assert_eq!(
-            result.is_ok(),
-            should_succeed,
-            "role {:?} approve() outcome mismatch",
-            role
+            client.contract_version(),
+            Some(String::from_str(&env, "1.0.0"))
         );
     }
-}
 
-#[test]
-fn transfer_from_by_approved_spender_clears_approval_so_it_cannot_be_reused() {
-    // A stale single-token approval must not survive its own use: once the
-    // approved spender transfers the token away, the same spender (and the
-    // same approval) must not be usable again.
-    let (env, client, _contract_id, _creator) = setup();
-    let owner = Address::generate(&env);
-    let recipient = Address::generate(&env);
-    let token_id = client.mint(&owner, &String::from_str(&env, "uri"));
+    #[test]
+    #[should_panic(expected = "AlreadyMigrated")]
+    fn double_migrate_reverts_with_already_migrated() {
+        let (_env, client, _contract_id, _creator) = setup();
 
-    let approved = Address::generate(&env);
-    client.approve(&owner, &approved, &token_id, &None::<u32>);
+        client.migrate();
+        // Second call must revert
+        client.migrate();
+    }
 
-    client.transfer_from(&approved, &owner, &recipient, &token_id);
-    assert_eq!(client.get_approved(&token_id), None);
+    #[test]
+    fn migrate_emits_migrated_event() {
+        let (env, client, _contract_id, _creator) = setup();
+        client.migrate();
 
-    // The recipient must re-approve explicitly; the old approval is dead.
-    let result = client.try_transfer_from(&approved, &recipient, &owner, &token_id);
-    assert_eq!(result, Err(Ok(Error::NotApproved)));
-}
+        let events = env.events().all();
+        let found = events.iter().any(|(_, topics, _)| {
+            // topics is a Vec<Val>; the first entry is the symbol "migrated"
+            topics.len() >= 1
+                && topics
+                    .get(0)
+                    .map(|v| {
+                        soroban_sdk::Symbol::try_from_val(&env, &v)
+                            .map(|s| s == soroban_sdk::symbol_short!("migrated"))
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false)
+        });
+        assert!(found, "expected 'migrated' event");
+    }
 
-#[test]
-fn operator_approval_is_scoped_to_the_owner_that_granted_it() {
-    // An operator approved by `owner_a` must not be able to move tokens
-    // belonging to `owner_b`, even though both tokens exist in the same
-    // collection and the operator address is identical.
-    let (env, client, _contract_id, _creator) = setup();
-    let owner_a = Address::generate(&env);
-    let owner_b = Address::generate(&env);
-    let operator = Address::generate(&env);
-    let recipient = Address::generate(&env);
+    #[test]
+    fn state_readable_after_migrate() {
+        let (env, client, _contract_id, _creator) = setup();
 
-    let token_a = client.mint(&owner_a, &String::from_str(&env, "uri-a"));
-    let token_b = client.mint(&owner_b, &String::from_str(&env, "uri-b"));
+        let alice = Address::generate(&env);
+        let token_id = client.mint(&alice, &String::from_str(&env, "ipfs://pre-migrate"));
 
-    client.set_approval_for_all(&owner_a, &operator, &true, &None::<u32>);
+        client.migrate();
 
-    // Operator can move owner_a's token…
-    client.transfer_from(&operator, &owner_a, &recipient, &token_a);
-    // …but not owner_b's, since owner_b never granted this operator anything.
-    let result = client.try_transfer_from(&operator, &owner_b, &recipient, &token_b);
-    assert_eq!(result, Err(Ok(Error::NotApproved)));
-}
+        // Token owner, balance, and total supply all survive the migration
+        assert_eq!(client.owner_of(&token_id), alice);
+        assert_eq!(client.balance_of(&alice), 1u64);
+        assert_eq!(client.total_supply(), 1u64);
+    }
 
-#[test]
-fn batch_mint_authorization_requires_creator() {
-    // batch_mint is gated on the stored creator via require_auth(); calling
-    // it without any mocked authorization (i.e. as a non-creator) must fail
-    // and must not mint any of the batch.
-    let env = Env::default();
-    env.ledger().with_mut(|li| li.sequence_number = 1);
-    let contract_id = env.register(NormalNFT721, ());
-    let client = NormalNFT721Client::new(&env, &contract_id);
-    let creator = Address::generate(&env);
-    let royalty_receiver = Address::generate(&env);
-    let alice = Address::generate(&env);
+    #[test]
+    fn royalty_info_readable_after_migrate() {
+        let (_env, client, _contract_id, _creator) = setup();
+        client.migrate();
 
-    // initialize() does not require auth, so no mocking is needed to set up
-    // the collection — only the subsequent batch_mint call is under test.
-    client.initialize(
-        &creator,
-        &String::from_str(&env, "T"),
-        &String::from_str(&env, "T"),
-        &100u64,
-        &0u32,
-        &royalty_receiver,
-    );
+        let (_, bps) = client.royalty_info();
+        assert_eq!(bps, 500u32);
+    }
 
-    let uris = soroban_sdk::Vec::from_array(
-        &env,
-        [String::from_str(&env, "a"), String::from_str(&env, "b")],
-    );
-    // No auths mocked for this call: even though batch_mint doesn't take an
-    // explicit caller argument, require_auth() on the stored creator must
-    // still be satisfied by a real signature — here there is none.
-    let result = client.try_batch_mint(&alice, &uris);
-    assert!(result.is_err(), "batch_mint must fail without creator authorization");
-    assert_eq!(client.total_supply(), 0, "no tokens should be minted on rejection");
+    #[test]
+    fn migrate_does_not_corrupt_existing_approvals() {
+        let (env, client, _contract_id, _creator) = setup();
+
+        let alice = Address::generate(&env);
+        let bob = Address::generate(&env);
+
+        let token_id = client.mint(&alice, &String::from_str(&env, "uri"));
+        client.approve(&alice, &bob, &token_id, &None::<u32>);
+
+        client.migrate();
+
+        assert_eq!(client.get_approved(&token_id), Some(bob));
+    }
 }

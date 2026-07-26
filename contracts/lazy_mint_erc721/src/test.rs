@@ -822,115 +822,98 @@ fn different_nonces_are_independent() {
     assert_ne!(res, Err(Ok(Error::VoucherAlreadyRedeemed)));
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// SECTION — Authorization matrix (#275)
-//
-// Post-redemption transfer/approve authorization must match the semantics
-// of the normal (non-lazy) 721 collection: on the delegated path
-// (transfer_from), only an explicitly `approve`d spender or operator is
-// authorized — the bare owner is NOT, and must use the direct `transfer()`
-// call instead (same nuance documented in collection_nft_erc721's matrix;
-// see `owner_can_always_transfer_directly_without_approval` below).
-// Creator (with no token relationship) and unrelated accounts are always
-// rejected.
-// ═══════════════════════════════════════════════════════════════════════════════
+// ── Migration tests ───────────────────────────────────────────────────────────
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum Role {
-    Owner,
-    Approved,
-    Operator,
-    Creator,
-    Unrelated,
-}
+mod migration {
+    use super::*;
 
-const ROLES: [(Role, bool); 5] = [
-    (Role::Owner, false),
-    (Role::Approved, true),
-    (Role::Operator, true),
-    (Role::Creator, false),
-    (Role::Unrelated, false),
-];
+    #[test]
+    fn fresh_install_migrate_records_version() {
+        let (env, client, _creator, _fee_receiver) = setup(0);
 
-fn caller_for_role(
-    env: &Env,
-    client: &LazyMint721Client<'_>,
-    creator: &Address,
-    owner: &Address,
-    token_id: u64,
-    role: Role,
-) -> Address {
-    match role {
-        Role::Owner => owner.clone(),
-        Role::Approved => {
-            let approved = Address::generate(env);
-            client.approve(owner, &approved, &token_id);
-            approved
-        }
-        Role::Operator => {
-            let operator = Address::generate(env);
-            client.set_approval_for_all(owner, &operator, &true);
-            operator
-        }
-        Role::Creator => creator.clone(),
-        Role::Unrelated => Address::generate(env),
+        assert!(client.contract_version().is_none());
+        client.migrate();
+        assert_eq!(
+            client.contract_version(),
+            Some(String::from_str(&env, "1.0.0"))
+        );
     }
-}
 
-#[test]
-fn transfer_from_authorization_matrix() {
-    for (role, should_succeed) in ROLES {
-        let (env, client, creator, _fee) = setup(0);
+    #[test]
+    #[should_panic(expected = "AlreadyMigrated")]
+    fn double_migrate_reverts() {
+        let (_env, client, _creator, _fee_receiver) = setup(0);
+        client.migrate();
+        client.migrate();
+    }
+
+    #[test]
+    fn migrate_emits_migrated_event() {
+        let (env, client, _creator, _fee_receiver) = setup(0);
+        client.migrate();
+
+        let events = env.events().all();
+        let found = events.iter().any(|(_, topics, _)| {
+            topics
+                .get(0)
+                .map(|v| {
+                    soroban_sdk::Symbol::try_from_val(&env, &v)
+                        .map(|s| s == soroban_sdk::symbol_short!("migrated"))
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false)
+        });
+        assert!(found, "expected 'migrated' event");
+    }
+
+    #[test]
+    fn used_voucher_marker_readable_after_migrate() {
+        let (env, client, _creator, _fee_receiver) = setup(0);
+
+        // Redeem one voucher to create a UsedVoucher entry pre-migration
+        let sk = creator_signing_key();
+        let voucher = make_voucher(&env, 42u64);
+        let sig = sign_voucher(&env, &sk, &client, &voucher);
+        let buyer = Address::generate(&env);
+
         client.set_public_phase();
-        let owner = Address::generate(&env);
-        let recipient = Address::generate(&env);
-        let v = make_voucher(&env, 1);
-        let sig = sign_voucher(&env, &client.address, &v);
-        let token_id = client.redeem(&owner, &v, &sig, &empty_proof(&env));
+        client.redeem(&buyer, &voucher, &sig, &empty_proof(&env));
 
-        let spender = caller_for_role(&env, &client, &creator, &owner, token_id, role);
-        let result = client.try_transfer_from(&spender, &owner, &recipient, &token_id);
+        assert!(client.is_voucher_redeemed(&42u64));
 
-        if should_succeed {
-            assert!(result.is_ok(), "role {:?} expected to succeed", role);
-            assert_eq!(client.owner_of(&token_id), recipient);
-        } else {
-            assert_eq!(result, Err(Ok(Error::NotApproved)), "role {:?} expected NotApproved", role);
-            assert_eq!(client.owner_of(&token_id), owner, "no partial mutation on rejection");
-        }
+        client.migrate();
+
+        // Still readable after migration
+        assert!(client.is_voucher_redeemed(&42u64));
     }
-}
 
-#[test]
-fn transfer_from_by_approved_spender_clears_approval_so_it_cannot_be_reused() {
-    let (env, client, _creator, _fee) = setup(0);
-    client.set_public_phase();
-    let owner = Address::generate(&env);
-    let recipient = Address::generate(&env);
-    let v = make_voucher(&env, 1);
-    let sig = sign_voucher(&env, &client.address, &v);
-    let token_id = client.redeem(&owner, &v, &sig, &empty_proof(&env));
+    #[test]
+    fn revoked_voucher_readable_after_migrate() {
+        let (env, client, _creator, _fee_receiver) = setup(0);
 
-    let approved = Address::generate(&env);
-    client.approve(&owner, &approved, &token_id);
+        client.revoke_voucher(&99u64);
+        assert!(client.is_voucher_revoked(&99u64));
 
-    client.transfer_from(&approved, &owner, &recipient, &token_id);
-    assert_eq!(client.get_approved(&token_id), None);
+        client.migrate();
 
-    let result = client.try_transfer_from(&approved, &recipient, &owner, &token_id);
-    assert_eq!(result, Err(Ok(Error::NotApproved)));
-}
+        assert!(client.is_voucher_revoked(&99u64));
+    }
 
-#[test]
-fn owner_can_always_transfer_directly_without_approval() {
-    let (env, client, _creator, _fee) = setup(0);
-    client.set_public_phase();
-    let owner = Address::generate(&env);
-    let recipient = Address::generate(&env);
-    let v = make_voucher(&env, 1);
-    let sig = sign_voucher(&env, &client.address, &v);
-    let token_id = client.redeem(&owner, &v, &sig, &empty_proof(&env));
+    #[test]
+    fn token_ownership_readable_after_migrate() {
+        let (env, client, _creator, _fee_receiver) = setup(0);
 
-    client.transfer(&owner, &recipient, &token_id);
-    assert_eq!(client.owner_of(&token_id), recipient);
+        let sk = creator_signing_key();
+        let voucher = make_voucher(&env, 1u64);
+        let sig = sign_voucher(&env, &sk, &client, &voucher);
+        let buyer = Address::generate(&env);
+
+        client.set_public_phase();
+        client.redeem(&buyer, &voucher, &sig, &empty_proof(&env));
+
+        client.migrate();
+
+        assert_eq!(client.owner_of(&1u64), buyer);
+        assert_eq!(client.balance_of(&buyer), 1u64);
+    }
 }

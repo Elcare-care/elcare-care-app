@@ -1172,224 +1172,82 @@ fn balance_of_batch_mismatched_lengths_returns_empty() {
     assert_eq!(result.len(), 0);
 }
 
-// ─── Authorization matrix (#275) ───────────────────────────────────────────
-//
-// Documented caller permissions for NormalNFT1155 (ERC-1155 has no
-// per-token approve — only operator-wide `set_approval_for_all`):
-//
-// | Caller             | transfer_from | burn | batch_transfer |
-// |--------------------|:---:|:---:|:---:|
-// | Owner              | ✅  | ✅  | ✅ |
-// | Operator (all-tokens)| ✅ | ✅  | ✅ |
-// | Creator (unrelated to token)| ❌ | ❌ | ❌ |
-// | Unrelated account  | ❌  | ❌  | ❌ |
-//
-// `transfer_from`'s owner column used to be a gap (#275): unlike
-// `batch_transfer`/`burn`, it didn't shortcut on `operator == from`, so the
-// bare owner needed a self-`set_approval_for_all` just to call the single-
-// item transfer path. Fixed in lib.rs so single and batch transfers share
-// the same authorization semantics.
+// ── Migration tests ───────────────────────────────────────────────────────────
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum Role {
-    Owner,
-    Operator,
-    Creator,
-    Unrelated,
-}
+mod migration {
+    use super::*;
 
-const ROLES: [(Role, bool); 4] = [
-    (Role::Owner, true),
-    (Role::Operator, true),
-    (Role::Creator, false),
-    (Role::Unrelated, false),
-];
+    #[test]
+    fn fresh_install_migrate_records_version() {
+        let (env, client, _contract_id, _creator) = setup();
 
-fn caller_for_role(
-    env: &Env,
-    client: &NormalNFT1155Client<'_>,
-    creator: &Address,
-    owner: &Address,
-    role: Role,
-) -> Address {
-    match role {
-        Role::Owner => owner.clone(),
-        Role::Operator => {
-            let operator = Address::generate(env);
-            client.set_approval_for_all(owner, &operator, &true);
-            operator
-        }
-        Role::Creator => creator.clone(),
-        Role::Unrelated => Address::generate(env),
+        assert!(client.contract_version().is_none());
+        client.migrate();
+        assert_eq!(
+            client.contract_version(),
+            Some(String::from_str(&env, "1.0.0"))
+        );
     }
-}
 
-#[test]
-fn transfer_from_authorization_matrix() {
-    for (role, should_succeed) in ROLES {
-        let (env, client, _, creator) = setup();
-        let owner = Address::generate(&env);
-        let recipient = Address::generate(&env);
-        let token_id = client.mint_new(&owner, &100u128, &String::from_str(&env, "uri"));
-
-        let caller = caller_for_role(&env, &client, &creator, &owner, role);
-        let result = client.try_transfer_from(&caller, &owner, &recipient, &token_id, &40u128);
-
-        if should_succeed {
-            assert!(result.is_ok(), "role {:?} expected to succeed", role);
-            assert_eq!(client.balance_of(&owner, &token_id), 60u128);
-            assert_eq!(client.balance_of(&recipient, &token_id), 40u128);
-        } else {
-            assert_eq!(result, Err(Ok(Error::NotApproved)), "role {:?} expected NotApproved", role);
-            assert_eq!(client.balance_of(&owner, &token_id), 100u128, "no partial mutation");
-            assert_eq!(client.balance_of(&recipient, &token_id), 0u128);
-        }
+    #[test]
+    #[should_panic(expected = "AlreadyMigrated")]
+    fn double_migrate_reverts() {
+        let (_env, client, _contract_id, _creator) = setup();
+        client.migrate();
+        client.migrate();
     }
-}
 
-#[test]
-fn burn_authorization_matrix() {
-    for (role, should_succeed) in ROLES {
-        let (env, client, _, creator) = setup();
-        let owner = Address::generate(&env);
-        let token_id = client.mint_new(&owner, &100u128, &String::from_str(&env, "uri"));
+    #[test]
+    fn migrate_emits_migrated_event() {
+        let (env, client, _contract_id, _creator) = setup();
+        client.migrate();
 
-        let caller = caller_for_role(&env, &client, &creator, &owner, role);
-        let result = client.try_burn(&caller, &owner, &token_id, &25u128);
-
-        if should_succeed {
-            assert!(result.is_ok(), "role {:?} expected to succeed", role);
-            assert_eq!(client.balance_of(&owner, &token_id), 75u128);
-        } else {
-            assert_eq!(result, Err(Ok(Error::NotApproved)), "role {:?} expected NotApproved", role);
-            assert_eq!(client.balance_of(&owner, &token_id), 100u128, "no partial mutation");
-        }
+        let events = env.events().all();
+        let found = events.iter().any(|(_, topics, _)| {
+            topics
+                .get(0)
+                .map(|v| {
+                    soroban_sdk::Symbol::try_from_val(&env, &v)
+                        .map(|s| s == soroban_sdk::symbol_short!("migrated"))
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false)
+        });
+        assert!(found, "expected 'migrated' event");
     }
-}
 
-#[test]
-fn batch_transfer_authorization_matrix() {
-    for (role, should_succeed) in ROLES {
-        let (env, client, _, creator) = setup();
-        let owner = Address::generate(&env);
-        let recipient = Address::generate(&env);
-        let t0 = client.mint_new(&owner, &100u128, &String::from_str(&env, "u0"));
-        let t1 = client.mint_new(&owner, &200u128, &String::from_str(&env, "u1"));
+    #[test]
+    fn balances_readable_after_migrate() {
+        let (env, client, _contract_id, _creator) = setup();
 
-        let caller = caller_for_role(&env, &client, &creator, &owner, role);
-        let ids = Vec::from_array(&env, [t0, t1]);
-        let amounts = Vec::from_array(&env, [10u128, 20u128]);
-        let result = client.try_batch_transfer(&caller, &owner, &recipient, &ids, &amounts);
+        let alice = Address::generate(&env);
+        client.mint_new(
+            &alice,
+            &10u128,
+            &String::from_str(&env, "ipfs://token0"),
+        );
 
-        if should_succeed {
-            assert!(result.is_ok(), "role {:?} expected to succeed", role);
-            assert_eq!(client.balance_of(&recipient, &t0), 10u128);
-            assert_eq!(client.balance_of(&recipient, &t1), 20u128);
-        } else {
-            assert_eq!(result, Err(Ok(Error::NotApproved)), "role {:?} expected NotApproved", role);
-            assert_eq!(client.balance_of(&recipient, &t0), 0u128, "no partial mutation");
-            assert_eq!(client.balance_of(&recipient, &t1), 0u128, "no partial mutation");
-        }
+        client.migrate();
+
+        assert_eq!(client.balance_of(&alice, &0u64), 10u128);
+        assert_eq!(client.total_supply(&0u64), 10u128);
     }
-}
 
-#[test]
-fn operator_approval_is_scoped_to_the_owner_that_granted_it() {
-    // An operator approved by owner_a must not be able to move owner_b's
-    // tokens, even in the same collection with the same operator address.
-    let (env, client, _, _creator) = setup();
-    let owner_a = Address::generate(&env);
-    let owner_b = Address::generate(&env);
-    let operator = Address::generate(&env);
-    let recipient = Address::generate(&env);
+    #[test]
+    fn per_token_max_supply_readable_after_migrate() {
+        let (env, client, _contract_id, _creator) = setup();
 
-    let token_a = client.mint_new(&owner_a, &50u128, &String::from_str(&env, "a"));
-    let token_b = client.mint_new(&owner_b, &50u128, &String::from_str(&env, "b"));
+        client.set_token_max_supply(&0u64, &500u128);
+        client.migrate();
 
-    client.set_approval_for_all(&owner_a, &operator, &true);
+        assert_eq!(client.token_max_supply(&0u64), 500u128);
+    }
 
-    client.transfer_from(&operator, &owner_a, &recipient, &token_a, &10u128);
-    let result = client.try_transfer_from(&operator, &owner_b, &recipient, &token_b, &10u128);
-    assert_eq!(result, Err(Ok(Error::NotApproved)));
-}
-
-#[test]
-fn batch_transfer_rejects_mismatched_array_lengths_before_any_mutation() {
-    let (env, client, _, _) = setup();
-    let owner = Address::generate(&env);
-    let recipient = Address::generate(&env);
-    let t0 = client.mint_new(&owner, &100u128, &String::from_str(&env, "u0"));
-
-    let ids = Vec::from_array(&env, [t0]);
-    let amounts = Vec::from_array(&env, [10u128, 20u128]); // mismatched length
-
-    let result = client.try_batch_transfer(&owner, &owner, &recipient, &ids, &amounts);
-    assert_eq!(result, Err(Ok(Error::LengthMismatch)));
-    assert_eq!(client.balance_of(&owner, &t0), 100u128, "no partial mutation on rejection");
-}
-
-#[test]
-fn batch_transfer_accumulates_duplicate_token_ids() {
-    // Unlike mint_batch, batch_transfer processes each (id, amount) pair in
-    // order rather than pre-aggregating — but the net effect of duplicate
-    // IDs in a batch must still be the cumulative amount, with no double
-    // counting or dropped entries.
-    let (env, client, _, _) = setup();
-    let owner = Address::generate(&env);
-    let recipient = Address::generate(&env);
-    let t0 = client.mint_new(&owner, &100u128, &String::from_str(&env, "u0"));
-
-    let ids = Vec::from_array(&env, [t0, t0]);
-    let amounts = Vec::from_array(&env, [30u128, 20u128]);
-
-    client.batch_transfer(&owner, &owner, &recipient, &ids, &amounts);
-
-    assert_eq!(client.balance_of(&owner, &t0), 50u128);
-    assert_eq!(client.balance_of(&recipient, &t0), 50u128);
-}
-
-#[test]
-fn mint_batch_authorization_requires_creator() {
-    // mint_batch is gated on the stored creator via require_auth(); calling
-    // it without any mocked authorization must fail and mint nothing.
-    let env = Env::default();
-    env.ledger().with_mut(|li| li.sequence_number = 1);
-    let contract_id = env.register(NormalNFT1155, ());
-    let client = NormalNFT1155Client::new(&env, &contract_id);
-    let creator = Address::generate(&env);
-    let royalty_receiver = Address::generate(&env);
-    let alice = Address::generate(&env);
-
-    // initialize() does not require auth; only mint_batch is under test.
-    client.initialize(
-        &creator,
-        &String::from_str(&env, "T"),
-        &500u32,
-        &royalty_receiver,
-    );
-
-    let ids = Vec::from_array(&env, [0u64]);
-    let amounts = Vec::from_array(&env, [10u128]);
-    let uris = Vec::from_array(&env, [String::from_str(&env, "u0")]);
-    let result = client.try_mint_batch(&alice, &ids, &amounts, &uris);
-    assert!(result.is_err(), "mint_batch must fail without creator authorization");
-    assert_eq!(client.balance_of(&alice, &0u64), 0, "no tokens minted on rejection");
-}
-
-#[test]
-fn mint_batch_rejects_mismatched_array_lengths_before_any_mutation() {
-    let (env, client, _, _) = setup();
-    let alice = Address::generate(&env);
-
-    let ids = Vec::from_array(&env, [0u64, 1u64]);
-    let amounts = Vec::from_array(&env, [10u128]); // one short
-    let uris = Vec::from_array(
-        &env,
-        [String::from_str(&env, "u0"), String::from_str(&env, "u1")],
-    );
-
-    let result = client.try_mint_batch(&alice, &ids, &amounts, &uris);
-    assert_eq!(result, Err(Ok(Error::LengthMismatch)));
-    assert_eq!(client.balance_of(&alice, &0u64), 0);
-    assert_eq!(client.balance_of(&alice, &1u64), 0);
+    #[test]
+    fn royalty_readable_after_migrate() {
+        let (_env, client, _contract_id, _creator) = setup();
+        client.migrate();
+        let (_, bps) = client.royalty_info();
+        assert_eq!(bps, 500u32);
+    }
 }

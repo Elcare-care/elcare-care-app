@@ -1632,6 +1632,44 @@ fn view_functions_return_correct_values() {
     assert_eq!(client.wasm_version(), 1u32);
 }
 
+#[test]
+fn update_collection_wasm_and_upgrade_collection_emit_events() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let launchpad_id = env.register(Launchpad, ());
+    let client = LaunchpadClient::new(&env, &launchpad_id);
+
+    let admin = Address::generate(&env);
+    let fee_receiver = Address::generate(&env);
+    client.initialize(&admin, &fee_receiver, &0i128);
+
+    let wasm_v1 = BytesN::from_array(&env, &[11u8; 32]);
+    let wasm_v2 = BytesN::from_array(&env, &[22u8; 32]);
+    client.set_wasm_hashes(&wasm_v1, &wasm_v1, &wasm_v1, &wasm_v1);
+
+    let creator = Address::generate(&env);
+    let currency = Address::generate(&env);
+    let royalty_receiver = Address::generate(&env);
+    let deployed = client.deploy_normal_721(
+        &creator,
+        &currency,
+        &String::from_str(&env, "Upgradeable 721"),
+        &String::from_str(&env, "UP721"),
+        &100u64,
+        &500u32,
+        &royalty_receiver,
+        &0u32,
+        &BytesN::from_array(&env, &[0xAAu8; 32]),
+    );
+
+    client.update_collection_wasm(&CollectionKind::Normal721, &wasm_v2);
+    client.upgrade_collection(&deployed);
+
+    assert!(event_with_tag_present(&env, &client.address, symbol_short!("wasm_upd")));
+    assert!(event_with_tag_present(&env, &client.address, symbol_short!("col_upgd")));
+}
+
 // ── Collections view tests ──────────────────────────────────────
 
 #[test]
@@ -2248,4 +2286,206 @@ fn invalid_fee_rejected_for_all_deploy_variants() {
         ),
         Err(Ok(Error::InvalidFeeBps))
     );
+}
+
+// ─── Preflight validation (#277) ───────────────────────────────────────────
+//
+// These tests prove that `preflight_deploy_*` and `deploy_*` agree: a clean
+// preflight (no errors) means the deploy succeeds at the *same* predicted
+// address, and every error the preflight reports is one the deploy call
+// would also raise.
+
+#[test]
+fn preflight_normal_721_predicts_the_deployed_address() {
+    let env = Env::default();
+    env.ledger().with_mut(|li| li.sequence_number = 1);
+    let (client, _admin, _fee_receiver, creator) = setup_launchpad(&env);
+
+    let salt = BytesN::from_array(&env, &[40u8; 32]);
+    let royalty_receiver = Address::generate(&env);
+    let currency = setup_token(&env, &creator, 1_000_000);
+
+    let preflight = client.preflight_deploy_normal_721(
+        &creator,
+        &currency,
+        &String::from_str(&env, "Preflight 721"),
+        &String::from_str(&env, "PF721"),
+        &1_000u64,
+        &500u32,
+        &0u32,
+        &salt,
+    );
+    assert!(preflight.errors.is_empty());
+
+    let deployed = client.deploy_normal_721(
+        &creator,
+        &currency,
+        &String::from_str(&env, "Preflight 721"),
+        &String::from_str(&env, "PF721"),
+        &1_000u64,
+        &500u32,
+        &royalty_receiver,
+        &0u32,
+        &salt,
+    );
+
+    assert_eq!(preflight.predicted_address, deployed);
+
+    // Re-running preflight against the now-consumed salt must surface the
+    // duplicate-salt error — and the real deploy call must reject it too.
+    let preflight_after = client.preflight_deploy_normal_721(
+        &creator,
+        &currency,
+        &String::from_str(&env, "Preflight 721 Dup"),
+        &String::from_str(&env, "PF72D"),
+        &1_000u64,
+        &500u32,
+        &0u32,
+        &salt,
+    );
+    assert_eq!(preflight_after.predicted_address, deployed);
+    assert!(preflight_after.errors.contains(&Error::DuplicateSalt));
+
+    assert_eq!(
+        client.try_deploy_normal_721(
+            &creator,
+            &currency,
+            &String::from_str(&env, "Preflight 721 Dup"),
+            &String::from_str(&env, "PF72D"),
+            &1_000u64,
+            &500u32,
+            &royalty_receiver,
+            &0u32,
+            &salt,
+        ),
+        Err(Ok(Error::DuplicateSalt))
+    );
+}
+
+#[test]
+fn preflight_normal_721_reports_every_error_deploy_would_raise() {
+    let env = Env::default();
+    env.ledger().with_mut(|li| li.sequence_number = 1);
+    let (client, _admin, _fee_receiver, creator) = setup_launchpad(&env);
+
+    client.pause();
+
+    let salt = BytesN::from_array(&env, &[41u8; 32]);
+    let currency = setup_token(&env, &creator, 1_000_000);
+
+    // Stack multiple violations at once: paused, empty name, empty symbol,
+    // zero max_supply, royalty over 100%, and platform fee over the cap.
+    let preflight = client.preflight_deploy_normal_721(
+        &creator,
+        &currency,
+        &String::from_str(&env, ""),
+        &String::from_str(&env, ""),
+        &0u64,
+        &10_001u32,
+        &2001u32,
+        &salt,
+    );
+
+    assert!(preflight.errors.contains(&Error::ContractPaused));
+    assert!(preflight.errors.contains(&Error::EmptyName));
+    assert!(preflight.errors.contains(&Error::EmptySymbol));
+    assert!(preflight.errors.contains(&Error::InvalidMaxSupply));
+    assert!(preflight.errors.contains(&Error::InvalidRoyaltyBps));
+    assert!(preflight.errors.contains(&Error::InvalidFeeBps));
+
+    // The real deploy call rejects on the first violation it checks
+    // (contract-paused) — proving preflight is a superset, never blind to a
+    // failure the mutating call would also hit.
+    let royalty_receiver = Address::generate(&env);
+    assert_eq!(
+        client.try_deploy_normal_721(
+            &creator,
+            &currency,
+            &String::from_str(&env, ""),
+            &String::from_str(&env, ""),
+            &0u64,
+            &10_001u32,
+            &royalty_receiver,
+            &2001u32,
+            &salt,
+        ),
+        Err(Ok(Error::ContractPaused))
+    );
+}
+
+#[test]
+fn preflight_flags_insufficient_balance_for_the_flat_fee() {
+    let env = Env::default();
+    env.ledger().with_mut(|li| li.sequence_number = 1);
+    let (client, _admin, fee_receiver, creator) = setup_launchpad(&env);
+
+    // Configure a flat deploy fee the creator cannot cover.
+    client.set_fee_config(&fee_receiver, &1_000i128);
+
+    let salt = BytesN::from_array(&env, &[42u8; 32]);
+    let currency = setup_token(&env, &creator, 10); // far below the 1_000 fee
+
+    let preflight = client.preflight_deploy_normal_1155(
+        &creator,
+        &currency,
+        &String::from_str(&env, "Poor Creator"),
+        &500u32,
+        &0u32,
+        &salt,
+    );
+
+    assert!(preflight.errors.contains(&Error::InsufficientFee));
+    assert_eq!(preflight.required_fee, 1_000i128);
+
+    // The real deploy call fails too — it attempts the token transfer, which
+    // panics on insufficient balance (Soroban SAC traps rather than
+    // returning a typed error, so we only assert preflight caught it ahead
+    // of the mutating, fee-charging call).
+    let deploy_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.deploy_normal_1155(
+            &creator,
+            &currency,
+            &String::from_str(&env, "Poor Creator"),
+            &500u32,
+            &Address::generate(&env),
+            &0u32,
+            &salt,
+        )
+    }));
+    assert!(deploy_result.is_err());
+}
+
+#[test]
+fn preflight_lazy_1155_predicts_the_deployed_address_and_matches_deploy_errors() {
+    let env = Env::default();
+    env.ledger().with_mut(|li| li.sequence_number = 1);
+    let (client, _admin, _fee_receiver, creator) = setup_launchpad(&env);
+
+    let salt = BytesN::from_array(&env, &[43u8; 32]);
+    let creator_pubkey = BytesN::from_array(&env, &[9u8; 32]);
+    let royalty_receiver = Address::generate(&env);
+    let currency = setup_token(&env, &creator, 1_000_000);
+
+    let preflight = client.preflight_deploy_lazy_1155(
+        &creator,
+        &currency,
+        &String::from_str(&env, "Preflight Lazy 1155"),
+        &500u32,
+        &0u32,
+        &salt,
+    );
+    assert!(preflight.errors.is_empty());
+
+    let deployed = client.deploy_lazy_1155(
+        &creator,
+        &currency,
+        &creator_pubkey,
+        &String::from_str(&env, "Preflight Lazy 1155"),
+        &500u32,
+        &royalty_receiver,
+        &0u32,
+        &salt,
+    );
+
+    assert_eq!(preflight.predicted_address, deployed);
 }

@@ -148,6 +148,9 @@ export function parseMarketplaceEvent(
   else if (obj.offerer)  actor = String(obj.offerer);
   else if (obj.bidder)   actor = String(obj.bidder);
   else if (obj.buyer)    actor = String(obj.buyer);
+  // Collection fee events carry no personal actor — use the collection address
+  // as a stable identifier so the MarketplaceEvent.actor column is never empty.
+  else if (obj.collection) actor = String(obj.collection);
 
   // For deploy events the value is a 2-tuple [creator, contract_address]
   if (
