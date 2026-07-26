@@ -101,6 +101,8 @@ model Auction {
   createdAt       DateTime      @default(now())
   updatedAt       DateTime      @updatedAt
   @@index([updatedAtLedger])
+  @@index([status, updatedAtLedger])
+  @@index([creator, updatedAtLedger])
 }
 
 model Offer {
@@ -117,6 +119,7 @@ model Offer {
   createdAt       DateTime    @default(now())
   updatedAt       DateTime    @updatedAt
   @@index([listingId])
+  @@index([listingId, updatedAtLedger])
 }
 
 model Bid {
@@ -148,6 +151,8 @@ model MarketplaceEvent {
   @@index([ledgerSequence])
   @@index([listingId, ledgerSequence])
   @@index([contractId])
+  @@index([actor, ledgerSequence])
+  @@index([contractId, ledgerSequence])
   @@unique([listingId, eventType, ledgerSequence])
 }
 
@@ -177,6 +182,8 @@ model Collection {
   deployedAtLedger Int
   createdAt       DateTime @default(now())
   @@index([creator])
+  @@index([creator, deployedAtLedger])
+  @@index([kind, deployedAtLedger])
 }
 
 // ── Backfill subsystem ───────────────────────────────────────────────────────
@@ -294,4 +301,70 @@ model KeeperAction {
   @@index([status])
   @@index([targetType, status])
   @@index([updatedAt])
+}
+
+// ── Dead-letter storage (#287) ────────────────────────────────────────────────
+//
+// Stores every event that the parser or domain-application layer fails to
+// process.  Operators can inspect records and replay them after a parser fix
+// using the dead-letter-replay CLI (src/dead-letter-replay.ts).
+//
+// rawTopics / rawValue are bounded at write time (max 512 / 2000 chars each).
+// errorMessage is truncated to 1000 chars and stack-frame paths are redacted.
+
+enum DeadLetterStatus {
+  Pending   // awaiting replay
+  Replayed  // successfully re-processed after a parser fix
+  Failed    // replay exhausted attempts; needs manual review
+}
+
+model DeadLetterEvent {
+  id             Int              @id @default(autoincrement())
+  network        String           @default("")
+  contractId     String
+  ledgerSequence Int
+  txHash         String
+  eventIndex     Int
+  rawTopics      Json
+  rawValue       String           @default("")
+  errorCode      String           // "SCHEMA_DECODE" | "UNKNOWN"
+  errorMessage   String
+  parserVersion  String           @default("")
+  status         DeadLetterStatus @default(Pending)
+  attempts       Int              @default(0)
+  createdAt      DateTime         @default(now())
+  updatedAt      DateTime         @updatedAt
+
+  @@unique([contractId, ledgerSequence, txHash, eventIndex])
+  @@index([status])
+  @@index([contractId, ledgerSequence])
+  @@index([createdAt])
+}
+
+// ── Reconciliation repairs (#288) ─────────────────────────────────────────────
+//
+// Audit trail for every field-level correction the reconciler applies.
+// Preserves oldValue so corrections are reversible and the history is auditable.
+// DryRun rows are written in dry-run mode so operators can preview changes.
+
+enum RepairStatus {
+  Applied  // correction written to the DB
+  DryRun   // would-be correction (dry-run mode; DB not modified)
+  Failed   // repair attempted but failed
+}
+
+model ReconciliationRepair {
+  id           Int          @id @default(autoincrement())
+  modelType    String       // "listing" | "auction" | "offer" | "collection"
+  recordId     String       // stringified BigInt / Int primary key
+  field        String       // e.g. "status", "price", "highestBid"
+  oldValue     String
+  newValue     String
+  reason       String       // e.g. "chain_status_mismatch"
+  sourceLedger Int
+  status       RepairStatus @default(Applied)
+  createdAt    DateTime     @default(now())
+
+  @@index([modelType, recordId])
+  @@index([createdAt])
 }

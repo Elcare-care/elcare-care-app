@@ -298,6 +298,49 @@ export const backfillLockContentions = new client.Counter({
   help: 'Number of times a BackfillJob advisory lock was already held by another worker',
 });
 
+// ── Dead-letter metrics (#287) ────────────────────────────────────────────────
+
+/** Total events that failed to parse and were persisted to dead-letter storage. */
+export const deadLetterCreatedTotal = new client.Counter({
+  name: 'indexer_dead_letter_created_total',
+  help: 'Total events persisted to dead-letter storage, by error code',
+  labelNames: ['error_code'],
+});
+
+/** Current number of Pending (unresolved) dead-letter records. */
+export const deadLetterPendingGauge = new client.Gauge({
+  name: 'indexer_dead_letter_pending',
+  help: 'Current number of dead-letter records in Pending status',
+});
+
+/** Age in seconds of the oldest Pending dead-letter record (0 when none). */
+export const deadLetterOldestAgeSeconds = new client.Gauge({
+  name: 'indexer_dead_letter_oldest_age_seconds',
+  help: 'Age in seconds of the oldest unresolved (Pending) dead-letter event',
+});
+
+// ── Reconciliation metrics (#288) ─────────────────────────────────────────────
+
+/** Total field-level discrepancies found per reconciliation run, by model and field. */
+export const reconcilerDiscrepanciesTotal = new client.Counter({
+  name: 'indexer_reconciler_discrepancies_total',
+  help: 'Total discrepancies detected during reconciliation, by model and field',
+  labelNames: ['model', 'field'],
+});
+
+/** Total deterministic repairs applied (or logged in dry-run), by model. */
+export const reconcilerRepairsTotal = new client.Counter({
+  name: 'indexer_reconciler_repairs_total',
+  help: 'Total repairs applied (or dry-run) by the reconciler, by model',
+  labelNames: ['model', 'dry_run'],
+});
+
+/** Number of records with detected drift in the last reconciliation run. */
+export const reconcilerDriftGauge = new client.Gauge({
+  name: 'indexer_reconciler_drift_records',
+  help: 'Number of records with detected drift in the most recent reconciliation run',
+});
+
 // ── Expose metrics handler ────────────────────────────────────────────────────
 
 export async function handleMetrics(req: express.Request, res: express.Response) {
