@@ -720,6 +720,33 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
       break;
     }
 
+    case 'ROYALTY_PAID': {
+      // Royalty audit trail (Issue #201): one RoyaltyPayment row per
+      // breakdown entry, written in a single atomic createMany. Field values
+      // arrive as strings via convertBigInts.
+      const isListing = data.listing_id !== undefined && data.listing_id !== null;
+      const isAuction = data.auction_id !== undefined && data.auction_id !== null;
+      const entries: Array<{ address: string; amount: string }> = Array.isArray(data.recipients)
+        ? data.recipients
+        : [];
+      if (entries.length > 0) {
+        await db.royaltyPayment.createMany({
+          data: entries.map((r) => ({
+            listingId: isListing ? BigInt(data.listing_id) : null,
+            auctionId: isAuction ? BigInt(data.auction_id) : null,
+            recipient: String(r.address),
+            amount: String(r.amount),
+            salePrice: String(data.sale_price),
+            ledgerSequence,
+          })),
+        });
+      }
+      for (const r of entries) {
+        invalidatePattern(`cache:*/wallets/${r.address}/royalty-breakdown*`).catch(() => {});
+      }
+      break;
+    }
+
     case 'LISTING_CANCELLED': {
       const { count } = await db.listing.updateMany({
         where: { listingId },

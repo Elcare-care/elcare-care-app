@@ -18,6 +18,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 ENV_FILE="$SCRIPT_DIR/.env.deploy"
 DEPLOYED_IDS="$SCRIPT_DIR/deployed_ids.env"
+DEPLOYED_VERSIONS="$SCRIPT_DIR/deployed_versions.json"
 CONTRACT_DIR="$REPO_ROOT/contracts/soroban-marketplace"
 WASM_LOCAL="$CONTRACT_DIR/target/wasm32v1-none/release/soroban_marketplace.wasm"
 WASM_WORKSPACE="$REPO_ROOT/target/wasm32v1-none/release/soroban_marketplace.wasm"
@@ -137,6 +138,38 @@ NETWORK=$NETWORK
 RPC_URL=$RPC_URL
 EOF
 echo "  Deployed IDs written to $DEPLOYED_IDS"
+
+# ── Write version mapping (WASM hash → source version) ───────
+CONTRACT_VERSION=$(grep '^version' "$CONTRACT_DIR/Cargo.toml" | head -1 | sed 's/.*"\(.*\)".*/\1/')
+CONTRACT_SEMVER=$(grep 'CONTRACT_VERSION' "$CONTRACT_DIR/src/contract.rs" | head -1 | sed 's/.*"\(.*\)".*/\1/')
+GIT_SHA=$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo "unknown")
+
+# Merge into deployed_versions.json (append or create)
+if [[ -f "$DEPLOYED_VERSIONS" ]]; then
+  EXISTING=$(cat "$DEPLOYED_VERSIONS")
+else
+  EXISTING='{"deployments":[]}'
+fi
+
+echo "$EXISTING" | jq \
+  --arg contract_id "$CONTRACT_ID" \
+  --arg wasm_hash "$WASM_HASH" \
+  --arg cargo_version "$CONTRACT_VERSION" \
+  --arg contract_version "$CONTRACT_SEMVER" \
+  --arg git_sha "$GIT_SHA" \
+  --arg network "$NETWORK" \
+  --arg deployed_at "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+  '.deployments += [{
+    "contract": "soroban-marketplace",
+    "contract_id": $contract_id,
+    "wasm_hash": $wasm_hash,
+    "cargo_version": $cargo_version,
+    "contract_version": $contract_version,
+    "git_sha": $git_sha,
+    "network": $network,
+    "deployed_at": $deployed_at
+  }]' > "$DEPLOYED_VERSIONS"
+echo "  Version mapping written to $DEPLOYED_VERSIONS"
 
 # ── Write frontend .env.local ────────────────────────────────
 mkdir -p "$(dirname "$FRONTEND_ENV")"

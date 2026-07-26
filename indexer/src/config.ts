@@ -1,5 +1,25 @@
 import { z } from 'zod';
 
+// ── Version metadata ─────────────────────────────────────────────────────────
+// Sourced from versions.toml at build time.  Dockerfile and CI set these via
+// build args or environment variables.  Fallback values allow local dev without
+// the build args present.
+
+export const VERSION = {
+  /** Application version — matches indexer/package.json */
+  app: process.env.INDEXER_VERSION || process.env.npm_package_version || '0.0.0-dev',
+  /** OpenAPI / REST API version — must match openapi.json info.version */
+  api: process.env.API_VERSION || '1.0.0',
+  /** Event schema version — bump when contract event fields change */
+  eventSchema: process.env.EVENT_SCHEMA_VERSION || '1',
+  /** Latest Prisma migration prefix (YYYYMMDDNNNNNN) */
+  dbMigration: process.env.DB_MIGRATION_VERSION || '20260724000000',
+  /** Git commit SHA embedded at build time */
+  gitSha: process.env.BUILD_SHA || 'unknown',
+  /** ISO-8601 build timestamp */
+  buildTime: process.env.BUILD_TIME || 'unknown',
+} as const;
+
 // ── Generic helpers ──────────────────────────────────────────────────────────
 
 function parsePositiveInt(name: string, raw: string | undefined, defaultVal: number): number {

@@ -91,6 +91,15 @@ export const syncGapsQuerySchema = z.object({
   offset: positiveInt(10_000).optional(),
 });
 
+export const royaltyBreakdownQuerySchema = z.object({
+  /** Inclusive lower ledger-sequence bound. */
+  from:   z.coerce.number().int().min(0).optional(),
+  /** Inclusive upper ledger-sequence bound. */
+  to:     z.coerce.number().int().min(0).optional(),
+  limit:  positiveInt(1000).optional(),
+  offset: positiveInt(10_000).optional(),
+});
+
 export const artistMetricsQuerySchema = z.object({
   range: z.enum(['day', 'week', 'month']).optional(),
 });

@@ -11,7 +11,7 @@ import { rpc } from '@stellar/stellar-sdk';
 import prisma from './db.js';
 import redis from './redis.js';
 import { logger } from './logger.js';
-import { getConfirmationHealthSummary } from './reorg.js';
+import { VERSION } from './config.js';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -29,6 +29,15 @@ export interface AggregateHealth {
   checks: Record<string, HealthCheckResult>;
   /** Unix timestamp (ms) when this snapshot was taken. */
   timestamp: number;
+  /** Component version metadata for runtime identification. */
+  version: {
+    app: string;
+    api: string;
+    eventSchema: string;
+    dbMigration: string;
+    gitSha: string;
+    buildTime: string;
+  };
 }
 
 // ── Thresholds ────────────────────────────────────────────────────────────────
@@ -221,7 +230,19 @@ export async function runAllChecks(): Promise<AggregateHealth> {
     statuses.includes('down')     ? 'down' :
     statuses.includes('degraded') ? 'degraded' : 'ok';
 
-  return { status: overall, checks, timestamp: Date.now() };
+  return {
+    status: overall,
+    checks,
+    timestamp: Date.now(),
+    version: {
+      app: VERSION.app,
+      api: VERSION.api,
+      eventSchema: VERSION.eventSchema,
+      dbMigration: VERSION.dbMigration,
+      gitSha: VERSION.gitSha,
+      buildTime: VERSION.buildTime,
+    },
+  };
 }
 
 /**
