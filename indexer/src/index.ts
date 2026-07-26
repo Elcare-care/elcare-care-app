@@ -21,6 +21,7 @@ import {
   runAllChecks,
   runReadinessChecks,
 } from './health.js';
+import { VERSION } from './config.js';
 import { warmCache } from './cache-warmer.js';
 
 dotenv.config();
@@ -51,6 +52,15 @@ app.use(express.json());
 // Global baseline rate limiter
 app.use(globalRateLimiter);
 
+// ── Version headers middleware — attaches version metadata to every response ─
+app.use((_req: express.Request, res: express.Response, next: express.NextFunction) => {
+  res.setHeader('X-Indexer-Version', VERSION.app);
+  res.setHeader('X-API-Version', VERSION.api);
+  res.setHeader('X-Event-Schema-Version', VERSION.eventSchema);
+  res.setHeader('X-DB-Migration-Version', VERSION.dbMigration);
+  next();
+});
+
 // Request logging and metrics
 app.use(requestLogger);
 app.use(metricsMiddleware);
@@ -80,6 +90,18 @@ app.get('/health', async (_req: express.Request, res: express.Response) => {
   const result = await runAllChecks();
   const httpStatus = result.status === 'down' ? 503 : 200;
   res.status(httpStatus).json(result);
+});
+
+// ── Version endpoint — lightweight, no auth required ────────────────────────
+app.get('/version', (_req: express.Request, res: express.Response) => {
+  res.json({
+    app: VERSION.app,
+    api: VERSION.api,
+    eventSchema: VERSION.eventSchema,
+    dbMigration: VERSION.dbMigration,
+    gitSha: VERSION.gitSha,
+    buildTime: VERSION.buildTime,
+  });
 });
 
 // GET /health/details — full diagnostics, requires admin token

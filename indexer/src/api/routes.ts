@@ -19,8 +19,9 @@ import {
   statsQuerySchema,
   syncGapsQuerySchema,
   artistMetricsQuerySchema,
+  royaltyBreakdownQuerySchema,
 } from './query-schemas.js';
-import { isValidStellarAddress } from '../stellar-address.js';
+import { isValidStellarAddress, STELLAR_ADDRESS_ERROR } from '../stellar-address.js';
 import {
   getOverviewStats,
   getDailyStats,
@@ -605,6 +606,49 @@ router.get('/wallets/:address/royalty-stats', strictRateLimiter, async (req: Req
     });
   } catch (err) {
     next(internalError('Failed to fetch royalty stats'));
+  }
+});
+
+// ── GET /wallets/:address/royalty-breakdown ───────────────────────────────────
+// Per-sale royalty audit trail (Issue #201): paginated RoyaltyPayment rows for
+// the given recipient address, newest-first, optionally bounded to the
+// inclusive ledger-sequence window [from, to]. Cached for 60 seconds.
+
+router.get('/wallets/:address/royalty-breakdown', cacheMiddleware(60), validateQuery(royaltyBreakdownQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
+  const address = req.params.address as string;
+  if (!isValidStellarAddress(address)) {
+    return next(badRequest(STELLAR_ADDRESS_ERROR));
+  }
+  const { from, to, limit, offset } = (req as any).validatedQuery;
+  try {
+    const where: any = { recipient: address };
+    if (from !== undefined || to !== undefined) {
+      where.ledgerSequence = {};
+      if (from !== undefined) where.ledgerSequence.gte = from;
+      if (to !== undefined)   where.ledgerSequence.lte = to;
+    }
+
+    const take = limit ?? 50;
+    const skip = offset ?? 0;
+    const [payments, total] = await Promise.all([
+      prisma.royaltyPayment.findMany({
+        where,
+        orderBy: { ledgerSequence: 'desc' },
+        take,
+        skip,
+      }),
+      prisma.royaltyPayment.count({ where }),
+    ]);
+
+    res.setHeader('X-Total-Count', String(total));
+    res.json({
+      payments: serialize(payments),
+      total,
+      limit: take,
+      offset: skip,
+    });
+  } catch (err) {
+    next(internalError('Failed to fetch royalty breakdown'));
   }
 });
 
