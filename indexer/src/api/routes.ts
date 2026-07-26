@@ -6,7 +6,7 @@ import { cacheMiddleware } from './cache-middleware.js';
 import { etagMiddleware } from './etag-middleware.js';
 import { strictRateLimiter } from './rate-limit-middleware.js';
 import { badRequest, notFound, internalError } from './errors.js';
-import { applyDecodedEvents } from '../poller.js';
+import { applyDecodedEvents, isPollerHalted, getHaltReason, resumePoller, revertLedgers } from '../poller.js';
 import { collectMarketplaceEvents } from '../event-sync.js';
 import {
   validateQuery,

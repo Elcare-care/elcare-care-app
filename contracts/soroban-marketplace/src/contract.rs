@@ -1959,6 +1959,7 @@ impl MarketplaceContract {
             soroban_sdk::vec![env],
         );
         let (royalty_receiver, royalty_bps) = royalty_info;
+        let mut payout = amount;
         if royalty_bps > 0 && royalty_receiver != *seller {
             let royalty = amount
                 .checked_mul(royalty_bps as i128)
@@ -1969,14 +1970,29 @@ impl MarketplaceContract {
             payouts.push_back(RecipientPayout { address: royalty_receiver, amount: royalty });
             payout -= royalty;
         }
+
+        // ── Fee + recipient split via math::distribute ────────────────────────
+        // `distribute` uses checked arithmetic throughout and guarantees
+        // fee + sum(payouts) == payout (no stroop lost).
+        //
+        // Only collect the fee when a treasury address is configured.
+        // When no treasury is set the fee_bps is ignored and the full `payout`
+        // is distributed to recipients — this preserves the original semantics.
+        let effective_fee_bps = if crate::storage::get_treasury_storage(env).is_some() {
+            fee_bps
+        } else {
+            0
+        };
+        let dist = crate::math::distribute(env, payout, effective_fee_bps, recipients);
+
+        // Transfer protocol fee to treasury (only when treasury is configured
+        // and fee > 0).
         let mut fee_collected: i128 = 0;
-        if let Some(t) = crate::storage::get_treasury_storage(env) {
-            let fee = payout * fee_bps as i128 / 10_000;
-            if fee > 0 {
-                token.transfer(&env.current_contract_address(), &t, &fee);
-                fee_collected = fee;
+        if dist.fee > 0 {
+            if let Some(t) = crate::storage::get_treasury_storage(env) {
+                token.transfer(&env.current_contract_address(), &t, &dist.fee);
+                fee_collected = dist.fee;
             }
-            payout -= fee;
         }
         let len = recipients.len();
         let mut ds = 0i128;

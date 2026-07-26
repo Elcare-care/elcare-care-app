@@ -39,6 +39,85 @@ import { promoteConfirmedEvents, rollbackReorg } from './reorg.js';
 
 dotenv.config();
 
+// ── Re-org SSE event types ────────────────────────────────────────────────────
+
+/**
+ * Emitted on a normal (shallow) re-org that was successfully rolled back.
+ * Frontends should show a brief notification and trigger a data refresh.
+ */
+export interface ReorgEvent {
+  type: 'REORG';
+  from_ledger: number;
+  to_ledger: number;
+  timestamp: string;
+  depth: number;
+}
+
+/**
+ * Emitted when a re-org depth exceeds MAX_ROLLBACK_DEPTH.
+ * The poller halts; a human operator must call POST /admin/reorg-recovery
+ * to trigger manual recovery.
+ */
+export interface CriticalReorgEvent {
+  type: 'CRITICAL_REORG';
+  from_ledger: number;
+  to_ledger: number;
+  timestamp: string;
+  depth: number;
+  message: string;
+}
+
+// ── Poller halt state ─────────────────────────────────────────────────────────
+
+let _pollerHalted = false;
+let _haltReason: string | null = null;
+
+/** Returns true when the poller has been halted due to a critical re-org. */
+export function isPollerHalted(): boolean {
+  return _pollerHalted;
+}
+
+/** Returns the halt reason, or null if not halted. */
+export function getHaltReason(): string | null {
+  return _haltReason;
+}
+
+/**
+ * Resumes the poller after a critical re-org.  Called by the admin recovery
+ * endpoint (POST /admin/reorg-recovery) once an operator has verified the
+ * chain state and performed any necessary manual rollback.
+ */
+export function resumePoller(): void {
+  _pollerHalted = false;
+  _haltReason = null;
+  logger.info('poller: resumed by operator after critical re-org');
+}
+
+function emitReorgEvent(fromLedger: number, toLedger: number, depth: number): void {
+  const event: ReorgEvent = {
+    type: 'REORG',
+    from_ledger: fromLedger,
+    to_ledger: toLedger,
+    timestamp: new Date().toISOString(),
+    depth,
+  };
+  emitSSEEvent(event);
+}
+
+function emitCriticalReorgEvent(fromLedger: number, toLedger: number, depth: number): void {
+  const msg = `Re-org depth ${depth} exceeds MAX_ROLLBACK_DEPTH — poller halted. ` +
+    `Call POST /admin/reorg-recovery to resume after manual verification.`;
+  const event: CriticalReorgEvent = {
+    type: 'CRITICAL_REORG',
+    from_ledger: fromLedger,
+    to_ledger: toLedger,
+    timestamp: new Date().toISOString(),
+    depth,
+    message: msg,
+  };
+  emitSSEEvent(event);
+}
+
 export const MAX_REORG_DEPTH = 100;
 
 const RPC_URL = process.env.STELLAR_RPC_URL || 'https://soroban-testnet.stellar.org';
@@ -262,7 +341,9 @@ export async function findReorgSafePoint(
 
 export async function validateHashContinuity(
   syncState: { lastLedger: number; lastLedgerHash: string | null },
-  rpcServer: rpc.Server
+  rpcServer: rpc.Server,
+  maxRollbackDepth = 100,
+  reorgHaltOnDeep = true
 ): Promise<boolean> {
   // No stored hash (initial sync or prior hash fetch failure) — cannot detect re-org.
   if (syncState.lastLedger > 0 && syncState.lastLedgerHash) {
@@ -274,9 +355,33 @@ export async function validateHashContinuity(
       if (ledgersRes.ledgers && ledgersRes.ledgers.length > 0) {
         const networkLedger = ledgersRes.ledgers[0];
         if (networkLedger.hash !== syncState.lastLedgerHash) {
-          console.warn(`Chain re-org detected at ledger ${syncState.lastLedger}! DB hash: ${syncState.lastLedgerHash}, Network hash: ${networkLedger.hash}`);
+          logger.warn('Chain re-org detected', {
+            ledger: syncState.lastLedger,
+            dbHash: syncState.lastLedgerHash,
+            networkHash: networkLedger.hash,
+          });
+
           const safeLedger = await findReorgSafePoint(syncState.lastLedger, rpcServer);
+          const rollbackDepth = syncState.lastLedger - safeLedger;
+
+          // Guard: deep re-orgs halt the poller instead of executing a destructive rollback.
+          if (reorgHaltOnDeep && rollbackDepth > maxRollbackDepth) {
+            _pollerHalted = true;
+            _haltReason =
+              `Re-org depth ${rollbackDepth} exceeds MAX_ROLLBACK_DEPTH (${maxRollbackDepth}). ` +
+              `Manual operator recovery required via POST /admin/reorg-recovery.`;
+            logger.error('CRITICAL: Re-org depth exceeds MAX_ROLLBACK_DEPTH — halting poller', {
+              rollbackDepth,
+              maxRollbackDepth,
+              fromLedger: syncState.lastLedger,
+              toLedger: safeLedger,
+            });
+            emitCriticalReorgEvent(syncState.lastLedger, safeLedger, rollbackDepth);
+            return false;
+          }
+
           await revertLedgers(safeLedger);
+          emitReorgEvent(syncState.lastLedger, safeLedger, rollbackDepth);
           return false;
         }
       }
@@ -323,6 +428,17 @@ async function pollContract(
   let localErrors = 0;
 
   while (!shuttingDown) {
+    // If the poller has been halted due to a critical re-org, pause and wait for
+    // an operator to call POST /admin/reorg-recovery to clear the halt flag.
+    if (_pollerHalted) {
+      logger.warn('pollContract: poller halted due to critical re-org — waiting for operator recovery', {
+        contractId: contractRow.contractId,
+        reason: _haltReason,
+      });
+      await new Promise((resolve) => setTimeout(resolve, 10_000));
+      continue;
+    }
+
     try {
       const contract = await prisma.trackedContract.findUnique({
         where: { id: contractRow.id },
@@ -350,11 +466,31 @@ async function pollContract(
                 ledger: contract.lastLedger,
               });
               const safeLedger = await findReorgSafePoint(contract.lastLedger, server);
+              const rollbackDepth = contract.lastLedger - safeLedger;
+
+              // Guard: deep re-orgs halt the poller.
+              if (config.reorgHaltOnDeep && rollbackDepth > config.maxRollbackDepth) {
+                _pollerHalted = true;
+                _haltReason =
+                  `Re-org depth ${rollbackDepth} exceeds MAX_ROLLBACK_DEPTH (${config.maxRollbackDepth}). ` +
+                  `Manual operator recovery required via POST /admin/reorg-recovery.`;
+                logger.error('CRITICAL: Re-org depth exceeds MAX_ROLLBACK_DEPTH — halting poller', {
+                  contractId: contract.contractId,
+                  rollbackDepth,
+                  maxRollbackDepth: config.maxRollbackDepth,
+                  fromLedger: contract.lastLedger,
+                  toLedger: safeLedger,
+                });
+                emitCriticalReorgEvent(contract.lastLedger, safeLedger, rollbackDepth);
+                continue; // loop back, where _pollerHalted will block
+              }
+
               await revertLedgers(safeLedger);
               await prisma.trackedContract.update({
                 where: { id: contract.id },
                 data: { lastLedger: safeLedger, lastLedgerHash: null },
               });
+              emitReorgEvent(contract.lastLedger, safeLedger, rollbackDepth);
               continue;
             }
           }
