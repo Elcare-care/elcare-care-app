@@ -470,6 +470,45 @@ impl MarketplaceContract {
         crate::storage::get_protocol_fee_bps_storage(&env).unwrap_or(0)
     }
 
+    // ── Per-collection fee overrides (Issue #322) ────────────────────────────
+
+    /// Set a per-collection protocol fee override (admin-only).
+    ///
+    /// `bps` must be in 0–10 000 (100 %).  All new listings and auctions
+    /// created for `collection` after this call will snapshot `bps` instead of
+    /// the global protocol fee.  Existing listings/auctions are unaffected —
+    /// they already captured their fee at creation time.
+    pub fn set_collection_fee_bps(env: Env, admin: Address, collection: Address, bps: u32) {
+        admin.require_auth();
+        if admin != Self::get_admin(env.clone()).expect("admin not set") {
+            panic_with_error!(&env, MarketplaceError::Unauthorized);
+        }
+        if bps > 10_000 {
+            panic_with_error!(&env, MarketplaceError::InvalidPrice);
+        }
+        set_collection_fee_bps_storage(&env, &collection, bps);
+        crate::events::emit_collection_fee_set(&env, collection, bps);
+    }
+
+    /// Remove the per-collection fee override (admin-only).
+    ///
+    /// After this call, new listings and auctions for `collection` will fall
+    /// back to the global protocol fee (`get_protocol_fee`).
+    pub fn clear_collection_fee_bps(env: Env, admin: Address, collection: Address) {
+        admin.require_auth();
+        if admin != Self::get_admin(env.clone()).expect("admin not set") {
+            panic_with_error!(&env, MarketplaceError::Unauthorized);
+        }
+        clear_collection_fee_bps_storage(&env, &collection);
+        crate::events::emit_collection_fee_cleared(&env, collection);
+    }
+
+    /// View: return the per-collection fee override (in bps) for `collection`,
+    /// or `None` when no override is set (global fee applies).
+    pub fn get_collection_fee_bps(env: Env, collection: Address) -> Option<u32> {
+        get_collection_fee_bps_storage(&env, &collection)
+    }
+
     pub fn set_min_bid_increment(env: Env, admin: Address, increment: i128) {
         admin.require_auth();
         if admin != Self::get_admin(env.clone()).expect("admin not set") {

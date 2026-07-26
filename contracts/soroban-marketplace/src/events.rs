@@ -507,6 +507,55 @@ pub fn emit_admin_proposal_cancelled(
     .publish(env);
 }
 
+// ── Per-collection fee events (Issue #322) ────────────────────────────────────
+
+pub const COLLECTION_FEE_SET: &str = "collection_fee_set";
+pub const COLLECTION_FEE_CLEARED: &str = "collection_fee_cleared";
+
+/// Emitted when an admin sets a per-collection protocol fee override.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CollectionFeeSetEvent {
+    pub collection: Address,
+    /// New override value in basis points (0–10 000).
+    pub bps: u32,
+}
+
+impl CollectionFeeSetEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, COLLECTION_FEE_SET),), self);
+    }
+}
+
+/// Emitted when an admin clears a per-collection protocol fee override,
+/// restoring global-fee fallback behaviour for that collection.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CollectionFeeClearedEvent {
+    pub collection: Address,
+}
+
+impl CollectionFeeClearedEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, COLLECTION_FEE_CLEARED),), self);
+    }
+}
+
+/// Emit `collection_fee_set` for a newly-configured collection-level override.
+pub fn emit_collection_fee_set(env: &Env, collection: Address, bps: u32) {
+    CollectionFeeSetEvent { collection, bps }.publish(env);
+}
+
+/// Emit `collection_fee_cleared` when the admin removes a collection-level
+/// override so the collection falls back to the global protocol fee.
+pub fn emit_collection_fee_cleared(env: &Env, collection: Address) {
+    CollectionFeeClearedEvent { collection }.publish(env);
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProtocolFeeCollectedEvent {

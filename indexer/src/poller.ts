@@ -871,7 +871,32 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
     return;
   }
 
-  // Update Listing state based on event type
+  // Update Listing/Collection state based on event type.
+  // Collection fee events carry no listingId — route them first, then guard
+  // the rest of the switch which requires a listingId.
+  if (eventType === 'COLLECTION_FEE_SET' || eventType === 'COLLECTION_FEE_CLEARED') {
+    const collectionAddr: string = data.collection?.toString() ?? '';
+    if (collectionAddr) {
+      if (eventType === 'COLLECTION_FEE_SET') {
+        const bps: number = Number(data.bps ?? 0);
+        await db.collection.updateMany({
+          where: { contractAddress: collectionAddr },
+          data: { feeBpsOverride: bps },
+        });
+      } else {
+        await db.collection.updateMany({
+          where: { contractAddress: collectionAddr },
+          data: { feeBpsOverride: null },
+        });
+      }
+      invalidatePattern('cache:*/collections*').catch(() => {});
+      invalidateKey(`cache:/collections/${collectionAddr}`).catch(() => {});
+    }
+    recordEventDuration();
+    if (!tx) emitSSEEvent(event);
+    return;
+  }
+
   if (!listingId) { recordEventDuration(); return; }
 
   switch (eventType) {
