@@ -1,0 +1,746 @@
+{
+  "_comment": "ElcareHub contract ABI — generated from contracts/soroban-marketplace and contracts/launchpad source. Version must match CONTRACT_VERSION in contract.rs.",
+  "schemaVersion": "1",
+  "contracts": {
+    "marketplace": {
+      "name": "soroban-marketplace",
+      "version": "1.1.0",
+      "description": "ElcareHub NFT Marketplace — listings, auctions, offers, royalties",
+      "methods": [
+        {
+          "name": "set_admin",
+          "args": [{ "name": "admin", "type": "Address" }],
+          "returns": "void",
+          "auth": ["admin"]
+        },
+        {
+          "name": "transfer_admin",
+          "args": [{ "name": "new_admin", "type": "Address" }],
+          "returns": "void",
+          "auth": ["admin"]
+        },
+        {
+          "name": "accept_admin",
+          "args": [],
+          "returns": "void",
+          "auth": ["pending_admin"]
+        },
+        {
+          "name": "cancel_admin_proposal",
+          "args": [],
+          "returns": "void",
+          "auth": ["admin"]
+        },
+        {
+          "name": "pause",
+          "args": [],
+          "returns": "void",
+          "auth": ["admin"]
+        },
+        {
+          "name": "unpause",
+          "args": [],
+          "returns": "void",
+          "auth": ["admin"]
+        },
+        {
+          "name": "pause_collection",
+          "args": [{ "name": "collection", "type": "Address" }],
+          "returns": "void",
+          "auth": ["admin"]
+        },
+        {
+          "name": "unpause_collection",
+          "args": [{ "name": "collection", "type": "Address" }],
+          "returns": "void",
+          "auth": ["admin"]
+        },
+        {
+          "name": "pause_function",
+          "args": [{ "name": "function_name", "type": "Symbol" }],
+          "returns": "void",
+          "auth": ["admin"]
+        },
+        {
+          "name": "unpause_function",
+          "args": [{ "name": "function_name", "type": "Symbol" }],
+          "returns": "void",
+          "auth": ["admin"]
+        },
+        {
+          "name": "revoke_artist",
+          "args": [{ "name": "artist", "type": "Address" }],
+          "returns": "void",
+          "auth": ["admin"]
+        },
+        {
+          "name": "reinstate_artist",
+          "args": [{ "name": "artist", "type": "Address" }],
+          "returns": "void",
+          "auth": ["admin"]
+        },
+        {
+          "name": "whitelist_token",
+          "args": [{ "name": "token", "type": "Address" }],
+          "returns": "void",
+          "auth": ["admin"]
+        },
+        {
+          "name": "remove_token",
+          "args": [{ "name": "token", "type": "Address" }],
+          "returns": "void",
+          "auth": ["admin"]
+        },
+        {
+          "name": "set_protocol_fee",
+          "args": [{ "name": "bps", "type": "u32" }],
+          "returns": "void",
+          "auth": ["admin"]
+        },
+        {
+          "name": "set_price_bounds",
+          "args": [
+            { "name": "min_price", "type": "i128" },
+            { "name": "max_price", "type": "i128" }
+          ],
+          "returns": "void",
+          "auth": ["admin"]
+        },
+        {
+          "name": "create_listing",
+          "args": [
+            { "name": "artist", "type": "Address" },
+            { "name": "collection", "type": "Address" },
+            { "name": "token_id", "type": "u64" },
+            { "name": "price", "type": "i128" },
+            { "name": "currency", "type": "Symbol" },
+            { "name": "token", "type": "Address" },
+            { "name": "recipients", "type": "Vec<Recipient>" },
+            { "name": "expires_at", "type": "Option<u64>" }
+          ],
+          "returns": "u64",
+          "auth": ["artist"]
+        },
+        {
+          "name": "update_listing",
+          "args": [
+            { "name": "artist", "type": "Address" },
+            { "name": "listing_id", "type": "u64" },
+            { "name": "new_price", "type": "i128" },
+            { "name": "new_token", "type": "Address" }
+          ],
+          "returns": "void",
+          "auth": ["artist"]
+        },
+        {
+          "name": "cancel_listing",
+          "args": [
+            { "name": "caller", "type": "Address" },
+            { "name": "listing_id", "type": "u64" }
+          ],
+          "returns": "void",
+          "auth": ["artist_or_admin"]
+        },
+        {
+          "name": "cancel_listings",
+          "args": [
+            { "name": "caller", "type": "Address" },
+            { "name": "listing_ids", "type": "Vec<u64>" }
+          ],
+          "returns": "void",
+          "auth": ["artist_or_admin"]
+        },
+        {
+          "name": "expire_listing",
+          "args": [
+            { "name": "caller", "type": "Address" },
+            { "name": "listing_id", "type": "u64" }
+          ],
+          "returns": "void",
+          "auth": ["any"]
+        },
+        {
+          "name": "purchase",
+          "args": [
+            { "name": "buyer", "type": "Address" },
+            { "name": "listing_id", "type": "u64" },
+            { "name": "token", "type": "Address" }
+          ],
+          "returns": "void",
+          "auth": ["buyer"]
+        },
+        {
+          "name": "create_auction",
+          "args": [
+            { "name": "creator", "type": "Address" },
+            { "name": "collection", "type": "Address" },
+            { "name": "token_id", "type": "u64" },
+            { "name": "reserve_price", "type": "i128" },
+            { "name": "token", "type": "Address" },
+            { "name": "duration", "type": "u64" },
+            { "name": "recipients", "type": "Vec<Recipient>" }
+          ],
+          "returns": "u64",
+          "auth": ["creator"]
+        },
+        {
+          "name": "place_bid",
+          "args": [
+            { "name": "bidder", "type": "Address" },
+            { "name": "auction_id", "type": "u64" },
+            { "name": "amount", "type": "i128" }
+          ],
+          "returns": "void",
+          "auth": ["bidder"]
+        },
+        {
+          "name": "finalize_auction",
+          "args": [
+            { "name": "caller", "type": "Address" },
+            { "name": "auction_id", "type": "u64" }
+          ],
+          "returns": "void",
+          "auth": ["any"]
+        },
+        {
+          "name": "cancel_auction",
+          "args": [
+            { "name": "caller", "type": "Address" },
+            { "name": "auction_id", "type": "u64" }
+          ],
+          "returns": "void",
+          "auth": ["creator_or_admin"]
+        },
+        {
+          "name": "admin_cancel_auction",
+          "args": [
+            { "name": "admin", "type": "Address" },
+            { "name": "auction_id", "type": "u64" }
+          ],
+          "returns": "void",
+          "auth": ["admin"]
+        },
+        {
+          "name": "refund_losing_bid",
+          "args": [
+            { "name": "bidder", "type": "Address" },
+            { "name": "auction_id", "type": "u64" }
+          ],
+          "returns": "void",
+          "auth": ["any"]
+        },
+        {
+          "name": "make_offer",
+          "args": [
+            { "name": "offerer", "type": "Address" },
+            { "name": "listing_id", "type": "u64" },
+            { "name": "amount", "type": "i128" },
+            { "name": "token", "type": "Address" },
+            { "name": "expires_at", "type": "Option<u64>" }
+          ],
+          "returns": "u64",
+          "auth": ["offerer"]
+        },
+        {
+          "name": "accept_offer",
+          "args": [
+            { "name": "artist", "type": "Address" },
+            { "name": "offer_id", "type": "u64" }
+          ],
+          "returns": "void",
+          "auth": ["artist"]
+        },
+        {
+          "name": "reject_offer",
+          "args": [
+            { "name": "artist", "type": "Address" },
+            { "name": "offer_id", "type": "u64" }
+          ],
+          "returns": "void",
+          "auth": ["artist"]
+        },
+        {
+          "name": "withdraw_offer",
+          "args": [
+            { "name": "offerer", "type": "Address" },
+            { "name": "offer_id", "type": "u64" }
+          ],
+          "returns": "void",
+          "auth": ["offerer"]
+        },
+        {
+          "name": "reclaim_offer",
+          "args": [
+            { "name": "caller", "type": "Address" },
+            { "name": "offer_id", "type": "u64" }
+          ],
+          "returns": "void",
+          "auth": ["any"]
+        },
+        {
+          "name": "get_listing",
+          "args": [{ "name": "listing_id", "type": "u64" }],
+          "returns": "Listing",
+          "auth": []
+        },
+        {
+          "name": "get_auction",
+          "args": [{ "name": "auction_id", "type": "u64" }],
+          "returns": "Auction",
+          "auth": []
+        },
+        {
+          "name": "get_offer",
+          "args": [{ "name": "offer_id", "type": "u64" }],
+          "returns": "Offer",
+          "auth": []
+        },
+        {
+          "name": "get_version",
+          "args": [],
+          "returns": "String",
+          "auth": []
+        },
+        {
+          "name": "migrate",
+          "args": [
+            { "name": "admin", "type": "Address" },
+            { "name": "version", "type": "u32" }
+          ],
+          "returns": "void",
+          "auth": ["admin"]
+        }
+      ],
+      "types": {
+        "Recipient": {
+          "kind": "struct",
+          "fields": [
+            { "name": "address", "type": "Address" },
+            { "name": "percentage", "type": "u32", "description": "basis points 0–10000" }
+          ]
+        },
+        "ListingStatus": {
+          "kind": "enum",
+          "variants": ["Active", "Sold", "Cancelled"]
+        },
+        "AuctionStatus": {
+          "kind": "enum",
+          "variants": ["Active", "Finalized", "Cancelled"]
+        },
+        "OfferStatus": {
+          "kind": "enum",
+          "variants": ["Pending", "Accepted", "Rejected", "Withdrawn"]
+        },
+        "CancelReason": {
+          "kind": "enum",
+          "variants": [
+            { "name": "Owner", "value": 1 },
+            { "name": "Expired", "value": 2 },
+            { "name": "AdminRevoked", "value": 3 }
+          ]
+        }
+      },
+      "errors": {
+        "InvalidCid": 1,
+        "InvalidPrice": 2,
+        "ListingNotFound": 3,
+        "ListingNotActive": 4,
+        "Unauthorized": 5,
+        "CannotBuyOwnListing": 6,
+        "InvalidSplit": 7,
+        "TooManyRecipients": 8,
+        "AuctionNotFound": 9,
+        "AuctionNotActive": 10,
+        "BidTooLow": 11,
+        "AuctionExpired": 12,
+        "AuctionNotExpired": 13,
+        "AuctionAlreadyFinalized": 14,
+        "ArtistRevoked": 15,
+        "OfferNotFound": 16,
+        "CannotOfferOwnListing": 17,
+        "OfferNotPending": 18,
+        "InsufficientOfferAmount": 19,
+        "ListingSold": 20,
+        "ListingCancelled": 21,
+        "ReentrancyGuard": 22,
+        "ContractPaused": 23,
+        "InvalidRoyalty": 24,
+        "TokenNotWhitelisted": 25,
+        "RoyaltyExceedsLimit": 26,
+        "ListingExpired": 27,
+        "ListingNotExpired": 28,
+        "AuctionNotEnded": 29,
+        "AuctionHasBids": 30,
+        "InvalidAuctionDuration": 31,
+        "SelfBidNotAllowed": 32,
+        "InvalidOfferState": 33,
+        "OfferExpired": 34,
+        "OfferLimitReached": 35,
+        "BatchTooLarge": 36,
+        "AlreadyMigrated": 37,
+        "SelfPurchaseNotAllowed": 38,
+        "PriceOutOfBounds": 39,
+        "ArithmeticOverflow": 40,
+        "AdminProposalExpired": 41,
+        "NoAdminProposalPending": 42,
+        "ZeroRecipientBps": 43,
+        "DuplicateRecipient": 44,
+        "InvalidAuctionState": 45,
+        "NoBidToRefund": 46,
+        "InvalidExtensionWindow": 47,
+        "MaxExtensionsReached": 48
+      },
+      "events": {
+        "listing_created": {
+          "topic": ["listing_created"],
+          "data": {
+            "listing_id": "u64",
+            "artist": "Address",
+            "price": "i128",
+            "currency": "Symbol",
+            "collection": "Address",
+            "token_id": "u64",
+            "ledger_sequence": "u32"
+          }
+        },
+        "artwork_sold": {
+          "topic": ["artwork_sold"],
+          "data": {
+            "listing_id": "u64",
+            "artist": "Address",
+            "buyer": "Address",
+            "price": "i128",
+            "currency": "Symbol",
+            "ledger_sequence": "u32"
+          }
+        },
+        "listing_cancelled": {
+          "topic": ["listing_cancelled"],
+          "data": {
+            "listing_id": "u64",
+            "cancelled_by": "Address",
+            "reason": "CancelReason",
+            "ledger_sequence": "u32"
+          }
+        },
+        "listing_updated": {
+          "topic": ["listing_updated"],
+          "data": {
+            "listing_id": "u64",
+            "artist": "Address",
+            "new_price": "i128",
+            "collection": "Address",
+            "token_id": "u64",
+            "ledger_sequence": "u32"
+          }
+        },
+        "listing_price_updated": {
+          "topic": ["listing_price_updated"],
+          "data": {
+            "listing_id": "u64",
+            "old_price": "i128",
+            "new_price": "i128",
+            "updated_by": "Address"
+          }
+        },
+        "listing_expired": {
+          "topic": ["listing_expired"],
+          "data": {
+            "listing_id": "u64",
+            "expired_at": "u64",
+            "ledger_sequence": "u32"
+          }
+        },
+        "auction_created": {
+          "topic": ["auction_created"],
+          "data": {
+            "auction_id": "u64",
+            "creator": "Address",
+            "reserve_price": "i128",
+            "token": "Address",
+            "collection": "Address",
+            "token_id": "u64",
+            "end_time": "u64"
+          }
+        },
+        "bid_placed": {
+          "topic": ["bid_placed"],
+          "data": {
+            "auction_id": "u64",
+            "bidder": "Address",
+            "bid_amount": "i128"
+          }
+        },
+        "auction_resolved": {
+          "topic": ["auction_resolved"],
+          "data": {
+            "auction_id": "u64",
+            "winner": "Option<Address>",
+            "amount": "i128"
+          }
+        },
+        "auction_cancelled": {
+          "topic": ["auction_cancelled"],
+          "data": {
+            "auction_id": "u64",
+            "cancelled_by": "Address",
+            "reason": "Symbol"
+          }
+        },
+        "auction_extended": {
+          "topic": ["auction_extended"],
+          "data": {
+            "auction_id": "u64",
+            "prev_end_time": "u64",
+            "new_end_time": "u64",
+            "extension_count": "u32"
+          }
+        },
+        "auction_bid_refunded": {
+          "topic": ["auction_bid_refunded"],
+          "data": {
+            "auction_id": "u64",
+            "bidder": "Address",
+            "amount": "i128",
+            "token": "Address",
+            "reason": "Symbol",
+            "ledger_sequence": "u32"
+          }
+        },
+        "auction_admin_cancelled": {
+          "topic": ["auction_admin_cancelled"],
+          "data": {
+            "auction_id": "u64",
+            "cancelled_by": "Address",
+            "refunded_amount": "i128",
+            "token": "Address",
+            "ledger_sequence": "u32"
+          }
+        },
+        "offer_made": {
+          "topic": ["offer_made"],
+          "data": {
+            "offer_id": "u64",
+            "listing_id": "u64",
+            "offerer": "Address",
+            "amount": "i128",
+            "token": "Address",
+            "expires_at": "Option<u64>"
+          }
+        },
+        "offer_accepted": {
+          "topic": ["offer_accepted"],
+          "data": {
+            "offer_id": "u64",
+            "listing_id": "u64",
+            "offerer": "Address",
+            "amount": "i128"
+          }
+        },
+        "offer_rejected": {
+          "topic": ["offer_rejected"],
+          "data": {
+            "offer_id": "u64",
+            "listing_id": "u64",
+            "offerer": "Address"
+          }
+        },
+        "offer_withdrawn": {
+          "topic": ["offer_withdrawn"],
+          "data": {
+            "offer_id": "u64",
+            "listing_id": "u64",
+            "offerer": "Address"
+          }
+        },
+        "offer_reclaimed": {
+          "topic": ["offer_reclaimed"],
+          "data": {
+            "offer_id": "u64",
+            "listing_id": "u64",
+            "offerer": "Address",
+            "amount": "i128"
+          }
+        },
+        "royalty_settlement": {
+          "topic": ["royalty_settlement"],
+          "data": {
+            "id": "u64",
+            "recipients": "Vec<Recipient>",
+            "total_amount": "i128",
+            "token": "Address",
+            "ledger_sequence": "u32"
+          }
+        },
+        "admin_transfer_proposed": {
+          "topic": ["admin_transfer_proposed"],
+          "data": {
+            "current_admin": "Address",
+            "proposed_admin": "Address",
+            "expires_at": "u64"
+          }
+        },
+        "admin_transferred": {
+          "topic": ["admin_transferred"],
+          "data": {
+            "old_admin": "Address",
+            "new_admin": "Address"
+          }
+        },
+        "admin_proposal_cancelled": {
+          "topic": ["admin_proposal_cancelled"],
+          "data": {
+            "current_admin": "Address",
+            "cancelled_candidate": "Address"
+          }
+        },
+        "contract_paused": {
+          "topic": ["contract_paused"],
+          "data": {}
+        },
+        "contract_unpaused": {
+          "topic": ["contract_unpaused"],
+          "data": {}
+        },
+        "collection_paused": {
+          "topic": ["collection_paused"],
+          "data": { "collection": "Address" }
+        },
+        "collection_unpaused": {
+          "topic": ["collection_unpaused"],
+          "data": { "collection": "Address" }
+        },
+        "function_paused": {
+          "topic": ["function_paused"],
+          "data": { "function_name": "Symbol" }
+        },
+        "function_unpaused": {
+          "topic": ["function_unpaused"],
+          "data": { "function_name": "Symbol" }
+        },
+        "artist_revoked": {
+          "topic": ["artist_revoked"],
+          "data": { "artist": "Address" }
+        },
+        "artist_reinstated": {
+          "topic": ["artist_reinstated"],
+          "data": { "artist": "Address" }
+        },
+        "nft_escrowed": {
+          "topic": ["nft_escrowed"],
+          "data": {
+            "id": "u64",
+            "collection": "Address",
+            "token_id": "u64",
+            "seller": "Address",
+            "ledger_sequence": "u32"
+          }
+        },
+        "nft_released": {
+          "topic": ["nft_released"],
+          "data": {
+            "id": "u64",
+            "collection": "Address",
+            "token_id": "u64",
+            "recipient": "Address",
+            "ledger_sequence": "u32"
+          }
+        },
+        "protocol_fee_collected": {
+          "topic": ["protocol_fee_collected"],
+          "data": {
+            "listing_id": "u64",
+            "amount": "i128",
+            "token": "Address",
+            "treasury": "Address"
+          }
+        }
+      }
+    },
+    "launchpad": {
+      "name": "launchpad",
+      "version": "1.0.0",
+      "description": "ElcareHub NFT Collection Factory — deploy ERC-721/ERC-1155 collections",
+      "methods": [
+        {
+          "name": "initialize",
+          "args": [
+            { "name": "admin", "type": "Address" },
+            { "name": "normal_721_hash", "type": "BytesN<32>" },
+            { "name": "normal_1155_hash", "type": "BytesN<32>" },
+            { "name": "lazy_721_hash", "type": "BytesN<32>" },
+            { "name": "lazy_1155_hash", "type": "BytesN<32>" }
+          ],
+          "returns": "void",
+          "auth": []
+        },
+        {
+          "name": "deploy_normal_721",
+          "args": [
+            { "name": "creator", "type": "Address" },
+            { "name": "name", "type": "String" },
+            { "name": "symbol", "type": "String" },
+            { "name": "salt", "type": "BytesN<32>" }
+          ],
+          "returns": "Address",
+          "auth": ["creator"]
+        },
+        {
+          "name": "deploy_normal_1155",
+          "args": [
+            { "name": "creator", "type": "Address" },
+            { "name": "name", "type": "String" },
+            { "name": "symbol", "type": "String" },
+            { "name": "salt", "type": "BytesN<32>" }
+          ],
+          "returns": "Address",
+          "auth": ["creator"]
+        },
+        {
+          "name": "deploy_lazy_721",
+          "args": [
+            { "name": "creator", "type": "Address" },
+            { "name": "name", "type": "String" },
+            { "name": "symbol", "type": "String" },
+            { "name": "salt", "type": "BytesN<32>" }
+          ],
+          "returns": "Address",
+          "auth": ["creator"]
+        },
+        {
+          "name": "deploy_lazy_1155",
+          "args": [
+            { "name": "creator", "type": "Address" },
+            { "name": "name", "type": "String" },
+            { "name": "symbol", "type": "String" },
+            { "name": "salt", "type": "BytesN<32>" }
+          ],
+          "returns": "Address",
+          "auth": ["creator"]
+        }
+      ],
+      "events": {
+        "deploy_normal_721": {
+          "topic": ["deploy", "dep_n721"],
+          "data": ["Address", "Address"],
+          "description": "Tuple: [creator, deployed_contract_address]"
+        },
+        "deploy_normal_1155": {
+          "topic": ["deploy", "dep_n1155"],
+          "data": ["Address", "Address"],
+          "description": "Tuple: [creator, deployed_contract_address]"
+        },
+        "deploy_lazy_721": {
+          "topic": ["deploy", "dep_l721"],
+          "data": ["Address", "Address"],
+          "description": "Tuple: [creator, deployed_contract_address]"
+        },
+        "deploy_lazy_1155": {
+          "topic": ["deploy", "dep_l1155"],
+          "data": ["Address", "Address"],
+          "description": "Tuple: [creator, deployed_contract_address]"
+        }
+      }
+    }
+  }
+}

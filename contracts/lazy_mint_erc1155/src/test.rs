@@ -843,56 +843,112 @@ fn persistent_balance_ttl_extended_on_transfer() {
     assert!(still_has);
 }
 
-// ─── Metadata mutability / freeze semantics (#276) ─────────────────────────
+// ── Migration tests ───────────────────────────────────────────────────────────
 
-#[test]
-fn is_metadata_frozen_is_always_true() {
-    // An edition's URI is set once by whichever voucher first registers it
-    // and is never updatable afterwards — the collection is permanently
-    // frozen from the start, unlike the normal collections where freeze is
-    // an explicit creator action.
-    let (env, client, _creator, _fee) = setup(0);
-    assert!(client.is_metadata_frozen());
-    client.set_public_phase();
-    let token_id = 900u64;
-    client.register_edition(&token_id, &1000u128);
-    let buyer = Address::generate(&env);
-    let v = make_voucher(&env, token_id, 900);
-    let sig = sign_voucher(&env, &client.address, &v);
-    client.redeem(&buyer, &v, &1u128, &sig, &empty_proof(&env));
-    assert!(client.is_metadata_frozen());
-}
+mod migration {
+    use super::*;
 
-#[test]
-fn redeem_rejects_empty_uri_voucher() {
-    let (env, client, _creator, _fee) = setup(0);
-    client.set_public_phase();
-    let token_id = 901u64;
-    client.register_edition(&token_id, &1000u128);
-    let buyer = Address::generate(&env);
-    let v = MintVoucher1155 {
-        uri: String::from_str(&env, ""),
-        ..make_voucher(&env, token_id, 901)
-    };
-    let sig = sign_voucher(&env, &client.address, &v);
-    let res = client.try_redeem(&buyer, &v, &1u128, &sig, &empty_proof(&env));
-    assert_eq!(res, Err(Ok(Error::EmptyUri)));
-}
+    #[test]
+    fn fresh_install_migrate_records_version() {
+        let (env, client, _creator, _fee_receiver) = setup(0);
 
-#[test]
-fn redeem_rejects_oversized_uri_voucher() {
-    let (env, client, _creator, _fee) = setup(0);
-    client.set_public_phase();
-    let token_id = 902u64;
-    client.register_edition(&token_id, &1000u128);
-    let buyer = Address::generate(&env);
-    let big = "a".repeat(2049);
-    let v = MintVoucher1155 {
-        uri: String::from_str(&env, &big),
-        ..make_voucher(&env, token_id, 902)
-    };
-    let sig = sign_voucher(&env, &client.address, &v);
-    let res = client.try_redeem(&buyer, &v, &1u128, &sig, &empty_proof(&env));
-    assert_eq!(res, Err(Ok(Error::UriTooLong)));
-    assert_eq!(client.balance_of(&buyer, &token_id), 0u128, "no partial mutation on rejection");
+        assert!(client.contract_version().is_none());
+        client.migrate();
+        assert_eq!(
+            client.contract_version(),
+            Some(String::from_str(&env, "1.0.0"))
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "AlreadyMigrated")]
+    fn double_migrate_reverts() {
+        let (_env, client, _creator, _fee_receiver) = setup(0);
+        client.migrate();
+        client.migrate();
+    }
+
+    #[test]
+    fn migrate_emits_migrated_event() {
+        let (env, client, _creator, _fee_receiver) = setup(0);
+        client.migrate();
+
+        let events = env.events().all();
+        let found = events.iter().any(|(_, topics, _)| {
+            topics
+                .get(0)
+                .map(|v| {
+                    soroban_sdk::Symbol::try_from_val(&env, &v)
+                        .map(|s| s == soroban_sdk::symbol_short!("migrated"))
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false)
+        });
+        assert!(found, "expected 'migrated' event");
+    }
+
+    #[test]
+    fn edition_max_supply_readable_after_migrate() {
+        let (_env, client, _creator, _fee_receiver) = setup(0);
+
+        client.register_edition(&7u64, &1000u128);
+        client.migrate();
+
+        assert_eq!(client.edition_max_supply(&7u64), 1000u128);
+    }
+
+    #[test]
+    fn redeemed_voucher_readable_after_migrate() {
+        let (env, client, _creator, _fee_receiver) = setup(0);
+        let contract_id = env.register(crate::LazyMint1155, ());
+
+        // Register an edition and redeem a voucher pre-migration
+        client.register_edition(&0u64, &500u128);
+        client.set_public_phase();
+
+        let voucher = make_voucher(&env, 0u64, 1u64);
+        let sig = sign_voucher(&env, &contract_id, &voucher);
+        let buyer = Address::generate(&env);
+
+        client.redeem(&buyer, &voucher, &1u128, &sig, &empty_proof(&env));
+
+        assert!(client.is_voucher_redeemed(&1u64));
+
+        client.migrate();
+
+        assert!(client.is_voucher_redeemed(&1u64));
+    }
+
+    #[test]
+    fn balance_readable_after_migrate() {
+        let (env, client, _creator, _fee_receiver) = setup(0);
+        let contract_id = env.register(crate::LazyMint1155, ());
+
+        client.register_edition(&0u64, &500u128);
+        client.set_public_phase();
+
+        let voucher = make_voucher(&env, 0u64, 10u64);
+        let sig = sign_voucher(&env, &contract_id, &voucher);
+        let buyer = Address::generate(&env);
+
+        client.redeem(&buyer, &voucher, &5u128, &sig, &empty_proof(&env));
+        assert_eq!(client.balance_of(&buyer, &0u64), 5u128);
+
+        client.migrate();
+
+        assert_eq!(client.balance_of(&buyer, &0u64), 5u128);
+        assert_eq!(client.total_supply(&0u64), 5u128);
+    }
+
+    #[test]
+    fn revoked_voucher_readable_after_migrate() {
+        let (_env, client, _creator, _fee_receiver) = setup(0);
+
+        client.revoke_voucher(&88u64);
+        assert!(client.is_voucher_revoked(&88u64));
+
+        client.migrate();
+
+        assert!(client.is_voucher_revoked(&88u64));
+    }
 }

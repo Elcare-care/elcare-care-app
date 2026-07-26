@@ -100,6 +100,10 @@ pub enum DataKey {
     /// Each new auction snapshots this value into `Auction::bid_history_cap`
     /// so changes here never affect in-progress auctions.
     BidHistoryCap,
+    /// Global cap on the number of times any single auction's end time may be
+    /// extended by anti-sniping logic.  0 = unlimited (legacy behaviour).
+    /// Each new auction snapshots this value into `Auction::max_extensions`.
+    AuctionMaxExtensions,
     /// One fixed-capacity page (`Vec<u64>`, at most `INDEX_PAGE_SIZE` entries)
     /// of the identified index.
     IndexPage(IndexId, u32),
@@ -122,6 +126,11 @@ pub enum DataKey {
     /// listing or auction; a double-listing guard reads it and settlement /
     /// cancellation clears it.
     EscrowedToken(Address, u64),
+    /// Bounded (≤ MAX_BLOCKED_BIDDERS) list of addresses barred from bidding
+    /// on this auction (anti-shill-bidding registry, Issue #199).  Kept as a
+    /// separate per-auction key — not a field on `Auction` — so auctions that
+    /// never block anyone pay no extra storage.
+    AuctionBlockedBidders(u64),
 }
 
 /// Custody record for an NFT held by the marketplace, keyed by
@@ -798,6 +807,36 @@ pub fn load_auction_bids(env: &Env, auction_id: u64) -> soroban_sdk::Vec<BidReco
     value
 }
 
+// ── Blocked bidders (Issue #199) ─────────────────────────────
+
+pub fn load_blocked_bidders(env: &Env, auction_id: u64) -> Vec<Address> {
+    let key = DataKey::AuctionBlockedBidders(auction_id);
+    let value = env
+        .storage()
+        .persistent()
+        .get::<DataKey, Vec<Address>>(&key)
+        .unwrap_or_else(|| Vec::new(env));
+    if !value.is_empty() {
+        bump_entry_ttl(env, &key);
+    }
+    value
+}
+
+pub fn save_blocked_bidders(env: &Env, auction_id: u64, list: &Vec<Address>) {
+    let key = DataKey::AuctionBlockedBidders(auction_id);
+    if list.is_empty() {
+        // Drop the entry entirely so an emptied registry costs nothing.
+        env.storage().persistent().remove(&key);
+    } else {
+        env.storage().persistent().set(&key, list);
+        bump_entry_ttl(env, &key);
+    }
+}
+
+pub fn is_bidder_blocked(env: &Env, auction_id: u64, bidder: &Address) -> bool {
+    load_blocked_bidders(env, auction_id).contains(bidder)
+}
+
 pub fn set_paused(env: &Env, paused: bool) {
     env.storage().persistent().set(&DataKey::IsPaused, &paused);
     bump_entry_ttl(env, &DataKey::IsPaused);
@@ -1010,46 +1049,27 @@ pub fn get_bid_history_cap_storage(env: &Env) -> u32 {
     value.unwrap_or(DEFAULT_BID_HISTORY_CAP)
 }
 
-// ── Escrow record ────────────────────────────────────────────
+// ── Auction max-extensions cap ───────────────────────────────
 
-/// A lightweight record written when an NFT is pulled into escrow and
-/// deleted when the NFT is released.  Supports the double-listing guard
-/// and the `get_escrow` view function.
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct EscrowRecord {
-    /// `true` → held for a listing; `false` → held for an auction.
-    pub is_listing: bool,
-    /// The listing_id or auction_id holding the token.
-    pub id: u64,
-}
+/// Default: 0 = unlimited extensions (legacy behaviour preserved).
+pub const DEFAULT_AUCTION_MAX_EXTENSIONS: u32 = 0;
 
-#[contracttype]
-#[derive(Clone)]
-pub enum EscrowKey {
-    EscrowedToken(Address, u64),
-}
-
-pub fn set_escrow_record(env: &Env, collection: &Address, token_id: u64, record: &EscrowRecord) {
-    let key = EscrowKey::EscrowedToken(collection.clone(), token_id);
-    env.storage().persistent().set(&key, record);
+/// Persist the global auction max-extensions cap.
+pub fn set_auction_max_extensions_storage(env: &Env, max: u32) {
     env.storage()
         .persistent()
-        .extend_ttl(&key, LEDGER_TTL_THRESHOLD, LEDGER_TTL_BUMP);
+        .set(&DataKey::AuctionMaxExtensions, &max);
+    bump_entry_ttl(env, &DataKey::AuctionMaxExtensions);
 }
 
-pub fn get_escrow_record(env: &Env, collection: &Address, token_id: u64) -> Option<EscrowRecord> {
-    let key = EscrowKey::EscrowedToken(collection.clone(), token_id);
-    let value = env.storage().persistent().get::<EscrowKey, EscrowRecord>(&key);
+/// Read the global auction max-extensions cap.
+pub fn get_auction_max_extensions_storage(env: &Env) -> u32 {
+    let value = env
+        .storage()
+        .persistent()
+        .get::<DataKey, u32>(&DataKey::AuctionMaxExtensions);
     if value.is_some() {
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, LEDGER_TTL_THRESHOLD, LEDGER_TTL_BUMP);
+        bump_entry_ttl(env, &DataKey::AuctionMaxExtensions);
     }
-    value
-}
-
-pub fn clear_escrow_record(env: &Env, collection: &Address, token_id: u64) {
-    let key = EscrowKey::EscrowedToken(collection.clone(), token_id);
-    env.storage().persistent().remove(&key);
+    value.unwrap_or(DEFAULT_AUCTION_MAX_EXTENSIONS)
 }

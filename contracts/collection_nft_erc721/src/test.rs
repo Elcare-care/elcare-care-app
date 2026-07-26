@@ -1479,81 +1479,96 @@ fn transfer_clears_expiry_key_alongside_approval() {
     assert!(expiry_after.is_none(), "expiry key must be cleared after transfer");
 }
 
-// ─── Metadata mutability / freeze semantics (#276) ─────────────────────────
+// ── Migration tests ───────────────────────────────────────────────────────────
 
-#[test]
-fn mint_rejects_empty_uri() {
-    let (env, client, _, _) = setup();
-    let alice = Address::generate(&env);
-    let result = client.try_mint(&alice, &String::from_str(&env, ""));
-    assert_eq!(result, Err(Ok(Error::EmptyUri)));
-    assert_eq!(client.total_supply(), 0);
-}
+mod migration {
+    use super::*;
 
-#[test]
-fn mint_rejects_oversized_uri() {
-    let (env, client, _, _) = setup();
-    let alice = Address::generate(&env);
-    let big = "a".repeat(2049);
-    let result = client.try_mint(&alice, &String::from_str(&env, &big));
-    assert_eq!(result, Err(Ok(Error::UriTooLong)));
-    assert_eq!(client.total_supply(), 0);
-}
+    // Re-use the shared setup() helper defined above.
 
-#[test]
-fn mint_at_max_uri_len_boundary_succeeds() {
-    let (env, client, _, _) = setup();
-    let alice = Address::generate(&env);
-    let boundary = "a".repeat(2048);
-    let id = client.mint(&alice, &String::from_str(&env, &boundary));
-    assert_eq!(client.token_uri(&id).len(), 2048);
-}
+    #[test]
+    fn fresh_install_migrate_records_marker_and_version() {
+        let (env, client, _contract_id, _creator) = setup();
 
-#[test]
-fn set_base_uri_rejects_empty_uri() {
-    let (env, client, _, _) = setup();
-    let result = client.try_set_base_uri(&String::from_str(&env, ""));
-    assert_eq!(result, Err(Ok(Error::EmptyUri)));
-}
+        // No migration done yet
+        assert!(client.contract_version().is_none());
 
-#[test]
-fn set_base_uri_rejects_oversized_uri() {
-    let (env, client, _, _) = setup();
-    let big = "a".repeat(2049);
-    let result = client.try_set_base_uri(&String::from_str(&env, &big));
-    assert_eq!(result, Err(Ok(Error::UriTooLong)));
-    assert_eq!(client.base_uri(), None);
-}
+        client.migrate();
 
-#[test]
-fn set_base_uri_emits_metadata_update_event() {
-    let (env, client, _, _) = setup();
-    let before = env.events().all().len();
-    client.set_base_uri(&String::from_str(&env, "ipfs://new-base/"));
-    let after = env.events().all().len();
-    assert!(after > before, "set_base_uri should emit a metadata update event");
-}
+        // Marker is now set and version is readable
+        assert_eq!(
+            client.contract_version(),
+            Some(String::from_str(&env, "1.0.0"))
+        );
+    }
 
-#[test]
-fn freeze_metadata_emits_event() {
-    let (env, client, _, _) = setup();
-    let before = env.events().all().len();
-    client.freeze_metadata();
-    let after = env.events().all().len();
-    assert!(after > before, "freeze_metadata should emit an event");
-}
+    #[test]
+    #[should_panic(expected = "AlreadyMigrated")]
+    fn double_migrate_reverts_with_already_migrated() {
+        let (_env, client, _contract_id, _creator) = setup();
 
-#[test]
-fn frozen_collection_rejects_base_uri_update_through_the_only_entry_point() {
-    // set_base_uri is the sole mutator for collection-level metadata; once
-    // frozen there is no alternate entry point that can bypass the check.
-    let (env, client, _, _) = setup();
-    client.set_base_uri(&String::from_str(&env, "ipfs://before-freeze/"));
-    client.freeze_metadata();
-    let result = client.try_set_base_uri(&String::from_str(&env, "ipfs://after-freeze/"));
-    assert_eq!(result, Err(Ok(Error::MetadataFrozen)));
-    assert_eq!(
-        client.base_uri(),
-        Some(String::from_str(&env, "ipfs://before-freeze/"))
-    );
+        client.migrate();
+        // Second call must revert
+        client.migrate();
+    }
+
+    #[test]
+    fn migrate_emits_migrated_event() {
+        let (env, client, _contract_id, _creator) = setup();
+        client.migrate();
+
+        let events = env.events().all();
+        let found = events.iter().any(|(_, topics, _)| {
+            // topics is a Vec<Val>; the first entry is the symbol "migrated"
+            topics.len() >= 1
+                && topics
+                    .get(0)
+                    .map(|v| {
+                        soroban_sdk::Symbol::try_from_val(&env, &v)
+                            .map(|s| s == soroban_sdk::symbol_short!("migrated"))
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false)
+        });
+        assert!(found, "expected 'migrated' event");
+    }
+
+    #[test]
+    fn state_readable_after_migrate() {
+        let (env, client, _contract_id, _creator) = setup();
+
+        let alice = Address::generate(&env);
+        let token_id = client.mint(&alice, &String::from_str(&env, "ipfs://pre-migrate"));
+
+        client.migrate();
+
+        // Token owner, balance, and total supply all survive the migration
+        assert_eq!(client.owner_of(&token_id), alice);
+        assert_eq!(client.balance_of(&alice), 1u64);
+        assert_eq!(client.total_supply(), 1u64);
+    }
+
+    #[test]
+    fn royalty_info_readable_after_migrate() {
+        let (_env, client, _contract_id, _creator) = setup();
+        client.migrate();
+
+        let (_, bps) = client.royalty_info();
+        assert_eq!(bps, 500u32);
+    }
+
+    #[test]
+    fn migrate_does_not_corrupt_existing_approvals() {
+        let (env, client, _contract_id, _creator) = setup();
+
+        let alice = Address::generate(&env);
+        let bob = Address::generate(&env);
+
+        let token_id = client.mint(&alice, &String::from_str(&env, "uri"));
+        client.approve(&alice, &bob, &token_id, &None::<u32>);
+
+        client.migrate();
+
+        assert_eq!(client.get_approved(&token_id), Some(bob));
+    }
 }

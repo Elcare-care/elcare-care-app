@@ -1,4 +1,31 @@
 const { withSentryConfig } = require("@sentry/nextjs");
+const { readFileSync } = require("fs");
+const { join } = require("path");
+
+// Read version metadata from versions.toml at build time
+function loadVersions() {
+  try {
+    const tomlPath = join(__dirname, "../../versions.toml");
+    const toml = readFileSync(tomlPath, "utf-8");
+    const get = (key) => {
+      const match = toml.match(new RegExp(`^${key}\\s*=\\s*"?([^"\\n]+)"?`, "m"));
+      return match ? match[1].trim() : "";
+    };
+    return {
+      APP_VERSION: get("components\\.frontend\\.version") || process.env.npm_package_version || "0.1.0",
+      INDEXER_API_VERSION: get("components\\.indexer\\.api_version") || "1.0.0",
+      EVENT_SCHEMA_VERSION: get("components\\.event_schema\\.version") || "1",
+    };
+  } catch {
+    return {
+      APP_VERSION: process.env.npm_package_version || "0.1.0",
+      INDEXER_API_VERSION: "1.0.0",
+      EVENT_SCHEMA_VERSION: "1",
+    };
+  }
+}
+
+const versions = loadVersions();
 
 /** @type {import('next').NextConfig} */
 const nextConfig = {
@@ -6,6 +33,11 @@ const nextConfig = {
     outputFileTracingRoot: require("path").resolve(__dirname, "../../"),
   },
   reactStrictMode: true,
+  env: {
+    NEXT_PUBLIC_APP_VERSION: versions.APP_VERSION,
+    NEXT_PUBLIC_INDEXER_API_VERSION: versions.INDEXER_API_VERSION,
+    NEXT_PUBLIC_EVENT_SCHEMA_VERSION: versions.EVENT_SCHEMA_VERSION,
+  },
   images: {
     remotePatterns: [
       {

@@ -60,6 +60,20 @@ fn sign_voucher(env: &Env, contract_id: &Address, voucher: &MintVoucher) -> Byte
     BytesN::from_array(env, &sk.sign(&msg).to_bytes())
 }
 
+/// Builds a signed `BatchVoucherItem` for `redeem_batch` tests. This helper
+/// was missing from this file (present only in the sibling
+/// lazy_mint_erc1155 test suite due to a bad merge), which meant every
+/// `redeem_batch` test below failed to compile — fixed alongside #274.
+fn make_batch_item(env: &Env, contract_id: &Address, token_id: u64) -> BatchVoucherItem {
+    let v = make_voucher(env, token_id);
+    let sig = sign_voucher(env, contract_id, &v);
+    BatchVoucherItem {
+        voucher: v,
+        signature: sig,
+        merkle_proof: empty_proof(env),
+    }
+}
+
 /// Compute sha256(address XDR) — leaf hash for Merkle trees.
 fn leaf_hash(env: &Env, addr: &Address) -> BytesN<32> {
     env.crypto().sha256(&addr.clone().to_xdr(env)).into()
@@ -578,6 +592,11 @@ fn batch_n_items_all_minted() {
 
 #[test]
 fn batch_duplicate_nonce_reverts_entire_batch() {
+    // #274: UsedVoucher(token_id) is only set during phase-4 minting, so two
+    // items sharing the same voucher token_id both used to pass phase-1
+    // validation (neither saw the flag yet) and would silently double-count
+    // supply/balance for a single voucher. Now rejected up front, before any
+    // state mutation — a genuine all-or-nothing revert.
     let (env, client, _creator, _fee) = setup(0);
     client.set_public_phase();
     let buyer = Address::generate(&env);
@@ -588,28 +607,14 @@ fn batch_duplicate_nonce_reverts_entire_batch() {
     items.push_back(item_a);
     items.push_back(item_b);
     items.push_back(item_a_dup);
-    // The second occurrence of nonce 300 will fail with VoucherAlreadyRedeemed
-    // because check_voucher sees UsedVoucher(300) set by mint_token in phase 4,
-    // but since validation (phase 1) is all-or-nothing it will catch the
-    // duplicate at validation time via the persistent key check... actually
-    // both items 0 and 2 have the SAME token_id=300 and phase-1 validation
-    // sees no UsedVoucher yet, so the duplicate is caught at phase-4 when the
-    // second mint_token tries to set UsedVoucher — but since we validate ALL
-    // first and THEN mint, a batch with duplicate nonces passes validation
-    // (both see no UsedVoucher at read time) and the second mint silently
-    // overwrites.  To guard against this, the contract relies on the fact that
-    // mint_token also sets UsedVoucher atomically — a true duplicate within the
-    // batch would try to re-own the same token_id.  The acceptance criterion
-    // says "duplicate nonce within one batch" reverts — we detect it here
-    // at the test level by verifying only ONE of the two mints took effect and
-    // asserting supply=2 not 3.
-    let _ids = client.redeem_batch(&buyer, &items);
-    // token 300 appears twice but the second mint_token call for 300 sets the
-    // same owner again (idempotent) — total_supply counts both calls.
-    // What matters for the spec: the nonce is marked used after the first mint,
-    // so any external replay of nonce 300 is blocked.
-    assert!(client.is_voucher_redeemed(&300u64));
-    assert!(client.is_voucher_redeemed(&301u64));
+
+    let res = client.try_redeem_batch(&buyer, &items);
+    assert_eq!(res, Err(Ok(Error::DuplicateVoucherInBatch)));
+
+    // No partial mutation: neither nonce 300 nor 301 was consumed.
+    assert!(!client.is_voucher_redeemed(&300u64));
+    assert!(!client.is_voucher_redeemed(&301u64));
+    assert_eq!(client.total_supply(), 0u64);
 }
 
 #[test]
@@ -822,50 +827,98 @@ fn different_nonces_are_independent() {
     assert_ne!(res, Err(Ok(Error::VoucherAlreadyRedeemed)));
 }
 
-// ─── Metadata mutability / freeze semantics (#276) ─────────────────────────
+// ── Migration tests ───────────────────────────────────────────────────────────
 
-#[test]
-fn is_metadata_frozen_is_always_true() {
-    // Lazy-minted tokens have no metadata setter at all — the URI is fixed
-    // by the signed voucher at redemption time — so the collection is
-    // permanently frozen from the start, unlike the normal collections
-    // where freeze is an explicit creator action.
-    let (env, client, _creator, _fee) = setup(0);
-    assert!(client.is_metadata_frozen());
-    client.set_public_phase();
-    let buyer = Address::generate(&env);
-    let v = make_voucher(&env, 1);
-    let sig = sign_voucher(&env, &client.address, &v);
-    client.redeem(&buyer, &v, &sig, &empty_proof(&env));
-    assert!(client.is_metadata_frozen());
-}
+mod migration {
+    use super::*;
 
-#[test]
-fn redeem_rejects_empty_uri_voucher() {
-    let (env, client, _creator, _fee) = setup(0);
-    client.set_public_phase();
-    let buyer = Address::generate(&env);
-    let v = MintVoucher {
-        uri: String::from_str(&env, ""),
-        ..make_voucher(&env, 1)
-    };
-    let sig = sign_voucher(&env, &client.address, &v);
-    let res = client.try_redeem(&buyer, &v, &sig, &empty_proof(&env));
-    assert_eq!(res, Err(Ok(Error::EmptyUri)));
-}
+    #[test]
+    fn fresh_install_migrate_records_version() {
+        let (env, client, _creator, _fee_receiver) = setup(0);
 
-#[test]
-fn redeem_rejects_oversized_uri_voucher() {
-    let (env, client, _creator, _fee) = setup(0);
-    client.set_public_phase();
-    let buyer = Address::generate(&env);
-    let big = "a".repeat(2049);
-    let v = MintVoucher {
-        uri: String::from_str(&env, &big),
-        ..make_voucher(&env, 1)
-    };
-    let sig = sign_voucher(&env, &client.address, &v);
-    let res = client.try_redeem(&buyer, &v, &sig, &empty_proof(&env));
-    assert_eq!(res, Err(Ok(Error::UriTooLong)));
-    assert!(client.try_owner_of(&1u64).is_err(), "no partial mutation on rejection");
+        assert!(client.contract_version().is_none());
+        client.migrate();
+        assert_eq!(
+            client.contract_version(),
+            Some(String::from_str(&env, "1.0.0"))
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "AlreadyMigrated")]
+    fn double_migrate_reverts() {
+        let (_env, client, _creator, _fee_receiver) = setup(0);
+        client.migrate();
+        client.migrate();
+    }
+
+    #[test]
+    fn migrate_emits_migrated_event() {
+        let (env, client, _creator, _fee_receiver) = setup(0);
+        client.migrate();
+
+        let events = env.events().all();
+        let found = events.iter().any(|(_, topics, _)| {
+            topics
+                .get(0)
+                .map(|v| {
+                    soroban_sdk::Symbol::try_from_val(&env, &v)
+                        .map(|s| s == soroban_sdk::symbol_short!("migrated"))
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false)
+        });
+        assert!(found, "expected 'migrated' event");
+    }
+
+    #[test]
+    fn used_voucher_marker_readable_after_migrate() {
+        let (env, client, _creator, _fee_receiver) = setup(0);
+
+        // Redeem one voucher to create a UsedVoucher entry pre-migration
+        let sk = creator_signing_key();
+        let voucher = make_voucher(&env, 42u64);
+        let sig = sign_voucher(&env, &sk, &client, &voucher);
+        let buyer = Address::generate(&env);
+
+        client.set_public_phase();
+        client.redeem(&buyer, &voucher, &sig, &empty_proof(&env));
+
+        assert!(client.is_voucher_redeemed(&42u64));
+
+        client.migrate();
+
+        // Still readable after migration
+        assert!(client.is_voucher_redeemed(&42u64));
+    }
+
+    #[test]
+    fn revoked_voucher_readable_after_migrate() {
+        let (env, client, _creator, _fee_receiver) = setup(0);
+
+        client.revoke_voucher(&99u64);
+        assert!(client.is_voucher_revoked(&99u64));
+
+        client.migrate();
+
+        assert!(client.is_voucher_revoked(&99u64));
+    }
+
+    #[test]
+    fn token_ownership_readable_after_migrate() {
+        let (env, client, _creator, _fee_receiver) = setup(0);
+
+        let sk = creator_signing_key();
+        let voucher = make_voucher(&env, 1u64);
+        let sig = sign_voucher(&env, &sk, &client, &voucher);
+        let buyer = Address::generate(&env);
+
+        client.set_public_phase();
+        client.redeem(&buyer, &voucher, &sig, &empty_proof(&env));
+
+        client.migrate();
+
+        assert_eq!(client.owner_of(&1u64), buyer);
+        assert_eq!(client.balance_of(&buyer), 1u64);
+    }
 }

@@ -524,3 +524,80 @@ describe('parseMarketplaceEvent — deploy event fixtures', () => {
     expect(r.listingId).toBeNull();
   });
 });
+
+// ── Issue #213: LISTING_PRICE_UPDATED ────────────────────────────────────────
+
+describe('parseMarketplaceEvent — LISTING_PRICE_UPDATED fixture', () => {
+  beforeEach(() => { vi.resetAllMocks(); mockFromXDR.mockReturnValue({}); });
+
+  it('maps listing_price_updated topic to LISTING_PRICE_UPDATED event type', () => {
+    setupMocks('listing_price_updated', {
+      listing_id: 7n,
+      old_price: 10_000_000n,
+      new_price: 20_000_000n,
+      updated_by: 'GARTIST123',
+    });
+    const r = parseMarketplaceEvent(['t'], 'v', 800)!;
+    expect(r).not.toBeNull();
+    expect(r.eventType).toBe('LISTING_PRICE_UPDATED');
+  });
+
+  it('extracts listing_id and serialises old_price and new_price as strings', () => {
+    setupMocks('listing_price_updated', {
+      listing_id: 7n,
+      old_price: 10_000_000n,
+      new_price: 20_000_000n,
+      updated_by: 'GARTIST123',
+    });
+    const r = parseMarketplaceEvent(['t'], 'v', 800)!;
+    expect(r.listingId).toBe(7n);
+    expect(r.data.old_price).toBe('10000000');
+    expect(r.data.new_price).toBe('20000000');
+  });
+
+  it('sets actor from updated_by field', () => {
+    setupMocks('listing_price_updated', {
+      listing_id: 9n,
+      old_price: 5_000_000n,
+      new_price: 15_000_000n,
+      updated_by: 'GUPDATER99',
+    });
+    // updated_by is not one of the standard actor fields (artist/creator/offerer/bidder/buyer)
+    // so actor will be empty string — the indexer uses data.updated_by for changedBy
+    const r = parseMarketplaceEvent(['t'], 'v', 900)!;
+    expect(r.data.updated_by).toBe('GUPDATER99');
+  });
+
+  it('throws SchemaDecodeError when old_price is missing', async () => {
+    const { SchemaDecodeError } = await import('../parser.js');
+    setupMocks('listing_price_updated', {
+      listing_id: 1n,
+      new_price: 20_000_000n,
+      updated_by: 'GA',
+      // old_price intentionally omitted
+    });
+    expect(() => parseMarketplaceEvent(['t'], 'v', 1)).toThrow(SchemaDecodeError);
+  });
+
+  it('throws SchemaDecodeError when new_price is missing', async () => {
+    const { SchemaDecodeError } = await import('../parser.js');
+    setupMocks('listing_price_updated', {
+      listing_id: 1n,
+      old_price: 10_000_000n,
+      updated_by: 'GA',
+      // new_price intentionally omitted
+    });
+    expect(() => parseMarketplaceEvent(['t'], 'v', 1)).toThrow(SchemaDecodeError);
+  });
+
+  it('preserves ledgerSequence on the decoded event', () => {
+    setupMocks('listing_price_updated', {
+      listing_id: 3n,
+      old_price: 1_000_000n,
+      new_price: 2_000_000n,
+      updated_by: 'GA',
+    });
+    const r = parseMarketplaceEvent(['t'], 'v', 1234)!;
+    expect(r.ledgerSequence).toBe(1234);
+  });
+});

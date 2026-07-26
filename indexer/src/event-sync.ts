@@ -1,7 +1,8 @@
 import { rpc } from '@stellar/stellar-sdk';
 import { parseMarketplaceEvent, SchemaDecodeError, type DecodedEvent } from './parser.js';
-import { decodeErrorsCounter, eventDecodeErrorsCounter } from './metrics.js';
+import { decodeErrorsCounter, eventDecodeErrorsCounter, deadLetterCreatedTotal } from './metrics.js';
 import { withRpcRetry } from './retry.js';
+import prismaWrite from './prisma-write.js';
 
 export const MAX_LEDGER_WINDOW = 17_000;
 export const EVENT_PAGE_LIMIT = 100;
@@ -56,6 +57,47 @@ function decodeRpcEvent(event: RpcEvent, eventIndex: number): DecodedEvent | nul
   );
 }
 
+const MAX_TOPIC_CHARS  = 512;
+const MAX_VALUE_CHARS  = 2000;
+const MAX_ERROR_CHARS  = 1000;
+
+async function persistDeadLetter(event: RpcEvent, fallbackIdx: number, err: unknown): Promise<void> {
+  const errorCode = err instanceof SchemaDecodeError ? 'SCHEMA_DECODE' : 'UNKNOWN';
+  const rawMsg    = err instanceof Error ? err.message : String(err);
+  // Redact stack-frame paths before storing
+  const errorMessage = rawMsg.replace(/\s+at\s+\S+:\d+:\d+/g, '').slice(0, MAX_ERROR_CHARS);
+
+  const rawTopics  = (event.topic ?? []).map((t) => String(toBase64(t)).slice(0, MAX_TOPIC_CHARS));
+  const rawValue   = String(toBase64(event.value ?? '')).slice(0, MAX_VALUE_CHARS);
+  const eventIndex = extractEventIndex(event, fallbackIdx);
+
+  await (prismaWrite as any).deadLetterEvent.upsert({
+    where: {
+      contractId_ledgerSequence_txHash_eventIndex: {
+        contractId:     event.contractId ?? '',
+        ledgerSequence: event.ledger,
+        txHash:         event.txHash    ?? '',
+        eventIndex,
+      },
+    },
+    create: {
+      network:        process.env.STELLAR_NETWORK  ?? '',
+      contractId:     event.contractId ?? '',
+      ledgerSequence: event.ledger,
+      txHash:         event.txHash    ?? '',
+      eventIndex,
+      rawTopics,
+      rawValue,
+      errorCode,
+      errorMessage,
+      parserVersion:  process.env.npm_package_version ?? '',
+    },
+    update: { attempts: { increment: 1 }, errorMessage },
+  });
+
+  deadLetterCreatedTotal.inc({ error_code: errorCode });
+}
+
 export async function collectMarketplaceEvents(
   server: rpc.Server,
   contractIds: string[],
@@ -106,6 +148,11 @@ export async function collectMarketplaceEvents(
             eventType,
             error: err instanceof Error ? err.message : String(err),
             rawTopic: (event as RpcEvent).topic,
+          });
+
+          // Persist durable diagnostic record (fire-and-forget — must not block the batch).
+          persistDeadLetter(event as RpcEvent, idx, err).catch((dlErr) => {
+            console.error('[EventSync] Failed to persist dead-letter record:', dlErr);
           });
         }
       }
