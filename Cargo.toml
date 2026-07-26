@@ -16,6 +16,7 @@ resolver = "2"
 # keeps everything on the v2 ABI that soroban-env-host 25.x was tested with.
 [workspace.dependencies]
 ed25519-dalek = "=2.2.0"
+proptest = "1.5"
 
 [patch.crates-io]
 soroban-env-host = { path = "patches/soroban-env-host-25.0.1" }

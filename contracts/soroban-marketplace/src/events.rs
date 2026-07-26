@@ -237,6 +237,68 @@ impl RoyaltySettlementEvent {
     }
 }
 
+/// One `{address, amount}` entry of a settlement breakdown: the exact token
+/// amount transferred to `address` during payout distribution. (Issue #201)
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecipientPayout {
+    pub address: Address,
+    pub amount: i128,
+}
+
+/// Emitted after all sale transfers complete, carrying the actual amount each
+/// recipient received — unlike [`RoyaltySettlementEvent`], which only snapshots
+/// the configured bps splits. Recipient payouts (including any collection-level
+/// `royalty_info` receiver) sum to `sale_price - protocol_fee_amount`, so the
+/// distribution can be audited without replaying the transaction. (Issue #201)
+///
+/// The whole struct is published as the single event data `Val` under one
+/// `royalty_paid` topic; the recipients vector lives in the data field, so the
+/// event never exceeds Soroban's topic limits regardless of recipient count.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoyaltyPaidEvent {
+    /// Set for `buy_listing` / `accept_offer` settlements.
+    pub listing_id: Option<u64>,
+    /// Set for `finalize_auction` settlements.
+    pub auction_id: Option<u64>,
+    pub sale_price: i128,
+    pub protocol_fee_amount: i128,
+    pub token: Address,
+    pub recipients: soroban_sdk::Vec<RecipientPayout>,
+    pub ledger_sequence: u32,
+}
+impl RoyaltyPaidEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events().publish((soroban_sdk::Symbol::new(env, ROYALTY_PAID),), self);
+    }
+}
+
+/// Emit `royalty_paid` for a completed settlement. Exactly one of `listing_id`
+/// / `auction_id` should be `Some`.
+#[allow(clippy::too_many_arguments)]
+pub fn emit_royalty_paid(
+    env: &Env,
+    listing_id: Option<u64>,
+    auction_id: Option<u64>,
+    sale_price: i128,
+    protocol_fee_amount: i128,
+    token: Address,
+    recipients: soroban_sdk::Vec<RecipientPayout>,
+) {
+    RoyaltyPaidEvent {
+        listing_id,
+        auction_id,
+        sale_price,
+        protocol_fee_amount,
+        token,
+        recipients,
+        ledger_sequence: env.ledger().sequence(),
+    }
+    .publish(env);
+}
+
 impl ListingUpdatedEvent {
     #[allow(deprecated)]
     pub fn publish(self, env: &Env) {
@@ -473,6 +535,48 @@ impl OfferReclaimedEvent {
     pub fn publish(self, env: &Env) {
         env.events().publish((soroban_sdk::Symbol::new(env, OFFER_RECLAIMED),), self);
     }
+}
+
+// ── Blocked-bidder Events (Issue #199) ────────────────────────────────────────
+
+/// Emitted when the auction creator or admin adds an address to the auction's
+/// blocked-bidder registry.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuctionBidderBlockedEvent {
+    pub auction_id: u64,
+    pub bidder: Address,
+}
+impl AuctionBidderBlockedEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events().publish((soroban_sdk::Symbol::new(env, AUCTION_BIDDER_BLOCKED),), self);
+    }
+}
+
+/// Emitted when a previously-blocked address is removed from the auction's
+/// blocked-bidder registry.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuctionBidderUnblockedEvent {
+    pub auction_id: u64,
+    pub bidder: Address,
+}
+impl AuctionBidderUnblockedEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events().publish((soroban_sdk::Symbol::new(env, AUCTION_BIDDER_UNBLOCKED),), self);
+    }
+}
+
+/// Emit `auction_bidder_blocked` for a newly-registered blocked address.
+pub fn emit_bidder_blocked(env: &Env, auction_id: u64, bidder: Address) {
+    AuctionBidderBlockedEvent { auction_id, bidder }.publish(env);
+}
+
+/// Emit `auction_bidder_unblocked` once an address is removed from the registry.
+pub fn emit_bidder_unblocked(env: &Env, auction_id: u64, bidder: Address) {
+    AuctionBidderUnblockedEvent { auction_id, bidder }.publish(env);
 }
 
 // ── NFT Escrow Events ─────────────────────────────────────────────────────────

@@ -2,10 +2,12 @@
 // hooks/useTxToast.ts — Transaction lifecycle toast helper
 //
 // Wraps an async on-chain action and fires standardised toasts
-// for each phase of the Soroban transaction lifecycle:
+// for each phase of the Soroban transaction lifecycle.
 //
-//   submitting → awaiting signature → broadcasting → confirmed
-//                                                  ↘ failed
+// Issue #300: now delegates the lifecycle state tracking to
+// useTxLifecycle so all actions share the same state machine.
+// The public API (run, isRunning, phase) is unchanged so
+// existing callers require no migration.
 //
 // Usage:
 //   const { run, isRunning } = useTxToast();
@@ -16,13 +18,24 @@
 
 "use client";
 
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useState } from "react";
 import { useToast } from "@/components/ToastProvider";
 import { getReadableErrorMessage, isUserRejectionError } from "@/lib/errors";
 import { config } from "@/lib/config";
+import {
+  useTxLifecycle,
+  txStateLabel,
+  TxState,
+  extractTxHash,
+  classifyTxError,
+} from "./useTxLifecycle";
 
 // ── Types ─────────────────────────────────────────────────────
 
+/**
+ * Legacy phase type — kept for backwards compatibility with components
+ * that read the `phase` field from useTxToast.
+ */
 export type TxLifecyclePhase =
   | "idle"
   | "submitting"
@@ -68,7 +81,7 @@ export interface UseTxToastResult {
   /** True while the transaction is in any non-idle phase. */
   isRunning: boolean;
 
-  /** Current lifecycle phase. */
+  /** Current lifecycle phase (legacy alias). */
   phase: TxLifecyclePhase;
 }
 
@@ -84,31 +97,31 @@ export function getTxExplorerUrl(txHash: string | null | undefined): string | nu
   return `https://stellar.expert/explorer/${network}/tx/${txHash}`;
 }
 
-// ── Heuristic: extract a transaction hash from a raw result ──
+// ── Map TxState → legacy TxLifecyclePhase ────────────────────
 
-/**
- * Many Soroban SDK responses embed a `hash` field.  We try a few
- * common shapes so callers don't need to pass the hash explicitly.
- */
-function extractHash(result: unknown): string | null {
-  if (!result || typeof result !== "object") return null;
-  const r = result as Record<string, unknown>;
-  if (typeof r["hash"] === "string") return r["hash"];
-  if (typeof r["txHash"] === "string") return r["txHash"];
-  if (typeof r["id"] === "string" && r["id"].length === 64) return r["id"];
-  return null;
+function toPhase(state: TxState): TxLifecyclePhase {
+  switch (state) {
+    case "idle":             return "idle";
+    case "simulating":       return "submitting";
+    case "signing":          return "signing";
+    case "broadcasting":     return "broadcasting";
+    case "confirming":
+    case "indexer_pending":  return "confirming";
+    case "success":          return "success";
+    case "error":            return "error";
+  }
 }
 
 // ── Hook ──────────────────────────────────────────────────────
 
 export function useTxToast(): UseTxToastResult {
   const { pushToast } = useToast();
-  const [isRunning, setIsRunning] = useState(false);
-  const [phase, setPhase] = useState<TxLifecyclePhase>("idle");
-
-  // Keep a ref so that we can cancel stale in-progress toasts if a new
-  // call is made before the previous one completes (edge case).
-  const abortRef = useRef(false);
+  // Delegate all lifecycle tracking to useTxLifecycle.
+  // Disable sessionStorage persistence here — useTxToast callers that want
+  // persistence should use useTxLifecycle directly.
+  const { txState, run: lifecycleRun } = useTxLifecycle({
+    persistKey: null,
+  });
 
   const run = useCallback(
     async <T>(
@@ -122,51 +135,42 @@ export function useTxToast(): UseTxToastResult {
         errorDurationMs = 6_000,
       } = opts;
 
-      abortRef.current = false;
-      setIsRunning(true);
-
-      // Phase 1 — submitting (building + simulating the transaction)
-      setPhase("submitting");
+      // Toast: building
       pushToast(`${action}: building transaction…`, "info");
 
-      // Phase 2 — awaiting wallet signature
-      // We transition immediately before calling fn() so the user sees
-      // "awaiting signature" the moment we hand off to the wallet.
-      setPhase("signing");
+      // Toast: awaiting signature (just before we call fn)
       pushToast(`${action}: awaiting wallet signature…`, "info");
 
-      let result: T;
-      try {
-        result = await fn();
-      } catch (err: unknown) {
-        if (abortRef.current) return null;
+      const result = await lifecycleRun(
+        async () => {
+          const r = await fn();
+          return r;
+        },
+        { action }
+      );
 
-        setPhase("error");
-        setIsRunning(false);
-
-        if (isUserRejectionError(err)) {
-          pushToast(`${action} cancelled — you rejected the request.`, "error", errorDurationMs);
-        } else {
-          const msg = getReadableErrorMessage(
-            err,
-            `${action} failed. Please try again.`
-          );
-          pushToast(msg, "error", errorDurationMs);
+      if (result === null) {
+        // Determine what went wrong from the lifecycle error
+        const { error } = txState;
+        if (error) {
+          if (error.category === "wallet_rejection") {
+            pushToast(`${action} cancelled — you rejected the request.`, "error", errorDurationMs);
+          } else {
+            const msg = getReadableErrorMessage(
+              error.originalError ?? error.message,
+              `${action} failed. Please try again.`
+            );
+            pushToast(msg, "error", errorDurationMs);
+          }
         }
         return null;
       }
 
-      if (abortRef.current) return null;
-
-      // Phase 3 — broadcasting (tx was signed, now polling)
-      setPhase("broadcasting");
+      // Toast: broadcasting
       pushToast(`${action}: broadcasting to the network…`, "info");
 
-      // Phase 4 — confirmed
-      setPhase("confirming");
-
-      // Build the success message, optionally including the explorer link.
-      const txHash = extractHash(result);
+      // Build success message
+      const txHash = extractTxHash(result);
       let successMsg: string;
       if (successMessage) {
         successMsg = successMessage(txHash);
@@ -176,15 +180,17 @@ export function useTxToast(): UseTxToastResult {
           ? `${action} confirmed! View on explorer: ${explorerUrl}`
           : `${action} confirmed successfully!`;
       }
-
-      setPhase("success");
-      setIsRunning(false);
       pushToast(successMsg, "success", successDurationMs);
 
       return result;
     },
-    [pushToast]
+    [pushToast, lifecycleRun, txState]
   );
 
-  return { run, isRunning, phase };
+  return {
+    run,
+    isRunning: txState.state !== "idle" && txState.state !== "success" && txState.state !== "error",
+    phase: toPhase(txState.state),
+  };
 }
+

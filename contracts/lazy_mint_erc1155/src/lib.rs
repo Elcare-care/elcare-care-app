@@ -59,12 +59,14 @@ pub enum Error {
     EditionAlreadyRegistered = 10,
     InvalidSignature = 11,
     MaxSupplyReached = 12,
-    /// Voucher nonce already redeemed (#39).
     VoucherAlreadyRedeemed = 13,
     NotAllowlisted = 14,
     InvalidMerkleProof = 15,
-    /// Voucher nonce has been explicitly revoked by the creator.
     VoucherRevoked = 16,
+    /// migrate() called for a version already marked done.
+    AlreadyMigrated = 17,
+    /// Unsupported version jump.
+    UnsupportedMigration = 18,
 }
 
 // ─── Data types ───────────────────────────────────────────────────────────────
@@ -99,6 +101,7 @@ pub enum DataKey {
     Initialized,
     Creator,
     CreatorPubkey,
+    CurrentWasmHash,
     Name,
     RoyaltyBps,
     RoyaltyReceiver,
@@ -378,6 +381,7 @@ impl LazyMint1155 {
         }
         env.storage().instance().set(&DataKey::Initialized, &true);
         env.storage().instance().set(&DataKey::Creator, &creator);
+        env.storage().instance().set(&DataKey::CurrentWasmHash, &BytesN::from_array(&env, &[0u8; 32]));
         env.storage()
             .instance()
             .set(&DataKey::CreatorPubkey, &creator_pubkey);
@@ -399,6 +403,24 @@ impl LazyMint1155 {
             .instance()
             .set(&DataKey::NetworkPassphrase, &network_passphrase);
         env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_BUMP);
+        Ok(())
+    }
+
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
+        let old_wasm_hash: BytesN<32> = env
+            .storage()
+            .instance()
+            .get(&DataKey::CurrentWasmHash)
+            .unwrap_or(BytesN::from_array(&env, &[0u8; 32]));
+        env.storage()
+            .instance()
+            .set(&DataKey::CurrentWasmHash, &new_wasm_hash);
+        env.deployer().update_current_contract_wasm(&new_wasm_hash);
+        env.events().publish(
+            (symbol_short!("upgraded"),),
+            (old_wasm_hash, new_wasm_hash),
+        );
         Ok(())
     }
 
@@ -636,6 +658,52 @@ impl LazyMint1155 {
     pub fn merkle_root(env: Env) -> Option<BytesN<32>> {
         env.storage().instance().get(&DataKey::MerkleRoot)
     }
+
+    // ── Versioning & Migration ─────────────────────────────────────────────
+
+    pub fn version(_env: Env) -> &'static str {
+        "1.0.0"
+    }
+
+    pub fn contract_version(env: Env) -> Option<String> {
+        env.storage().instance().get(&DataKey::ContractVersion)
+    }
+
+    /// Creator-guarded idempotent migration entry point.
+    /// v1.0.0: records the completion marker and on-chain version string.
+    pub fn migrate(env: Env) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
+        Self::only_creator(&env)?;
+
+        let target = String::from_str(&env, "1.0.0");
+        let done_key = DataKey::MigrationDone(target.clone());
+
+        if env
+            .storage()
+            .persistent()
+            .get::<DataKey, bool>(&done_key)
+            .unwrap_or(false)
+        {
+            return Err(Error::AlreadyMigrated);
+        }
+
+        // v1.0.0 migration body: nothing to migrate for the initial version.
+        // EditionMaxSupply, Balance, TotalSupply, RedeemedVoucher, and
+        // RevokedVoucher entries are already in persistent storage and remain
+        // readable as-is.
+
+        env.storage().persistent().set(&done_key, &true);
+        env.storage()
+            .persistent()
+            .extend_ttl(&done_key, TTL_THRESHOLD, TTL_BUMP);
+        env.storage()
+            .instance()
+            .set(&DataKey::ContractVersion, &target);
+        env.events()
+            .publish((soroban_sdk::symbol_short!("migrated"), target), ());
+        Ok(())
+    }
+
     // ── Transfers ─────────────────────────────────────────────────────────
 
     pub fn transfer(

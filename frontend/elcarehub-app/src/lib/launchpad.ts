@@ -6,6 +6,7 @@ import {
 } from "@stellar/stellar-sdk";
 import { config } from "./config";
 import { invokeContract } from "./contract";
+import { assertWritePreflight } from "./preflight";
 
 // ── Types ─────────────────────────────────────────────────────
 
@@ -24,6 +25,11 @@ export interface CollectionRecord {
 export interface PlatformFee {
   receiver: string;
   bps: number;
+}
+
+export interface LaunchpadWasmUpdatePayload {
+  kind: CollectionKind;
+  wasmHashHex: string;
 }
 
 // ── Parsing ───────────────────────────────────────────────────
@@ -459,6 +465,54 @@ export async function updatePlatformFee(
   await invokeContract(
     adminPublicKey,
     "update_platform_fee",
+    args,
+    false,
+    config.launchpadContractId
+  );
+}
+
+function toWasmKindScVal(kind: CollectionKind): xdr.ScVal {
+  return nativeToScVal(kind, { type: "symbol" });
+}
+
+function parseWasmHashHex(wasmHashHex: string): Uint8Array {
+  const normalized = wasmHashHex.replace(/^0x/i, "").trim();
+  if (normalized.length !== 64 || /[^0-9a-fA-F]/.test(normalized)) {
+    throw new Error("WASM hash must be a 32-byte hex string.");
+  }
+  const bytes = new Uint8Array(32);
+  for (let i = 0; i < 32; i += 1) {
+    bytes[i] = parseInt(normalized.slice(i * 2, i * 2 + 2), 16);
+  }
+  return bytes;
+}
+
+export async function updateCollectionWasm(
+  adminPublicKey: string,
+  kind: CollectionKind,
+  wasmHashHex: string
+): Promise<void> {
+  const args = [
+    toWasmKindScVal(kind),
+    nativeToScVal(parseWasmHashHex(wasmHashHex), { type: "bytes" }),
+  ];
+  await invokeContract(
+    adminPublicKey,
+    "update_collection_wasm",
+    args,
+    false,
+    config.launchpadContractId
+  );
+}
+
+export async function upgradeCollection(
+  adminPublicKey: string,
+  collectionAddress: string
+): Promise<void> {
+  const args = [toAddressScVal(collectionAddress)];
+  await invokeContract(
+    adminPublicKey,
+    "upgrade_collection",
     args,
     false,
     config.launchpadContractId

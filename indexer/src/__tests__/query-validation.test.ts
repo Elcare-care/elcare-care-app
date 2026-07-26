@@ -18,10 +18,10 @@ import request from 'supertest';
 
 const mockPrisma = vi.hoisted(() => ({
   listing:          { findMany: vi.fn(), count: vi.fn(), aggregate: vi.fn() },
-  auction:          { findMany: vi.fn(), findUnique: vi.fn() },
-  offer:            { findMany: vi.fn() },
+  auction:          { findMany: vi.fn(), findUnique: vi.fn(), count: vi.fn() },
+  offer:            { findMany: vi.fn(), count: vi.fn() },
   marketplaceEvent: { findMany: vi.fn(), count: vi.fn() },
-  collection:       { findMany: vi.fn() },
+  collection:       { findMany: vi.fn(), count: vi.fn() },
 }));
 
 const mockRedis = vi.hoisted(() => ({
@@ -57,7 +57,9 @@ beforeEach(() => {
   mockPrisma.listing.count.mockResolvedValue(0);
   mockPrisma.listing.aggregate.mockResolvedValue({ _sum: { price: null } });
   mockPrisma.auction.findMany.mockResolvedValue([]);
+  mockPrisma.auction.count.mockResolvedValue(0);
   mockPrisma.offer.findMany.mockResolvedValue([]);
+  mockPrisma.offer.count.mockResolvedValue(0);
   mockPrisma.marketplaceEvent.findMany.mockResolvedValue([]);
   mockPrisma.marketplaceEvent.count.mockResolvedValue(0);
   mockPrisma.collection.findMany.mockResolvedValue([]);
@@ -106,7 +108,7 @@ describe('isValidStellarAddress', () => {
 
   it('accepts addresses using digits 2-7', () => {
     // Construct a synthetic but format-valid G-address (55 A-Z/2-7 chars after G)
-    const addr = 'G' + 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA3' + 'AAAA';
+    const addr = 'G' + 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA3';
     // length check: 1 + 55 = 56
     expect(addr.length).toBe(56);
     expect(isValidStellarAddress(addr)).toBe(true);
