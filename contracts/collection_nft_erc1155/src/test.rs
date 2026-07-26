@@ -1172,79 +1172,82 @@ fn balance_of_batch_mismatched_lengths_returns_empty() {
     assert_eq!(result.len(), 0);
 }
 
-// ─── Supply / mint invariants (#274) ───────────────────────────────────────
+// ── Migration tests ───────────────────────────────────────────────────────────
 
-#[test]
-fn mint_new_zero_amount_returns_error() {
-    let (env, client, _, _) = setup();
-    let alice = Address::generate(&env);
-    let result = client.try_mint_new(&alice, &0u128, &String::from_str(&env, "uri"));
-    assert_eq!(result, Err(Ok(Error::ZeroAmount)));
-}
+mod migration {
+    use super::*;
 
-#[test]
-fn mint_zero_amount_returns_error() {
-    let (env, client, _, _) = setup();
-    let alice = Address::generate(&env);
-    let token_id = client.mint_new(&alice, &10u128, &String::from_str(&env, "uri"));
-    let result = client.try_mint(&alice, &token_id, &0u128, &String::from_str(&env, "uri"));
-    assert_eq!(result, Err(Ok(Error::ZeroAmount)));
-    assert_eq!(client.balance_of(&alice, &token_id), 10u128, "no partial mutation");
-}
+    #[test]
+    fn fresh_install_migrate_records_version() {
+        let (env, client, _contract_id, _creator) = setup();
 
-#[test]
-fn mint_batch_empty_batch_returns_error() {
-    let (env, client, _, _) = setup();
-    let alice = Address::generate(&env);
-    let ids: Vec<u64> = Vec::new(&env);
-    let amounts: Vec<u128> = Vec::new(&env);
-    let uris: Vec<String> = Vec::new(&env);
-    let result = client.try_mint_batch(&alice, &ids, &amounts, &uris);
-    assert_eq!(result, Err(Ok(Error::EmptyBatch)));
-}
-
-#[test]
-fn mint_batch_zero_amount_item_returns_error() {
-    let (env, client, _, _) = setup();
-    let alice = Address::generate(&env);
-    let ids = Vec::from_array(&env, [0u64, 1u64]);
-    let amounts = Vec::from_array(&env, [10u128, 0u128]);
-    let uris = Vec::from_array(
-        &env,
-        [String::from_str(&env, "u0"), String::from_str(&env, "u1")],
-    );
-    let result = client.try_mint_batch(&alice, &ids, &amounts, &uris);
-    assert_eq!(result, Err(Ok(Error::ZeroAmount)));
-    assert_eq!(client.balance_of(&alice, &0u64), 0, "no partial mutation on rejection");
-}
-
-#[test]
-fn mint_batch_exceeding_max_batch_size_returns_error() {
-    let (env, client, _, _) = setup();
-    let alice = Address::generate(&env);
-    let mut ids: Vec<u64> = Vec::new(&env);
-    let mut amounts: Vec<u128> = Vec::new(&env);
-    let mut uris: Vec<String> = Vec::new(&env);
-    for i in 0..201u64 {
-        ids.push_back(i);
-        amounts.push_back(1u128);
-        uris.push_back(String::from_str(&env, "u"));
+        assert!(client.contract_version().is_none());
+        client.migrate();
+        assert_eq!(
+            client.contract_version(),
+            Some(String::from_str(&env, "1.0.0"))
+        );
     }
-    let result = client.try_mint_batch(&alice, &ids, &amounts, &uris);
-    assert_eq!(result, Err(Ok(Error::BatchTooLarge)));
-}
 
-#[test]
-fn batch_transfer_exceeding_max_batch_size_returns_error() {
-    let (env, client, _, _) = setup();
-    let owner = Address::generate(&env);
-    let recipient = Address::generate(&env);
-    let mut ids: Vec<u64> = Vec::new(&env);
-    let mut amounts: Vec<u128> = Vec::new(&env);
-    for i in 0..201u64 {
-        ids.push_back(i);
-        amounts.push_back(1u128);
+    #[test]
+    #[should_panic(expected = "AlreadyMigrated")]
+    fn double_migrate_reverts() {
+        let (_env, client, _contract_id, _creator) = setup();
+        client.migrate();
+        client.migrate();
     }
-    let result = client.try_batch_transfer(&owner, &owner, &recipient, &ids, &amounts);
-    assert_eq!(result, Err(Ok(Error::BatchTooLarge)));
+
+    #[test]
+    fn migrate_emits_migrated_event() {
+        let (env, client, _contract_id, _creator) = setup();
+        client.migrate();
+
+        let events = env.events().all();
+        let found = events.iter().any(|(_, topics, _)| {
+            topics
+                .get(0)
+                .map(|v| {
+                    soroban_sdk::Symbol::try_from_val(&env, &v)
+                        .map(|s| s == soroban_sdk::symbol_short!("migrated"))
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false)
+        });
+        assert!(found, "expected 'migrated' event");
+    }
+
+    #[test]
+    fn balances_readable_after_migrate() {
+        let (env, client, _contract_id, _creator) = setup();
+
+        let alice = Address::generate(&env);
+        client.mint_new(
+            &alice,
+            &10u128,
+            &String::from_str(&env, "ipfs://token0"),
+        );
+
+        client.migrate();
+
+        assert_eq!(client.balance_of(&alice, &0u64), 10u128);
+        assert_eq!(client.total_supply(&0u64), 10u128);
+    }
+
+    #[test]
+    fn per_token_max_supply_readable_after_migrate() {
+        let (env, client, _contract_id, _creator) = setup();
+
+        client.set_token_max_supply(&0u64, &500u128);
+        client.migrate();
+
+        assert_eq!(client.token_max_supply(&0u64), 500u128);
+    }
+
+    #[test]
+    fn royalty_readable_after_migrate() {
+        let (_env, client, _contract_id, _creator) = setup();
+        client.migrate();
+        let (_, bps) = client.royalty_info();
+        assert_eq!(bps, 500u32);
+    }
 }

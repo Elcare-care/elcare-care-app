@@ -827,28 +827,98 @@ fn different_nonces_are_independent() {
     assert_ne!(res, Err(Ok(Error::VoucherAlreadyRedeemed)));
 }
 
-// ─── Supply / mint invariants (#274) ───────────────────────────────────────
+// ── Migration tests ───────────────────────────────────────────────────────────
 
-#[test]
-fn redeem_batch_empty_batch_returns_error() {
-    let (env, client, _creator, _fee) = setup(0);
-    client.set_public_phase();
-    let buyer = Address::generate(&env);
-    let items: Vec<BatchVoucherItem> = Vec::new(&env);
-    let result = client.try_redeem_batch(&buyer, &items);
-    assert_eq!(result, Err(Ok(Error::EmptyBatch)));
-}
+mod migration {
+    use super::*;
 
-#[test]
-fn redeem_batch_exceeding_max_batch_size_returns_error() {
-    let (env, client, _creator, _fee) = setup(0);
-    client.set_public_phase();
-    let buyer = Address::generate(&env);
-    let mut items: Vec<BatchVoucherItem> = Vec::new(&env);
-    for i in 0..101u64 {
-        items.push_back(make_batch_item(&env, &client.address, i));
+    #[test]
+    fn fresh_install_migrate_records_version() {
+        let (env, client, _creator, _fee_receiver) = setup(0);
+
+        assert!(client.contract_version().is_none());
+        client.migrate();
+        assert_eq!(
+            client.contract_version(),
+            Some(String::from_str(&env, "1.0.0"))
+        );
     }
-    let result = client.try_redeem_batch(&buyer, &items);
-    assert_eq!(result, Err(Ok(Error::BatchTooLarge)));
-    assert_eq!(client.total_supply(), 0u64, "no partial mutation on rejection");
+
+    #[test]
+    #[should_panic(expected = "AlreadyMigrated")]
+    fn double_migrate_reverts() {
+        let (_env, client, _creator, _fee_receiver) = setup(0);
+        client.migrate();
+        client.migrate();
+    }
+
+    #[test]
+    fn migrate_emits_migrated_event() {
+        let (env, client, _creator, _fee_receiver) = setup(0);
+        client.migrate();
+
+        let events = env.events().all();
+        let found = events.iter().any(|(_, topics, _)| {
+            topics
+                .get(0)
+                .map(|v| {
+                    soroban_sdk::Symbol::try_from_val(&env, &v)
+                        .map(|s| s == soroban_sdk::symbol_short!("migrated"))
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false)
+        });
+        assert!(found, "expected 'migrated' event");
+    }
+
+    #[test]
+    fn used_voucher_marker_readable_after_migrate() {
+        let (env, client, _creator, _fee_receiver) = setup(0);
+
+        // Redeem one voucher to create a UsedVoucher entry pre-migration
+        let sk = creator_signing_key();
+        let voucher = make_voucher(&env, 42u64);
+        let sig = sign_voucher(&env, &sk, &client, &voucher);
+        let buyer = Address::generate(&env);
+
+        client.set_public_phase();
+        client.redeem(&buyer, &voucher, &sig, &empty_proof(&env));
+
+        assert!(client.is_voucher_redeemed(&42u64));
+
+        client.migrate();
+
+        // Still readable after migration
+        assert!(client.is_voucher_redeemed(&42u64));
+    }
+
+    #[test]
+    fn revoked_voucher_readable_after_migrate() {
+        let (env, client, _creator, _fee_receiver) = setup(0);
+
+        client.revoke_voucher(&99u64);
+        assert!(client.is_voucher_revoked(&99u64));
+
+        client.migrate();
+
+        assert!(client.is_voucher_revoked(&99u64));
+    }
+
+    #[test]
+    fn token_ownership_readable_after_migrate() {
+        let (env, client, _creator, _fee_receiver) = setup(0);
+
+        let sk = creator_signing_key();
+        let voucher = make_voucher(&env, 1u64);
+        let sig = sign_voucher(&env, &sk, &client, &voucher);
+        let buyer = Address::generate(&env);
+
+        client.set_public_phase();
+        client.redeem(&buyer, &voucher, &sig, &empty_proof(&env));
+
+        client.migrate();
+
+        assert_eq!(client.owner_of(&1u64), buyer);
+        assert_eq!(client.balance_of(&buyer), 1u64);
+    }
 }

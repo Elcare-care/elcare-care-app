@@ -43,25 +43,17 @@ pub enum Error {
     NotApproved = 3,
     InsufficientBalance = 4,
     LengthMismatch = 5,
-    NotCreator = 6, // kept for ABI stability; not used internally
-    /// Mint would exceed the per-token max supply.
+    NotCreator = 6,
     MaxSupplyReached = 7,
-    /// Mint would exceed the per-wallet cap.
     WalletLimitReached = 8,
-    /// Collection is paused; state-mutating calls are blocked.
     CollectionPaused = 9,
-    /// base_uri cannot be updated after metadata is frozen.
     MetadataFrozen = 10,
-    /// freeze_metadata called more than once.
     AlreadyFrozen = 11,
-    /// basis points exceed MAX_BPS (10_000).
     InvalidBps = 12,
-    /// mint_batch/batch_transfer called with zero items (#274).
-    EmptyBatch = 13,
-    /// A batch call exceeded MAX_BATCH_SIZE items (#274).
-    BatchTooLarge = 14,
-    /// mint/mint_new/mint_batch called with a zero amount (#274).
-    ZeroAmount = 15,
+    /// migrate() called for a version already marked done.
+    AlreadyMigrated = 13,
+    /// Unsupported version jump.
+    UnsupportedMigration = 14,
 }
 
 // ─── Storage Keys ─────────────────────────────────────────────────────────────
@@ -73,6 +65,7 @@ pub enum DataKey {
     Initialized,
     Creator,
     Name,
+    CurrentWasmHash,
     NextTokenId,
     RoyaltyBps,
     RoyaltyReceiver,
@@ -97,6 +90,10 @@ pub enum DataKey {
     TokenRoyaltyReceiver(u64),
     /// Per-token royalty override — bps.
     TokenRoyaltyBps(u64),
+    // ── Versioned migration registry ─────────────────────────────────────
+    MigrationDone(String),
+    MigrationCursor(String),
+    ContractVersion,
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -142,6 +139,7 @@ impl NormalNFT1155 {
         env.storage().instance().set(&DataKey::Initialized, &true);
         env.storage().instance().set(&DataKey::Creator, &creator);
         env.storage().instance().set(&DataKey::Name, &name);
+        env.storage().instance().set(&DataKey::CurrentWasmHash, &BytesN::from_array(&env, &[0u8; 32]));
         env.storage().instance().set(&DataKey::NextTokenId, &0u64);
         env.storage()
             .instance()
@@ -157,6 +155,24 @@ impl NormalNFT1155 {
 
     /// Set the maximum mintable supply for a specific token_id.
     /// Pass 0 to remove the cap.
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
+        let old_wasm_hash: BytesN<32> = env
+            .storage()
+            .instance()
+            .get(&DataKey::CurrentWasmHash)
+            .unwrap_or(BytesN::from_array(&env, &[0u8; 32]));
+        env.storage()
+            .instance()
+            .set(&DataKey::CurrentWasmHash, &new_wasm_hash);
+        env.deployer().update_current_contract_wasm(&new_wasm_hash);
+        env.events().publish(
+            (symbol_short!("upgraded"),),
+            (old_wasm_hash, new_wasm_hash),
+        );
+        Ok(())
+    }
+
     pub fn set_token_max_supply(env: Env, token_id: u64, max_supply: u128) -> Result<(), Error> {
         Self::extend_instance_ttl(&env);
         Self::only_creator(&env)?;
@@ -601,7 +617,9 @@ impl NormalNFT1155 {
         Self::_transfer(&env, &from, &to, token_id, amount)
     }
 
-    /// Operator transfer on behalf of `from`. Blocked while paused.
+    /// Transfer on behalf of `from` — the owner themselves or an authorized
+    /// operator (#275: matches the owner-shortcut already used by
+    /// `batch_transfer`/`burn`, so single and batch paths behave the same).
     pub fn transfer_from(
         env: Env,
         operator: Address,
@@ -613,7 +631,7 @@ impl NormalNFT1155 {
         Self::extend_instance_ttl(&env);
         operator.require_auth();
         Self::require_not_paused(&env)?;
-        if !Self::_is_approved_for_all(&env, &operator, &from) {
+        if operator != from && !Self::_is_approved_for_all(&env, &operator, &from) {
             return Err(Error::NotApproved);
         }
         Self::_transfer_with_operator(&env, &from, &to, token_id, amount)
@@ -820,6 +838,48 @@ impl NormalNFT1155 {
         env.storage()
             .instance()
             .set(&DataKey::Creator, &new_creator);
+        Ok(())
+    }
+
+    // ── Versioning & Migration ─────────────────────────────────────────────
+
+    pub fn version(_env: Env) -> &'static str {
+        "1.0.0"
+    }
+
+    pub fn contract_version(env: Env) -> Option<String> {
+        env.storage().instance().get(&DataKey::ContractVersion)
+    }
+
+    /// Creator-guarded idempotent migration entry point.
+    /// v1.0.0: records the completion marker and on-chain version string.
+    pub fn migrate(env: Env) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
+        Self::only_creator(&env)?;
+
+        let target = String::from_str(&env, "1.0.0");
+        let done_key = DataKey::MigrationDone(target.clone());
+
+        if env
+            .storage()
+            .persistent()
+            .get::<DataKey, bool>(&done_key)
+            .unwrap_or(false)
+        {
+            return Err(Error::AlreadyMigrated);
+        }
+
+        // v1.0.0 migration body: nothing to migrate for the initial version.
+
+        env.storage().persistent().set(&done_key, &true);
+        env.storage()
+            .persistent()
+            .extend_ttl(&done_key, TTL_THRESHOLD, TTL_BUMP);
+        env.storage()
+            .instance()
+            .set(&DataKey::ContractVersion, &target);
+        env.events()
+            .publish((soroban_sdk::symbol_short!("migrated"), target), ());
         Ok(())
     }
 

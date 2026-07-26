@@ -1,7 +1,12 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { useDeployCollection, DeployCollectionInput } from "@/hooks/useLaunchpad";
+import {
+  useDeployCollection,
+  useDeploySalt,
+  usePreflightDeploy,
+  DeployCollectionInput,
+} from "@/hooks/useLaunchpad";
 import { useWalletContext } from "@/context/WalletContext";
 import { useToast } from "@/components/ToastProvider";
 import { Loader2, Rocket, CheckCircle, ArrowRight, ArrowLeft, Check } from "lucide-react";
@@ -26,6 +31,7 @@ export function CollectionForm() {
   const { pushToast } = useToast();
   const { tokens: supportedTokens } = useSupportedTokens();
   const hasSupportedTokens = supportedTokens.length > 0;
+  const deploySalt = useDeploySalt();
 
   const [step, setStep] = useState(0);
   const [successAddress, setSuccessAddress] = useState<string | null>(null);
@@ -51,6 +57,28 @@ export function CollectionForm() {
 
   const is721 = form.kind.includes("721");
 
+  // Issue #277: read-only preflight, only wired up once the creator reaches
+  // the Review step — validates the exact deploy inputs and predicts the
+  // collection address before any wallet signature is requested.
+  const preflightInput: DeployCollectionInput | null =
+    step === 3
+      ? {
+          kind: form.kind,
+          name: form.name,
+          symbol: is721 ? form.symbol : undefined,
+          maxSupply: is721 ? form.maxSupply : undefined,
+          royaltyBps: form.royaltyBps,
+          royaltyReceiver: form.royaltyReceiver || publicKey || "",
+          currencyAddress: form.currencyAddress,
+        }
+      : null;
+  const { result: preflight, isLoading: isPreflighting } = usePreflightDeploy(
+    publicKey,
+    preflightInput,
+    deploySalt
+  );
+  const preflightBlocked = !!preflight && preflight.errors.length > 0;
+
   const stepValid = useMemo(() => {
     switch (step) {
       case 0:
@@ -75,6 +103,9 @@ export function CollectionForm() {
     const input: DeployCollectionInput = {
       ...form,
       royaltyReceiver: form.royaltyReceiver || publicKey,
+      // Reuse the salt already shown to the creator during preflight so the
+      // deployed address matches the predicted address exactly (#277).
+      salt: deploySalt,
     };
 
     if (form.kind.startsWith("LazyMint")) {
@@ -389,6 +420,55 @@ export function CollectionForm() {
               ))}
             </div>
 
+            {/* Issue #277: preflight — predicted address, required fee, and
+                every validation error deployment would otherwise catch late. */}
+            <div className="mb-6 rounded-2xl border border-brand-100 bg-brand-50/40 p-6">
+              <h3 className="text-sm font-bold text-brand-700 uppercase tracking-wider font-inter mb-3">
+                Preflight Check
+              </h3>
+              {isPreflighting && (
+                <p className="text-sm text-gray-500 font-inter flex items-center gap-2">
+                  <Loader2 size={16} className="animate-spin" /> Validating deployment inputs…
+                </p>
+              )}
+              {!isPreflighting && preflight && (
+                <div className="space-y-3">
+                  <div className="flex flex-wrap items-start justify-between gap-2">
+                    <span className="text-xs font-bold text-gray-500 uppercase tracking-wider font-inter">
+                      Predicted Address
+                    </span>
+                    <span className="text-xs font-mono text-gray-900 text-right break-all">
+                      {preflight.predictedAddress}
+                    </span>
+                  </div>
+                  <div className="flex flex-wrap items-start justify-between gap-2">
+                    <span className="text-xs font-bold text-gray-500 uppercase tracking-wider font-inter">
+                      Required Fee
+                    </span>
+                    <span className="text-xs font-medium text-gray-900">
+                      {preflight.requiredFee.toString()}{" "}
+                      {supportedTokens.find((t) => t.address === form.currencyAddress)?.symbol ??
+                        ""}
+                    </span>
+                  </div>
+                  {preflight.errors.length > 0 && (
+                    <ul className="mt-2 space-y-1 rounded-xl bg-red-50 border border-red-100 px-4 py-3">
+                      {preflight.errors.map((e) => (
+                        <li key={e} className="text-xs font-bold text-red-600">
+                          {e}
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                  {preflight.errors.length === 0 && (
+                    <p className="text-xs font-bold text-green-600 flex items-center gap-1.5">
+                      <CheckCircle size={14} /> Ready to deploy
+                    </p>
+                  )}
+                </div>
+              )}
+            </div>
+
             {error && (
               <p className="rounded-2xl bg-red-50 px-6 py-4 text-sm font-bold text-red-600 border border-red-100 mb-6">
                 {error}
@@ -397,7 +477,7 @@ export function CollectionForm() {
 
             <GuardButton
               type="button"
-              disabled={isDeploying || !hasSupportedTokens}
+              disabled={isDeploying || !hasSupportedTokens || isPreflighting || preflightBlocked}
               actionName="to deploy your collection"
               onAction={handleDeploy}
               className="w-full flex items-center justify-center gap-3 rounded-2xl bg-brand-500 py-5 text-xl font-bold text-white shadow-2xl shadow-brand-500/30 hover:bg-brand-600 hover:scale-[1.01] transition-all active:scale-[0.98] disabled:opacity-50 disabled:hover:scale-100"
