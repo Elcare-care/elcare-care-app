@@ -304,3 +304,17 @@ jobs:
             exit 1
           fi
         working-directory: indexer
+
+  release-validate:
+    name: Release Version Validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Validate Version Consistency
+        run: |
+          bash scripts/validate-compatibility.sh

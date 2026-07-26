@@ -1476,3 +1476,97 @@ fn transfer_clears_expiry_key_alongside_approval() {
     });
     assert!(expiry_after.is_none(), "expiry key must be cleared after transfer");
 }
+
+// ── Migration tests ───────────────────────────────────────────────────────────
+
+mod migration {
+    use super::*;
+
+    // Re-use the shared setup() helper defined above.
+
+    #[test]
+    fn fresh_install_migrate_records_marker_and_version() {
+        let (env, client, _contract_id, _creator) = setup();
+
+        // No migration done yet
+        assert!(client.contract_version().is_none());
+
+        client.migrate();
+
+        // Marker is now set and version is readable
+        assert_eq!(
+            client.contract_version(),
+            Some(String::from_str(&env, "1.0.0"))
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "AlreadyMigrated")]
+    fn double_migrate_reverts_with_already_migrated() {
+        let (_env, client, _contract_id, _creator) = setup();
+
+        client.migrate();
+        // Second call must revert
+        client.migrate();
+    }
+
+    #[test]
+    fn migrate_emits_migrated_event() {
+        let (env, client, _contract_id, _creator) = setup();
+        client.migrate();
+
+        let events = env.events().all();
+        let found = events.iter().any(|(_, topics, _)| {
+            // topics is a Vec<Val>; the first entry is the symbol "migrated"
+            topics.len() >= 1
+                && topics
+                    .get(0)
+                    .map(|v| {
+                        soroban_sdk::Symbol::try_from_val(&env, &v)
+                            .map(|s| s == soroban_sdk::symbol_short!("migrated"))
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false)
+        });
+        assert!(found, "expected 'migrated' event");
+    }
+
+    #[test]
+    fn state_readable_after_migrate() {
+        let (env, client, _contract_id, _creator) = setup();
+
+        let alice = Address::generate(&env);
+        let token_id = client.mint(&alice, &String::from_str(&env, "ipfs://pre-migrate"));
+
+        client.migrate();
+
+        // Token owner, balance, and total supply all survive the migration
+        assert_eq!(client.owner_of(&token_id), alice);
+        assert_eq!(client.balance_of(&alice), 1u64);
+        assert_eq!(client.total_supply(), 1u64);
+    }
+
+    #[test]
+    fn royalty_info_readable_after_migrate() {
+        let (_env, client, _contract_id, _creator) = setup();
+        client.migrate();
+
+        let (_, bps) = client.royalty_info();
+        assert_eq!(bps, 500u32);
+    }
+
+    #[test]
+    fn migrate_does_not_corrupt_existing_approvals() {
+        let (env, client, _contract_id, _creator) = setup();
+
+        let alice = Address::generate(&env);
+        let bob = Address::generate(&env);
+
+        let token_id = client.mint(&alice, &String::from_str(&env, "uri"));
+        client.approve(&alice, &bob, &token_id, &None::<u32>);
+
+        client.migrate();
+
+        assert_eq!(client.get_approved(&token_id), Some(bob));
+    }
+}

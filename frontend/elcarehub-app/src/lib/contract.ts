@@ -58,6 +58,22 @@ export interface Listing {
   expires_at?: number;
 }
 
+export interface BatchCreateListingInput {
+  price: number;
+  tokenAddress?: string;
+  collectionAddress: string;
+  nftTokenId: number;
+  recipients?: Array<{ address: string; percentage: number }>;
+  expiresAt?: number | null;
+}
+
+export interface BatchUpdateListingInput {
+  listingId: number;
+  newPrice: number;
+  newTokenAddress: string;
+  newRecipients?: Array<{ address: string; percentage: number }>;
+}
+
 export type AuctionStatus = "Active" | "Finalized" | "Cancelled";
 
 export interface Auction {
@@ -242,6 +258,16 @@ function parseAuctionFromScVal(raw: unknown): Auction {
   };
 }
 
+function toScRecipientVec(recipients: Array<{ address: string; percentage: number }>): xdr.ScVal {
+  return nativeToScVal(
+    recipients.map((r) => ({
+      address: new Address(r.address),
+      percentage: r.percentage,
+    })),
+    { type: "vec" }
+  );
+}
+
 // ── Listing contract methods ──────────────────────────────────
 
 /**
@@ -281,10 +307,7 @@ export async function createListing(
     new Address(selectedToken.address).toScVal(),
     new Address(collectionAddress).toScVal(),
     nativeToScVal(nftTokenId, { type: "u64" }),
-    nativeToScVal(finalRecipients.map(r => ({
-        address: new Address(r.address),
-        percentage: r.percentage
-    })), { type: "vec" }),
+    toScRecipientVec(finalRecipients),
   ];
 
   const retVal = await invokeContract(artistPublicKey, "create_listing", args);
@@ -328,6 +351,64 @@ export async function cancelListing(
   return true;
 }
 
+export async function createListings(
+  artistPublicKey: string,
+  requests: BatchCreateListingInput[]
+): Promise<number[]> {
+  if (isE2eMockChain()) {
+    if (typeof window !== "undefined") registerE2eMockListingsOnWindow();
+    return requests.map((request) => e2eMockCreateListing(
+      artistPublicKey,
+      request.price,
+      request.tokenAddress ?? DEFAULT_TOKEN.address,
+      request.collectionAddress,
+      request.nftTokenId
+    ));
+  }
+
+  const payload = requests.map((request) => {
+    const priceStroops = xlmToStroops(request.price);
+    const selectedToken = resolveConfiguredToken(request.tokenAddress ?? DEFAULT_TOKEN.address);
+    const finalRecipients = (request.recipients && request.recipients.length > 0)
+      ? request.recipients
+      : [{ address: artistPublicKey, percentage: 100 }];
+
+    return {
+      price: priceStroops,
+      currency: selectedToken.symbol,
+      token: new Address(selectedToken.address),
+      collection: new Address(request.collectionAddress),
+      token_id: request.nftTokenId,
+      recipients: finalRecipients.map((r) => ({
+        address: new Address(r.address),
+        percentage: r.percentage,
+      })),
+      expires_at: request.expiresAt ?? null,
+    };
+  });
+
+  const args: xdr.ScVal[] = [
+    new Address(artistPublicKey).toScVal(),
+    nativeToScVal(payload, { type: "vec" }),
+  ];
+
+  const retVal = await invokeContract(artistPublicKey, "create_listings", args);
+  return (scValToNative(retVal) as bigint[]).map(Number);
+}
+
+export async function cancelListings(
+  artistPublicKey: string,
+  listingIds: number[]
+): Promise<boolean> {
+  const args: xdr.ScVal[] = [
+    new Address(artistPublicKey).toScVal(),
+    nativeToScVal(listingIds.map((id) => BigInt(id)), { type: "vec" }),
+  ];
+
+  await invokeContract(artistPublicKey, "cancel_listings", args);
+  return true;
+}
+
 /**
  * update_listing — Artist updates an active listing with new metadata or price.
  */
@@ -345,16 +426,38 @@ export async function updateListing(
   const args: xdr.ScVal[] = [
     new Address(artistPublicKey).toScVal(),
     nativeToScVal(BigInt(listingId), { type: "u64" }),
-    nativeToScVal(Buffer.from(newMetadataCid, "utf-8"), { type: "bytes" }),
     nativeToScVal(priceStroops, { type: "i128" }),
     new Address(selectedToken.address).toScVal(),
-    nativeToScVal(newRecipients.map(r => ({
-        address: new Address(r.address),
-        percentage: r.percentage
-    })), { type: "vec" }),
+    toScRecipientVec(newRecipients),
   ];
 
   await invokeContract(artistPublicKey, "update_listing", args);
+  return true;
+}
+
+export async function updateListings(
+  artistPublicKey: string,
+  requests: BatchUpdateListingInput[]
+): Promise<boolean> {
+  const payload = requests.map((request) => ({
+    listing_id: BigInt(request.listingId),
+    new_price: xlmToStroops(request.newPrice),
+    new_token: new Address(request.newTokenAddress),
+    new_recipients: (request.newRecipients && request.newRecipients.length > 0
+      ? request.newRecipients
+      : [{ address: artistPublicKey, percentage: 100 }]
+    ).map((r) => ({
+      address: new Address(r.address),
+      percentage: r.percentage,
+    })),
+  }));
+
+  const args: xdr.ScVal[] = [
+    new Address(artistPublicKey).toScVal(),
+    nativeToScVal(payload, { type: "vec" }),
+  ];
+
+  await invokeContract(artistPublicKey, "update_listings", args);
   return true;
 }
 
@@ -626,6 +729,66 @@ export async function finalizeAuction(
 
   await invokeContract(callerPublicKey, "finalize_auction", args);
   return true;
+}
+
+/**
+ * block_bidder — Auction creator or admin bars an address from bidding on
+ * this auction (anti-shill-bidding registry, Issue #199).
+ */
+export async function blockBidder(
+  callerPublicKey: string,
+  auctionId: number,
+  bidderAddress: string
+): Promise<boolean> {
+  const args: xdr.ScVal[] = [
+    new Address(callerPublicKey).toScVal(),
+    nativeToScVal(BigInt(auctionId), { type: "u64" }),
+    new Address(bidderAddress).toScVal(),
+  ];
+
+  await invokeContract(callerPublicKey, "block_bidder", args);
+  return true;
+}
+
+/**
+ * unblock_bidder — Remove an address from the auction's blocked-bidder
+ * registry (Issue #199).
+ */
+export async function unblockBidder(
+  callerPublicKey: string,
+  auctionId: number,
+  bidderAddress: string
+): Promise<boolean> {
+  const args: xdr.ScVal[] = [
+    new Address(callerPublicKey).toScVal(),
+    nativeToScVal(BigInt(auctionId), { type: "u64" }),
+    new Address(bidderAddress).toScVal(),
+  ];
+
+  await invokeContract(callerPublicKey, "unblock_bidder", args);
+  return true;
+}
+
+/**
+ * get_blocked_bidders — Read the auction's current blocked-bidder registry
+ * (read-only, Issue #199).
+ */
+export async function getBlockedBidders(auctionId: number): Promise<string[]> {
+  const callerPublicKey = await getReadOnlyCallerPublicKey();
+
+  const args: xdr.ScVal[] = [
+    nativeToScVal(BigInt(auctionId), { type: "u64" }),
+  ];
+
+  const retVal = await invokeContract(
+    callerPublicKey,
+    "get_blocked_bidders",
+    args,
+    true
+  );
+
+  const addrs = scValToNative(retVal) as string[];
+  return addrs.map(String);
 }
 
 /**
