@@ -151,6 +151,22 @@ model MarketplaceEvent {
   @@unique([listingId, eventType, ledgerSequence])
 }
 
+/// One row per recipient per settled sale, sourced from ROYALTY_PAID events.
+/// Exactly one of listingId / auctionId is set, mirroring the on-chain event.
+model RoyaltyPayment {
+  id             Int      @id @default(autoincrement())
+  listingId      BigInt?
+  auctionId      BigInt?
+  recipient      String
+  amount         Decimal  @db.Decimal(32, 7)
+  salePrice      Decimal  @db.Decimal(32, 7)
+  ledgerSequence Int
+  createdAt      DateTime @default(now())
+  @@index([recipient])
+  @@index([ledgerSequence])
+  @@index([recipient, ledgerSequence])
+}
+
 model Collection {
   id              Int      @id @default(autoincrement())
   contractAddress String   @unique
