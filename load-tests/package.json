@@ -1,0 +1,24 @@
+{
+  "name": "elcarehub-load-tests",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "description": "Load testing harness for the elcarehub indexer",
+  "scripts": {
+    "seed": "DATABASE_URL=${DATABASE_URL:-postgresql://ltuser:ltpass@localhost:5433/marketplace_lt} REDIS_URL=${REDIS_URL:-redis://localhost:6380} tsx fixtures/seed.ts",
+    "poller-sim": "DATABASE_URL=${DATABASE_URL:-postgresql://ltuser:ltpass@localhost:5433/marketplace_lt} REDIS_URL=${REDIS_URL:-redis://localhost:6380} tsx ingestion/poller-sim.ts",
+    "load-test": "bash harness/run-load-test.sh",
+    "load-test:soak": "SOAK=1 bash harness/run-load-test.sh",
+    "update-baseline": "node harness/reporter.mjs --update-baseline",
+    "report": "node harness/reporter.mjs --results-dir results"
+  },
+  "dependencies": {
+    "@prisma/client": "^5.22.0",
+    "redis": "^6.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.0",
+    "tsx": "^4.22.4",
+    "typescript": "^6.0.2"
+  }
+}

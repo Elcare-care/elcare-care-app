@@ -37,6 +37,7 @@ Copy this template for each release. Fill in all sections before tagging.
 - [ ] Document rollback procedure in CHANGELOG.md
 - [ ] Note any breaking changes for API consumers or event parsers
 - [ ] Update `docs/guides/deployment.md` if deployment process changed
+- [ ] If contract files were changed: threat-model record exists in `docs/threat-models/` and independent reviewer has signed off
 
 ### Deployment
 
