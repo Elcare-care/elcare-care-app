@@ -1,0 +1,233 @@
+name: Load Tests
+
+# ── Trigger policy ─────────────────────────────────────────────────────────────
+#
+# Load tests are NOT run on every PR — they require Docker and k6, take ~10 min,
+# and need an isolated network environment.
+#
+# They run:
+#   • On pushes to main/master (short load after each merge)
+#   • On a nightly schedule (soak run — ~40 min)
+#   • On manual dispatch (any branch, any mode)
+#
+# The job is intentionally excluded from branch-protection required checks so
+# it never blocks a PR merge, but results are uploaded as artifacts and compared
+# against the stored baseline on every run.
+
+on:
+  push:
+    branches: ["main", "master"]
+    paths:
+      - "indexer/**"
+      - "contracts/**"
+      - "load-tests/**"
+
+  schedule:
+    # Nightly soak run at 03:00 UTC
+    - cron: "0 3 * * *"
+
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Run mode: short | soak"
+        required: true
+        default: "short"
+        type: choice
+        options: [short, soak]
+      update_baseline:
+        description: "Promote results to baseline after passing"
+        required: false
+        default: "false"
+        type: boolean
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  load-test:
+    name: Load Test (${{ github.event_name == 'schedule' && 'soak' || inputs.mode || 'short' }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60   # short=15, soak=50; 60 is safe upper bound
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── Tool setup ───────────────────────────────────────────────────────────
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Cache indexer node_modules
+        uses: actions/cache@v4
+        with:
+          path: indexer/node_modules
+          key: ${{ runner.os }}-indexer-20-${{ hashFiles('indexer/package-lock.json') }}
+          restore-keys: ${{ runner.os }}-indexer-20-
+
+      - name: Install indexer dependencies
+        run: npm ci
+        working-directory: indexer
+
+      - name: Cache load-test node_modules
+        uses: actions/cache@v4
+        with:
+          path: load-tests/node_modules
+          key: ${{ runner.os }}-load-tests-${{ hashFiles('load-tests/package.json', 'load-tests/package-lock.json') }}
+          restore-keys: ${{ runner.os }}-load-tests-
+
+      - name: Install load-test dependencies
+        # Installs tsx + @prisma/client + redis client for seed / poller-sim
+        run: |
+          if [ -f "load-tests/package.json" ]; then
+            npm ci
+          else
+            npm install --save-dev tsx @types/node
+          fi
+        working-directory: load-tests
+        continue-on-error: true
+
+      - name: Install k6
+        run: |
+          sudo gpg -k 2>/dev/null
+          curl -fsSL https://dl.k6.io/key.gpg | sudo gpg --dearmor -o /usr/share/keyrings/k6-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main" \
+            | sudo tee /etc/apt/sources.list.d/k6.list
+          sudo apt-get update -qq
+          sudo apt-get install -y k6
+
+      # ── Stack setup ──────────────────────────────────────────────────────────
+
+      - name: Build indexer Docker image
+        run: |
+          docker build \
+            --build-arg BUILD_SHA=${{ github.sha }} \
+            --build-arg BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
+            -t elcarehub-indexer-lt:${{ github.sha }} \
+            ./indexer
+
+      - name: Start load-test Docker Compose stack
+        run: |
+          # Patch the compose file to use the pre-built image rather than re-building
+          sed -i "s|build:.*|image: elcarehub-indexer-lt:${{ github.sha }}|" \
+            load-tests/docker-compose.load-test.yml || true
+          docker compose -f load-tests/docker-compose.load-test.yml up -d --wait
+        timeout-minutes: 5
+
+      # ── Migrations + seed ────────────────────────────────────────────────────
+
+      - name: Run Prisma migrations on load-test DB
+        env:
+          DATABASE_URL: postgresql://ltuser:ltpass@localhost:5433/marketplace_lt
+        run: npx prisma migrate deploy --schema indexer/prisma/schema.prisma
+
+      - name: Seed load-test fixtures
+        env:
+          DATABASE_URL: postgresql://ltuser:ltpass@localhost:5433/marketplace_lt
+          REDIS_URL: redis://localhost:6380
+        run: npx tsx load-tests/fixtures/seed.ts
+
+      # ── Load tests ───────────────────────────────────────────────────────────
+
+      - name: Run ingestion simulator
+        env:
+          DATABASE_URL: postgresql://ltuser:ltpass@localhost:5433/marketplace_lt
+          REDIS_URL: redis://localhost:6380
+          SIM_LEDGERS: "300"
+          SIM_EVENTS_PER_LEDGER: "20"
+          SIM_CONCURRENCY: "2"
+        run: npx tsx load-tests/ingestion/poller-sim.ts
+
+      - name: Run k6 API load test
+        env:
+          SOAK: ${{ github.event_name == 'schedule' && '1' || (inputs.mode == 'soak' && '1' || '0') }}
+        run: |
+          k6 run \
+            --env BASE_URL=http://localhost:4001 \
+            --env K6_SOAK=${SOAK} \
+            --summary-export=load-tests/results/api-load-latest-summary.json \
+            load-tests/k6/api-load.js
+        continue-on-error: true   # reporter determines pass/fail from thresholds
+
+      - name: Run k6 SSE load test
+        env:
+          SOAK: ${{ github.event_name == 'schedule' && '1' || (inputs.mode == 'soak' && '1' || '0') }}
+        run: |
+          k6 run \
+            --env BASE_URL=http://localhost:4001 \
+            --env K6_SOAK=${SOAK} \
+            --summary-export=load-tests/results/sse-load-latest-summary.json \
+            load-tests/k6/sse-load.js
+        continue-on-error: true
+
+      # ── Resource snapshot ────────────────────────────────────────────────────
+
+      - name: Capture resource metrics
+        run: |
+          mkdir -p load-tests/results
+          DB_CONNS=$(PGPASSWORD=ltpass psql -h localhost -p 5433 -U ltuser -d marketplace_lt \
+            -t -c "SELECT count(*) FROM pg_stat_activity WHERE state != 'idle';" \
+            2>/dev/null | tr -d ' ' || echo "0")
+          REDIS_MEM=$(redis-cli -p 6380 info memory 2>/dev/null \
+            | grep 'used_memory:' | cut -d: -f2 | tr -d $'\r' || echo "0")
+          REDIS_MEM_MB=$(echo "scale=1; ${REDIS_MEM:-0} / 1048576" | bc || echo "0")
+          REDIS_HITS=$(redis-cli -p 6380 info stats 2>/dev/null \
+            | grep 'keyspace_hits:' | cut -d: -f2 | tr -d $'\r' || echo "0")
+          REDIS_MISSES=$(redis-cli -p 6380 info stats 2>/dev/null \
+            | grep 'keyspace_misses:' | cut -d: -f2 | tr -d $'\r' || echo "0")
+          cat > load-tests/results/resources-latest.json <<EOF
+          {
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "db_active_connections": ${DB_CONNS},
+            "redis_memory_mb": ${REDIS_MEM_MB},
+            "redis_hits": ${REDIS_HITS:-0},
+            "redis_misses": ${REDIS_MISSES:-0}
+          }
+          EOF
+          echo "DB connections: ${DB_CONNS}"
+          echo "Redis memory:   ${REDIS_MEM_MB} MB"
+
+      # ── Report ───────────────────────────────────────────────────────────────
+
+      - name: Generate load-test report
+        id: report
+        run: |
+          UPDATE_FLAG=""
+          if [[ "${{ inputs.update_baseline }}" == "true" ]]; then
+            UPDATE_FLAG="--update-baseline"
+          fi
+          node load-tests/harness/reporter.mjs \
+            --timestamp "$(date +%Y%m%d_%H%M%S)" \
+            --results-dir load-tests/results \
+            ${UPDATE_FLAG}
+        continue-on-error: true
+
+      # ── Teardown ─────────────────────────────────────────────────────────────
+
+      - name: Tear down stack
+        if: always()
+        run: docker compose -f load-tests/docker-compose.load-test.yml down -v --remove-orphans
+
+      # ── Artifacts ────────────────────────────────────────────────────────────
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: load-test-results-${{ github.run_id }}
+          path: |
+            load-tests/results/
+            LOAD_TEST_RESULTS.md
+          retention-days: 30
+
+      - name: Commit baseline update
+        if: inputs.update_baseline == 'true' && steps.report.outcome == 'success'
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add load-tests/results/baseline.json LOAD_TEST_RESULTS.md
+          git diff --staged --quiet || \
+            git commit -m "chore: update load-test baseline [skip ci]"
+          git push
