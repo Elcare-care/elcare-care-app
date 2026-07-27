@@ -36,7 +36,7 @@ FROM node:20-alpine AS runtime
 
 WORKDIR /app
 
-# Runtime system deps
+# Runtime system deps: openssl (Prisma), wget is provided by busybox (health probe)
 RUN apk add --no-cache openssl \
  && addgroup -S appgroup \
  && adduser  -S appuser -G appgroup
@@ -46,9 +46,14 @@ COPY package*.json ./
 RUN npm ci --omit=dev
 
 # Copy compiled output and Prisma artifacts
-COPY --from=builder /build/dist        ./dist
-COPY --from=builder /build/prisma      ./prisma
+COPY --from=builder /build/dist               ./dist
+COPY --from=builder /build/prisma             ./prisma
 COPY --from=builder /build/node_modules/.prisma ./node_modules/.prisma
+
+# Transfer all /app ownership to the non-root runtime user before switching context.
+# This ensures appuser can read node_modules (installed as root above) and execute
+# prisma migrate deploy without a privilege escalation.
+RUN chown -R appuser:appgroup /app
 
 # OCI image labels for version tracking
 ARG BUILD_SHA=unknown
