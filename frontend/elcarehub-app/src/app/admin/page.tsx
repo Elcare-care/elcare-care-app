@@ -76,7 +76,7 @@ export default function AdminPage() {
         refresh: refreshTokens
     } = useTokenManagement(publicKey);
 
-    const { isAuthenticated, authenticate, logout, sessionExpiresIn } = useAdminSession();
+    const { isAuthenticated, authenticate, logout, sessionExpiresIn } = useAdminSession(publicKey);
 
     // Admin key rotation (Issue #202)
     const {

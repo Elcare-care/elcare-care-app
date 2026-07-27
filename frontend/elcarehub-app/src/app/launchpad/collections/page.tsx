@@ -3,6 +3,7 @@
 import { useState } from "react";
 import Link from "next/link";
 import { Navbar } from "@/components/Navbar";
+import { Breadcrumb } from "@/components/Breadcrumb";
 import { useLaunchpadCollections } from "@/hooks/useLaunchpad";
 import { CollectionKind } from "@/lib/launchpad";
 import { Loader2, Search, Filter, Rocket, ExternalLink } from "lucide-react";
@@ -25,6 +26,13 @@ export default function CollectionsDirectoryPage() {
 
       <div className="pt-24 pb-12">
         <div className="max-w-7xl mx-auto px-4">
+          <Breadcrumb
+            items={[
+              { label: "Launchpad", href: "/launchpad" },
+              { label: "Collections" },
+            ]}
+            className="mb-6"
+          />
           <header className="mb-12">
             <div className="flex flex-col md:flex-row md:items-end justify-between gap-6">
               <div className="space-y-2">

@@ -25,6 +25,8 @@ import {
 } from "@/lib/contract";
 import { Horizon } from "@stellar/stellar-sdk";
 import { config } from "@/lib/config";
+import { emitAuditEvent, extractTxHash } from "@/lib/auditLog";
+import { pseudonymiseAddress } from "@/lib/privacy";
 
 export interface AdminStats {
     totalListings: number;
@@ -91,11 +93,30 @@ export function useModeration(adminPublicKey: string | null) {
         if (!adminPublicKey) return;
         setIsProcessing(true);
         setError(null);
+        emitAuditEvent("artist.revoke", adminPublicKey, "initiated", {
+            target: pseudonymiseAddress(artistAddress),
+            network: config.network,
+        });
         try {
-            await revokeArtist(adminPublicKey, artistAddress);
+            const result = await revokeArtist(adminPublicKey, artistAddress);
+            emitAuditEvent("artist.revoke", adminPublicKey, "success", {
+                target: pseudonymiseAddress(artistAddress),
+                txHash: extractTxHash(result) ?? undefined,
+                network: config.network,
+                contractId: config.contractId,
+            });
             return true;
         } catch (err: unknown) {
-            setError(err instanceof Error ? err.message : "Revoke failed");
+            const msg = err instanceof Error ? err.message : "Revoke failed";
+            const category = msg.toLowerCase().includes("rejected") || msg.toLowerCase().includes("cancelled")
+                ? "rejected" as const
+                : "failed" as const;
+            emitAuditEvent("artist.revoke", adminPublicKey, category, {
+                target: pseudonymiseAddress(artistAddress),
+                errorMessage: msg,
+                network: config.network,
+            });
+            setError(msg);
             return false;
         } finally {
             setIsProcessing(false);
@@ -106,11 +127,30 @@ export function useModeration(adminPublicKey: string | null) {
         if (!adminPublicKey) return;
         setIsProcessing(true);
         setError(null);
+        emitAuditEvent("artist.reinstate", adminPublicKey, "initiated", {
+            target: pseudonymiseAddress(artistAddress),
+            network: config.network,
+        });
         try {
-            await reinstateArtist(adminPublicKey, artistAddress);
+            const result = await reinstateArtist(adminPublicKey, artistAddress);
+            emitAuditEvent("artist.reinstate", adminPublicKey, "success", {
+                target: pseudonymiseAddress(artistAddress),
+                txHash: extractTxHash(result) ?? undefined,
+                network: config.network,
+                contractId: config.contractId,
+            });
             return true;
         } catch (err: unknown) {
-            setError(err instanceof Error ? err.message : "Reinstate failed");
+            const msg = err instanceof Error ? err.message : "Reinstate failed";
+            const category = msg.toLowerCase().includes("rejected") || msg.toLowerCase().includes("cancelled")
+                ? "rejected" as const
+                : "failed" as const;
+            emitAuditEvent("artist.reinstate", adminPublicKey, category, {
+                target: pseudonymiseAddress(artistAddress),
+                errorMessage: msg,
+                network: config.network,
+            });
+            setError(msg);
             return false;
         } finally {
             setIsProcessing(false);
@@ -119,7 +159,8 @@ export function useModeration(adminPublicKey: string | null) {
 
     const checkStatus = async (artistAddress: string) => {
         try {
-            return await isArtistRevoked(artistAddress);
+            const revoked = await isArtistRevoked(artistAddress);
+            return revoked;
         } catch {
             return false;
         }
@@ -155,17 +196,34 @@ export function useTokenManagement(adminPublicKey: string | null) {
         if (!adminPublicKey) return;
         setIsProcessing(true);
         setError(null);
-        
+        emitAuditEvent("token.whitelist_add", adminPublicKey, "initiated", {
+            target: pseudonymiseAddress(tokenAddress),
+            network: config.network,
+        });
         // Optimistic update
         const prev = [...whitelistedTokens];
         setWhitelistedTokens(curr => [...curr, tokenAddress]);
 
         try {
-            await addTokenToWhitelist(adminPublicKey, tokenAddress);
+            const result = await addTokenToWhitelist(adminPublicKey, tokenAddress);
+            emitAuditEvent("token.whitelist_add", adminPublicKey, "success", {
+                target: pseudonymiseAddress(tokenAddress),
+                txHash: extractTxHash(result) ?? undefined,
+                network: config.network,
+                contractId: config.contractId,
+            });
             return true;
         } catch (err: unknown) {
             setWhitelistedTokens(prev); // Rollback
-            setError(err instanceof Error ? err.message : "Whitelist failed");
+            const msg = err instanceof Error ? err.message : "Whitelist failed";
+            const category = msg.toLowerCase().includes("rejected") || msg.toLowerCase().includes("cancelled")
+                ? "rejected" as const : "failed" as const;
+            emitAuditEvent("token.whitelist_add", adminPublicKey, category, {
+                target: pseudonymiseAddress(tokenAddress),
+                errorMessage: msg,
+                network: config.network,
+            });
+            setError(msg);
             return false;
         } finally {
             setIsProcessing(false);
@@ -176,17 +234,34 @@ export function useTokenManagement(adminPublicKey: string | null) {
         if (!adminPublicKey) return;
         setIsProcessing(true);
         setError(null);
-
+        emitAuditEvent("token.whitelist_remove", adminPublicKey, "initiated", {
+            target: pseudonymiseAddress(tokenAddress),
+            network: config.network,
+        });
         // Optimistic update
         const prev = [...whitelistedTokens];
         setWhitelistedTokens(curr => curr.filter(t => t !== tokenAddress));
 
         try {
-            await removeTokenFromWhitelist(adminPublicKey, tokenAddress);
+            const result = await removeTokenFromWhitelist(adminPublicKey, tokenAddress);
+            emitAuditEvent("token.whitelist_remove", adminPublicKey, "success", {
+                target: pseudonymiseAddress(tokenAddress),
+                txHash: extractTxHash(result) ?? undefined,
+                network: config.network,
+                contractId: config.contractId,
+            });
             return true;
         } catch (err: unknown) {
             setWhitelistedTokens(prev); // Rollback
-            setError(err instanceof Error ? err.message : "Unwhitelist failed");
+            const msg = err instanceof Error ? err.message : "Unwhitelist failed";
+            const category = msg.toLowerCase().includes("rejected") || msg.toLowerCase().includes("cancelled")
+                ? "rejected" as const : "failed" as const;
+            emitAuditEvent("token.whitelist_remove", adminPublicKey, category, {
+                target: pseudonymiseAddress(tokenAddress),
+                errorMessage: msg,
+                network: config.network,
+            });
+            setError(msg);
             return false;
         } finally {
             setIsProcessing(false);
@@ -228,12 +303,30 @@ export function useAdminTransfer(currentPublicKey: string | null) {
         if (!currentPublicKey) return false;
         setIsProcessing(true);
         setError(null);
+        emitAuditEvent("admin.transfer_propose", currentPublicKey, "initiated", {
+            target: pseudonymiseAddress(candidate),
+            network: config.network,
+        });
         try {
-            await proposeAdmin(currentPublicKey, candidate);
+            const result = await proposeAdmin(currentPublicKey, candidate);
+            emitAuditEvent("admin.transfer_propose", currentPublicKey, "success", {
+                target: pseudonymiseAddress(candidate),
+                txHash: extractTxHash(result) ?? undefined,
+                network: config.network,
+                contractId: config.contractId,
+            });
             await refresh();
             return true;
         } catch (err: unknown) {
-            setError(err instanceof Error ? err.message : "Proposal failed");
+            const msg = err instanceof Error ? err.message : "Proposal failed";
+            const category = msg.toLowerCase().includes("rejected") || msg.toLowerCase().includes("cancelled")
+                ? "rejected" as const : "failed" as const;
+            emitAuditEvent("admin.transfer_propose", currentPublicKey, category, {
+                target: pseudonymiseAddress(candidate),
+                errorMessage: msg,
+                network: config.network,
+            });
+            setError(msg);
             return false;
         } finally {
             setIsProcessing(false);
@@ -244,12 +337,27 @@ export function useAdminTransfer(currentPublicKey: string | null) {
         if (!currentPublicKey) return false;
         setIsProcessing(true);
         setError(null);
+        emitAuditEvent("admin.transfer_accept", currentPublicKey, "initiated", {
+            network: config.network,
+        });
         try {
-            await acceptAdmin(currentPublicKey);
+            const result = await acceptAdmin(currentPublicKey);
+            emitAuditEvent("admin.transfer_accept", currentPublicKey, "success", {
+                txHash: extractTxHash(result) ?? undefined,
+                network: config.network,
+                contractId: config.contractId,
+            });
             await refresh();
             return true;
         } catch (err: unknown) {
-            setError(err instanceof Error ? err.message : "Accept failed");
+            const msg = err instanceof Error ? err.message : "Accept failed";
+            const category = msg.toLowerCase().includes("rejected") || msg.toLowerCase().includes("cancelled")
+                ? "rejected" as const : "failed" as const;
+            emitAuditEvent("admin.transfer_accept", currentPublicKey, category, {
+                errorMessage: msg,
+                network: config.network,
+            });
+            setError(msg);
             return false;
         } finally {
             setIsProcessing(false);
@@ -260,12 +368,27 @@ export function useAdminTransfer(currentPublicKey: string | null) {
         if (!currentPublicKey) return false;
         setIsProcessing(true);
         setError(null);
+        emitAuditEvent("admin.transfer_cancel", currentPublicKey, "initiated", {
+            network: config.network,
+        });
         try {
-            await cancelAdminProposal(currentPublicKey);
+            const result = await cancelAdminProposal(currentPublicKey);
+            emitAuditEvent("admin.transfer_cancel", currentPublicKey, "success", {
+                txHash: extractTxHash(result) ?? undefined,
+                network: config.network,
+                contractId: config.contractId,
+            });
             await refresh();
             return true;
         } catch (err: unknown) {
-            setError(err instanceof Error ? err.message : "Cancel failed");
+            const msg = err instanceof Error ? err.message : "Cancel failed";
+            const category = msg.toLowerCase().includes("rejected") || msg.toLowerCase().includes("cancelled")
+                ? "rejected" as const : "failed" as const;
+            emitAuditEvent("admin.transfer_cancel", currentPublicKey, category, {
+                errorMessage: msg,
+                network: config.network,
+            });
+            setError(msg);
             return false;
         } finally {
             setIsProcessing(false);
@@ -381,15 +504,30 @@ export function usePauseControls(adminPublicKey: string | null) {
         if (!adminPublicKey) return;
         setIsProcessing(true);
         setError(null);
+        const action = state.globalPaused ? "pause.global_disable" : "pause.global_enable";
+        emitAuditEvent(action, adminPublicKey, "initiated", { network: config.network });
         try {
+            let result: unknown;
             if (state.globalPaused) {
-                await adminUnpause(adminPublicKey);
+                result = await adminUnpause(adminPublicKey);
             } else {
-                await adminPause(adminPublicKey);
+                result = await adminPause(adminPublicKey);
             }
+            emitAuditEvent(action, adminPublicKey, "success", {
+                txHash: extractTxHash(result) ?? undefined,
+                network: config.network,
+                contractId: config.contractId,
+            });
             await refresh();
         } catch (err: unknown) {
-            setError(err instanceof Error ? err.message : "Toggle failed");
+            const msg = err instanceof Error ? err.message : "Toggle failed";
+            const category = msg.toLowerCase().includes("rejected") || msg.toLowerCase().includes("cancelled")
+                ? "rejected" as const : "failed" as const;
+            emitAuditEvent(action, adminPublicKey, category, {
+                errorMessage: msg,
+                network: config.network,
+            });
+            setError(msg);
         } finally {
             setIsProcessing(false);
         }
@@ -399,14 +537,34 @@ export function usePauseControls(adminPublicKey: string | null) {
         if (!adminPublicKey) return;
         setIsProcessing(true);
         setError(null);
+        const action = currentlyPaused ? "pause.collection_disable" : "pause.collection_enable";
+        emitAuditEvent(action, adminPublicKey, "initiated", {
+            target: pseudonymiseAddress(collectionAddress),
+            network: config.network,
+        });
         try {
+            let result: unknown;
             if (currentlyPaused) {
-                await unpauseCollection(adminPublicKey, collectionAddress);
+                result = await unpauseCollection(adminPublicKey, collectionAddress);
             } else {
-                await pauseCollection(adminPublicKey, collectionAddress);
+                result = await pauseCollection(adminPublicKey, collectionAddress);
             }
+            emitAuditEvent(action, adminPublicKey, "success", {
+                target: pseudonymiseAddress(collectionAddress),
+                txHash: extractTxHash(result) ?? undefined,
+                network: config.network,
+                contractId: config.contractId,
+            });
         } catch (err: unknown) {
-            setError(err instanceof Error ? err.message : "Collection toggle failed");
+            const msg = err instanceof Error ? err.message : "Collection toggle failed";
+            const category = msg.toLowerCase().includes("rejected") || msg.toLowerCase().includes("cancelled")
+                ? "rejected" as const : "failed" as const;
+            emitAuditEvent(action, adminPublicKey, category, {
+                target: pseudonymiseAddress(collectionAddress),
+                errorMessage: msg,
+                network: config.network,
+            });
+            setError(msg);
         } finally {
             setIsProcessing(false);
         }
@@ -416,20 +574,40 @@ export function usePauseControls(adminPublicKey: string | null) {
         if (!adminPublicKey) return;
         setIsProcessing(true);
         setError(null);
+        const action = state.pausedFunctions[fn] ? "pause.function_disable" : "pause.function_enable";
+        emitAuditEvent(action, adminPublicKey, "initiated", {
+            target: fn,
+            network: config.network,
+        });
         // Optimistic update
         setState(prev => ({
             ...prev,
             pausedFunctions: { ...prev.pausedFunctions, [fn]: !prev.pausedFunctions[fn] },
         }));
         try {
+            let result: unknown;
             if (state.pausedFunctions[fn]) {
-                await unpauseFunction(adminPublicKey, fn);
+                result = await unpauseFunction(adminPublicKey, fn);
             } else {
-                await pauseFunction(adminPublicKey, fn);
+                result = await pauseFunction(adminPublicKey, fn);
             }
+            emitAuditEvent(action, adminPublicKey, "success", {
+                target: fn,
+                txHash: extractTxHash(result) ?? undefined,
+                network: config.network,
+                contractId: config.contractId,
+            });
             await refresh();
         } catch (err: unknown) {
-            setError(err instanceof Error ? err.message : "Function toggle failed");
+            const msg = err instanceof Error ? err.message : "Function toggle failed";
+            const category = msg.toLowerCase().includes("rejected") || msg.toLowerCase().includes("cancelled")
+                ? "rejected" as const : "failed" as const;
+            emitAuditEvent(action, adminPublicKey, category, {
+                target: fn,
+                errorMessage: msg,
+                network: config.network,
+            });
+            setError(msg);
             await refresh(); // rollback optimistic update
         } finally {
             setIsProcessing(false);

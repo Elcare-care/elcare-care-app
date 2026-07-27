@@ -28,6 +28,7 @@ import { PriceHistoryChart } from "@/components/PriceHistoryChart";
 import { SocialShare } from "@/components/SocialShare";
 import { GuardButton } from "@/components/WalletGuard";
 import { ResourceState } from "@/components/PageStates";
+import { Breadcrumb } from "@/components/Breadcrumb";
 import { categorizePageError, PageStateError } from "@/lib/pageState";
 import {
     ArrowLeft,
@@ -264,6 +265,14 @@ export default function ListingDetailPage({ id }: ListingClientProps) {
 
     return (
         <div className="min-h-screen bg-midnight-950 text-white pb-20 pt-24 px-4 sm:px-6 lg:px-8">
+            {/* Breadcrumb */}
+            <Breadcrumb
+                items={[
+                    { label: "Discover", href: "/explore" },
+                    { label: metadata?.title ?? `Artwork #${id}` },
+                ]}
+                className="mb-8"
+            />
 
             <div className="grid gap-12 lg:grid-cols-2 lg:items-start">
                 {/* LEFT COLUMN: Media, Tabs & Description */}

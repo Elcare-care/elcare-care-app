@@ -92,3 +92,41 @@ long-lived GitHub issues: close obsolete items with rationale, or link them to a
 
 Follow [Conventional Commits](https://www.conventionalcommits.org/), e.g. `feat(frontend): add checkout coverage thresholds`.
 
+
+## Contract changes and threat-model review
+
+Any pull request that modifies files under `contracts/` — entry points, settlement logic, authorization, signatures, storage layout, events, or deployment scripts — **must** include a completed threat-model record and an independent review before it can merge.
+
+### Process
+
+1. **Copy the template** — `docs/threat-model-template.md`
+2. **Save it** as `docs/threat-models/TM-YYYY-MM-DD-short-description.md`
+3. **Complete all sections** — work through every row in section 4 (the threat checklist) and every box in section 6 (flow-specific review)
+4. **Log open findings** in section 7 with severity, owner, and residual risk
+5. **Get an independent review** — a second engineer who did not author the change must sign section 8
+6. **Link the record** in the PR description under "Contract change review"
+7. **Commit the record** to the same branch so the CI gate can find it
+
+### CI enforcement
+
+`.github/workflows/contract-threat-model-gate.yml` runs on every PR that touches `contracts/**/src/*.rs`. It fails if:
+
+- No file was added or modified under `docs/threat-models/`
+- The threat-model file still contains the unfilled template stub in the reviewer sign-off (section 8)
+
+The gate is a **required status check** — add it to your branch protection rules alongside the existing contract and frontend checks.
+
+### Severity guidance
+
+| Severity | Description |
+|---|---|
+| Critical | Can drain funds or take full admin control |
+| High | Significant value at risk; requires specific but realistic conditions |
+| Medium | Limited impact or requires unlikely attacker preconditions |
+| Low | Informational; acknowledged risk with no immediate action |
+
+High and Critical findings must be mitigated or have a documented accepted-risk decision before merge. Medium and Low findings may be accepted with a tracking issue.
+
+### Reference examples
+
+See `docs/threat-models/TM-2026-07-27-marketplace-purchase-auction-offer-lazy-mint.md` for an annotated example covering the core marketplace flows.
