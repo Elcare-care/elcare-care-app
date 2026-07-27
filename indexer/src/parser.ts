@@ -1,6 +1,11 @@
 import { xdr, Address, scValToNative } from '@stellar/stellar-sdk';
 import { createHash } from 'crypto';
-import { SCHEMA_REGISTRY, decodeWithSchema, type DecodeResult } from './event-schemas.js';
+import {
+  SCHEMA_REGISTRY,
+  decodeWithSchema,
+  isSupportedSchemaVersion,
+  type DecodeResult,
+} from './event-schemas.js';
 
 export interface DecodedEvent {
   eventType: string;
@@ -73,6 +78,13 @@ const TOPIC_MAP: Record<string, string> = {
   'collection_unpaused': 'COLLECTION_UNPAUSED',
   'function_paused':     'FUNCTION_PAUSED',
   'function_unpaused':   'FUNCTION_UNPAUSED',
+  // Royalty settlement snapshot (Issue #270) and auction escrow recovery
+  // (Issue #271) — previously emitted on-chain but not mapped here, so the
+  // indexer silently dropped every one of these events. Fixed as part of
+  // Issue #278's "every indexed event has a documented version and schema".
+  'royalty_settlement':     'ROYALTY_SETTLEMENT',
+  'auction_bid_refunded':   'AUCTION_BID_REFUNDED',
+  'auction_admin_cancelled':'AUCTION_ADMIN_CANCELLED',
   // Launchpad deploy events (topics[0] = "deploy", topics[1] = kind tag)
   'dep_n721':  'DEPLOY_NORMAL_721',
   'dep_n1155': 'DEPLOY_NORMAL_1155',
@@ -162,6 +174,21 @@ export function parseMarketplaceEvent(
     }
   }
 
+  // ── Schema-version gate (Issue #278) ──────────────────────────────────────
+  // Structural decoding above can succeed even for a *future* schema_version
+  // this indexer build doesn't know about — additive fields it doesn't
+  // recognize are simply ignored by decodeWithSchema. That's fine for a
+  // genuinely additive change, but the indexer can't prove that from the
+  // shape alone, so any schema_version beyond what SUPPORTED_SCHEMA_VERSIONS
+  // records is surfaced distinctly (never as a silent success, and never
+  // lumped in with a generic SchemaDecodeError) so it can be counted and
+  // investigated. Events with no schema_version field at all (legacy/
+  // pre-Issue-278 events) are implicit version 0 and always supported.
+  const schemaVersion = extractSchemaVersion(type, nativeData);
+  if (schemaVersion !== undefined && !isSupportedSchemaVersion(type, schemaVersion)) {
+    throw new UnsupportedSchemaVersionError(type, schemaVersion, nativeData);
+  }
+
   // ── Shared field extraction ───────────────────────────────────────────────
   const obj = nativeData as Record<string, unknown>;
 
@@ -238,6 +265,64 @@ export class SchemaDecodeError extends Error {
     super(`[SchemaDecodeError] ${eventType}: ${reason}`);
     this.name = 'SchemaDecodeError';
   }
+}
+
+// ── UnsupportedSchemaVersionError ─────────────────────────────────────────────
+
+/**
+ * Thrown by parseMarketplaceEvent when an event decodes structurally, but its
+ * `schema_version` is higher than this indexer build's
+ * `SUPPORTED_SCHEMA_VERSIONS` entry for that event type (Issue #278). This is
+ * deliberately distinct from `SchemaDecodeError`: the payload wasn't
+ * malformed, the indexer is simply out of date relative to the contract.
+ * event-sync.ts catches this to increment a dedicated Prometheus counter and
+ * log a structured warning with enough context (event type, version, ledger,
+ * tx) to investigate, rather than folding it into the generic decode-error
+ * counters.
+ */
+export class UnsupportedSchemaVersionError extends Error {
+  constructor(
+    public readonly eventType: string,
+    public readonly schemaVersion: number,
+    public readonly raw: unknown
+  ) {
+    super(
+      `[UnsupportedSchemaVersionError] ${eventType}: schema_version ${schemaVersion} is not supported by this indexer build`
+    );
+    this.name = 'UnsupportedSchemaVersionError';
+  }
+}
+
+/**
+ * Reads the `schema_version` carried by a decoded event, if any.
+ *
+ * - Object-shaped events (the common case) carry it as a named field.
+ * - DEPLOY_* events are a positional tuple; `schema_version` (Issue #278) was
+ *   appended as the 3rd element, so index 2 is checked instead of a name.
+ *
+ * Returns `undefined` when the field/element is absent — callers must treat
+ * that as implicit version 0, not as "unsupported".
+ */
+function extractSchemaVersion(eventType: string, nativeData: unknown): number | undefined {
+  if (
+    eventType === 'DEPLOY_NORMAL_721' ||
+    eventType === 'DEPLOY_NORMAL_1155' ||
+    eventType === 'DEPLOY_LAZY_721' ||
+    eventType === 'DEPLOY_LAZY_1155'
+  ) {
+    if (Array.isArray(nativeData) && nativeData.length >= 3) {
+      const v = nativeData[2];
+      return v === undefined || v === null ? undefined : Number(v as number | bigint);
+    }
+    return undefined;
+  }
+
+  if (nativeData !== null && typeof nativeData === 'object' && !Array.isArray(nativeData)) {
+    const v = (nativeData as Record<string, unknown>).schema_version;
+    return v === undefined || v === null ? undefined : Number(v as number | bigint);
+  }
+
+  return undefined;
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

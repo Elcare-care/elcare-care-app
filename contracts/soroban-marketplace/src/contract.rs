@@ -1470,6 +1470,7 @@ impl MarketplaceContract {
             listing_id, artist: listing.artist.clone(), buyer: buyer.clone(),
             price: listing.price, currency: listing.currency.clone(),
             ledger_sequence: env.ledger().sequence(),
+            schema_version: EVENT_SCHEMA_VERSION,
         }.publish(&env);
         // Interactions
         let (fee, payouts) = Self::distribute_payout(
@@ -1481,6 +1482,7 @@ impl MarketplaceContract {
                 crate::storage::add_protocol_fee_total(&env, &listing.token, fee);
                 ProtocolFeeCollectedEvent {
                     listing_id, amount: fee, token: listing.token.clone(), treasury,
+                    schema_version: EVENT_SCHEMA_VERSION,
                 }.publish(&env);
             }
         }
@@ -1496,6 +1498,7 @@ impl MarketplaceContract {
             total_amount: listing.price,
             token: listing.token.clone(),
             ledger_sequence: env.ledger().sequence(),
+            schema_version: EVENT_SCHEMA_VERSION,
         }.publish(&env);
         // Per-recipient payout breakdown for the royalty audit trail (Issue #201)
         emit_royalty_paid(
@@ -1617,6 +1620,7 @@ impl MarketplaceContract {
         AuctionCreatedEvent {
             auction_id, creator: creator.clone(), reserve_price,
             token, collection: collection.clone(), token_id, end_time,
+            schema_version: EVENT_SCHEMA_VERSION,
         }.publish(&env);
         // Interaction — pull NFT into custody
         escrow::escrow_nft(&env, &creator, &collection, token_id, false, auction_id);
@@ -1704,6 +1708,7 @@ impl MarketplaceContract {
                 token: auction.token.clone(),
                 reason: Symbol::new(&env, "outbid"),
                 ledger_sequence: env.ledger().sequence(),
+                schema_version: EVENT_SCHEMA_VERSION,
             }.publish(&env);
         }
         tc.transfer(&bidder, &env.current_contract_address(), &amount);
@@ -1730,7 +1735,10 @@ impl MarketplaceContract {
         let snapshotted_fee = auction.protocol_fee_bps;
         auction.status = if winner.is_some() { AuctionStatus::Finalized } else { AuctionStatus::Cancelled };
         save_auction(&env, &auction);
-        AuctionFinalizedEvent { auction_id, winner: winner.clone(), amount: winning_bid }.publish(&env);
+        AuctionFinalizedEvent {
+            auction_id, winner: winner.clone(), amount: winning_bid,
+            schema_version: EVENT_SCHEMA_VERSION,
+        }.publish(&env);
         if let Some(ref w) = winner {
             let (fee, payouts) = Self::distribute_payout(
                 &env, &auction.token, &auction.collection, winning_bid,
@@ -1742,6 +1750,7 @@ impl MarketplaceContract {
                     ProtocolFeeCollectedEvent {
                         listing_id: auction_id, amount: fee,
                         token: auction.token.clone(), treasury,
+                        schema_version: EVENT_SCHEMA_VERSION,
                     }.publish(&env);
                 }
             }
@@ -1755,6 +1764,7 @@ impl MarketplaceContract {
                 total_amount: winning_bid,
                 token: auction.token.clone(),
                 ledger_sequence: env.ledger().sequence(),
+                schema_version: EVENT_SCHEMA_VERSION,
             }.publish(&env);
             // Per-recipient payout breakdown for the royalty audit trail (Issue #201)
             emit_royalty_paid(
@@ -1834,6 +1844,7 @@ impl MarketplaceContract {
                 token: auction.token.clone(),
                 reason: Symbol::new(&env, "admin_cancel"),
                 ledger_sequence: env.ledger().sequence(),
+                schema_version: EVENT_SCHEMA_VERSION,
             }.publish(&env);
         }
         auction.status = AuctionStatus::Cancelled;
@@ -1849,6 +1860,7 @@ impl MarketplaceContract {
             refunded_amount,
             token: auction.token.clone(),
             ledger_sequence: env.ledger().sequence(),
+            schema_version: EVENT_SCHEMA_VERSION,
         }.publish(&env);
         // Return NFT to creator
         escrow::release_nft(&env, &auction.collection, auction.token_id,
@@ -1911,6 +1923,7 @@ impl MarketplaceContract {
             amount,
             token,
             expires_at,
+            schema_version: EVENT_SCHEMA_VERSION,
         }
         .publish(&env);
 
@@ -2034,6 +2047,7 @@ impl MarketplaceContract {
 
         OfferAcceptedEvent {
             offer_id, listing_id, offerer: accepted_offerer.clone(), amount: accepted_amount,
+            schema_version: EVENT_SCHEMA_VERSION,
         }.publish(&env);
         // Interactions
         let (fee, payouts) = Self::distribute_payout(
@@ -2045,6 +2059,7 @@ impl MarketplaceContract {
                 crate::storage::add_protocol_fee_total(&env, &offer.token, fee);
                 ProtocolFeeCollectedEvent {
                     listing_id, amount: fee, token: offer.token.clone(), treasury,
+                    schema_version: EVENT_SCHEMA_VERSION,
                 }.publish(&env);
             }
         }
@@ -2058,6 +2073,7 @@ impl MarketplaceContract {
             total_amount: offer.amount,
             token: offer.token.clone(),
             ledger_sequence: env.ledger().sequence(),
+            schema_version: EVENT_SCHEMA_VERSION,
         }.publish(&env);
         // Per-recipient payout breakdown for the royalty audit trail (Issue #201)
         emit_royalty_paid(

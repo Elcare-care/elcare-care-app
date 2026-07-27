@@ -8607,12 +8607,14 @@ fn test_event_catalog_topics() {
         listing_id: 1, artist: artist.clone(), price: 100,
         currency: soroban_sdk::Symbol::new(&env, "xlm"),
         collection: collection.clone(), token_id: 1, ledger_sequence: 1,
+        schema_version: crate::events::EVENT_SCHEMA_VERSION,
     };
     ev1.publish(&env);
-    
+
     let ev2 = crate::events::ArtworkSoldEvent {
         listing_id: 1, artist: artist.clone(), buyer: artist.clone(),
         price: 100, currency: soroban_sdk::Symbol::new(&env, "xlm"), ledger_sequence: 1,
+        schema_version: crate::events::EVENT_SCHEMA_VERSION,
     };
     ev2.publish(&env);
     

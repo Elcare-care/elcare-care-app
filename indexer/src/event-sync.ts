@@ -171,6 +171,29 @@ export async function collectMarketplaceEvents(
           const decoded = decodeRpcEvent(event, idx);
           if (decoded) decodedEvents.push(decoded);
         } catch (err) {
+          // ── Unsupported schema version (Issue #278) ───────────────────────
+          // Distinct from a generic decode failure: the payload decoded fine
+          // structurally, but its schema_version is ahead of what this
+          // indexer build recognizes as safe. Count and log it separately so
+          // it's investigable as an indexer/contract version-skew signal
+          // rather than being buried in the generic decode-error counters.
+          if (err instanceof UnsupportedSchemaVersionError) {
+            unsupportedSchemaVersionCounter.inc({
+              event_type: err.eventType,
+              schema_version: String(err.schemaVersion),
+            });
+            logger.warn('Unsupported event schema version — skipping event, indexer may be behind the deployed contract', {
+              ledger: (event as RpcEvent).ledger,
+              eventIndex: idx,
+              eventType: err.eventType,
+              schemaVersion: err.schemaVersion,
+              contractId: (event as RpcEvent).contractId,
+              txHash: (event as RpcEvent).txHash,
+              rawTopic: (event as RpcEvent).topic,
+            });
+            continue;
+          }
+
           // Always increment the legacy unlabeled counter for backward compat.
           decodeErrorsCounter.inc();
 
