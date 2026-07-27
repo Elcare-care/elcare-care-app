@@ -7,7 +7,17 @@ const mockPrisma = vi.hoisted(() => ({
   auction: { findMany: vi.fn() },
 }));
 
-vi.mock('../db', () => ({ default: mockPrisma }));
+const mockPrismaWrite = vi.hoisted(() => ({
+  $transaction:         vi.fn().mockImplementation(async (fn: any) => fn(mockPrismaWrite)),
+  listing:              { update: vi.fn().mockResolvedValue({}) },
+  auction:              { update: vi.fn().mockResolvedValue({}) },
+  reconciliationRepair: { create: vi.fn().mockResolvedValue({}) },
+  reconciliationRun:    { create: vi.fn().mockResolvedValue({ id: 42 }), update: vi.fn().mockResolvedValue({}) },
+  discrepancy:          { create: vi.fn().mockResolvedValue({ id: 1 }), update: vi.fn().mockResolvedValue({}) },
+}));
+
+vi.mock('../db',           () => ({ default: mockPrisma }));
+vi.mock('../prisma-write', () => ({ default: mockPrismaWrite }));
 
 import { runReconciliation, fetchListingOnChain, fetchAuctionOnChain } from '../reconciler';
 import type { rpc } from '@stellar/stellar-sdk';
@@ -15,16 +25,20 @@ import type { rpc } from '@stellar/stellar-sdk';
 const mockServer = {} as rpc.Server;
 
 const sampleListing = (overrides = {}) => ({
-  listingId: BigInt(1),
-  status: 'Active',
-  price: { toString: () => '100.0000000' },
+  listingId:       BigInt(1),
+  status:          'Active',
+  price:           { toString: () => '100.0000000' },
+  updatedAtLedger: 500,
   ...overrides,
 });
 
 const sampleAuction = (overrides = {}) => ({
-  auctionId: BigInt(1),
-  status: 'Active',
-  highestBid: { toString: () => '0.0000000' },
+  auctionId:       BigInt(1),
+  status:          'Active',
+  highestBid:      { toString: () => '0.0000000' },
+  highestBidder:   null,
+  endTime:         { toString: () => '1700000000' },
+  updatedAtLedger: 500,
   ...overrides,
 });
 
@@ -32,6 +46,23 @@ beforeEach(() => {
   vi.clearAllMocks();
   mockPrisma.listing.findMany.mockResolvedValue([]);
   mockPrisma.auction.findMany.mockResolvedValue([]);
+  mockPrismaWrite.$transaction.mockImplementation(async (fn: any) => fn(mockPrismaWrite));
+  mockPrismaWrite.listing.update.mockResolvedValue({});
+  mockPrismaWrite.auction.update.mockResolvedValue({});
+  mockPrismaWrite.reconciliationRepair.create.mockResolvedValue({});
+  mockPrismaWrite.reconciliationRun.create.mockResolvedValue({ id: 42 });
+  mockPrismaWrite.reconciliationRun.update.mockResolvedValue({});
+  mockPrismaWrite.discrepancy.create.mockResolvedValue({ id: 1 });
+  mockPrismaWrite.discrepancy.update.mockResolvedValue({});
+});
+
+// ── Exports ───────────────────────────────────────────────────────────────────
+
+describe('fetchListingOnChain / fetchAuctionOnChain exports', () => {
+  it('are exported from reconciler as callable functions', () => {
+    expect(typeof fetchListingOnChain).toBe('function');
+    expect(typeof fetchAuctionOnChain).toBe('function');
+  });
 });
 
 // ── runReconciliation ─────────────────────────────────────────────────────────
@@ -46,24 +77,21 @@ describe('runReconciliation', () => {
     expect(result.sampledListings).toBe(1);
     expect(result.sampledAuctions).toBe(1);
     expect(result.discrepancies).toHaveLength(0);
+    expect(result.repairs).toBe(0);
+    // Default dryRun = !AUTO_REPAIR; RECONCILER_AUTO_REPAIR is unset in tests → dryRun=true
+    expect(result.dryRun).toBe(true);
   });
 
   it('detects a listing status mismatch', async () => {
     mockPrisma.listing.findMany.mockResolvedValue([sampleListing()]);
     mockPrisma.auction.findMany.mockResolvedValue([]);
 
-    // Override fetchListingOnChain to return a different status
-    vi.spyOn({ fetchListingOnChain }, 'fetchListingOnChain');
     const fetchSpy = vi.fn().mockResolvedValue({ status: 'Sold', price: '100.0000000' });
-
-    const result = await runReconciliation(mockServer, 'CONTRACT', 50, fetchSpy, undefined);
+    const result   = await runReconciliation(mockServer, 'CONTRACT', 50, fetchSpy, undefined);
 
     expect(result.discrepancies).toHaveLength(1);
     expect(result.discrepancies[0]).toMatchObject({
-      kind: 'listing',
-      field: 'status',
-      dbValue: 'Active',
-      chainValue: 'Sold',
+      kind: 'listing', field: 'status', dbValue: 'Active', chainValue: 'Sold',
     });
   });
 
@@ -72,15 +100,11 @@ describe('runReconciliation', () => {
     mockPrisma.auction.findMany.mockResolvedValue([]);
 
     const fetchSpy = vi.fn().mockResolvedValue({ status: 'Active', price: '999.0000000' });
-
-    const result = await runReconciliation(mockServer, 'CONTRACT', 50, fetchSpy, undefined);
+    const result   = await runReconciliation(mockServer, 'CONTRACT', 50, fetchSpy, undefined);
 
     expect(result.discrepancies).toHaveLength(1);
     expect(result.discrepancies[0]).toMatchObject({
-      kind: 'listing',
-      field: 'price',
-      dbValue: '100.0000000',
-      chainValue: '999.0000000',
+      kind: 'listing', field: 'price', dbValue: '100.0000000', chainValue: '999.0000000',
     });
   });
 
@@ -89,15 +113,11 @@ describe('runReconciliation', () => {
     mockPrisma.auction.findMany.mockResolvedValue([sampleAuction()]);
 
     const fetchAuctionSpy = vi.fn().mockResolvedValue({ status: 'Finalized', highestBid: '0.0000000' });
-
-    const result = await runReconciliation(mockServer, 'CONTRACT', 50, undefined, fetchAuctionSpy);
+    const result          = await runReconciliation(mockServer, 'CONTRACT', 50, undefined, fetchAuctionSpy);
 
     expect(result.discrepancies).toHaveLength(1);
     expect(result.discrepancies[0]).toMatchObject({
-      kind: 'auction',
-      field: 'status',
-      dbValue: 'Active',
-      chainValue: 'Finalized',
+      kind: 'auction', field: 'status', dbValue: 'Active', chainValue: 'Finalized',
     });
   });
 
@@ -106,15 +126,11 @@ describe('runReconciliation', () => {
     mockPrisma.auction.findMany.mockResolvedValue([sampleAuction()]);
 
     const fetchAuctionSpy = vi.fn().mockResolvedValue({ status: 'Active', highestBid: '500.0000000' });
-
-    const result = await runReconciliation(mockServer, 'CONTRACT', 50, undefined, fetchAuctionSpy);
+    const result          = await runReconciliation(mockServer, 'CONTRACT', 50, undefined, fetchAuctionSpy);
 
     expect(result.discrepancies).toHaveLength(1);
     expect(result.discrepancies[0]).toMatchObject({
-      kind: 'auction',
-      field: 'highestBid',
-      dbValue: '0.0000000',
-      chainValue: '500.0000000',
+      kind: 'auction', field: 'highestBid', dbValue: '0.0000000', chainValue: '500.0000000',
     });
   });
 
@@ -124,12 +140,12 @@ describe('runReconciliation', () => {
 
     const fetchListingSpy = vi.fn().mockResolvedValue({ status: 'Active', price: '100.0000000' });
     const fetchAuctionSpy = vi.fn().mockResolvedValue({ status: 'Active', highestBid: '0.0000000' });
-
     const result = await runReconciliation(mockServer, 'CONTRACT', 50, fetchListingSpy, fetchAuctionSpy);
 
     expect(result.discrepancies).toHaveLength(0);
     expect(result.sampledListings).toBe(1);
     expect(result.sampledAuctions).toBe(1);
+    expect(result.repairs).toBe(0);
   });
 
   it('respects the sampleSize parameter', async () => {
@@ -144,5 +160,79 @@ describe('runReconciliation', () => {
     expect(mockPrisma.auction.findMany).toHaveBeenCalledWith(
       expect.objectContaining({ take: 25 })
     );
+  });
+});
+
+// ── Dry-run mode ──────────────────────────────────────────────────────────────
+
+describe('runReconciliation — dry-run', () => {
+  it('records a DryRun repair without updating the DB when dryRun=true', async () => {
+    mockPrisma.listing.findMany.mockResolvedValue([sampleListing()]);
+    mockPrisma.auction.findMany.mockResolvedValue([]);
+
+    const fetchSpy = vi.fn().mockResolvedValue({ status: 'Sold', price: '100.0000000' });
+    const result   = await runReconciliation(mockServer, 'CONTRACT', 50, fetchSpy, undefined, true);
+
+    expect(result.dryRun).toBe(true);
+    expect(result.discrepancies).toHaveLength(1);
+    expect(result.repairs).toBe(1);
+
+    // DB record should NOT be updated in dry-run
+    expect(mockPrismaWrite.listing.update).not.toHaveBeenCalled();
+
+    // Audit repair record should be written with DryRun status
+    expect(mockPrismaWrite.reconciliationRepair.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ status: 'DryRun', field: 'status' }),
+      })
+    );
+  });
+
+  it('applies DB update and writes Applied repair record when dryRun=false', async () => {
+    mockPrisma.listing.findMany.mockResolvedValue([sampleListing()]);
+    mockPrisma.auction.findMany.mockResolvedValue([]);
+
+    const fetchSpy = vi.fn().mockResolvedValue({ status: 'Cancelled', price: '100.0000000' });
+    await runReconciliation(mockServer, 'CONTRACT', 50, fetchSpy, undefined, false);
+
+    expect(mockPrismaWrite.$transaction).toHaveBeenCalled();
+    expect(mockPrismaWrite.reconciliationRepair.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ status: 'Applied' }),
+      })
+    );
+  });
+});
+
+// ── RPC failure ───────────────────────────────────────────────────────────────
+
+describe('runReconciliation — RPC failure', () => {
+  it('leaves DB unchanged and skips the record when RPC throws', async () => {
+    mockPrisma.listing.findMany.mockResolvedValue([sampleListing()]);
+    mockPrisma.auction.findMany.mockResolvedValue([]);
+
+    const throwingSpy = vi.fn().mockRejectedValue(new Error('RPC timeout'));
+    const result      = await runReconciliation(mockServer, 'CONTRACT', 50, throwingSpy, undefined);
+
+    expect(result.discrepancies).toHaveLength(0);
+    expect(result.repairs).toBe(0);
+    expect(mockPrismaWrite.listing.update).not.toHaveBeenCalled();
+    expect(mockPrismaWrite.reconciliationRepair.create).not.toHaveBeenCalled();
+  });
+
+  it('continues processing remaining records after a single RPC failure', async () => {
+    const listings = [sampleListing({ listingId: BigInt(1) }), sampleListing({ listingId: BigInt(2) })];
+    mockPrisma.listing.findMany.mockResolvedValue(listings);
+    mockPrisma.auction.findMany.mockResolvedValue([]);
+
+    const fetchSpy = vi.fn()
+      .mockRejectedValueOnce(new Error('RPC timeout'))
+      .mockResolvedValueOnce({ status: 'Sold', price: '100.0000000' });
+
+    const result = await runReconciliation(mockServer, 'CONTRACT', 50, fetchSpy, undefined);
+
+    // First record skipped; second record detected as discrepancy
+    expect(result.discrepancies).toHaveLength(1);
+    expect(result.discrepancies[0]).toMatchObject({ kind: 'listing', field: 'status' });
   });
 });

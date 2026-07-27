@@ -1632,6 +1632,44 @@ fn view_functions_return_correct_values() {
     assert_eq!(client.wasm_version(), 1u32);
 }
 
+#[test]
+fn update_collection_wasm_and_upgrade_collection_emit_events() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let launchpad_id = env.register(Launchpad, ());
+    let client = LaunchpadClient::new(&env, &launchpad_id);
+
+    let admin = Address::generate(&env);
+    let fee_receiver = Address::generate(&env);
+    client.initialize(&admin, &fee_receiver, &0i128);
+
+    let wasm_v1 = BytesN::from_array(&env, &[11u8; 32]);
+    let wasm_v2 = BytesN::from_array(&env, &[22u8; 32]);
+    client.set_wasm_hashes(&wasm_v1, &wasm_v1, &wasm_v1, &wasm_v1);
+
+    let creator = Address::generate(&env);
+    let currency = Address::generate(&env);
+    let royalty_receiver = Address::generate(&env);
+    let deployed = client.deploy_normal_721(
+        &creator,
+        &currency,
+        &String::from_str(&env, "Upgradeable 721"),
+        &String::from_str(&env, "UP721"),
+        &100u64,
+        &500u32,
+        &royalty_receiver,
+        &0u32,
+        &BytesN::from_array(&env, &[0xAAu8; 32]),
+    );
+
+    client.update_collection_wasm(&CollectionKind::Normal721, &wasm_v2);
+    client.upgrade_collection(&deployed);
+
+    assert!(event_with_tag_present(&env, &client.address, symbol_short!("wasm_upd")));
+    assert!(event_with_tag_present(&env, &client.address, symbol_short!("col_upgd")));
+}
+
 // ── Collections view tests ──────────────────────────────────────
 
 #[test]

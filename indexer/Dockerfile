@@ -18,15 +18,25 @@ RUN npx prisma generate
 
 COPY src ./src/
 
-# Compile TypeScript
-RUN npm run build
+# Compile TypeScript with build-time version metadata
+ARG BUILD_SHA=unknown
+ARG BUILD_TIME=unknown
+ARG INDEXER_VERSION=1.0.0
+ARG API_VERSION=1.0.0
+ARG EVENT_SCHEMA_VERSION=1
+ARG DB_MIGRATION_VERSION=20260724000000
+RUN BUILD_SHA="$BUILD_SHA" BUILD_TIME="$BUILD_TIME" \
+    INDEXER_VERSION="$INDEXER_VERSION" API_VERSION="$API_VERSION" \
+    EVENT_SCHEMA_VERSION="$EVENT_SCHEMA_VERSION" \
+    DB_MIGRATION_VERSION="$DB_MIGRATION_VERSION" \
+    npm run build
 
 # ── Stage 2: runtime ─────────────────────────────────────────────────────────
 FROM node:20-alpine AS runtime
 
 WORKDIR /app
 
-# Runtime system deps
+# Runtime system deps: openssl (Prisma), wget is provided by busybox (health probe)
 RUN apk add --no-cache openssl \
  && addgroup -S appgroup \
  && adduser  -S appuser -G appgroup
@@ -36,9 +46,37 @@ COPY package*.json ./
 RUN npm ci --omit=dev
 
 # Copy compiled output and Prisma artifacts
-COPY --from=builder /build/dist        ./dist
-COPY --from=builder /build/prisma      ./prisma
+COPY --from=builder /build/dist               ./dist
+COPY --from=builder /build/prisma             ./prisma
 COPY --from=builder /build/node_modules/.prisma ./node_modules/.prisma
+
+# Transfer all /app ownership to the non-root runtime user before switching context.
+# This ensures appuser can read node_modules (installed as root above) and execute
+# prisma migrate deploy without a privilege escalation.
+RUN chown -R appuser:appgroup /app
+
+# OCI image labels for version tracking
+ARG BUILD_SHA=unknown
+ARG BUILD_TIME=unknown
+ARG INDEXER_VERSION=1.0.0
+ARG API_VERSION=1.0.0
+ARG EVENT_SCHEMA_VERSION=1
+ARG DB_MIGRATION_VERSION=20260724000000
+LABEL org.opencontainers.image.title="elcarehub-indexer"
+LABEL org.opencontainers.image.version="${INDEXER_VERSION}"
+LABEL org.opencontainers.image.revision="${BUILD_SHA}"
+LABEL org.opencontainers.image.created="${BUILD_TIME}"
+LABEL org.elcarehub.indexer.api-version="${API_VERSION}"
+LABEL org.elcarehub.indexer.event-schema-version="${EVENT_SCHEMA_VERSION}"
+LABEL org.elcarehub.indexer.db-migration-version="${DB_MIGRATION_VERSION}"
+
+# Pass version metadata as runtime environment variables
+ENV INDEXER_VERSION="${INDEXER_VERSION}"
+ENV API_VERSION="${API_VERSION}"
+ENV EVENT_SCHEMA_VERSION="${EVENT_SCHEMA_VERSION}"
+ENV DB_MIGRATION_VERSION="${DB_MIGRATION_VERSION}"
+ENV BUILD_SHA="${BUILD_SHA}"
+ENV BUILD_TIME="${BUILD_TIME}"
 
 EXPOSE 4000
 

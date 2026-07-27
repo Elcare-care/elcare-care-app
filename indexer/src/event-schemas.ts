@@ -270,10 +270,25 @@ export interface RoyaltySettlementData {
   schema_version?: number;
 }
 
-export interface RoyaltyPaidData {
-  listing_id?: bigint;
-  recipient: string;
+/** One `{address, amount}` payout entry of a ROYALTY_PAID breakdown. */
+export interface RoyaltyRecipientPayout {
+  address: string;
   amount: bigint;
+}
+
+/**
+ * Per-sale royalty distribution breakdown (Issue #201). Exactly one of
+ * listing_id / auction_id is set. Recipient amounts sum to
+ * sale_price - protocol_fee_amount.
+ */
+export interface RoyaltyPaidData {
+  listing_id?: bigint | null;
+  auction_id?: bigint | null;
+  sale_price: bigint;
+  protocol_fee_amount: bigint;
+  token: string;
+  recipients: RoyaltyRecipientPayout[];
+  ledger_sequence?: bigint;
 }
 
 export interface ArtistRevokedData {
@@ -301,6 +316,18 @@ export interface AdminProposalCancelledData {
   cancelled_candidate: string;
 }
 
+/** Anti-shill-bidding registry (Issue #199): address barred from an auction. */
+export interface AuctionBidderBlockedData {
+  auction_id: bigint;
+  bidder: string;
+}
+
+/** Anti-shill-bidding registry (Issue #199): address removed from the registry. */
+export interface AuctionBidderUnblockedData {
+  auction_id: bigint;
+  bidder: string;
+}
+
 export interface ContractPausedData {
   paused_by?: string;
 }
@@ -313,6 +340,17 @@ export interface ContractUnpausedData {
 export interface DeployData {
   0: string;
   1: string;
+}
+
+export interface LaunchpadWasmUpdateData {
+  0: string;
+  1: string;
+}
+
+export interface LaunchpadCollectionUpgradedData {
+  0: string;
+  1: string;
+  2: string;
 }
 
 // ── Decode result types ───────────────────────────────────────────────────────
@@ -545,9 +583,13 @@ export const OFFER_RECLAIMED_SCHEMA: ContractEventSchema = {
 export const ROYALTY_PAID_SCHEMA: ContractEventSchema = {
   type: 'ROYALTY_PAID',
   data: [
-    { name: 'recipient', type: 'string' },
-    { name: 'amount', type: 'bigint' },
     { name: 'listing_id', type: 'bigint', optional: true },
+    { name: 'auction_id', type: 'bigint', optional: true },
+    { name: 'sale_price', type: 'bigint' },
+    { name: 'protocol_fee_amount', type: 'bigint' },
+    { name: 'token', type: 'string' },
+    { name: 'recipients', type: 'array' },
+    { name: 'ledger_sequence', type: 'bigint', optional: true },
   ],
 };
 
@@ -614,6 +656,22 @@ export const ADMIN_PROPOSAL_CANCELLED_SCHEMA: ContractEventSchema = {
   ],
 };
 
+export const AUCTION_BIDDER_BLOCKED_SCHEMA: ContractEventSchema = {
+  type: 'AUCTION_BIDDER_BLOCKED',
+  data: [
+    { name: 'auction_id', type: 'bigint' },
+    { name: 'bidder', type: 'string' },
+  ],
+};
+
+export const AUCTION_BIDDER_UNBLOCKED_SCHEMA: ContractEventSchema = {
+  type: 'AUCTION_BIDDER_UNBLOCKED',
+  data: [
+    { name: 'auction_id', type: 'bigint' },
+    { name: 'bidder', type: 'string' },
+  ],
+};
+
 export const CONTRACT_PAUSED_SCHEMA: ContractEventSchema = {
   type: 'CONTRACT_PAUSED',
   data: [{ name: 'paused_by', type: 'string', optional: true }],
@@ -635,6 +693,16 @@ export const DEPLOY_SCHEMA: ContractEventSchema = {
     // Positional tuple: index 0 = creator, index 1 = contract address
     // These are validated structurally in decodeWithSchema; array items don't carry names.
   ],
+};
+
+export const LAUNCHPAD_WASM_UPDATED_SCHEMA: ContractEventSchema = {
+  type: 'LAUNCHPAD_WASM_UPDATED',
+  data: [],
+};
+
+export const LAUNCHPAD_COLLECTION_UPGRADED_SCHEMA: ContractEventSchema = {
+  type: 'LAUNCHPAD_COLLECTION_UPGRADED',
+  data: [],
 };
 
 // ── Schema registry ───────────────────────────────────────────────────────────
@@ -668,11 +736,15 @@ export const SCHEMA_REGISTRY: Map<string, ContractEventSchema> = new Map([
   ['ADMIN_PROPOSAL_CANCELLED', ADMIN_PROPOSAL_CANCELLED_SCHEMA],
   ['CONTRACT_PAUSED', CONTRACT_PAUSED_SCHEMA],
   ['CONTRACT_UNPAUSED', CONTRACT_UNPAUSED_SCHEMA],
+  ['AUCTION_BIDDER_BLOCKED', AUCTION_BIDDER_BLOCKED_SCHEMA],
+  ['AUCTION_BIDDER_UNBLOCKED', AUCTION_BIDDER_UNBLOCKED_SCHEMA],
   // Deploy events share a common tuple structure; each variant is registered separately.
   ['DEPLOY_NORMAL_721', DEPLOY_SCHEMA],
   ['DEPLOY_NORMAL_1155', DEPLOY_SCHEMA],
   ['DEPLOY_LAZY_721', DEPLOY_SCHEMA],
   ['DEPLOY_LAZY_1155', DEPLOY_SCHEMA],
+  ['LAUNCHPAD_WASM_UPDATED', LAUNCHPAD_WASM_UPDATED_SCHEMA],
+  ['LAUNCHPAD_COLLECTION_UPGRADED', LAUNCHPAD_COLLECTION_UPGRADED_SCHEMA],
 ]);
 
 // ── Schema-driven decoder ─────────────────────────────────────────────────────
@@ -699,33 +771,67 @@ export function decodeWithSchema<T = unknown>(
     eventType === 'DEPLOY_NORMAL_721' ||
     eventType === 'DEPLOY_NORMAL_1155' ||
     eventType === 'DEPLOY_LAZY_721' ||
-    eventType === 'DEPLOY_LAZY_1155'
+    eventType === 'DEPLOY_LAZY_1155' ||
+    eventType === 'LAUNCHPAD_WASM_UPDATED' ||
+    eventType === 'LAUNCHPAD_COLLECTION_UPGRADED'
   ) {
     if (!Array.isArray(nativeData)) {
       return {
         ok: false,
         eventType,
-        reason: `Deploy event data must be an array, got ${typeof nativeData}`,
+        reason: `Event data must be an array for ${eventType}`,
         raw: nativeData,
       };
     }
-    if (nativeData.length < 2) {
-      return {
-        ok: false,
-        eventType,
-        reason: `Deploy event tuple requires at least 2 elements, got ${nativeData.length}`,
-        raw: nativeData,
-      };
+
+    if (
+      eventType === 'DEPLOY_NORMAL_721' ||
+      eventType === 'DEPLOY_NORMAL_1155' ||
+      eventType === 'DEPLOY_LAZY_721' ||
+      eventType === 'DEPLOY_LAZY_1155'
+    ) {
+      if (nativeData.length < 2) {
+        return {
+          ok: false,
+          eventType,
+          reason: `Deploy event tuple requires at least 2 elements, got ${nativeData.length}`,
+          raw: nativeData,
+        };
+      }
+      if (typeof nativeData[0] !== 'string' || typeof nativeData[1] !== 'string') {
+        return {
+          ok: false,
+          eventType,
+          reason: `Deploy event tuple elements must be strings, got [${typeof nativeData[0]}, ${typeof nativeData[1]}]`,
+          raw: nativeData,
+        };
+      }
+      return { ok: true, eventType, data: nativeData as T };
     }
-    if (typeof nativeData[0] !== 'string' || typeof nativeData[1] !== 'string') {
-      return {
-        ok: false,
-        eventType,
-        reason: `Deploy event tuple elements must be strings, got [${typeof nativeData[0]}, ${typeof nativeData[1]}]`,
-        raw: nativeData,
-      };
+
+    if (eventType === 'LAUNCHPAD_WASM_UPDATED') {
+      if (nativeData.length < 2) {
+        return {
+          ok: false,
+          eventType,
+          reason: `WASM update event tuple requires 2 elements, got ${nativeData.length}`,
+          raw: nativeData,
+        };
+      }
+      return { ok: true, eventType, data: nativeData as T };
     }
-    return { ok: true, eventType, data: nativeData as T };
+
+    if (eventType === 'LAUNCHPAD_COLLECTION_UPGRADED') {
+      if (nativeData.length < 3) {
+        return {
+          ok: false,
+          eventType,
+          reason: `Collection upgrade event tuple requires 3 elements, got ${nativeData.length}`,
+          raw: nativeData,
+        };
+      }
+      return { ok: true, eventType, data: nativeData as T };
+    }
   }
 
   // ── Object path ───────────────────────────────────────────────────────────

@@ -6,17 +6,19 @@
 
 import { useState, useEffect } from "react";
 import { useWalletContext } from "@/context/WalletContext";
-import { useArtistListings, useCancelListing } from "@/hooks/useMarketplace";
+import { useArtistListings, useCancelListing, useCancelListings } from "@/hooks/useMarketplace";
 import { ListingForm } from "@/components/ListingForm";
 import { AuctionForm } from "@/components/AuctionForm";
 import { stroopsToXlm, Listing } from "@/lib/contract";
-import { fetchArtistMetrics, ArtistMetrics, MetricsRange } from "@/lib/indexer";
-import { Plus, Package, XCircle, Wallet, Edit2, Activity, TrendingUp, Gavel, BarChart2 } from "lucide-react";
+import { fetchArtistMetrics, ArtistMetrics, MetricsRange, fetchRoyaltyBreakdown, RoyaltyPaymentRow } from "@/lib/indexer";
+import { Plus, Package, XCircle, Wallet, Edit2, Activity, TrendingUp, Gavel, BarChart2, Coins, ChevronLeft, ChevronRight, ExternalLink } from "lucide-react";
+import Link from "next/link";
+import { config } from "@/lib/config";
 import { WalletGuard } from "@/components/WalletGuard";
 import { SUPPORTED_TOKENS } from "@/config/tokens";
 import { clsx } from "clsx";
 
-type Tab = "listings" | "list" | "edit" | "auction" | "metrics";
+type Tab = "listings" | "list" | "edit" | "auction" | "metrics" | "royalties";
 
 const STATUS_COLOR: Record<string, string> = {
   Active: "text-green-600 bg-green-50",
@@ -52,6 +54,145 @@ function MiniBarChart({ data, label }: { data: { date: string; count: number }[]
         <span className="text-[9px] text-white/20">{data[0]?.date}</span>
         <span className="text-[9px] text-white/20">{data[data.length - 1]?.date}</span>
       </div>
+    </div>
+  );
+}
+
+// ── RoyaltyHistory (Issue #201) ───────────────────────────────────────────────
+
+const ROYALTY_PAGE_SIZE = 20;
+
+function RoyaltyHistory({ publicKey }: { publicKey: string }) {
+  const [payments, setPayments] = useState<RoyaltyPaymentRow[]>([]);
+  const [total, setTotal] = useState(0);
+  const [page, setPage] = useState(0);
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    if (!publicKey) return;
+    setLoading(true);
+    fetchRoyaltyBreakdown(publicKey, { limit: ROYALTY_PAGE_SIZE, offset: page * ROYALTY_PAGE_SIZE })
+      .then((res) => {
+        setPayments(res.payments);
+        setTotal(res.total);
+      })
+      .finally(() => setLoading(false));
+  }, [publicKey, page]);
+
+  const pageCount = Math.max(Math.ceil(total / ROYALTY_PAGE_SIZE), 1);
+  const explorerNetwork = config.network === "mainnet" ? "mainnet" : "testnet";
+
+  const saleHref = (p: RoyaltyPaymentRow) =>
+    p.auctionId !== null && p.auctionId !== undefined
+      ? `/auctions/${p.auctionId}`
+      : `/listings/${p.listingId}`;
+
+  const saleLabel = (p: RoyaltyPaymentRow) =>
+    p.auctionId !== null && p.auctionId !== undefined
+      ? `Auction #${p.auctionId}`
+      : `Listing #${p.listingId}`;
+
+  if (loading) {
+    return (
+      <div className="space-y-4">
+        {[1, 2, 3].map((i) => (
+          <div key={i} className="h-16 animate-pulse rounded-[2rem] bg-white/[0.03] border border-white/5" />
+        ))}
+      </div>
+    );
+  }
+
+  if (payments.length === 0) {
+    return (
+      <div className="flex flex-col items-center justify-center rounded-[3.5rem] bg-midnight-900/50 border-2 border-dashed border-white/5 py-24 px-10 text-center">
+        <div className="mb-8 flex h-24 w-24 items-center justify-center rounded-[2rem] bg-midnight-950 text-white/10 shadow-inner">
+          <Coins size={40} />
+        </div>
+        <h3 className="font-display text-2xl font-bold text-white tracking-tight">No royalty payouts yet.</h3>
+        <p className="mt-3 max-w-sm text-sm text-brand-300/40 leading-relaxed font-medium">
+          When artworks that name you as a royalty recipient sell, each payout will appear here.
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-6">
+      <div className="overflow-x-auto rounded-[2rem] bg-white/[0.03] border border-white/5 shadow-2xl">
+        <table className="w-full min-w-[640px] text-left">
+          <thead>
+            <tr className="border-b border-white/5">
+              {["Sale Date", "Artwork", "Sale Price", "Your Share", "Transaction"].map((h) => (
+                <th key={h} className="px-6 py-4 text-[10px] uppercase tracking-[0.2em] font-bold text-white/40">
+                  {h}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {payments.map((p) => (
+              <tr key={p.id} className="border-b border-white/5 last:border-b-0 hover:bg-white/[0.04] transition-colors">
+                <td className="px-6 py-4 text-sm text-white/70 whitespace-nowrap">
+                  {p.createdAt ? new Date(p.createdAt).toLocaleDateString() : "—"}
+                </td>
+                <td className="px-6 py-4">
+                  <Link
+                    href={saleHref(p)}
+                    className="text-sm font-bold text-brand-400 hover:text-brand-300 transition-colors"
+                  >
+                    {saleLabel(p)}
+                  </Link>
+                </td>
+                <td className="px-6 py-4 text-sm font-mono text-white/70 whitespace-nowrap">
+                  {stroopsToXlm(BigInt(Math.round(parseFloat(p.salePrice))))}
+                </td>
+                <td className="px-6 py-4 text-sm font-mono font-bold text-mint-400 whitespace-nowrap">
+                  {stroopsToXlm(BigInt(Math.round(parseFloat(p.amount))))}
+                </td>
+                <td className="px-6 py-4 whitespace-nowrap">
+                  <a
+                    href={`https://stellar.expert/explorer/${explorerNetwork}/ledger/${p.ledgerSequence}`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex items-center gap-1.5 text-xs font-mono text-white/40 hover:text-white transition-colors"
+                  >
+                    Ledger #{p.ledgerSequence}
+                    <ExternalLink size={12} />
+                  </a>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      {pageCount > 1 && (
+        <div className="flex items-center justify-between">
+          <p className="text-xs text-white/40">
+            Page {page + 1} of {pageCount} · {total} payout{total === 1 ? "" : "s"}
+          </p>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => setPage((p) => Math.max(p - 1, 0))}
+              disabled={page === 0}
+              aria-label="Previous page"
+              className="flex items-center gap-1 rounded-xl bg-white/5 px-4 py-2 text-sm font-bold text-white border border-white/10 hover:border-white/20 transition-all disabled:opacity-30 disabled:cursor-not-allowed"
+            >
+              <ChevronLeft size={16} />
+              Prev
+            </button>
+            <button
+              onClick={() => setPage((p) => Math.min(p + 1, pageCount - 1))}
+              disabled={page >= pageCount - 1}
+              aria-label="Next page"
+              className="flex items-center gap-1 rounded-xl bg-white/5 px-4 py-2 text-sm font-bold text-white border border-white/10 hover:border-white/20 transition-all disabled:opacity-30 disabled:cursor-not-allowed"
+            >
+              Next
+              <ChevronRight size={16} />
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -154,16 +295,100 @@ function MetricsDashboard({ publicKey }: { publicKey: string }) {
   );
 }
 
+// ── BidRefundBanner ───────────────────────────────────────────────────────────
+//
+// Shown on the dashboard when the indexer records an AUCTION_BID_REFUNDED
+// event for the connected wallet — notifying bidders their funds were returned
+// because the artist was suspended (Issue #214).
+
+function useBidRefundNotifications(publicKey: string | null) {
+  const [refunds, setRefunds] = useState<ActivityEvent[]>([]);
+
+  useEffect(() => {
+    if (!publicKey) return;
+    getWalletActivity(publicKey)
+      .then((events) => {
+        const refundEvents = events.filter(
+          (e) => (e as any).type === "AUCTION_BID_REFUNDED" ||
+                  (e.type === "SALE" && (e as any).reason === "admin_revoke")
+        );
+        setRefunds(refundEvents);
+      })
+      .catch(() => {});
+  }, [publicKey]);
+
+  return refunds;
+}
+
+function BidRefundBanner({ refunds, onDismiss }: { refunds: ActivityEvent[]; onDismiss: () => void }) {
+  if (refunds.length === 0) return null;
+  return (
+    <div
+      className="mb-8 flex items-start gap-4 rounded-[2rem] border border-amber-500/20 bg-amber-500/10 p-5"
+      role="alert"
+      data-testid="bid-refund-banner"
+    >
+      <div className="shrink-0 mt-0.5 w-9 h-9 rounded-full bg-amber-500/20 flex items-center justify-center">
+        <AlertTriangle size={18} className="text-amber-400" />
+      </div>
+      <div className="flex-1 min-w-0">
+        <p className="text-sm font-bold text-amber-300">Auction bid{refunds.length > 1 ? "s" : ""} refunded</p>
+        <p className="mt-1 text-xs text-amber-400/80 leading-relaxed">
+          {refunds.length === 1
+            ? "One of your bids was refunded because the auction was cancelled — the artist's account was suspended by the platform. Your funds have been returned to your wallet."
+            : `${refunds.length} of your bids were refunded because their auctions were cancelled due to artist suspension. Your funds have been returned to your wallet.`}
+        </p>
+      </div>
+      <button
+        onClick={onDismiss}
+        className="shrink-0 text-amber-400/60 hover:text-amber-300 transition-colors text-lg leading-none"
+        aria-label="Dismiss refund notification"
+      >
+        ×
+      </button>
+    </div>
+  );
+}
+
 export default function DashboardPage() {
   const { publicKey } = useWalletContext();
   const { listings, isLoading, refresh } = useArtistListings(publicKey);
   const { cancel, isCancelling } = useCancelListing(publicKey);
+  const { cancelMany, isCancelling: isBatchCancelling } = useCancelListings(publicKey);
   const [tab, setTab] = useState<Tab>("listings");
-  const [editingListing, setEditingListing] = useState<Listing | null>(null);  const activeCnt = listings.filter((l: Listing) => l.status === "Active").length;
+  const [editingListing, setEditingListing] = useState<Listing | null>(null);
+  const [selectedIds, setSelectedIds] = useState<number[]>([]);
+  const bidRefunds = useBidRefundNotifications(publicKey);
+  const [refundsDismissed, setRefundsDismissed] = useState(false);
+  const activeCnt = listings.filter((l: Listing) => l.status === "Active").length;
   const soldCnt = listings.filter((l: Listing) => l.status === "Sold").length;
+  const activeListings = listings.filter((l: Listing) => l.status === "Active");
 
   const getTokenSymbol = (address: string) => {
     return SUPPORTED_TOKENS.find(t => t.address === address)?.symbol || "Tokens";
+  };
+
+  const toggleSelection = (listingId: number) => {
+    setSelectedIds((current) =>
+      current.includes(listingId)
+        ? current.filter((id) => id !== listingId)
+        : [...current, listingId]
+    );
+  };
+
+  const handleBatchCancel = async () => {
+    if (selectedIds.length === 0) return;
+    await cancelMany(selectedIds);
+    setSelectedIds([]);
+    refresh();
+  };
+
+  const selectAllActive = () => {
+    setSelectedIds(activeListings.map((listing) => listing.listing_id));
+  };
+
+  const clearSelection = () => {
+    setSelectedIds([]);
   };
 
   return (
@@ -174,6 +399,14 @@ export default function DashboardPage() {
 
       <WalletGuard actionName="To access your artist dashboard">
         <div className="relative z-10 mx-auto max-w-7xl px-4 sm:px-6 lg:px-8">
+
+          {/* Bid refund notification banner (Issue #214) */}
+          {!refundsDismissed && (
+            <BidRefundBanner
+              refunds={bidRefunds}
+              onDismiss={() => setRefundsDismissed(true)}
+            />
+          )}
 
           <div className="relative mb-12 overflow-hidden rounded-[3rem] bg-midnight-900 border border-white/5 shadow-2xl p-8 sm:p-12">
             <div className="absolute -top-24 -right-24 h-64 w-64 rounded-full bg-brand-500/10 blur-[100px]" />
@@ -276,6 +509,19 @@ export default function DashboardPage() {
               )}
             </button>
             <button
+              onClick={() => setTab("royalties")}
+              className={clsx(
+                "group relative flex items-center gap-3 px-6 sm:px-8 py-5 text-sm font-bold transition-all duration-500 whitespace-nowrap",
+                tab === "royalties" ? "text-terracotta-400" : "text-white/40 hover:text-white"
+              )}
+            >
+              <Coins size={18} className={clsx("transition-all duration-500 group-hover:scale-125", tab === "royalties" && "text-terracotta-400 drop-shadow-[0_0_8px_rgba(235,79,27,0.5)]")} />
+              Royalty History
+              {tab === "royalties" && (
+                <div className="absolute inset-x-4 bottom-0 h-1.5 rounded-t-full bg-terracotta-500 shadow-[0_-5px_15px_rgba(235,79,27,0.6)] animate-slide-in-right" />
+              )}
+            </button>
+            <button
               onClick={() => setTab("list")}
               className={clsx(
                 "group relative flex items-center gap-3 px-6 sm:px-8 py-5 text-sm font-bold transition-all duration-500 whitespace-nowrap",
@@ -315,6 +561,8 @@ export default function DashboardPage() {
           <div className="animate-fade-in duration-700">
             {tab === "metrics" ? (
               <MetricsDashboard publicKey={publicKey ?? ""} />
+            ) : tab === "royalties" ? (
+              <RoyaltyHistory publicKey={publicKey ?? ""} />
             ) : tab === "list" ? (
               <div className="w-full">
                 <ListingForm
@@ -373,10 +621,53 @@ export default function DashboardPage() {
                     </button>
                   </div>
                 ) : (
-                  <div className="grid gap-6">
-                    {listings.map((l: Listing) => (
-                      <div key={l.listing_id} className="group relative flex flex-col sm:flex-row items-center justify-between gap-6 rounded-[2.5rem] bg-white/[0.03] hover:bg-white/[0.07] hover:border-white/10 transition-all duration-500 border border-white/5 p-6 shadow-2xl">
-                        <div className="flex items-center gap-6 w-full sm:w-auto">
+                  <div className="space-y-4">
+                    {selectedIds.length > 0 && (
+                      <div className="flex flex-wrap items-center justify-between gap-3 rounded-[2rem] border border-white/10 bg-white/[0.04] px-4 py-3">
+                        <p className="text-sm text-white/70">{selectedIds.length} selected</p>
+                        <div className="flex flex-wrap gap-2">
+                          <button
+                            onClick={selectAllActive}
+                            className="rounded-xl bg-white/5 px-3 py-2 text-sm font-semibold text-white/70 hover:bg-white/10"
+                          >
+                            Select all active
+                          </button>
+                          <button
+                            onClick={clearSelection}
+                            className="rounded-xl bg-white/5 px-3 py-2 text-sm font-semibold text-white/70 hover:bg-white/10"
+                          >
+                            Clear
+                          </button>
+                          <button
+                            onClick={handleBatchCancel}
+                            disabled={isBatchCancelling}
+                            className="flex items-center gap-2 rounded-xl bg-terracotta-500/20 px-3 py-2 text-sm font-semibold text-terracotta-400 border border-terracotta-500/20 hover:bg-terracotta-500/30 disabled:opacity-50"
+                          >
+                            <XCircle size={16} />
+                            Cancel selected
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                    <div className="grid gap-6">
+                    {listings.map((l: Listing) => {
+                      const isSelected = selectedIds.includes(l.listing_id);
+                      const canSelect = l.status === "Active";
+                      return (
+                        <div key={l.listing_id} className="group relative flex flex-col sm:flex-row items-center justify-between gap-6 rounded-[2.5rem] bg-white/[0.03] hover:bg-white/[0.07] hover:border-white/10 transition-all duration-500 border border-white/5 p-6 shadow-2xl">
+                        <div className="flex items-center gap-4 w-full sm:w-auto">
+                          {canSelect ? (
+                            <button
+                              type="button"
+                              onClick={() => toggleSelection(l.listing_id)}
+                              className="rounded-lg border border-white/10 bg-white/5 p-2 text-white/60"
+                              aria-label={`Toggle selection for listing ${l.listing_id}`}
+                            >
+                              {isSelected ? <CheckSquare2 size={18} className="text-brand-400" /> : <Square size={18} />}
+                            </button>
+                          ) : (
+                            <div className="h-9 w-9" />
+                          )}
                           <div className="h-16 w-16 rounded-[1.2rem] bg-brand-500/10 flex items-center justify-center text-brand-400 border border-brand-500/20 shadow-inner">
                             <span className="font-bold text-xl">#{l.listing_id}</span>
                           </div>
@@ -430,8 +721,10 @@ export default function DashboardPage() {
                           </div>
                         </div>
                       </div>
-                    ))}
+                    );
+                    })}
                   </div>
+                </div>
                 )}
               </>
             )}

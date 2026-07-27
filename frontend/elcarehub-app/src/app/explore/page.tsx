@@ -16,6 +16,8 @@ import { FilterSidebar, filterReducer, SortOption } from "@/components/FilterSid
 import { fetchListings } from "@/lib/indexer";
 import { getAllListings } from "@/lib/contract";
 import { useFilterUrlSync } from "@/hooks/useFilterUrlSync";
+import { ResourceState } from "@/components/PageStates";
+import { categorizePageError, PageStateError } from "@/lib/pageState";
 
 const PAGE_SIZE = 12;
 
@@ -31,7 +33,7 @@ export default function ExplorePage() {
   const [listings, setListings] = useState<Listing[]>([]);
   const [totalCount, setTotalCount] = useState(0);
   const [isLoading, setIsLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<PageStateError | null>(null);
 
   // cursorStack[i] = X-Next-Cursor value returned after fetching page i.
   // currentCursorIdx = index of the page currently displayed (0 = first page).
@@ -95,7 +97,9 @@ export default function ExplorePage() {
         setListings(all.slice(0, PAGE_SIZE));
         setTotalCount(all.length);
       } catch (e: unknown) {
-        setError(e instanceof Error ? e.message : "Failed to load listings");
+        // Both the indexer and the on-chain fallback failed — this is a real
+        // outage, not "no listings," so it must never render as an empty state.
+        setError(categorizePageError(e, { resourceLabel: "listings" }));
       }
       return "";
     } finally {
@@ -241,26 +245,29 @@ export default function ExplorePage() {
           )}
 
           {error && (
-            <div className="text-red-500 p-4 border border-red-200 bg-red-50 rounded-lg">{error}</div>
+            // Retrying re-runs fetchPage, which closes over the current filter
+            // state — a retry never drops the user's search/filter selections.
+            <ResourceState isLoading={false} error={error} onRetry={() => fetchPage(undefined)} />
           )}
 
           {isLoading && (
-            <div className="grid gap-6 sm:grid-cols-2 lg:grid-cols-3">
+            <div role="status" aria-live="polite" className="grid gap-6 sm:grid-cols-2 lg:grid-cols-3">
+              <span className="sr-only">Loading artworks…</span>
               {Array.from({ length: PAGE_SIZE }).map((_, i) => <ListingCardSkeleton key={i} />)}
             </div>
           )}
 
           {!isLoading && !error && listings.length === 0 && (
-            <div className="py-20 text-center">
-              <h3 className="text-xl font-bold text-gray-900 mb-2">No artworks found</h3>
-              <p className="text-gray-500">Try adjusting your filters or search criteria.</p>
-              <button
-                onClick={() => dispatch({ type: "CLEAR_ALL" })}
-                className="mt-4 text-brand-600 font-medium hover:underline"
-              >
-                Clear all filters
-              </button>
-            </div>
+            <ResourceState
+              isLoading={false}
+              error={null}
+              isEmpty
+              empty={{
+                title: "No artworks found",
+                description: "Try adjusting your filters or search criteria.",
+                action: { label: "Clear all filters", onClick: () => dispatch({ type: "CLEAR_ALL" }) },
+              }}
+            />
           )}
 
           {!isLoading && !error && listings.length > 0 && (
