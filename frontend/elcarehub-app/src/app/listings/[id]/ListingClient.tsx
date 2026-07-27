@@ -282,7 +282,11 @@ export default function ListingDetailPage({ id }: ListingClientProps) {
                         {imageUrl ? (
                             <Image
                                 src={imageUrl}
-                                alt={metadata?.title ?? "Artwork"}
+                                alt={
+                                    metadata?.isDecorativeImage
+                                        ? ""
+                                        : (metadata?.altText ?? metadata?.title ?? "Artwork")
+                                }
                                 fill
                                 className="object-cover transition-transform duration-700 group-hover:scale-105"
                                 priority

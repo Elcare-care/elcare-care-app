@@ -33,6 +33,7 @@ import {
 } from "lucide-react";
 import { ConnectWalletModal } from "./ConnectWalletModal";
 import { WalletMenu } from "./WalletMenu";
+import { NotificationCenter } from "./NotificationCenter";
 
 // ── Nav item definitions ──────────────────────────────────────
 
