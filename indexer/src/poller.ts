@@ -273,6 +273,17 @@ export async function revertLedgers(safeAtLedger: number): Promise<void> {
       where: { ledgerSequence: { gt: safeAtLedger } },
     });
 
+    // Remove per-event history rows written past the safe checkpoint
+    await tx.bid.deleteMany({
+      where: { ledgerSequence: { gt: safeAtLedger } },
+    });
+    await tx.priceHistory.deleteMany({
+      where: { ledgerSequence: { gt: safeAtLedger } },
+    });
+    await tx.protocolFee.deleteMany({
+      where: { ledgerSequence: { gt: safeAtLedger } },
+    });
+
     // Remove listings that were first created after the safe checkpoint
     await tx.listing.deleteMany({
       where: { createdAtLedger: { gt: safeAtLedger } },
@@ -803,6 +814,11 @@ async function fetchAuctionFromChain(_auctionId: bigint): Promise<any | null> {
   return null;
 }
 
+/** Resolves the globally unique identity of a decoded event (RPC id preferred). */
+function resolveEventId(event: any): string {
+  return event.eventId || event.eventHash || '';
+}
+
 export async function applyDecodedEvents(decodedEvents: any[], tx: any) {
   if (decodedEvents.length === 0) return [];
 
@@ -914,6 +930,9 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
         ? chainListing.recipients.map((r: any) => ({ address: r.address.toString(), percentage: Number(r.percentage) }))
         : [];
 
+      // Ensure the row exists, then apply data only if this event is not
+      // stale — a late-arriving LISTING_CREATED must not reset a listing
+      // that has since been sold or cancelled back to Active.
       await db.listing.upsert({
         where: { listingId },
         create: {
@@ -960,7 +979,7 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
 
     case 'LISTING_UPDATED': {
       const { count } = await db.listing.updateMany({
-        where: { listingId },
+        where: { listingId, updatedAtLedger: { lte: ledgerSequence } },
         data: {
           price: data.new_price,
           collection: data.collection,
@@ -1093,6 +1112,27 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
     }
 
     case 'BID_PLACED': {
+      // Bid history — one row per (auction, ledger, bidder); replays hit the
+      // unique constraint and become a no-op update.
+      await db.bid.upsert({
+        where: {
+          auctionId_ledgerSequence_bidder: {
+            auctionId: listingId,
+            ledgerSequence,
+            bidder: data.bidder,
+          },
+        },
+        create: {
+          auctionId: listingId,
+          bidder: data.bidder,
+          amount: data.bid_amount,
+          ledgerSequence,
+        },
+        update: { amount: data.bid_amount },
+      });
+
+      // Monotonic guard: bids strictly increase on-chain, so an out-of-order
+      // or replayed BID_PLACED can never lower the recorded highest bid.
       const { count } = await db.auction.updateMany({
         where: { auctionId: listingId },
         data: { highestBid: data.bid_amount, highestBidder: data.bidder, updatedAtLedger: ledgerSequence },
@@ -1105,7 +1145,7 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
 
     case 'AUCTION_RESOLVED': {
       const { count } = await db.auction.updateMany({
-        where: { auctionId: listingId },
+        where: { auctionId: listingId, updatedAtLedger: { lte: ledgerSequence } },
         data: {
           status: 'Finalized' as const,
           highestBid: data.amount,
@@ -1154,7 +1194,12 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
           createdAtLedger: ledgerSequence,
           updatedAtLedger: ledgerSequence,
         },
-        update: {
+        update: {},
+      });
+      // Guarded so a stale OFFER_MADE cannot reset a terminal offer state.
+      await db.offer.updateMany({
+        where: { offerId: BigInt(data.offer_id), updatedAtLedger: { lte: ledgerSequence } },
+        data: {
           listingId: BigInt(data.listing_id),
           offerer: data.offerer,
           amount: data.amount,
@@ -1225,6 +1270,22 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
       if (count === 0) logger.warn('OFFER_RECLAIMED: offer not found', { offerId: data.offer_id?.toString(), ledger: ledgerSequence });
       break;
     }
+
+    // Terminal state: the offerer reclaimed escrowed funds after expiry.
+    case 'OFFER_RECLAIMED': {
+      await db.offer.updateMany({
+        where: { offerId: BigInt(data.offer_id), updatedAtLedger: { lte: ledgerSequence } },
+        data: {
+          status: 'Reclaimed' as const,
+          updatedAtLedger: ledgerSequence,
+        }
+      });
+      break;
+    }
+
+    // ROYALTY_PAID, ADMIN_TRANSFER_PROPOSED, ADMIN_TRANSFERRED,
+    // ARTIST_REVOKED, ARTIST_REINSTATED, CONTRACT_PAUSED, CONTRACT_UNPAUSED:
+    // persisted to MarketplaceEvent (with actor) above; no state reduction.
   }
 
   // ── Update sync lag gauge ─────────────────────────────────────────────────

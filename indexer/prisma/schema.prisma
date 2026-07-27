@@ -29,6 +29,7 @@ enum OfferStatus {
   Accepted
   Rejected
   Withdrawn
+  Reclaimed
 }
 
 model SyncState {
