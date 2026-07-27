@@ -12,11 +12,12 @@ import {
   createListing,
   buyArtwork,
   cancelListing,
+  cancelListings,
   updateListing,
   Listing,
   stroopsToXlm,
 } from "@/lib/contract";
-import { fetchListings, fetchArtistListings } from "@/lib/indexer";
+import { fetchListings, fetchArtistListings, FreshnessMetadata, makeFreshness } from "@/lib/indexer";
 import {
   uploadImageToIPFS,
   uploadMetadataToIPFS,
@@ -28,6 +29,11 @@ import { useTransientErrorToast } from "./useTransientErrorToast";
 import { useTxToast } from "./useTxToast";
 import { assertSupportedTokenAddress } from "@/lib/token-support";
 import { trackEvent } from "@/providers/PostHogProvider";
+import {
+  useReconciliation,
+  generatePendingId,
+  type ConfirmedSnapshot,
+} from "./useReconciliation";
 
 // ── Listing with resolved metadata ───────────────────────────
 
@@ -41,6 +47,9 @@ export function useMarketplace(opts?: { page?: number; limit?: number }) {
   const [listings, setListings] = useState<Listing[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Issue #44 — freshness metadata & SSE state
+  const [freshness, setFreshness] = useState<FreshnessMetadata>(() => makeFreshness());
+  const [sseConnected, setSseConnected] = useState(false);
   useTransientErrorToast(error);
 
   const refresh = useCallback(async () => {
@@ -78,31 +87,44 @@ export function useMarketplace(opts?: { page?: number; limit?: number }) {
         const sorted = [...all].sort((a, b) => b.created_at - a.created_at);
         setListings(sorted);
       }
+      // Record freshness snapshot after successful load
+      setFreshness(makeFreshness({ sseConnected }));
     } catch (err: unknown) {
       setError(getReadableErrorMessage(err, "Failed to load listings"));
     } finally {
       setIsLoading(false);
     }
-  }, [opts?.page, opts?.limit]);
+  }, [opts?.page, opts?.limit, sseConnected]);
 
   useEffect(() => {
     refresh();
   }, [refresh]);
 
-  // Subscribe to real-time updates via SSE (issue #161).
+  // Subscribe to real-time updates via SSE and track connection state (issue #44).
   useEffect(() => {
     if (typeof window === "undefined" || !config.indexerUrl) return;
     const es = new EventSource(`${config.indexerUrl}/events/stream`);
+
+    es.onopen = () => {
+      setSseConnected(true);
+    };
+
     es.onmessage = () => {
       refresh();
     };
+
     es.onerror = () => {
+      setSseConnected(false);
       es.close();
     };
-    return () => es.close();
+
+    return () => {
+      setSseConnected(false);
+      es.close();
+    };
   }, [refresh]);
 
-  return { listings, isLoading, error, refresh };
+  return { listings, isLoading, error, refresh, freshness, sseConnected };
 }
 
 // ── useArtistListings ─────────────────────────────────────────
@@ -274,6 +296,24 @@ export function useCancelListing(artistPublicKey: string | null) {
   return { cancel, isCancelling, error: null };
 }
 
+export function useCancelListings(artistPublicKey: string | null) {
+  const { run, isRunning: isCancelling } = useTxToast();
+
+  const cancelMany = useCallback(
+    async (listingIds: number[]): Promise<boolean> => {
+      if (!artistPublicKey || listingIds.length === 0) return false;
+      const result = await run(
+        () => cancelListings(artistPublicKey, listingIds),
+        { action: "Cancel listings" }
+      );
+      return result !== null;
+    },
+    [artistPublicKey, run],
+  );
+
+  return { cancelMany, isCancelling, error: null };
+}
+
 // ── useUpdateListing ──────────────────────────────────────────
 
 export interface UpdateListingInput {
@@ -411,4 +451,85 @@ export function useAuction(auctionId: number | null) {
   }, [refresh]);
 
   return { auction, isLoading, error, refresh };
+}
+
+// ── useMarketplaceWithReconciliation (Issue #302) ─────────────────────────────
+//
+// Wraps useMarketplace with explicit provisional state:
+//   - Tags pending mutations (create, buy, cancel, update) with txHash + expiry
+//   - Retains the last confirmed snapshot so failed mutations can be rolled back
+//   - Resolves mutations automatically when SSE/REST delivers fresh data
+//   - Exposes pendingMutations so the UI can render "pending" indicators
+//
+// Public API is additive: all existing fields are preserved.
+
+export interface ListingMutationPayload {
+  action: "create" | "buy" | "cancel" | "update";
+  listing: Listing;
+}
+
+export function useMarketplaceWithReconciliation(opts?: { page?: number; limit?: number }) {
+  const marketplace = useMarketplace(opts);
+  const recon = useReconciliation<Listing>({ mutationTtlMs: 60_000 });
+
+  // When fresh listing data arrives (from SSE-triggered refresh), push it into
+  // the reconciler as confirmed snapshots.
+  const prevListingsRef = useRef<Listing[]>([]);
+  useEffect(() => {
+    if (marketplace.listings === prevListingsRef.current) return;
+    prevListingsRef.current = marketplace.listings;
+
+    const snapshots: ConfirmedSnapshot<Listing>[] = marketplace.listings.map((l) => ({
+      resourceId: String(l.listing_id),
+      data: l,
+      ledger: (l as any).updatedAtLedger ?? 0,
+    }));
+    recon.applyConfirmedData(snapshots);
+  }, [marketplace.listings]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  /**
+   * Add a pending mutation for a listing action.
+   * Call this immediately after submitting a transaction.
+   */
+  const addListingMutation = useCallback(
+    (
+      action: ListingMutationPayload["action"],
+      listing: Listing,
+      txHash: string | null = null
+    ): string => {
+      const pendingId = generatePendingId(`listing-${action}`);
+      recon.addMutation({
+        pendingId,
+        txHash,
+        kind: "listing",
+        resourceId: String(listing.listing_id),
+        // For buy/cancel, optimistic value shows the mutated state immediately
+        optimisticValue: action === "cancel"
+          ? { ...listing, status: "Cancelled" as any }
+          : listing,
+      });
+      return pendingId;
+    },
+    [recon]
+  );
+
+  /**
+   * Get the display state for a single listing.
+   * Returns the optimistic/provisional value while a mutation is pending.
+   */
+  const getListingState = useCallback(
+    (listingId: string | number) =>
+      recon.getResourceState(String(listingId), "listing"),
+    [recon]
+  );
+
+  return {
+    ...marketplace,
+    // Reconciliation extensions
+    pendingMutations: recon.pendingMutations,
+    addListingMutation,
+    getListingState,
+    resolveMutation: recon.resolveMutation,
+    rejectMutation: recon.rejectMutation,
+  };
 }
