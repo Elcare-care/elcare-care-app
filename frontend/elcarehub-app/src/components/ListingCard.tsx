@@ -102,7 +102,11 @@ export function ListingCard({ listing, onPurchased }: ListingCardProps) {
             <Image
               key={currentImageUrl}
               src={currentImageUrl}
-              alt={metadata?.title ?? `Listing #${listing.listing_id}`}
+              alt={
+                metadata?.isDecorativeImage
+                  ? ""
+                  : (metadata?.altText ?? metadata?.title ?? `Listing #${listing.listing_id}`)
+              }
               fill
               className="object-cover transition-transform duration-300 group-hover:scale-105"
               onError={() => setGatewayIndex((i) => i + 1)}
@@ -145,10 +149,23 @@ export function ListingCard({ listing, onPurchased }: ListingCardProps) {
               {listing.artist.slice(0, 8)}…{listing.artist.slice(-4)}
             </span>
           </div>
+          {metadata?.creator && (
+            <div className="flex items-center gap-1.5">
+              <User size={12} />
+              <span className="truncate">{metadata.creator}</span>
+            </div>
+          )}
           {metadata?.year && (
             <div className="flex items-center gap-1.5">
               <Calendar size={12} />
               <span>{metadata.year}</span>
+            </div>
+          )}
+          {metadata?.license && (
+            <div className="flex items-center gap-1.5">
+              <span className="text-[10px] uppercase tracking-wider opacity-70">
+                {metadata.license}
+              </span>
             </div>
           )}
         </div>
