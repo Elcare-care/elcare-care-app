@@ -110,6 +110,11 @@ pub enum MarketplaceError {
     /// The auction has reached its `max_extensions` cap and can no longer be
     /// extended by the anti-sniping logic.
     MaxExtensionsReached = 48,
+    /// `escrow_nft` was called by an account that does not own the token.
+    NotTokenOwner = 49,
+    /// The token is already held in marketplace escrow for another listing
+    /// or auction (double-listing guard).
+    TokenAlreadyEscrowed = 50,
 }
 
 #[contracttype]
@@ -137,6 +142,27 @@ pub struct Recipient {
     pub address: Address,
     /// Share expressed in basis points (0 – 10 000).
     pub percentage: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct BatchCreateListingInput {
+    pub price: i128,
+    pub currency: Symbol,
+    pub token: Address,
+    pub collection: Address,
+    pub token_id: u64,
+    pub recipients: soroban_sdk::Vec<Recipient>,
+    pub expires_at: Option<u64>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct BatchUpdateListingInput {
+    pub listing_id: u64,
+    pub new_price: i128,
+    pub new_token: Address,
+    pub new_recipients: soroban_sdk::Vec<Recipient>,
 }
 
 #[contracttype]

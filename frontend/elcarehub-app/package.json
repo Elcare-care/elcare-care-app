@@ -13,7 +13,8 @@
     "test:coverage": "COLLECT_COVERAGE=true jest --coverage --passWithNoTests",
     "test:a11y": "jest --testPathPatterns=a11y --passWithNoTests",
     "test:e2e": "playwright test",
-    "test:e2e:ui": "playwright test --ui"
+    "test:e2e:ui": "playwright test --ui",
+    "test:e2e:live": "playwright test -c playwright.live.config.ts"
   },
   "dependencies": {
     "@lobstrco/signer-extension-api": "^2.0.0",

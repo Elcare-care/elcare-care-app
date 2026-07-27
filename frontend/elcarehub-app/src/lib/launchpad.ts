@@ -6,6 +6,7 @@ import {
 } from "@stellar/stellar-sdk";
 import { config } from "./config";
 import { invokeContract } from "./contract";
+import { assertWritePreflight } from "./preflight";
 
 // ── Types ─────────────────────────────────────────────────────
 
@@ -24,6 +25,11 @@ export interface CollectionRecord {
 export interface PlatformFee {
   receiver: string;
   bps: number;
+}
+
+export interface LaunchpadWasmUpdatePayload {
+  kind: CollectionKind;
+  wasmHashHex: string;
 }
 
 // ── Parsing ───────────────────────────────────────────────────
@@ -465,6 +471,54 @@ export async function updatePlatformFee(
   );
 }
 
+function toWasmKindScVal(kind: CollectionKind): xdr.ScVal {
+  return nativeToScVal(kind, { type: "symbol" });
+}
+
+function parseWasmHashHex(wasmHashHex: string): Uint8Array {
+  const normalized = wasmHashHex.replace(/^0x/i, "").trim();
+  if (normalized.length !== 64 || /[^0-9a-fA-F]/.test(normalized)) {
+    throw new Error("WASM hash must be a 32-byte hex string.");
+  }
+  const bytes = new Uint8Array(32);
+  for (let i = 0; i < 32; i += 1) {
+    bytes[i] = parseInt(normalized.slice(i * 2, i * 2 + 2), 16);
+  }
+  return bytes;
+}
+
+export async function updateCollectionWasm(
+  adminPublicKey: string,
+  kind: CollectionKind,
+  wasmHashHex: string
+): Promise<void> {
+  const args = [
+    toWasmKindScVal(kind),
+    nativeToScVal(parseWasmHashHex(wasmHashHex), { type: "bytes" }),
+  ];
+  await invokeContract(
+    adminPublicKey,
+    "update_collection_wasm",
+    args,
+    false,
+    config.launchpadContractId
+  );
+}
+
+export async function upgradeCollection(
+  adminPublicKey: string,
+  collectionAddress: string
+): Promise<void> {
+  const args = [toAddressScVal(collectionAddress)];
+  await invokeContract(
+    adminPublicKey,
+    "upgrade_collection",
+    args,
+    false,
+    config.launchpadContractId
+  );
+}
+
 // ── Collection-Specific Methods ───────────────────────────────
 
 export interface CollectionMetadata {
@@ -475,6 +529,13 @@ export interface CollectionMetadata {
   maxSupply: number;
   royaltyBps: number;
   royaltyReceiver: string;
+  /**
+   * True once metadata can no longer change (#276). Normal collections
+   * start mutable and become frozen when the creator calls
+   * `freeze_metadata()`; lazy-mint collections have no metadata setter at
+   * all and are always frozen.
+   */
+  isMetadataFrozen: boolean;
 }
 
 /**
@@ -485,7 +546,7 @@ export async function getCollectionMetadata(
 ): Promise<CollectionMetadata> {
   const DUMMY_KEY = "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN";
 
-  const [name, symbol, creator, totalSupply, maxSupply, royalty] =
+  const [name, symbol, creator, totalSupply, maxSupply, royalty, isMetadataFrozen] =
     await Promise.all([
       invokeContract(DUMMY_KEY, "name", [], true, collectionAddress),
       invokeContract(DUMMY_KEY, "symbol", [], true, collectionAddress).catch(
@@ -495,6 +556,13 @@ export async function getCollectionMetadata(
       invokeContract(DUMMY_KEY, "total_supply", [], true, collectionAddress),
       invokeContract(DUMMY_KEY, "max_supply", [], true, collectionAddress),
       invokeContract(DUMMY_KEY, "royalty_info", [], true, collectionAddress),
+      invokeContract(
+        DUMMY_KEY,
+        "is_metadata_frozen",
+        [],
+        true,
+        collectionAddress
+      ).catch(() => nativeToScVal(false, { type: "bool" })),
     ]);
 
   const royaltyNative = scValToNative(royalty) as [Address, number];
@@ -507,6 +575,7 @@ export async function getCollectionMetadata(
     maxSupply: Number(scValToNative(maxSupply)),
     royaltyBps: Number(royaltyNative[1]),
     royaltyReceiver: royaltyNative[0].toString(),
+    isMetadataFrozen: Boolean(scValToNative(isMetadataFrozen)),
   };
 }
 

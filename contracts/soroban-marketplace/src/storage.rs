@@ -205,6 +205,9 @@ pub enum DataKey {
     /// Resume position for the batched `cancel_artist_listings` operation:
     /// number of entries of the artist-listings index already processed.
     ArtistCancelCursor(Address),
+    /// Resume position for the batched auction cancellation on revocation
+    /// (Issue #214): number of entries of the artist-auctions index processed.
+    ArtistAuctionCancelCursor(Address),
     /// Resumable progress of the versioned `migrate`/`migrate_step` operation.
     MigrationCursor(soroban_sdk::String),
     /// Escrow record for a `(collection, token_id)` currently held in
@@ -212,9 +215,11 @@ pub enum DataKey {
     /// listing or auction; a double-listing guard reads it and settlement /
     /// cancellation clears it.
     EscrowedToken(Address, u64),
-    /// Singleton resumable cursor for the `extend_active_ttls` maintenance
-    /// sweep (Issue #280). See `TtlSweepProgress`.
-    TtlSweepState,
+    /// Bounded (≤ MAX_BLOCKED_BIDDERS) list of addresses barred from bidding
+    /// on this auction (anti-shill-bidding registry, Issue #199).  Kept as a
+    /// separate per-auction key — not a field on `Auction` — so auctions that
+    /// never block anyone pay no extra storage.
+    AuctionBlockedBidders(u64),
 }
 
 /// Custody record for an NFT held by the marketplace, keyed by
@@ -691,6 +696,27 @@ pub fn clear_artist_cancel_cursor(env: &Env, artist: &Address) {
         .remove(&DataKey::ArtistCancelCursor(artist.clone()));
 }
 
+// ── Batched cancel_artist_auctions cursor (Issue #214) ───────
+
+pub fn get_artist_auction_cancel_cursor(env: &Env, artist: &Address) -> u32 {
+    env.storage()
+        .persistent()
+        .get::<DataKey, u32>(&DataKey::ArtistAuctionCancelCursor(artist.clone()))
+        .unwrap_or(0)
+}
+
+pub fn set_artist_auction_cancel_cursor(env: &Env, artist: &Address, cursor: u32) {
+    let key = DataKey::ArtistAuctionCancelCursor(artist.clone());
+    env.storage().persistent().set(&key, &cursor);
+    bump_entry_ttl(env, &key);
+}
+
+pub fn clear_artist_auction_cancel_cursor(env: &Env, artist: &Address) {
+    env.storage()
+        .persistent()
+        .remove(&DataKey::ArtistAuctionCancelCursor(artist.clone()));
+}
+
 // ── Moderation & Config ────────────────────────────────────
 
 pub fn set_artist_revocation_storage(env: &Env, artist: &Address) {
@@ -889,6 +915,36 @@ pub fn load_auction_bids(env: &Env, auction_id: u64) -> soroban_sdk::Vec<BidReco
         bump_entry_ttl(env, &key);
     }
     value
+}
+
+// ── Blocked bidders (Issue #199) ─────────────────────────────
+
+pub fn load_blocked_bidders(env: &Env, auction_id: u64) -> Vec<Address> {
+    let key = DataKey::AuctionBlockedBidders(auction_id);
+    let value = env
+        .storage()
+        .persistent()
+        .get::<DataKey, Vec<Address>>(&key)
+        .unwrap_or_else(|| Vec::new(env));
+    if !value.is_empty() {
+        bump_entry_ttl(env, &key);
+    }
+    value
+}
+
+pub fn save_blocked_bidders(env: &Env, auction_id: u64, list: &Vec<Address>) {
+    let key = DataKey::AuctionBlockedBidders(auction_id);
+    if list.is_empty() {
+        // Drop the entry entirely so an emptied registry costs nothing.
+        env.storage().persistent().remove(&key);
+    } else {
+        env.storage().persistent().set(&key, list);
+        bump_entry_ttl(env, &key);
+    }
+}
+
+pub fn is_bidder_blocked(env: &Env, auction_id: u64, bidder: &Address) -> bool {
+    load_blocked_bidders(env, auction_id).contains(bidder)
 }
 
 pub fn set_paused(env: &Env, paused: bool) {

@@ -14,6 +14,7 @@ import { DEFAULT_TOKEN } from "@/config/tokens";
 import { useSupportedTokens } from "@/hooks/useSupportedTokens";
 import { getDefaultSupportedToken } from "@/lib/token-support";
 import { ART_CATEGORIES } from "./ListingForm";
+import { validateIpfsCid } from "@/lib/validation";
 
 interface AuctionFormProps {
   onSuccess?: (auctionId: number) => void;
@@ -28,6 +29,7 @@ export function AuctionForm({ onSuccess, onCancel }: AuctionFormProps) {
   const [preview, setPreview] = useState<string | null>(null);
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [successId, setSuccessId] = useState<number | null>(null);
+  const [cidError, setCidError] = useState<string | null>(null);
   const [form, setForm] = useState({
     title: "",
     description: "",
@@ -37,6 +39,7 @@ export function AuctionForm({ onSuccess, onCancel }: AuctionFormProps) {
     reservePriceXlm: 1,
     durationHours: 24,
     tokenAddress: DEFAULT_TOKEN.address,
+    metadataCid: "",
   });
 
   const fileRef = useRef<HTMLInputElement>(null);
@@ -70,6 +73,12 @@ export function AuctionForm({ onSuccess, onCancel }: AuctionFormProps) {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!selectedFile) return;
+
+    // Validate CID before submitting — avoids a contract InvalidCid revert
+    const err = validateIpfsCid(form.metadataCid);
+    setCidError(err);
+    if (err) return;
+
     const id = await create({ ...form, imageFile: selectedFile });
     if (id !== null) {
       setSuccessId(id);
@@ -163,6 +172,43 @@ export function AuctionForm({ onSuccess, onCancel }: AuctionFormProps) {
 
           {/* Fields */}
           <div className="grid gap-6 sm:grid-cols-2">
+
+            {/* Metadata CID */}
+            <div className="sm:col-span-2 space-y-2">
+              <label className="block text-sm font-bold text-gray-950 uppercase tracking-wider font-inter">
+                Artwork Metadata CID *
+              </label>
+              <input
+                required
+                value={form.metadataCid}
+                onChange={(e) => {
+                  const val = e.target.value;
+                  setForm({ ...form, metadataCid: val });
+                  setCidError(validateIpfsCid(val));
+                }}
+                onBlur={() => setCidError(validateIpfsCid(form.metadataCid))}
+                aria-invalid={!!cidError}
+                aria-describedby={cidError ? "err-auction-cid" : undefined}
+                className={`w-full rounded-2xl border px-5 py-4 text-base font-mono focus:outline-none transition-all shadow-sm font-inter ${
+                  cidError
+                    ? "border-red-400 bg-red-50/40 focus:border-red-500"
+                    : "border-gray-200 bg-gray-50/50 focus:border-brand-500 focus:bg-white"
+                }`}
+                placeholder="bafybeig… or Qm…"
+              />
+              {cidError ? (
+                <p id="err-auction-cid" className="text-sm text-red-600 mt-1" role="alert">
+                  {cidError}
+                </p>
+              ) : (
+                <p className="text-xs text-gray-400 font-inter">
+                  CIDv1 starts with <code className="font-mono">b</code> (46–100 chars) or
+                  CIDv0 starts with <code className="font-mono">Qm</code> (46 chars).
+                </p>
+              )}
+            </div>
+
+            {/* Title */}
             <div className="sm:col-span-2 space-y-2">
               <label className="block text-sm font-bold text-gray-950 uppercase tracking-wider font-inter">
                 Title *
@@ -336,7 +382,7 @@ export function AuctionForm({ onSuccess, onCancel }: AuctionFormProps) {
             )}
             <GuardButton
               type="submit"
-              disabled={isCreating || !hasTokenOptions || !selectedFile}
+              disabled={isCreating || !hasTokenOptions || !selectedFile || !!cidError}
               actionName="to create your auction"
               className="flex-[2] flex items-center justify-center gap-3 rounded-2xl bg-brand-500 py-5 text-xl font-bold text-white shadow-2xl shadow-brand-500/30 hover:bg-brand-600 hover:scale-[1.01] transition-all active:scale-[0.98] disabled:opacity-50 disabled:hover:scale-100"
             >
