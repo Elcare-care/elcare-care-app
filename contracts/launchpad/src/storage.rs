@@ -322,3 +322,92 @@ pub fn creator_collection_by_index(
         .persistent()
         .get(&DataKey::CreatorCollectionByIndex(creator.clone(), index))
 }
+
+// ── Versioned migration registry ─────────────────────────────────────────────
+//
+// Mirrors the marketplace contract's migration plumbing so all contracts in
+// the workspace share the same upgrade operator playbook.
+//
+// Storage keys:
+//   MigrationDone(version_str)   — boolean, set after a successful migration
+//   MigrationCursor(version_str) — MigrationProgress struct for resumable steps
+//   ContractVersion              — the version string last written by migrate()
+
+/// Resumable progress marker for a versioned migration.
+#[soroban_sdk::contracttype]
+#[derive(Clone)]
+pub struct MigrationProgress {
+    pub phase:  u32,
+    pub cursor: u64,
+}
+
+pub fn set_migration_done(env: &Env, version: &soroban_sdk::String) {
+    let key = DataKey::MigrationDone(version.clone());
+    env.storage().persistent().set(&key, &true);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, TTL_THRESHOLD, TTL_BUMP);
+}
+
+pub fn is_migration_done(env: &Env, version: &soroban_sdk::String) -> bool {
+    let key = DataKey::MigrationDone(version.clone());
+    let done = env
+        .storage()
+        .persistent()
+        .get::<_, bool>(&key)
+        .unwrap_or(false);
+    if done {
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_THRESHOLD, TTL_BUMP);
+    }
+    done
+}
+
+pub fn get_migration_progress(env: &Env, version: &soroban_sdk::String) -> MigrationProgress {
+    env.storage()
+        .persistent()
+        .get::<DataKey, MigrationProgress>(&DataKey::MigrationCursor(version.clone()))
+        .unwrap_or(MigrationProgress { phase: 0, cursor: 0 })
+}
+
+pub fn set_migration_progress(
+    env: &Env,
+    version: &soroban_sdk::String,
+    progress: &MigrationProgress,
+) {
+    let key = DataKey::MigrationCursor(version.clone());
+    env.storage().persistent().set(&key, progress);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, TTL_THRESHOLD, TTL_BUMP);
+}
+
+pub fn clear_migration_progress(env: &Env, version: &soroban_sdk::String) {
+    env.storage()
+        .persistent()
+        .remove(&DataKey::MigrationCursor(version.clone()));
+}
+
+pub fn set_contract_version(env: &Env, version: &soroban_sdk::String) {
+    env.storage()
+        .instance()
+        .set(&DataKey::ContractVersion, version);
+    extend_instance_ttl(env);
+}
+
+pub fn get_contract_version(env: &Env) -> Option<soroban_sdk::String> {
+    env.storage().instance().get(&DataKey::ContractVersion)
+}
+
+/// Retrieve the platform fee config (receiver address + fee basis points).
+/// Used internally by the deploy_* functions and the fee_config view.
+pub fn get_platform_fee(env: &Env) -> (Address, u32) {
+    (
+        env.storage().instance().get(&DataKey::FeeReceiver).unwrap(),
+        env.storage()
+            .instance()
+            .get::<DataKey, i128>(&DataKey::DeployFee)
+            .unwrap_or(0) as u32,
+    )
+}

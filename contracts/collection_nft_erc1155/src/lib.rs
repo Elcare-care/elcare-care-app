@@ -29,6 +29,8 @@ use soroban_sdk::{
 const TTL_THRESHOLD: u32 = 50_000;
 const TTL_BUMP: u32 = 100_000;
 const MAX_BPS: u32 = 10_000; // 100 % in basis points
+/// Maximum number of items accepted by any single batch call (#274).
+const MAX_BATCH_SIZE: u32 = 200;
 
 // ─── Errors ──────────────────────────────────────────────────────────────────
 
@@ -41,19 +43,17 @@ pub enum Error {
     NotApproved = 3,
     InsufficientBalance = 4,
     LengthMismatch = 5,
-    NotCreator = 6, // kept for ABI stability; not used internally
-    /// Mint would exceed the per-token max supply.
+    NotCreator = 6,
     MaxSupplyReached = 7,
-    /// Mint would exceed the per-wallet cap.
     WalletLimitReached = 8,
-    /// Collection is paused; state-mutating calls are blocked.
     CollectionPaused = 9,
-    /// base_uri cannot be updated after metadata is frozen.
     MetadataFrozen = 10,
-    /// freeze_metadata called more than once.
     AlreadyFrozen = 11,
-    /// basis points exceed MAX_BPS (10_000).
     InvalidBps = 12,
+    /// migrate() called for a version already marked done.
+    AlreadyMigrated = 13,
+    /// Unsupported version jump.
+    UnsupportedMigration = 14,
 }
 
 // ─── Storage Keys ─────────────────────────────────────────────────────────────
@@ -90,6 +90,10 @@ pub enum DataKey {
     TokenRoyaltyReceiver(u64),
     /// Per-token royalty override — bps.
     TokenRoyaltyBps(u64),
+    // ── Versioned migration registry ─────────────────────────────────────
+    MigrationDone(String),
+    MigrationCursor(String),
+    ContractVersion,
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -111,6 +115,20 @@ fn u64_to_string(env: &Env, mut n: u64) -> String {
         buf[..len].reverse();
     }
     String::from_bytes(env, &buf[..len])
+}
+
+/// Rejects empty or oversized metadata URIs (#276). Applied to every mint
+/// path and to `set_base_uri` so boundary/malformed values are caught
+/// consistently regardless of entry point.
+fn validate_uri(uri: &String) -> Result<(), Error> {
+    let len = uri.len();
+    if len == 0 {
+        return Err(Error::EmptyUri);
+    }
+    if len > MAX_URI_LEN {
+        return Err(Error::UriTooLong);
+    }
+    Ok(())
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -257,7 +275,7 @@ impl NormalNFT1155 {
     /// Callable only by creator.
     pub fn set_base_uri(env: Env, base_uri: String) -> Result<(), Error> {
         Self::extend_instance_ttl(&env);
-        Self::only_creator(&env)?;
+        let creator = Self::only_creator(&env)?;
         if env
             .storage()
             .instance()
@@ -266,7 +284,13 @@ impl NormalNFT1155 {
         {
             return Err(Error::MetadataFrozen);
         }
+        validate_uri(&base_uri)?;
+        let old_uri: Option<String> = env.storage().instance().get(&DataKey::BaseUri);
         env.storage().instance().set(&DataKey::BaseUri, &base_uri);
+        env.events().publish(
+            (symbol_short!("meta_upd"), creator),
+            (old_uri, base_uri),
+        );
         Ok(())
     }
 
@@ -279,7 +303,7 @@ impl NormalNFT1155 {
     /// After this, `set_base_uri` reverts forever. Callable only by creator.
     pub fn freeze_metadata(env: Env) -> Result<(), Error> {
         Self::extend_instance_ttl(&env);
-        Self::only_creator(&env)?;
+        let creator = Self::only_creator(&env)?;
         if env
             .storage()
             .instance()
@@ -291,6 +315,8 @@ impl NormalNFT1155 {
         env.storage()
             .instance()
             .set(&DataKey::MetadataFrozen, &true);
+        env.events()
+            .publish((symbol_short!("meta_frz"),), creator);
         Ok(())
     }
 
@@ -413,6 +439,9 @@ impl NormalNFT1155 {
         Self::extend_instance_ttl(&env);
         Self::only_creator(&env)?;
         Self::require_not_paused(&env)?;
+        if amount == 0 {
+            return Err(Error::ZeroAmount);
+        }
         let token_id: u64 = env
             .storage()
             .instance()
@@ -440,6 +469,9 @@ impl NormalNFT1155 {
         Self::extend_instance_ttl(&env);
         Self::only_creator(&env)?;
         Self::require_not_paused(&env)?;
+        if amount == 0 {
+            return Err(Error::ZeroAmount);
+        }
         Self::_check_supply_cap(&env, token_id, amount)?;
         Self::_check_wallet_limit(&env, &to, token_id, amount)?;
         Self::_mint(&env, &to, token_id, amount, &uri);
@@ -465,10 +497,18 @@ impl NormalNFT1155 {
 
         let len = token_ids.len();
         if len == 0 {
-            return Ok(());
+            return Err(Error::EmptyBatch);
+        }
+        if len > MAX_BATCH_SIZE {
+            return Err(Error::BatchTooLarge);
         }
         if token_ids.len() != amounts.len() || token_ids.len() != uris.len() {
             return Err(Error::LengthMismatch);
+        }
+
+        // Validate every URI up front (#276) — before any storage mutation.
+        for uri in uris.iter() {
+            validate_uri(&uri)?;
         }
 
         // ── Invariant hardening: accumulate amounts per-id within the batch ──
@@ -482,6 +522,9 @@ impl NormalNFT1155 {
         for i in 0..len {
             let tid = token_ids.get(i).unwrap();
             let amt = amounts.get(i).unwrap();
+            if amt == 0 {
+                return Err(Error::ZeroAmount);
+            }
 
             // Find whether `tid` was already seen in this batch.
             let mut found = false;
@@ -601,7 +644,9 @@ impl NormalNFT1155 {
         Self::_transfer(&env, &from, &to, token_id, amount)
     }
 
-    /// Operator transfer on behalf of `from`. Blocked while paused.
+    /// Transfer on behalf of `from` — the owner themselves or an authorized
+    /// operator (#275: matches the owner-shortcut already used by
+    /// `batch_transfer`/`burn`, so single and batch paths behave the same).
     pub fn transfer_from(
         env: Env,
         operator: Address,
@@ -613,7 +658,7 @@ impl NormalNFT1155 {
         Self::extend_instance_ttl(&env);
         operator.require_auth();
         Self::require_not_paused(&env)?;
-        if !Self::_is_approved_for_all(&env, &operator, &from) {
+        if operator != from && !Self::_is_approved_for_all(&env, &operator, &from) {
             return Err(Error::NotApproved);
         }
         Self::_transfer_with_operator(&env, &from, &to, token_id, amount)
@@ -639,6 +684,9 @@ impl NormalNFT1155 {
 
         if token_ids.len() != amounts.len() {
             return Err(Error::LengthMismatch);
+        }
+        if token_ids.len() > MAX_BATCH_SIZE {
+            return Err(Error::BatchTooLarge);
         }
 
         for i in 0..token_ids.len() {
@@ -817,6 +865,48 @@ impl NormalNFT1155 {
         env.storage()
             .instance()
             .set(&DataKey::Creator, &new_creator);
+        Ok(())
+    }
+
+    // ── Versioning & Migration ─────────────────────────────────────────────
+
+    pub fn version(_env: Env) -> &'static str {
+        "1.0.0"
+    }
+
+    pub fn contract_version(env: Env) -> Option<String> {
+        env.storage().instance().get(&DataKey::ContractVersion)
+    }
+
+    /// Creator-guarded idempotent migration entry point.
+    /// v1.0.0: records the completion marker and on-chain version string.
+    pub fn migrate(env: Env) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
+        Self::only_creator(&env)?;
+
+        let target = String::from_str(&env, "1.0.0");
+        let done_key = DataKey::MigrationDone(target.clone());
+
+        if env
+            .storage()
+            .persistent()
+            .get::<DataKey, bool>(&done_key)
+            .unwrap_or(false)
+        {
+            return Err(Error::AlreadyMigrated);
+        }
+
+        // v1.0.0 migration body: nothing to migrate for the initial version.
+
+        env.storage().persistent().set(&done_key, &true);
+        env.storage()
+            .persistent()
+            .extend_ttl(&done_key, TTL_THRESHOLD, TTL_BUMP);
+        env.storage()
+            .instance()
+            .set(&DataKey::ContractVersion, &target);
+        env.events()
+            .publish((soroban_sdk::symbol_short!("migrated"), target), ());
         Ok(())
     }
 

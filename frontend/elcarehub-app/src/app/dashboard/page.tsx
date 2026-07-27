@@ -10,13 +10,15 @@ import { useArtistListings, useCancelListing, useCancelListings } from "@/hooks/
 import { ListingForm } from "@/components/ListingForm";
 import { AuctionForm } from "@/components/AuctionForm";
 import { stroopsToXlm, Listing } from "@/lib/contract";
-import { fetchArtistMetrics, ArtistMetrics, MetricsRange, getWalletActivity, ActivityEvent } from "@/lib/indexer";
-import { Plus, Package, XCircle, Wallet, Edit2, Activity, TrendingUp, Gavel, BarChart2, CheckSquare2, Square, AlertTriangle } from "lucide-react";
+import { fetchArtistMetrics, ArtistMetrics, MetricsRange, fetchRoyaltyBreakdown, RoyaltyPaymentRow } from "@/lib/indexer";
+import { Plus, Package, XCircle, Wallet, Edit2, Activity, TrendingUp, Gavel, BarChart2, Coins, ChevronLeft, ChevronRight, ExternalLink } from "lucide-react";
+import Link from "next/link";
+import { config } from "@/lib/config";
 import { WalletGuard } from "@/components/WalletGuard";
 import { SUPPORTED_TOKENS } from "@/config/tokens";
 import { clsx } from "clsx";
 
-type Tab = "listings" | "list" | "edit" | "auction" | "metrics";
+type Tab = "listings" | "list" | "edit" | "auction" | "metrics" | "royalties";
 
 const STATUS_COLOR: Record<string, string> = {
   Active: "text-green-600 bg-green-50",
@@ -52,6 +54,145 @@ function MiniBarChart({ data, label }: { data: { date: string; count: number }[]
         <span className="text-[9px] text-white/20">{data[0]?.date}</span>
         <span className="text-[9px] text-white/20">{data[data.length - 1]?.date}</span>
       </div>
+    </div>
+  );
+}
+
+// ── RoyaltyHistory (Issue #201) ───────────────────────────────────────────────
+
+const ROYALTY_PAGE_SIZE = 20;
+
+function RoyaltyHistory({ publicKey }: { publicKey: string }) {
+  const [payments, setPayments] = useState<RoyaltyPaymentRow[]>([]);
+  const [total, setTotal] = useState(0);
+  const [page, setPage] = useState(0);
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    if (!publicKey) return;
+    setLoading(true);
+    fetchRoyaltyBreakdown(publicKey, { limit: ROYALTY_PAGE_SIZE, offset: page * ROYALTY_PAGE_SIZE })
+      .then((res) => {
+        setPayments(res.payments);
+        setTotal(res.total);
+      })
+      .finally(() => setLoading(false));
+  }, [publicKey, page]);
+
+  const pageCount = Math.max(Math.ceil(total / ROYALTY_PAGE_SIZE), 1);
+  const explorerNetwork = config.network === "mainnet" ? "mainnet" : "testnet";
+
+  const saleHref = (p: RoyaltyPaymentRow) =>
+    p.auctionId !== null && p.auctionId !== undefined
+      ? `/auctions/${p.auctionId}`
+      : `/listings/${p.listingId}`;
+
+  const saleLabel = (p: RoyaltyPaymentRow) =>
+    p.auctionId !== null && p.auctionId !== undefined
+      ? `Auction #${p.auctionId}`
+      : `Listing #${p.listingId}`;
+
+  if (loading) {
+    return (
+      <div className="space-y-4">
+        {[1, 2, 3].map((i) => (
+          <div key={i} className="h-16 animate-pulse rounded-[2rem] bg-white/[0.03] border border-white/5" />
+        ))}
+      </div>
+    );
+  }
+
+  if (payments.length === 0) {
+    return (
+      <div className="flex flex-col items-center justify-center rounded-[3.5rem] bg-midnight-900/50 border-2 border-dashed border-white/5 py-24 px-10 text-center">
+        <div className="mb-8 flex h-24 w-24 items-center justify-center rounded-[2rem] bg-midnight-950 text-white/10 shadow-inner">
+          <Coins size={40} />
+        </div>
+        <h3 className="font-display text-2xl font-bold text-white tracking-tight">No royalty payouts yet.</h3>
+        <p className="mt-3 max-w-sm text-sm text-brand-300/40 leading-relaxed font-medium">
+          When artworks that name you as a royalty recipient sell, each payout will appear here.
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-6">
+      <div className="overflow-x-auto rounded-[2rem] bg-white/[0.03] border border-white/5 shadow-2xl">
+        <table className="w-full min-w-[640px] text-left">
+          <thead>
+            <tr className="border-b border-white/5">
+              {["Sale Date", "Artwork", "Sale Price", "Your Share", "Transaction"].map((h) => (
+                <th key={h} className="px-6 py-4 text-[10px] uppercase tracking-[0.2em] font-bold text-white/40">
+                  {h}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {payments.map((p) => (
+              <tr key={p.id} className="border-b border-white/5 last:border-b-0 hover:bg-white/[0.04] transition-colors">
+                <td className="px-6 py-4 text-sm text-white/70 whitespace-nowrap">
+                  {p.createdAt ? new Date(p.createdAt).toLocaleDateString() : "—"}
+                </td>
+                <td className="px-6 py-4">
+                  <Link
+                    href={saleHref(p)}
+                    className="text-sm font-bold text-brand-400 hover:text-brand-300 transition-colors"
+                  >
+                    {saleLabel(p)}
+                  </Link>
+                </td>
+                <td className="px-6 py-4 text-sm font-mono text-white/70 whitespace-nowrap">
+                  {stroopsToXlm(BigInt(Math.round(parseFloat(p.salePrice))))}
+                </td>
+                <td className="px-6 py-4 text-sm font-mono font-bold text-mint-400 whitespace-nowrap">
+                  {stroopsToXlm(BigInt(Math.round(parseFloat(p.amount))))}
+                </td>
+                <td className="px-6 py-4 whitespace-nowrap">
+                  <a
+                    href={`https://stellar.expert/explorer/${explorerNetwork}/ledger/${p.ledgerSequence}`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex items-center gap-1.5 text-xs font-mono text-white/40 hover:text-white transition-colors"
+                  >
+                    Ledger #{p.ledgerSequence}
+                    <ExternalLink size={12} />
+                  </a>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      {pageCount > 1 && (
+        <div className="flex items-center justify-between">
+          <p className="text-xs text-white/40">
+            Page {page + 1} of {pageCount} · {total} payout{total === 1 ? "" : "s"}
+          </p>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => setPage((p) => Math.max(p - 1, 0))}
+              disabled={page === 0}
+              aria-label="Previous page"
+              className="flex items-center gap-1 rounded-xl bg-white/5 px-4 py-2 text-sm font-bold text-white border border-white/10 hover:border-white/20 transition-all disabled:opacity-30 disabled:cursor-not-allowed"
+            >
+              <ChevronLeft size={16} />
+              Prev
+            </button>
+            <button
+              onClick={() => setPage((p) => Math.min(p + 1, pageCount - 1))}
+              disabled={page >= pageCount - 1}
+              aria-label="Next page"
+              className="flex items-center gap-1 rounded-xl bg-white/5 px-4 py-2 text-sm font-bold text-white border border-white/10 hover:border-white/20 transition-all disabled:opacity-30 disabled:cursor-not-allowed"
+            >
+              Next
+              <ChevronRight size={16} />
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -368,6 +509,19 @@ export default function DashboardPage() {
               )}
             </button>
             <button
+              onClick={() => setTab("royalties")}
+              className={clsx(
+                "group relative flex items-center gap-3 px-6 sm:px-8 py-5 text-sm font-bold transition-all duration-500 whitespace-nowrap",
+                tab === "royalties" ? "text-terracotta-400" : "text-white/40 hover:text-white"
+              )}
+            >
+              <Coins size={18} className={clsx("transition-all duration-500 group-hover:scale-125", tab === "royalties" && "text-terracotta-400 drop-shadow-[0_0_8px_rgba(235,79,27,0.5)]")} />
+              Royalty History
+              {tab === "royalties" && (
+                <div className="absolute inset-x-4 bottom-0 h-1.5 rounded-t-full bg-terracotta-500 shadow-[0_-5px_15px_rgba(235,79,27,0.6)] animate-slide-in-right" />
+              )}
+            </button>
+            <button
               onClick={() => setTab("list")}
               className={clsx(
                 "group relative flex items-center gap-3 px-6 sm:px-8 py-5 text-sm font-bold transition-all duration-500 whitespace-nowrap",
@@ -407,6 +561,8 @@ export default function DashboardPage() {
           <div className="animate-fade-in duration-700">
             {tab === "metrics" ? (
               <MetricsDashboard publicKey={publicKey ?? ""} />
+            ) : tab === "royalties" ? (
+              <RoyaltyHistory publicKey={publicKey ?? ""} />
             ) : tab === "list" ? (
               <div className="w-full">
                 <ListingForm

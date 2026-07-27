@@ -19,6 +19,7 @@ import {
 import { config } from "./config";
 import { getConnectedPublicKey, signWithFreighter } from "./freighter";
 import { mapSorobanErrorMessage } from "./errors";
+import { assertWritePreflight } from "./preflight";
 import {
   isE2eMockChain,
   e2eMockCreateListing,
@@ -169,6 +170,38 @@ export async function invokeContract(
       .result?.retval;
     if (!retVal) throw new Error("No return value from simulation.");
     return retVal;
+  }
+
+  // ── Preflight guard (Issue #305) ─────────────────────────────────────
+  // Re-validate network and contract config immediately before signing.
+  // Catches mid-flow network switches that happened after the wallet was
+  // initially connected.
+  try {
+    const walletPassphrase = await (async () => {
+      try {
+        // getNetworkPassphrase() returns the app-configured value.
+        // To detect a *live* wallet mismatch we query Freighter directly
+        // when available; if not available we trust the app config.
+        if (typeof window !== "undefined" && (window as any)?.freighter?.getNetworkDetails) {
+          const details = await (window as any).freighter.getNetworkDetails();
+          return details?.networkPassphrase ?? null;
+        }
+      } catch { /* ignore */ }
+      return null; // Magic or unavailable — skip network check
+    })();
+
+    assertWritePreflight({
+      walletPassphrase,
+      isConnected: true,          // we have a callerPublicKey, so connected
+      contractId,
+      skipNetworkCheck: walletPassphrase === null,
+    });
+  } catch (preflightErr) {
+    if (preflightErr instanceof Error && preflightErr.name === "PreflightError") {
+      throw preflightErr;
+    }
+    // Re-throw unexpected errors from the preflight query
+    throw preflightErr;
   }
 
   // Assemble the transaction with the real resource fee.
@@ -729,6 +762,66 @@ export async function finalizeAuction(
 
   await invokeContract(callerPublicKey, "finalize_auction", args);
   return true;
+}
+
+/**
+ * block_bidder — Auction creator or admin bars an address from bidding on
+ * this auction (anti-shill-bidding registry, Issue #199).
+ */
+export async function blockBidder(
+  callerPublicKey: string,
+  auctionId: number,
+  bidderAddress: string
+): Promise<boolean> {
+  const args: xdr.ScVal[] = [
+    new Address(callerPublicKey).toScVal(),
+    nativeToScVal(BigInt(auctionId), { type: "u64" }),
+    new Address(bidderAddress).toScVal(),
+  ];
+
+  await invokeContract(callerPublicKey, "block_bidder", args);
+  return true;
+}
+
+/**
+ * unblock_bidder — Remove an address from the auction's blocked-bidder
+ * registry (Issue #199).
+ */
+export async function unblockBidder(
+  callerPublicKey: string,
+  auctionId: number,
+  bidderAddress: string
+): Promise<boolean> {
+  const args: xdr.ScVal[] = [
+    new Address(callerPublicKey).toScVal(),
+    nativeToScVal(BigInt(auctionId), { type: "u64" }),
+    new Address(bidderAddress).toScVal(),
+  ];
+
+  await invokeContract(callerPublicKey, "unblock_bidder", args);
+  return true;
+}
+
+/**
+ * get_blocked_bidders — Read the auction's current blocked-bidder registry
+ * (read-only, Issue #199).
+ */
+export async function getBlockedBidders(auctionId: number): Promise<string[]> {
+  const callerPublicKey = await getReadOnlyCallerPublicKey();
+
+  const args: xdr.ScVal[] = [
+    nativeToScVal(BigInt(auctionId), { type: "u64" }),
+  ];
+
+  const retVal = await invokeContract(
+    callerPublicKey,
+    "get_blocked_bidders",
+    args,
+    true
+  );
+
+  const addrs = scValToNative(retVal) as string[];
+  return addrs.map(String);
 }
 
 /**

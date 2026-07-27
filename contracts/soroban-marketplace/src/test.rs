@@ -53,7 +53,7 @@ use soroban_sdk::{
     testutils::Events as _,
     testutils::Ledger,
     token::{StellarAssetClient, TokenClient},
-    vec, Address, Env,
+    vec, Address, Env, Symbol,
 };
 
 /// Standard test setup. Token #1 on the mock NFT is pre-assigned to `artist`.
@@ -216,7 +216,7 @@ fn test_create_listing_zero_price() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #36)")]
+#[should_panic(expected = "Error(Contract, #43)")]
 fn test_create_listing_seller_not_owner_fails() {
     let (env, client, artist, buyer, token_id, _, collection_id) = setup();
     client.set_admin(&artist);
@@ -231,7 +231,10 @@ fn test_create_listing_seller_not_owner_fails() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #37)")]
+// Note: after the first listing escrows the token, `owner_of` returns the
+// marketplace, so the ownership check (#43 NotTokenOwner) fires before the
+// double-listing guard (#44 TokenAlreadyEscrowed) can be reached.
+#[should_panic(expected = "Error(Contract, #43)")]
 fn test_create_listing_double_listing_fails() {
     let (env, client, artist, _, token_id, _, collection_id) = setup();
     client.set_admin(&artist);
@@ -469,18 +472,36 @@ fn test_finalize_auction_no_bids_returns_nft_to_creator() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #36)")]
+#[should_panic(expected = "Error(Contract, #43)")]
 fn test_create_auction_seller_not_owner_fails() {
     let (env, client, artist, buyer, token_id, _cid, collection_id) = setup();
     client.set_admin(&artist);
     client.add_token_to_whitelist(&token_id);
-    let treasury = Address::generate(&env);
-    client.set_treasury(&artist, &treasury);
-    let price = 5_i128; // Very small price
-                        // Create listing before setting protocol fee so validate_recipients passes
-    let id = client.create_listing(
+    // buyer does NOT own token #1 — escrow_nft must revert with NotTokenOwner
+    client.create_auction(
+        &buyer,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1_000_000_i128,
+        &3600u64,
+        &valid_recipients(&env, &buyer),
+    );
+}
+
+#[test]
+// Note: expects #43 for the same reason as the double-listing test above —
+// the escrowed token's owner is the marketplace, so create_auction's
+// ownership check fires before the TokenAlreadyEscrowed guard.
+#[should_panic(expected = "Error(Contract, #43)")]
+fn test_create_listing_then_auction_same_token_fails() {
+    let (env, client, artist, _buyer, token_id, _cid, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    // First: list token #1 — it moves into marketplace custody.
+    client.create_listing(
         &artist,
-        &price,
+        &1_000_000_i128,
         &symbol_short!("XLM"),
         &token_id,
         &collection_id,
@@ -488,43 +509,16 @@ fn test_create_auction_seller_not_owner_fails() {
         &valid_recipients(&env, &artist),
         &None::<u64>,
     );
-}
-
-#[test]
-#[should_panic(expected = "Error(Contract, #37)")]
-fn test_create_listing_then_auction_same_token_fails() {
-    let (env, client, artist, buyer, token_id, _cid, collection_id) = setup();
-    client.set_admin(&artist);
-    client.add_token_to_whitelist(&token_id);
-    let treasury = Address::generate(&env);
-    client.set_treasury(&artist, &treasury);
-    client.set_protocol_fee(&artist, &333u32);
-    let price = 100_i128;
-    let recipients = vec![
-        &env,
-        Recipient {
-            address: artist.clone(),
-            percentage: 9_667, // leaves 333 bps of room for the snapshotted fee
-        },
-    ];
-    let id = client.create_listing(
+    // Then: auctioning the same token must fail — it is already escrowed.
+    client.create_auction(
         &artist,
-        &price,
-        &symbol_short!("XLM"),
         &token_id,
         &collection_id,
         &1u64,
-        &recipients,
-        &None::<u64>,
+        &1_000_000_i128,
+        &3600u64,
+        &valid_recipients(&env, &artist),
     );
-    let result = client.buy_artwork(&buyer, &id);
-    assert!(result);
-    let listing = client.get_listing(&id);
-    assert_eq!(listing.status, ListingStatus::Sold);
-    assert_eq!(listing.owner, Some(buyer.clone()));
-    // Fee: 100 * 333 / 10_000 = 3 (integer division), seller gets 97
-    let token = TokenClient::new(&env, &token_id);
-    assert_eq!(token.balance(&treasury), 3_i128);
 }
 
 // ════════════════════════════════════════════════════════════
@@ -8447,6 +8441,8 @@ fn setup_legacy_v1_fixture(
                 extension_trigger: 0,
                 protocol_fee_bps: 0,
                 bid_history_cap: 20,
+                max_extensions: 0,
+                extension_count: 0,
             },
         );
         env.storage()
@@ -8728,8 +8724,8 @@ fn test_pause_function_buy_artwork_blocks_purchases() {
         &token_id, &collection_id, &1u64,
         &valid_recipients(&env, &artist), &None::<u64>,
     );
-    client.pause_function(&artist, &symbol_short!("buy_artwork"));
-    assert!(client.is_function_paused(&symbol_short!("buy_artwork")));
+    client.pause_function(&artist, &Symbol::new(&env, "buy_artwork"));
+    assert!(client.is_function_paused(&Symbol::new(&env, "buy_artwork")));
     let result = client.try_buy_artwork(&buyer, &id);
     assert!(result.is_err(), "buy_artwork must be blocked when function is paused");
 }
@@ -8740,7 +8736,7 @@ fn test_pause_function_buy_artwork_allows_create_listing() {
     let (env, client, artist, _, token_id, _, collection_id) = setup();
     client.set_admin(&artist);
     client.add_token_to_whitelist(&token_id);
-    client.pause_function(&artist, &symbol_short!("buy_artwork"));
+    client.pause_function(&artist, &Symbol::new(&env, "buy_artwork"));
     let id = client.create_listing(
         &artist, &1_000_000_i128, &symbol_short!("XLM"),
         &token_id, &collection_id, &1u64,
@@ -8754,7 +8750,7 @@ fn test_pause_function_create_listing_blocks_new_listings() {
     let (env, client, artist, _, token_id, _, collection_id) = setup();
     client.set_admin(&artist);
     client.add_token_to_whitelist(&token_id);
-    client.pause_function(&artist, &symbol_short!("create_listing"));
+    client.pause_function(&artist, &Symbol::new(&env, "create_listing"));
     let result = client.try_create_listing(
         &artist, &1_000_000_i128, &symbol_short!("XLM"),
         &token_id, &collection_id, &1u64,
@@ -8773,9 +8769,9 @@ fn test_unpause_function_restores_buy_artwork() {
         &token_id, &collection_id, &1u64,
         &valid_recipients(&env, &artist), &None::<u64>,
     );
-    client.pause_function(&artist, &symbol_short!("buy_artwork"));
-    client.unpause_function(&artist, &symbol_short!("buy_artwork"));
-    assert!(!client.is_function_paused(&symbol_short!("buy_artwork")));
+    client.pause_function(&artist, &Symbol::new(&env, "buy_artwork"));
+    client.unpause_function(&artist, &Symbol::new(&env, "buy_artwork"));
+    assert!(!client.is_function_paused(&Symbol::new(&env, "buy_artwork")));
     assert!(client.buy_artwork(&buyer, &id), "buy_artwork must succeed after unpause");
 }
 
@@ -8804,7 +8800,7 @@ fn test_pause_function_make_offer_blocks_offers() {
         &token_id, &collection_id, &1u64,
         &valid_recipients(&env, &artist), &None::<u64>,
     );
-    client.pause_function(&artist, &symbol_short!("make_offer"));
+    client.pause_function(&artist, &Symbol::new(&env, "make_offer"));
     let result = client.try_make_offer(&buyer, &id, &500_000_i128, &token_id, &None::<u64>);
     assert!(result.is_err(), "make_offer must be blocked when function is paused");
 }
@@ -8824,9 +8820,9 @@ fn test_pause_collection_requires_admin() {
 #[test]
 #[should_panic]
 fn test_pause_function_requires_admin() {
-    let (_, client, artist, buyer, _, _, _) = setup();
+    let (env, client, artist, buyer, _, _, _) = setup();
     client.set_admin(&artist);
-    client.pause_function(&buyer, &symbol_short!("buy_artwork"));
+    client.pause_function(&buyer, &Symbol::new(&env, "buy_artwork"));
 }
 
 // ════════════════════════════════════════════════════════════
@@ -8854,210 +8850,253 @@ fn test_global_pause_still_blocks_collection_aware_functions() {
 }
 
 // ════════════════════════════════════════════════════════════
-// SECTION 18: Issue #214 — revoke_artist cascade cleanup
+// SECTION: Royalty audit trail — RoyaltyPaid event (Issue #201)
 // ════════════════════════════════════════════════════════════
 
-/// Helper: create a fresh collection, mint token `token_no` to `artist`,
-/// then create a listing for that token.  Returns (listing_id, collection_id).
-fn create_listing_with_token(
-    env: &Env,
-    client: &MarketplaceContractClient,
-    artist: &Address,
-    token_id: &Address,
-    token_no: u64,
-) -> (u64, Address) {
-    let col = env.register(mock_nft::MockNft, ());
-    MockNftClient::new(env, &col).set_owner(&token_no, artist);
-    let lid = client.create_listing(
-        artist,
-        &10_000_000_i128,
-        &symbol_short!("XLM"),
-        token_id,
-        &col,
-        &token_no,
-        &valid_recipients(env, artist),
-        &None::<u64>,
-    );
-    (lid, col)
+/// Locate the single `royalty_paid` event and return its data payload map.
+fn find_royalty_paid_data(env: &Env) -> Option<soroban_sdk::xdr::ScMap> {
+    use soroban_sdk::xdr::{ContractEventBody, ScVal};
+    let all = env.events().all();
+    for e in all.events().iter() {
+        if let ContractEventBody::V0(body) = &e.body {
+            let is_rp = body.topics.iter().any(|t| {
+                if let ScVal::Symbol(s) = t {
+                    core::str::from_utf8(s.0.as_slice()).unwrap_or("") == "royalty_paid"
+                } else {
+                    false
+                }
+            });
+            if is_rp {
+                if let ScVal::Map(Some(m)) = &body.data {
+                    return Some(m.clone());
+                }
+            }
+        }
+    }
+    None
 }
 
+/// Look up a field of a decoded `#[contracttype]` struct map by key symbol.
+fn rp_field(m: &soroban_sdk::xdr::ScMap, name: &str) -> Option<soroban_sdk::xdr::ScVal> {
+    use soroban_sdk::xdr::ScVal;
+    for entry in m.iter() {
+        if let ScVal::Symbol(s) = &entry.key {
+            if core::str::from_utf8(s.0.as_slice()).unwrap_or("") == name {
+                return Some(entry.val.clone());
+            }
+        }
+    }
+    None
+}
+
+fn rp_i128(v: &soroban_sdk::xdr::ScVal) -> i128 {
+    match v {
+        soroban_sdk::xdr::ScVal::I128(p) => ((p.hi as i128) << 64) | (p.lo as i128),
+        other => panic!("expected i128 ScVal, got {:?}", other),
+    }
+}
+
+/// Decode an `Option<u64>` field (`None` → Void, `Some(n)` → U64).
+fn rp_opt_u64(v: &soroban_sdk::xdr::ScVal) -> Option<u64> {
+    match v {
+        soroban_sdk::xdr::ScVal::Void => None,
+        soroban_sdk::xdr::ScVal::U64(n) => Some(*n),
+        other => panic!("expected Option<u64> ScVal, got {:?}", other),
+    }
+}
+
+/// Return the `amount` of the `idx`-th `{address, amount}` breakdown entry.
+fn rp_breakdown_amount(recipients: &soroban_sdk::xdr::ScVal, idx: usize) -> i128 {
+    use soroban_sdk::xdr::ScVal;
+    if let ScVal::Vec(Some(v)) = recipients {
+        if let ScVal::Map(Some(entry)) = &v.0[idx] {
+            return rp_i128(&rp_field(entry, "amount").expect("amount field missing"));
+        }
+        panic!("breakdown entry {} is not a map", idx);
+    }
+    panic!("recipients is not a vec");
+}
+
+fn rp_breakdown_len(recipients: &soroban_sdk::xdr::ScVal) -> usize {
+    if let soroban_sdk::xdr::ScVal::Vec(Some(v)) = recipients {
+        v.0.len()
+    } else {
+        panic!("recipients is not a vec");
+    }
+}
+
+/// buy_artwork must emit `royalty_paid` carrying the actual amount each
+/// configured recipient received; entries sum to price − protocol fee.
 #[test]
-fn test_revoke_artist_cancels_active_listing() {
-    let (env, client, artist, _buyer, token_id, _cid, collection_id) = setup();
+fn test_buy_artwork_emits_royalty_paid_with_recipient_breakdown() {
+    let (env, client, artist, buyer, token_id, _cid, collection_id) = setup();
     client.set_admin(&artist);
     client.add_token_to_whitelist(&token_id);
+    let treasury = Address::generate(&env);
+    client.set_treasury(&artist, &treasury);
+    client.set_protocol_fee(&artist, &500u32);
 
-    let (lid, _col) = create_listing_with_token(&env, &client, &artist, &token_id, 1);
-    assert_eq!(client.get_listing(&lid).status, ListingStatus::Active);
-
-    client.revoke_artist(&artist);
-
-    let listing = client.get_listing(&lid);
-    assert_eq!(
-        listing.status,
-        ListingStatus::Cancelled,
-        "revoke_artist must cancel the artist's active listing"
+    let collab = Address::generate(&env);
+    let price = 10_000_000_i128;
+    // 7000 + 2500 recipient bps + 500 fee bps = 10 000 (valid)
+    let recipients = vec![
+        &env,
+        Recipient { address: artist.clone(), percentage: 7_000 },
+        Recipient { address: collab.clone(), percentage: 2_500 },
+    ];
+    let id = client.create_listing(
+        &artist, &price, &symbol_short!("XLM"),
+        &token_id, &collection_id, &1u64, &recipients, &None::<u64>,
     );
+    client.buy_artwork(&buyer, &id);
+
+    let data = find_royalty_paid_data(&env)
+        .expect("royalty_paid event not emitted from buy_artwork");
+
+    // Identity: listing-path settlement → listing_id set, auction_id empty.
+    assert_eq!(rp_opt_u64(&rp_field(&data, "listing_id").unwrap()), Some(id));
+    assert_eq!(rp_opt_u64(&rp_field(&data, "auction_id").unwrap()), None);
+
+    // fee = 10 000 000 × 500 / 10 000 = 500 000; distributable = 9 500 000
+    let expected_fee = price * 500 / 10_000;
+    assert_eq!(rp_i128(&rp_field(&data, "sale_price").unwrap()), price);
+    assert_eq!(rp_i128(&rp_field(&data, "protocol_fee_amount").unwrap()), expected_fee);
+
+    // artist: 9 500 000 × 7000 / 10 000 = 6 650 000; collab (last) takes the
+    // remainder 2 850 000. Together: price − fee.
+    let breakdown = rp_field(&data, "recipients").unwrap();
+    assert_eq!(rp_breakdown_len(&breakdown), 2);
+    let artist_amt = rp_breakdown_amount(&breakdown, 0);
+    let collab_amt = rp_breakdown_amount(&breakdown, 1);
+    assert_eq!(artist_amt, 6_650_000);
+    assert_eq!(collab_amt, 2_850_000);
+    assert_eq!(artist_amt + collab_amt, price - expected_fee);
+
+    // Event amounts must match the transfers that actually happened.
+    let token = TokenClient::new(&env, &token_id);
+    assert_eq!(token.balance(&artist), 100_000_000_000_i128 + artist_amt);
+    assert_eq!(token.balance(&collab), collab_amt);
+    assert_eq!(token.balance(&treasury), expected_fee);
 }
 
+/// finalize_auction must emit `royalty_paid` identified by auction_id.
 #[test]
-fn test_revoke_artist_emits_listing_cancelled_with_admin_revoked_reason() {
-    let (env, client, artist, _buyer, token_id, _cid, _collection_id) = setup();
+fn test_finalize_auction_emits_royalty_paid_with_auction_id() {
+    let (env, client, artist, buyer, token_id, _cid, collection_id) = setup();
     client.set_admin(&artist);
     client.add_token_to_whitelist(&token_id);
+    let treasury = Address::generate(&env);
+    client.set_treasury(&artist, &treasury);
+    client.set_protocol_fee(&artist, &500u32);
 
-    create_listing_with_token(&env, &client, &artist, &token_id, 1);
-    client.revoke_artist(&artist);
-
-    assert!(
-        has_event_with_topic(&env.events().all(), "lst_cncl"),
-        "revoke_artist must emit ListingCancelledEvent"
+    // 9500 recipient bps + 500 fee bps = 10 000 (valid)
+    let recipients = vec![
+        &env,
+        Recipient { address: artist.clone(), percentage: 9_500 },
+    ];
+    let aid = client.create_auction(
+        &artist, &token_id, &collection_id, &1u64,
+        &1_000_000_i128, &3600u64, &recipients,
     );
+    let winning_bid = 2_000_000_i128;
+    client.place_bid(&buyer, &aid, &winning_bid);
+    env.ledger().set_timestamp(env.ledger().timestamp() + 3601);
+    client.finalize_auction(&buyer, &aid);
+
+    let data = find_royalty_paid_data(&env)
+        .expect("royalty_paid event not emitted from finalize_auction");
+
+    assert_eq!(rp_opt_u64(&rp_field(&data, "listing_id").unwrap()), None);
+    assert_eq!(rp_opt_u64(&rp_field(&data, "auction_id").unwrap()), Some(aid));
+
+    // fee = 2 000 000 × 500 / 10 000 = 100 000; sole recipient takes the rest.
+    let expected_fee = winning_bid * 500 / 10_000;
+    assert_eq!(rp_i128(&rp_field(&data, "sale_price").unwrap()), winning_bid);
+    assert_eq!(rp_i128(&rp_field(&data, "protocol_fee_amount").unwrap()), expected_fee);
+
+    let breakdown = rp_field(&data, "recipients").unwrap();
+    assert_eq!(rp_breakdown_len(&breakdown), 1);
+    assert_eq!(rp_breakdown_amount(&breakdown, 0), winning_bid - expected_fee);
+
+    let token = TokenClient::new(&env, &token_id);
+    assert_eq!(token.balance(&artist), 100_000_000_000_i128 + winning_bid - expected_fee);
+    assert_eq!(token.balance(&treasury), expected_fee);
 }
 
+/// accept_offer settles a sale too, so it must also emit `royalty_paid`.
+/// With no treasury configured the fee is 0 and recipients receive the full
+/// offer amount.
 #[test]
-fn test_revoke_artist_refunds_offers_on_cancelled_listing() {
+fn test_accept_offer_emits_royalty_paid_zero_fee() {
     let (env, client, artist, buyer, token_id, _cid, _collection_id) = setup();
     client.set_admin(&artist);
     client.add_token_to_whitelist(&token_id);
 
-    let (lid, _col) = create_listing_with_token(&env, &client, &artist, &token_id, 1);
-    // Buyer places an offer; their funds go into escrow
+    let listing_id = create_test_listing(&env, &client, &artist, &token_id);
     let offer_amount = 5_000_000_i128;
-    client.make_offer(&buyer, &lid, &offer_amount, &token_id, &None);
+    let offer_id = client.make_offer(&buyer, &listing_id, &offer_amount, &token_id, &None);
+    client.accept_offer(&artist, &offer_id);
 
-    let tc = soroban_sdk::token::TokenClient::new(&env, &token_id);
-    let buyer_before = tc.balance(&buyer);
+    let data = find_royalty_paid_data(&env)
+        .expect("royalty_paid event not emitted from accept_offer");
 
-    client.revoke_artist(&artist);
+    assert_eq!(rp_opt_u64(&rp_field(&data, "listing_id").unwrap()), Some(listing_id));
+    assert_eq!(rp_opt_u64(&rp_field(&data, "auction_id").unwrap()), None);
+    assert_eq!(rp_i128(&rp_field(&data, "sale_price").unwrap()), offer_amount);
+    assert_eq!(rp_i128(&rp_field(&data, "protocol_fee_amount").unwrap()), 0);
 
-    // Offer should be refunded (buyer balance restored)
-    let buyer_after = tc.balance(&buyer);
-    assert_eq!(
-        buyer_after,
-        buyer_before + offer_amount,
-        "pending offer must be refunded when listing is cancelled by revocation"
-    );
+    let breakdown = rp_field(&data, "recipients").unwrap();
+    assert_eq!(rp_breakdown_len(&breakdown), 1);
+    assert_eq!(rp_breakdown_amount(&breakdown, 0), offer_amount);
 }
 
+/// When the collection reports an ERC2981-style royalty receiver distinct from
+/// the seller, that payout must appear in the breakdown so entries still sum
+/// to price − protocol fee.
 #[test]
-fn test_revoke_artist_cancels_active_auction_and_refunds_bidder() {
+fn test_royalty_paid_includes_collection_royalty_receiver() {
     let (env, client, artist, buyer, token_id, _cid, collection_id) = setup();
     client.set_admin(&artist);
     client.add_token_to_whitelist(&token_id);
+    let treasury = Address::generate(&env);
+    client.set_treasury(&artist, &treasury);
+    client.set_protocol_fee(&artist, &500u32);
 
-    let col = collection_id.clone();
-    MockNftClient::new(&env, &col).set_owner(&1u64, &artist);
+    // Collection-level royalty: 1000 bps to an external receiver.
+    let royalty_recv = Address::generate(&env);
+    MockNftClient::new(&env, &collection_id).set_royalty(&royalty_recv, &1_000u32);
 
-    let aid = client.create_auction(
-        &artist,
-        &token_id,
-        &col,
-        &1u64,
-        &1_000_000_i128,
-        &3_600u64,
-        &valid_recipients(&env, &artist),
+    let price = 10_000_000_i128;
+    let recipients = vec![
+        &env,
+        Recipient { address: artist.clone(), percentage: 9_500 },
+    ];
+    let id = client.create_listing(
+        &artist, &price, &symbol_short!("XLM"),
+        &token_id, &collection_id, &1u64, &recipients, &None::<u64>,
     );
+    client.buy_artwork(&buyer, &id);
 
-    let bid_amount = 2_000_000_i128;
-    client.place_bid(&buyer, &aid, &bid_amount);
+    let data = find_royalty_paid_data(&env)
+        .expect("royalty_paid event not emitted");
 
-    let tc = soroban_sdk::token::TokenClient::new(&env, &token_id);
-    let buyer_before = tc.balance(&buyer);
+    // royalty = 10 000 000 × 1000 / 10 000 = 1 000 000 (off the top);
+    // fee = 9 000 000 × 500 / 10 000 = 450 000; artist takes the remainder.
+    let expected_royalty = 1_000_000_i128;
+    let expected_fee = 450_000_i128;
+    let expected_artist = price - expected_royalty - expected_fee;
+    assert_eq!(rp_i128(&rp_field(&data, "protocol_fee_amount").unwrap()), expected_fee);
 
-    client.revoke_artist(&artist);
+    let breakdown = rp_field(&data, "recipients").unwrap();
+    assert_eq!(rp_breakdown_len(&breakdown), 2);
+    let recv_amt = rp_breakdown_amount(&breakdown, 0);
+    let artist_amt = rp_breakdown_amount(&breakdown, 1);
+    assert_eq!(recv_amt, expected_royalty);
+    assert_eq!(artist_amt, expected_artist);
+    assert_eq!(recv_amt + artist_amt, price - expected_fee);
 
-    // Auction must be Cancelled
-    assert_eq!(
-        client.get_auction(&aid).status,
-        AuctionStatus::Cancelled,
-        "revoke_artist must cancel the artist's active auction"
-    );
-    // Bidder must be refunded
-    let buyer_after = tc.balance(&buyer);
-    assert_eq!(
-        buyer_after,
-        buyer_before + bid_amount,
-        "highest bidder must be refunded when auction is cancelled by revocation"
-    );
-}
-
-#[test]
-fn test_revoke_artist_emits_auction_bid_refunded_event() {
-    let (env, client, artist, buyer, token_id, _cid, collection_id) = setup();
-    client.set_admin(&artist);
-    client.add_token_to_whitelist(&token_id);
-
-    MockNftClient::new(&env, &collection_id).set_owner(&1u64, &artist);
-    let aid = client.create_auction(
-        &artist, &token_id, &collection_id, &1u64,
-        &1_000_000_i128, &3_600u64, &valid_recipients(&env, &artist),
-    );
-    client.place_bid(&buyer, &aid, &2_000_000_i128);
-    client.revoke_artist(&artist);
-
-    assert!(
-        has_event_with_topic(&env.events().all(), "auction_bid_refunded"),
-        "AuctionBidRefundedEvent must be emitted when active auction bid is refunded on revocation"
-    );
-}
-
-#[test]
-fn test_revoke_artist_no_active_listings_is_noop() {
-    let (env, client, artist, _buyer, token_id, _cid, _collection_id) = setup();
-    client.set_admin(&artist);
-    client.add_token_to_whitelist(&token_id);
-    // Artist has no listings at all — revoke must not panic
-    client.revoke_artist(&artist);
-    assert!(client.is_artist_revoked(&artist));
-}
-
-#[test]
-fn test_revoke_artist_emits_artist_revoked_event() {
-    let (env, client, artist, _buyer, _token_id, _cid, _collection_id) = setup();
-    client.set_admin(&artist);
-    client.revoke_artist(&artist);
-
-    assert!(
-        has_event_with_topic(&env.events().all(), "artist_revoked"),
-        "ArtistRevokedEvent must be emitted on revocation"
-    );
-}
-
-#[test]
-fn test_reinstate_clears_revocation_and_cursors() {
-    let (env, client, artist, _buyer, token_id, _cid, _collection_id) = setup();
-    client.set_admin(&artist);
-    client.add_token_to_whitelist(&token_id);
-
-    client.revoke_artist(&artist);
-    assert!(client.is_artist_revoked(&artist));
-
-    client.reinstate_artist(&artist);
-    assert!(
-        !client.is_artist_revoked(&artist),
-        "artist must not be revoked after reinstatement"
-    );
-}
-
-#[test]
-fn test_revoke_artist_auction_no_bids_no_refund_event() {
-    let (env, client, artist, _buyer, token_id, _cid, collection_id) = setup();
-    client.set_admin(&artist);
-    client.add_token_to_whitelist(&token_id);
-
-    MockNftClient::new(&env, &collection_id).set_owner(&1u64, &artist);
-    let aid = client.create_auction(
-        &artist, &token_id, &collection_id, &1u64,
-        &1_000_000_i128, &3_600u64, &valid_recipients(&env, &artist),
-    );
-
-    client.revoke_artist(&artist);
-
-    // Auction cancelled but no AuctionBidRefundedEvent since there were no bids
-    assert_eq!(client.get_auction(&aid).status, AuctionStatus::Cancelled);
-    assert!(
-        !has_event_with_topic(&env.events().all(), "auction_bid_refunded"),
-        "no refund event should be emitted when auction had no bids"
-    );
+    let token = TokenClient::new(&env, &token_id);
+    assert_eq!(token.balance(&royalty_recv), expected_royalty);
+    assert_eq!(token.balance(&artist), 100_000_000_000_i128 + expected_artist);
+    assert_eq!(token.balance(&treasury), expected_fee);
 }

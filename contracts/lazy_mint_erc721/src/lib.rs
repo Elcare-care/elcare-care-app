@@ -40,6 +40,8 @@ use soroban_sdk::{
 
 const TTL_THRESHOLD: u32 = 50_000;
 const TTL_BUMP: u32 = 100_000;
+/// Maximum number of vouchers accepted by a single redeem_batch call (#274).
+const MAX_BATCH_SIZE: u32 = 100;
 
 // ─── Errors ──────────────────────────────────────────────────────────────────
 
@@ -60,8 +62,11 @@ pub enum Error {
     InvalidSignature = 10,
     NotAllowlisted = 11,
     InvalidMerkleProof = 12,
-    /// Voucher nonce has been explicitly revoked by the creator.
     VoucherRevoked = 13,
+    /// migrate() called for a version already marked done.
+    AlreadyMigrated = 14,
+    /// Unsupported version jump.
+    UnsupportedMigration = 15,
 }
 
 // ─── Data types ───────────────────────────────────────────────────────────────
@@ -484,6 +489,13 @@ impl LazyMint721 {
         Self::extend_instance_ttl(&env);
         buyer.require_auth();
 
+        if items.len() == 0 {
+            return Err(Error::EmptyBatch);
+        }
+        if items.len() > MAX_BATCH_SIZE {
+            return Err(Error::BatchTooLarge);
+        }
+
         let pubkey: BytesN<32> = env
             .storage()
             .instance()
@@ -513,8 +525,23 @@ impl LazyMint721 {
 
         // Phase 1: validate every item (all-or-nothing — no state changes yet).
         // We track supply headroom manually since NextTokenId is not yet updated.
+        //
+        // Duplicate-nonce hardening (#274): UsedVoucher(token_id) is only set
+        // during Phase 4 minting, so two items sharing the same voucher
+        // token_id would both pass validation here and get double-minted —
+        // inflating balance/total_supply from a single voucher. Reject any
+        // in-batch duplicate before any state mutation.
+        let mut seen_ids: Vec<u64> = Vec::new(&env);
         let mut supply_used: u64 = 0u64;
         for item in items.iter() {
+            let tid = item.voucher.token_id;
+            for i in 0..seen_ids.len() {
+                if seen_ids.get(i).unwrap() == tid {
+                    return Err(Error::DuplicateVoucherInBatch);
+                }
+            }
+            seen_ids.push_back(tid);
+
             Self::check_allowlist(&env, &buyer, &item.merkle_proof)?;
             let effective_next = next_id_start.saturating_add(supply_used);
             Self::check_voucher(
@@ -728,6 +755,15 @@ impl LazyMint721 {
             .ok_or(Error::TokenNotFound)
     }
 
+    /// Always `true` — a lazy-minted token's URI comes from its signed
+    /// voucher and is set once at redemption; there is no setter to change
+    /// it afterwards (#276). Exposed as a method (rather than left implicit)
+    /// so every collection type — normal and lazy — exposes the same
+    /// `is_metadata_frozen()` query for frontend/indexer consumers.
+    pub fn is_metadata_frozen(_env: Env) -> bool {
+        true
+    }
+
     pub fn balance_of(env: Env, owner: Address) -> u64 {
         env.storage()
             .persistent()
@@ -861,6 +897,50 @@ impl LazyMint721 {
     /// Return the current Merkle root (None if unset).
     pub fn merkle_root(env: Env) -> Option<BytesN<32>> {
         env.storage().instance().get(&DataKey::MerkleRoot)
+    }
+
+    // ── Versioning & Migration ─────────────────────────────────────────────
+
+    pub fn version(_env: Env) -> &'static str {
+        "1.0.0"
+    }
+
+    pub fn contract_version(env: Env) -> Option<String> {
+        env.storage().instance().get(&DataKey::ContractVersion)
+    }
+
+    /// Creator-guarded idempotent migration entry point.
+    /// v1.0.0: records the completion marker and on-chain version string.
+    pub fn migrate(env: Env) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
+        Self::only_creator(&env)?;
+
+        let target = String::from_str(&env, "1.0.0");
+        let done_key = DataKey::MigrationDone(target.clone());
+
+        if env
+            .storage()
+            .persistent()
+            .get::<DataKey, bool>(&done_key)
+            .unwrap_or(false)
+        {
+            return Err(Error::AlreadyMigrated);
+        }
+
+        // v1.0.0 migration body: nothing to migrate for the initial version.
+        // UsedVoucher entries are already in persistent storage and remain
+        // readable as-is.  RevokedVoucher entries are likewise unaffected.
+
+        env.storage().persistent().set(&done_key, &true);
+        env.storage()
+            .persistent()
+            .extend_ttl(&done_key, TTL_THRESHOLD, TTL_BUMP);
+        env.storage()
+            .instance()
+            .set(&DataKey::ContractVersion, &target);
+        env.events()
+            .publish((soroban_sdk::symbol_short!("migrated"), target), ());
+        Ok(())
     }
 
     // ── Private helpers ───────────────────────────────────────────────────

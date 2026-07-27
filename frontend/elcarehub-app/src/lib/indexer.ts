@@ -9,6 +9,74 @@ const DEFAULT_TIMEOUT_MS = 12_000;
 const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 500;
 
+// ─────────────────────────────────────────────────────────────
+// Issue #309 / #44 — Freshness metadata
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * Freshness metadata attached to every indexed response.
+ * Consumers use this to determine whether data is stale and
+ * to show a non-blocking stale banner to the user.
+ */
+export interface FreshnessMetadata {
+  /** Last indexed ledger sequence number */
+  lastIndexedLedger: number;
+  /** Unix ms timestamp when the client fetched this response */
+  fetchedAt: number;
+  /** Unix ms timestamp when the indexer last processed a new ledger */
+  indexerUpdatedAt: number | null;
+  /** Whether the SSE stream is currently connected */
+  sseConnected: boolean;
+}
+
+/**
+ * Per-resource stale thresholds in milliseconds.
+ * A resource is considered stale when
+ *   (Date.now() - fetchedAt) > threshold  OR
+ *   (Date.now() - indexerUpdatedAt) > threshold
+ */
+export const STALE_THRESHOLDS_MS: Record<"listing" | "auction" | "offer" | "default", number> = {
+  listing: 30_000,   // 30 s — listings can sell fast
+  auction:  15_000,  // 15 s — bids change frequently
+  offer:    45_000,  // 45 s — offers are less time-critical
+  default:  30_000,
+};
+
+/**
+ * Returns true when the resource should be considered stale
+ * and a refresh should be prompted before sensitive actions.
+ */
+export function isDataStale(
+  freshness: FreshnessMetadata,
+  resourceType: keyof typeof STALE_THRESHOLDS_MS = "default"
+): boolean {
+  const threshold = STALE_THRESHOLDS_MS[resourceType];
+  const now = Date.now();
+  const ageSinceFetch = now - freshness.fetchedAt;
+  if (ageSinceFetch > threshold) return true;
+  if (freshness.indexerUpdatedAt !== null) {
+    const ageSinceIndexer = now - freshness.indexerUpdatedAt;
+    if (ageSinceIndexer > threshold) return true;
+  }
+  return false;
+}
+
+/**
+ * Creates a freshness snapshot at the current moment.
+ * `lastIndexedLedger` and `indexerUpdatedAt` are populated from
+ * the indexer /health response when available.
+ */
+export function makeFreshness(
+  opts: Partial<Pick<FreshnessMetadata, "lastIndexedLedger" | "indexerUpdatedAt" | "sseConnected">> = {}
+): FreshnessMetadata {
+  return {
+    lastIndexedLedger: opts.lastIndexedLedger ?? 0,
+    fetchedAt: Date.now(),
+    indexerUpdatedAt: opts.indexerUpdatedAt ?? null,
+    sseConnected: opts.sseConnected ?? false,
+  };
+}
+
 export interface ActivityEvent {
   id: string;
   type: "PURCHASE" | "LISTED" | "CANCELLED" | "SALE" | "ROYALTY" | "OFFER_SUBMITTED" | "OFFER_ACCEPTED" | "TRANSFER";
@@ -283,6 +351,64 @@ export async function getRoyaltyStats(
   } catch (e) {
     console.warn(
       "[indexer] getRoyaltyStats:",
+      e instanceof Error ? e.message : e
+    );
+  }
+  return empty;
+}
+
+// ── Royalty payout breakdown (Issue #201) ─────────────────────────────────────
+
+/** One RoyaltyPayment row from GET /wallets/:address/royalty-breakdown. */
+export interface RoyaltyPaymentRow {
+  id: number;
+  /** Set for fixed-price / offer settlements, null for auctions. */
+  listingId: string | null;
+  /** Set for auction settlements, null otherwise. */
+  auctionId: string | null;
+  recipient: string;
+  amount: string;
+  salePrice: string;
+  ledgerSequence: number;
+  createdAt?: string;
+}
+
+export interface RoyaltyBreakdownPage {
+  payments: RoyaltyPaymentRow[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+/**
+ * Fetches the paginated per-sale royalty payout audit trail for a wallet,
+ * optionally bounded to the inclusive ledger-sequence window [from, to].
+ */
+export async function fetchRoyaltyBreakdown(
+  address: string,
+  opts: { limit?: number; offset?: number; from?: number; to?: number } = {}
+): Promise<RoyaltyBreakdownPage> {
+  const empty: RoyaltyBreakdownPage = {
+    payments: [],
+    total: 0,
+    limit: opts.limit ?? 50,
+    offset: opts.offset ?? 0,
+  };
+  if (!isNonEmptyString(address)) return empty;
+  try {
+    const params = new URLSearchParams();
+    if (opts.limit !== undefined) params.set("limit", String(opts.limit));
+    if (opts.offset !== undefined) params.set("offset", String(opts.offset));
+    if (opts.from !== undefined) params.set("from", String(opts.from));
+    if (opts.to !== undefined) params.set("to", String(opts.to));
+    const qs = params.toString();
+    const data = await fetchWithRetry<RoyaltyBreakdownPage>(
+      `/wallets/${encodeURIComponent(address)}/royalty-breakdown${qs ? `?${qs}` : ""}`
+    );
+    if (data && typeof data === "object" && Array.isArray(data.payments)) return data;
+  } catch (e) {
+    console.warn(
+      "[indexer] fetchRoyaltyBreakdown:",
       e instanceof Error ? e.message : e
     );
   }
@@ -778,13 +904,21 @@ export type MarketplaceSSEEventType =
   | "BID_PLACED"
   | "AUCTION_FINALIZED"
   | "AUCTION_CANCELLED"
-  | "AUCTION_EXTENDED";
+  | "AUCTION_EXTENDED"
+  | "REORG"
+  | "CRITICAL_REORG";
 
 export interface MarketplaceSSEEvent {
   type: MarketplaceSSEEventType;
   listingId?: number;
   auctionId?: number;
   data?: Record<string, unknown>;
+  // Re-org specific fields
+  from_ledger?: number;
+  to_ledger?: number;
+  timestamp?: string;
+  depth?: number;
+  message?: string;
 }
 
 /** Options for {@link subscribeToMarketplaceEvents}. */
@@ -836,6 +970,8 @@ const SSE_RELEVANT_TYPES = new Set<string>([
   "AUCTION_FINALIZED",
   "AUCTION_CANCELLED",
   "AUCTION_EXTENDED",
+  "REORG",
+  "CRITICAL_REORG",
 ]);
 
 function parseSSEData(rawData: string): MarketplaceSSEEvent | null {
@@ -853,6 +989,12 @@ function parseSSEData(rawData: string): MarketplaceSSEEvent | null {
         typeof parsed.data === "object" && parsed.data !== null
           ? (parsed.data as Record<string, unknown>)
           : undefined,
+      // Re-org specific fields
+      from_ledger: parsed.from_ledger != null ? Number(parsed.from_ledger) : undefined,
+      to_ledger: parsed.to_ledger != null ? Number(parsed.to_ledger) : undefined,
+      timestamp: typeof parsed.timestamp === "string" ? parsed.timestamp : undefined,
+      depth: parsed.depth != null ? Number(parsed.depth) : undefined,
+      message: typeof parsed.message === "string" ? parsed.message : undefined,
     };
   } catch {
     return null;
@@ -953,7 +1095,6 @@ export function subscribeToMarketplaceEvents(
         if (parsed) dispatchEvent(parsed);
       });
     }
-
     es.onerror = () => {
       es?.close();
       es = null;

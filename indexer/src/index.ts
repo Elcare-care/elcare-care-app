@@ -3,10 +3,16 @@ import express from 'express';
 import cors from 'cors';
 import compression from 'compression';
 import dotenv from 'dotenv';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import yaml from 'yaml';
+import swaggerUi from 'swagger-ui-express';
 import routes, { closeSSEClients } from './api/routes.js';
 import { startPolling, registerShutdownHook, stopPoller, gracefulShutdown } from './poller.js';
 import { rateLimiter, globalRateLimiter } from './api/rate-limit-middleware.js';
 import { metricsMiddleware, handleMetrics, requestLogger } from './metrics.js';
+import { isStalled } from './stall.js';
 import { errorHandler } from './api/errors.js';
 import { startReconciler } from './reconciler.js';
 import { validateRequiredEnv, loadKeeperConfig, loadConfig } from './config.js';
@@ -21,6 +27,7 @@ import {
   runAllChecks,
   runReadinessChecks,
 } from './health.js';
+import { VERSION } from './config.js';
 import { warmCache } from './cache-warmer.js';
 
 dotenv.config();
@@ -51,6 +58,15 @@ app.use(express.json());
 // Global baseline rate limiter
 app.use(globalRateLimiter);
 
+// ── Version headers middleware — attaches version metadata to every response ─
+app.use((_req: express.Request, res: express.Response, next: express.NextFunction) => {
+  res.setHeader('X-Indexer-Version', VERSION.app);
+  res.setHeader('X-API-Version', VERSION.api);
+  res.setHeader('X-Event-Schema-Version', VERSION.eventSchema);
+  res.setHeader('X-DB-Migration-Version', VERSION.dbMigration);
+  next();
+});
+
 // Request logging and metrics
 app.use(requestLogger);
 app.use(metricsMiddleware);
@@ -80,6 +96,18 @@ app.get('/health', async (_req: express.Request, res: express.Response) => {
   const result = await runAllChecks();
   const httpStatus = result.status === 'down' ? 503 : 200;
   res.status(httpStatus).json(result);
+});
+
+// ── Version endpoint — lightweight, no auth required ────────────────────────
+app.get('/version', (_req: express.Request, res: express.Response) => {
+  res.json({
+    app: VERSION.app,
+    api: VERSION.api,
+    eventSchema: VERSION.eventSchema,
+    dbMigration: VERSION.dbMigration,
+    gitSha: VERSION.gitSha,
+    buildTime: VERSION.buildTime,
+  });
 });
 
 // GET /health/details — full diagnostics, requires admin token

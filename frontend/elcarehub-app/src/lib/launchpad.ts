@@ -6,6 +6,7 @@ import {
 } from "@stellar/stellar-sdk";
 import { config } from "./config";
 import { invokeContract } from "./contract";
+import { assertWritePreflight } from "./preflight";
 
 // ── Types ─────────────────────────────────────────────────────
 
@@ -528,6 +529,13 @@ export interface CollectionMetadata {
   maxSupply: number;
   royaltyBps: number;
   royaltyReceiver: string;
+  /**
+   * True once metadata can no longer change (#276). Normal collections
+   * start mutable and become frozen when the creator calls
+   * `freeze_metadata()`; lazy-mint collections have no metadata setter at
+   * all and are always frozen.
+   */
+  isMetadataFrozen: boolean;
 }
 
 /**
@@ -538,7 +546,7 @@ export async function getCollectionMetadata(
 ): Promise<CollectionMetadata> {
   const DUMMY_KEY = "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN";
 
-  const [name, symbol, creator, totalSupply, maxSupply, royalty] =
+  const [name, symbol, creator, totalSupply, maxSupply, royalty, isMetadataFrozen] =
     await Promise.all([
       invokeContract(DUMMY_KEY, "name", [], true, collectionAddress),
       invokeContract(DUMMY_KEY, "symbol", [], true, collectionAddress).catch(
@@ -548,6 +556,13 @@ export async function getCollectionMetadata(
       invokeContract(DUMMY_KEY, "total_supply", [], true, collectionAddress),
       invokeContract(DUMMY_KEY, "max_supply", [], true, collectionAddress),
       invokeContract(DUMMY_KEY, "royalty_info", [], true, collectionAddress),
+      invokeContract(
+        DUMMY_KEY,
+        "is_metadata_frozen",
+        [],
+        true,
+        collectionAddress
+      ).catch(() => nativeToScVal(false, { type: "bool" })),
     ]);
 
   const royaltyNative = scValToNative(royalty) as [Address, number];
@@ -560,6 +575,7 @@ export async function getCollectionMetadata(
     maxSupply: Number(scValToNative(maxSupply)),
     royaltyBps: Number(royaltyNative[1]),
     royaltyReceiver: royaltyNative[0].toString(),
+    isMetadataFrozen: Boolean(scValToNative(isMetadataFrozen)),
   };
 }
 

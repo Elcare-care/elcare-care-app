@@ -21,6 +21,11 @@ import { useTransientErrorToast } from "./useTransientErrorToast";
 import { useTxToast } from "./useTxToast";
 import { assertSupportedTokenAddress } from "@/lib/token-support";
 import { DEFAULT_TOKEN } from "@/config/tokens";
+import {
+  useReconciliation,
+  generatePendingId,
+  type ConfirmedSnapshot,
+} from "./useReconciliation";
 
 // ── useAuctions ──────────────────────────────────────────────
 
@@ -212,4 +217,62 @@ export function useFinalizeAuction(callerPublicKey: string | null) {
   );
 
   return { finalize, isFinalizing, error: null };
+}
+
+// ── useAuctionsWithReconciliation (Issue #302) ────────────────────────────────
+//
+// Wraps useAuctions with provisional state tracking for bid and finalize actions.
+
+import { useRef } from "react";
+
+export function useAuctionsWithReconciliation() {
+  const auctionsHook = useAuctions();
+  const recon = useReconciliation<Auction>({ mutationTtlMs: 60_000 });
+
+  const prevRef = useRef<Auction[]>([]);
+  useEffect(() => {
+    if (auctionsHook.auctions === prevRef.current) return;
+    prevRef.current = auctionsHook.auctions;
+
+    const snapshots: ConfirmedSnapshot<Auction>[] = auctionsHook.auctions.map((a) => ({
+      resourceId: String(a.auction_id),
+      data: a,
+      ledger: (a as any).updatedAtLedger ?? 0,
+    }));
+    recon.applyConfirmedData(snapshots);
+  }, [auctionsHook.auctions]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const addAuctionMutation = useCallback(
+    (
+      action: "bid" | "finalize" | "create",
+      auction: Auction,
+      txHash: string | null = null
+    ): string => {
+      const pendingId = generatePendingId(`auction-${action}`);
+      recon.addMutation({
+        pendingId,
+        txHash,
+        kind: "auction",
+        resourceId: String(auction.auction_id),
+        optimisticValue: auction,
+      });
+      return pendingId;
+    },
+    [recon]
+  );
+
+  const getAuctionState = useCallback(
+    (auctionId: string | number) =>
+      recon.getResourceState(String(auctionId), "auction"),
+    [recon]
+  );
+
+  return {
+    ...auctionsHook,
+    pendingMutations: recon.pendingMutations,
+    addAuctionMutation,
+    getAuctionState,
+    resolveMutation: recon.resolveMutation,
+    rejectMutation: recon.rejectMutation,
+  };
 }

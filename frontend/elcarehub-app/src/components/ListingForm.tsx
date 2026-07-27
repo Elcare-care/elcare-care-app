@@ -44,6 +44,7 @@ export interface RecipientInput {
 }
 
 interface FormState {
+  metadataCid: string;
   collectionAddress: string;
   nftTokenId: number;
   price: number;
@@ -52,6 +53,7 @@ interface FormState {
 }
 
 interface FieldErrors {
+  metadataCid?: string;
   collectionAddress?: string;
   nftTokenId?: string;
   price?: string;
@@ -74,6 +76,12 @@ interface ListingFormProps {
  */
 export function validateListingForm(form: FormState): FieldErrors {
   const errors: FieldErrors = {};
+
+  // Metadata CID — must be a valid IPFS CIDv0 or CIDv1
+  const cidError = validateIpfsCid(form.metadataCid);
+  if (cidError) {
+    errors.metadataCid = cidError;
+  }
 
   // Collection address — must be a non-empty, valid Stellar address
   if (!form.collectionAddress.trim()) {
@@ -141,6 +149,7 @@ export function validateListingForm(form: FormState): FieldErrors {
 
 export function isFormValid(errors: FieldErrors): boolean {
   const hasTopLevelError =
+    errors.metadataCid !== undefined ||
     errors.collectionAddress !== undefined ||
     errors.nftTokenId !== undefined ||
     errors.price !== undefined ||
@@ -167,6 +176,7 @@ export function ListingForm({ listing, onSuccess, onCancel }: ListingFormProps) 
     useUpdateListing(publicKey);
 
   const [form, setForm] = useState<FormState>({
+    metadataCid: "",
     collectionAddress: "",
     nftTokenId: 0,
     price: 10,
@@ -215,6 +225,7 @@ export function ListingForm({ listing, onSuccess, onCancel }: ListingFormProps) 
                 }))
               : [{ address: listing.artist, percentage: 100 }];
           setForm({
+            metadataCid: listing.metadata_cid ?? "",
             collectionAddress: listing.collection,
             nftTokenId: Number(listing.token_id),
             price: parseFloat(stroopsToXlm(listing.price)),
@@ -415,6 +426,7 @@ export function ListingForm({ listing, onSuccess, onCancel }: ListingFormProps) 
                 setSubmitAttempted(false);
                 setTouched(new Set());
                 setForm({
+                  metadataCid: "",
                   collectionAddress: "",
                   nftTokenId: 0,
                   price: 10,
@@ -458,6 +470,36 @@ export function ListingForm({ listing, onSuccess, onCancel }: ListingFormProps) 
 
         <form onSubmit={handleSubmit} noValidate className="space-y-8">
           <div className="grid gap-6 sm:grid-cols-2">
+
+            {/* Metadata CID */}
+            <div className="sm:col-span-2 space-y-2">
+              <label className="block text-sm font-bold text-gray-950 uppercase tracking-wider font-inter">
+                Artwork Metadata CID *
+              </label>
+              <input
+                value={form.metadataCid}
+                onChange={(e) => setForm({ ...form, metadataCid: e.target.value })}
+                onBlur={() => markTouched("metadataCid")}
+                aria-invalid={shouldShowError("metadataCid") && !!errors.metadataCid}
+                aria-describedby={errors.metadataCid ? "err-metadata-cid" : undefined}
+                className={`w-full rounded-2xl border px-5 py-4 text-base font-mono focus:outline-none transition-all shadow-sm ${
+                  shouldShowError("metadataCid") && errors.metadataCid
+                    ? "border-red-400 bg-red-50/40 focus:border-red-500"
+                    : "border-gray-200 bg-gray-50/50 focus:border-brand-500 focus:bg-white"
+                }`}
+                placeholder="bafybeig… or Qm…"
+              />
+              {shouldShowError("metadataCid") && errors.metadataCid ? (
+                <p id="err-metadata-cid" className="text-sm text-red-600 mt-1" role="alert">
+                  {errors.metadataCid}
+                </p>
+              ) : (
+                <p className="text-xs text-gray-400 font-inter">
+                  CIDv1 starts with <code className="font-mono">b</code> (46–100 chars) or
+                  CIDv0 starts with <code className="font-mono">Qm</code> (46 chars).
+                </p>
+              )}
+            </div>
 
             {/* Collection Address */}
             <div className="sm:col-span-2 space-y-2">

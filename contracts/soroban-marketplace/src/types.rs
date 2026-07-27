@@ -110,6 +110,11 @@ pub enum MarketplaceError {
     /// The auction has reached its `max_extensions` cap and can no longer be
     /// extended by the anti-sniping logic.
     MaxExtensionsReached = 48,
+    /// `escrow_nft` was called by an account that does not own the token.
+    NotTokenOwner = 49,
+    /// The token is already held in marketplace escrow for another listing
+    /// or auction (double-listing guard).
+    TokenAlreadyEscrowed = 50,
 }
 
 #[contracttype]
