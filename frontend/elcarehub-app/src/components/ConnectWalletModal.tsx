@@ -21,6 +21,7 @@ import {
 import { config } from "@/lib/config";
 import { MagicWalletModal } from "./MagicWalletModal";
 import { useModalA11y } from "@/hooks/useModalA11y";
+import { StatusAnnouncer } from "@/components/a11y/StatusAnnouncer";
 import posthog from "posthog-js";
 
 interface ConnectWalletModalProps {
@@ -94,6 +95,17 @@ export function ConnectWalletModal({ isOpen, onClose }: ConnectWalletModalProps)
       ? lobstr.error
       : magic.error;
 
+  const statusMessage = isConnected
+    ? "Wallet connected successfully."
+    : wrongNetwork
+    ? `Wrong network. Please switch to ${config.network}.`
+    : activeError
+    ? `Error: ${activeError}`
+    : anyConnecting
+    ? "Connecting to wallet…"
+    : "";
+  const statusPoliteness = (wrongNetwork || activeError) && !anyConnecting ? "assertive" : "polite";
+
   // -- Render -------------------------------------------------
 
   return (
@@ -124,6 +136,7 @@ export function ConnectWalletModal({ isOpen, onClose }: ConnectWalletModalProps)
           tabIndex={-1}
           className="relative w-full max-w-md overflow-hidden rounded-3xl bg-white shadow-2xl shadow-black/50 animate-scale-in outline-none"
         >
+          <StatusAnnouncer message={statusMessage} politeness={statusPoliteness} />
           <div className="tribal-strip h-2" aria-hidden="true" />
 
           {/* Header */}
@@ -326,8 +339,8 @@ export function ConnectWalletModal({ isOpen, onClose }: ConnectWalletModalProps)
 
             {/* Error display */}
             {activeError && !isConnected && !anyConnecting && (
-              <div className="mt-4 rounded-xl bg-terracotta-50 p-3 flex items-start gap-2 text-xs text-terracotta-700 animate-slide-up">
-                <AlertTriangle size={14} className="flex-shrink-0 mt-0.5" />
+              <div role="alert" className="mt-4 rounded-xl bg-terracotta-50 p-3 flex items-start gap-2 text-xs text-terracotta-700 animate-slide-up">
+                <AlertTriangle size={14} className="flex-shrink-0 mt-0.5" aria-hidden="true" />
                 <p>{activeError}</p>
               </div>
             )}

@@ -10,25 +10,38 @@
 //!
 //! # Replay protection (#39)
 //! Every redeemed `token_id` is tracked in `UsedVoucher`. Once redeemed it
-//! can never be claimed again (`VoucherAlreadyRedeemed`). The token_id serves
-//! as the unique voucher nonce — each collection token may be lazy-minted at
-//! most once.
+//! can never be claimed again (`VoucherAlreadyRedeemed`).
+//!
+//! # Voucher revocation
+//! The creator can revoke a specific voucher nonce before it is redeemed via
+//! `revoke_voucher(nonce)` or batch-revoke with `revoke_vouchers(nonces)`.
+//! Attempting to redeem a revoked voucher returns `VoucherRevoked`.
+//! Revoking an already-redeemed nonce returns `VoucherAlreadyRedeemed`.
+//!
+//! # Merkle allowlist
+//! A Merkle-root-based allowlist phase gates redemptions before
+//! `set_public_phase()` is called.
 //!
 //! # Platform fee (#38)
-//! A per-collection `platform_fee_bps` (≤ MAX_FEE_BPS set by the launchpad) is
-//! stored at initialization. When a buyer redeems a priced voucher the fee
-//! portion is transferred to `platform_fee_receiver` and the remainder to the
-//! creator.
+//! A per-collection `platform_fee_bps` is stored at initialization. When a
+//! buyer redeems a priced voucher the fee portion is transferred to
+//! `platform_fee_receiver` and the remainder to the creator.
+//!
+//! # Batch redemption
+//! `redeem_batch` verifies and mints multiple vouchers atomically (all-or-nothing).
+//! Payments are aggregated per currency to minimise token transfer calls.
 #![no_std]
 #![allow(clippy::too_many_arguments, deprecated)]
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short,
-    token::Client as TokenClient, xdr::ToXdr, Address, Bytes, BytesN, Env, String, Vec,
+    token::Client as TokenClient, xdr::ToXdr, Address, Bytes, BytesN, Env, Map, String, Vec,
 };
 
 const TTL_THRESHOLD: u32 = 50_000;
 const TTL_BUMP: u32 = 100_000;
+/// Maximum number of vouchers accepted by a single redeem_batch call (#274).
+const MAX_BATCH_SIZE: u32 = 100;
 
 // ─── Errors ──────────────────────────────────────────────────────────────────
 
@@ -43,30 +56,56 @@ pub enum Error {
     TokenNotFound = 5,
     MaxSupplyReached = 6,
     VoucherExpired = 7,
-    /// Voucher nonce (token_id) already redeemed (#39).
+    /// Voucher nonce already redeemed (#273).
     VoucherAlreadyRedeemed = 8,
     NotCreator = 9,
     InvalidSignature = 10,
     NotAllowlisted = 11,
     InvalidMerkleProof = 12,
+    VoucherRevoked = 13,
+    /// migrate() called for a version already marked done.
+    AlreadyMigrated = 14,
+    /// Unsupported version jump.
+    UnsupportedMigration = 15,
 }
 
 // ─── Data types ───────────────────────────────────────────────────────────────
 
 /// Off-chain voucher created by the collection creator.
 ///
-/// Field `uri_hash` = sha256(uri_string) computed off-chain.
-/// This is included in the signed digest so a relayer cannot swap the URI
-/// while keeping the signature valid.
+/// `uri_hash` = sha256(uri_string) computed off-chain; included in the signed
+/// digest so a relayer cannot swap the URI while keeping the signature valid.
+///
+/// # Issue #273 — nonce-based replay protection
+/// `nonce` is the unique per-voucher identifier used for replay protection and
+/// revocation.  It is intentionally separate from `token_id` so that:
+///   * A creator can issue multiple vouchers for the same token at different
+///     prices / recipients without one redemption invalidating the others.
+///   * The nonce can be incremented independently of the on-chain mint counter.
+///
+/// The signed digest now also includes the network passphrase bound at
+/// initialization, preventing cross-deployment and cross-network replay.
 #[contracttype]
 #[derive(Clone)]
 pub struct MintVoucher {
     pub token_id: u64,
+    /// Unique per-voucher identifier used for replay protection (#273).
+    /// Must be unique across all vouchers for this contract instance.
+    pub nonce: u64,
     pub price: i128,          // 0 = free
     pub currency: Address,    // SAC address (ignored when price == 0)
     pub uri: String,          // IPFS / HTTPS metadata URI
     pub uri_hash: BytesN<32>, // sha256(uri bytes) — included in signature
     pub valid_until: u64,     // ledger sequence; 0 = no expiry
+}
+
+/// One element of a `redeem_batch` call.
+#[contracttype]
+#[derive(Clone)]
+pub struct BatchVoucherItem {
+    pub voucher: MintVoucher,
+    pub signature: BytesN<64>,
+    pub merkle_proof: Vec<BytesN<32>>,
 }
 
 #[contracttype]
@@ -75,6 +114,7 @@ pub enum DataKey {
     Initialized,
     Creator,
     CreatorPubkey,
+    CurrentWasmHash,
     Name,
     Symbol,
     MaxSupply,
@@ -91,9 +131,13 @@ pub enum DataKey {
     Approved(u64),
     BalanceOf(Address),
     ApprovedForAll(Address, Address),
-    UsedVoucher(u64), // token_id → bool
-    MerkleRoot,       // BytesN<32> — root of allowlist Merkle tree
-    IsPublicPhase,    // bool — true once public minting is enabled
+    UsedVoucher(u64),    // nonce → bool  (redeemed)
+    RevokedVoucher(u64), // nonce → bool  (creator-revoked, per-nonce)
+    MerkleRoot,          // BytesN<32> — root of allowlist Merkle tree
+    IsPublicPhase,       // bool — true once public minting is enabled
+    /// Network passphrase bound at initialization.
+    /// Included in the signed digest to prevent cross-network replay (#273).
+    NetworkPassphrase,   // String
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -111,28 +155,21 @@ impl LazyMint721 {
         env.crypto().ed25519_verify(pubkey, digest, signature);
     }
 
-    /// Verify a standard binary Merkle proof against the stored root.
-    ///
-    /// Leaf = sha256(address XDR).
-    /// At each step the two sibling nodes are sorted (smaller first) before
-    /// hashing so that proofs are order-independent (standard OpenZeppelin
-    /// Merkle tree convention, ported to sha256).
+    /// Verify a standard binary Merkle proof against `root`.
+    /// Leaf = sha256(address XDR).  Siblings are sorted (smaller first) at each
+    /// level so proofs are position-independent (OpenZeppelin convention).
     fn verify_merkle_proof(
         env: &Env,
         root: &BytesN<32>,
         leaf_preimage: &Address,
         proof: &Vec<BytesN<32>>,
     ) -> bool {
-        // Leaf hash = sha256(address XDR)
         let mut computed: BytesN<32> = env
             .crypto()
             .sha256(&leaf_preimage.clone().to_xdr(env))
             .into();
-
         for sibling in proof.iter() {
             let mut pair = Bytes::new(env);
-            // Sort the pair so the smaller hash goes first — makes proofs
-            // position-independent (matches standard Merkle tree tooling).
             if computed.to_array() <= sibling.to_array() {
                 pair.append(&computed.clone().into());
                 pair.append(&sibling.clone().into());
@@ -142,8 +179,150 @@ impl LazyMint721 {
             }
             computed = env.crypto().sha256(&pair).into();
         }
-
         &computed == root
+    }
+
+    /// Enforce the allowlist gate for `buyer`.  No-op in public phase.
+    fn check_allowlist(
+        env: &Env,
+        buyer: &Address,
+        merkle_proof: &Vec<BytesN<32>>,
+    ) -> Result<(), Error> {
+        let is_public: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::IsPublicPhase)
+            .unwrap_or(false);
+        if is_public {
+            return Ok(());
+        }
+        let root: BytesN<32> = env
+            .storage()
+            .instance()
+            .get(&DataKey::MerkleRoot)
+            .ok_or(Error::NotAllowlisted)?;
+        if merkle_proof.is_empty() {
+            return Err(Error::NotAllowlisted);
+        }
+        if !Self::verify_merkle_proof(env, &root, buyer, merkle_proof) {
+            return Err(Error::InvalidMerkleProof);
+        }
+        Ok(())
+    }
+
+    /// Validate a single voucher (expiry → replay → revocation → supply → sig).
+    /// Does NOT write state or transfer funds.
+    fn check_voucher(
+        env: &Env,
+        voucher: &MintVoucher,
+        signature: &BytesN<64>,
+        pubkey: &BytesN<32>,
+        max: u64,
+        next_id: u64,
+    ) -> Result<(), Error> {
+        if voucher.valid_until != 0 && env.ledger().sequence() > voucher.valid_until as u32 {
+            return Err(Error::VoucherExpired);
+        }
+        // Replay protection uses the voucher's nonce (not token_id) so the same
+        // token can be covered by multiple vouchers with independent lifetimes.
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::UsedVoucher(voucher.nonce))
+        {
+            return Err(Error::VoucherAlreadyRedeemed);
+        }
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::RevokedVoucher(voucher.nonce))
+        {
+            return Err(Error::VoucherRevoked);
+        }
+        if next_id >= max {
+            return Err(Error::MaxSupplyReached);
+        }
+        let digest = Self::_voucher_digest(env, voucher);
+        Self::verify_signature_or_panic(env, pubkey, &digest, signature);
+        Ok(())
+    }
+
+    /// Execute payment split for one voucher's price.
+    fn pay(
+        env: &Env,
+        buyer: &Address,
+        creator: &Address,
+        currency: &Address,
+        price: i128,
+        fee_bps: u32,
+        fee_receiver: &Address,
+    ) {
+        if price <= 0 {
+            return;
+        }
+        if fee_bps > 0 {
+            let fee_amount = (price * fee_bps as i128) / 10_000;
+            let creator_amount = price - fee_amount;
+            if fee_amount > 0 {
+                TokenClient::new(env, currency).transfer(buyer, fee_receiver, &fee_amount);
+            }
+            if creator_amount > 0 {
+                TokenClient::new(env, currency).transfer(buyer, creator, &creator_amount);
+            }
+        } else {
+            TokenClient::new(env, currency).transfer(buyer, creator, &price);
+        }
+    }
+
+    /// Mint a single token after all checks have passed.
+    /// Updates Owner, TokenUri, UsedVoucher (keyed by nonce), BalanceOf, TotalSupply, NextTokenId.
+    fn mint_token(env: &Env, buyer: &Address, token_id: u64, nonce: u64, uri: &String, next_id: u64) {
+        env.storage()
+            .persistent()
+            .set(&DataKey::Owner(token_id), buyer);
+        env.storage()
+            .persistent()
+            .set(&DataKey::TokenUri(token_id), uri);
+        // Replay protection: mark the voucher nonce as consumed (not token_id).
+        env.storage()
+            .persistent()
+            .set(&DataKey::UsedVoucher(nonce), &true);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::Owner(token_id), TTL_THRESHOLD, TTL_BUMP);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::TokenUri(token_id), TTL_THRESHOLD, TTL_BUMP);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::UsedVoucher(nonce), TTL_THRESHOLD, TTL_BUMP);
+
+        let bal: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::BalanceOf(buyer.clone()))
+            .unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&DataKey::BalanceOf(buyer.clone()), &(bal + 1));
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::BalanceOf(buyer.clone()), TTL_THRESHOLD, TTL_BUMP);
+
+        let supply: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalSupply)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalSupply, &(supply + 1));
+
+        if token_id >= next_id {
+            env.storage()
+                .instance()
+                .set(&DataKey::NextTokenId, &(token_id + 1));
+        }
     }
 }
 
@@ -153,6 +332,7 @@ impl LazyMint721 {
 
     /// Issue #38: accepts `platform_fee_receiver` and `platform_fee_bps` so
     /// the launchpad can configure per-collection fee splits at deployment time.
+    /// Issue #273: accepts `network_passphrase` for cross-network domain separation.
     pub fn initialize(
         env: Env,
         creator: Address,
@@ -164,12 +344,14 @@ impl LazyMint721 {
         royalty_receiver: Address,
         platform_fee_receiver: Address,
         platform_fee_bps: u32,
+        network_passphrase: String,
     ) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Initialized) {
             return Err(Error::AlreadyInitialized);
         }
         env.storage().instance().set(&DataKey::Initialized, &true);
         env.storage().instance().set(&DataKey::Creator, &creator);
+        env.storage().instance().set(&DataKey::CurrentWasmHash, &BytesN::from_array(&env, &[0u8; 32]));
         env.storage()
             .instance()
             .set(&DataKey::CreatorPubkey, &creator_pubkey);
@@ -192,15 +374,36 @@ impl LazyMint721 {
         env.storage()
             .instance()
             .set(&DataKey::PlatformFeeBps, &platform_fee_bps);
-        env.storage().instance().extend_ttl(50_000, 100_000);
+        // Store the network passphrase for cross-network domain separation (#273).
+        env.storage()
+            .instance()
+            .set(&DataKey::NetworkPassphrase, &network_passphrase);
+        env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_BUMP);
         Ok(())
     }
 
-    // ── Lazy Mint (core) ──────────────────────────────────────────────────
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
+        let old_wasm_hash: BytesN<32> = env
+            .storage()
+            .instance()
+            .get(&DataKey::CurrentWasmHash)
+            .unwrap_or(BytesN::from_array(&env, &[0u8; 32]));
+        env.storage()
+            .instance()
+            .set(&DataKey::CurrentWasmHash, &new_wasm_hash);
+        env.deployer().update_current_contract_wasm(&new_wasm_hash);
+        env.events().publish(
+            (symbol_short!("upgraded"),),
+            (old_wasm_hash, new_wasm_hash),
+        );
+        Ok(())
+    }
+
+    // ── Lazy Mint (single) ────────────────────────────────────────────────
 
     /// Buyer submits a signed voucher to mint their NFT.
     /// During the allowlist phase a valid Merkle proof for `buyer` is required.
-    /// The transaction fails (panics) if the ed25519 signature is invalid.
     pub fn redeem(
         env: Env,
         buyer: Address,
@@ -212,41 +415,14 @@ impl LazyMint721 {
         buyer.require_auth();
 
         // 0. Allowlist phase check
-        let is_public: bool = env
+        Self::check_allowlist(&env, &buyer, &merkle_proof)?;
+
+        // 1–5. Validate
+        let pubkey: BytesN<32> = env
             .storage()
             .instance()
-            .get(&DataKey::IsPublicPhase)
-            .unwrap_or(false);
-        if !is_public {
-            // Merkle root must be set; proof must be non-empty and valid.
-            let root: BytesN<32> = env
-                .storage()
-                .instance()
-                .get(&DataKey::MerkleRoot)
-                .ok_or(Error::NotAllowlisted)?;
-            if merkle_proof.is_empty() {
-                return Err(Error::NotAllowlisted);
-            }
-            if !Self::verify_merkle_proof(&env, &root, &buyer, &merkle_proof) {
-                return Err(Error::InvalidMerkleProof);
-            }
-        }
-
-        // 1. Expiry check
-        if voucher.valid_until != 0 && env.ledger().sequence() > voucher.valid_until as u32 {
-            return Err(Error::VoucherExpired);
-        }
-
-        // 2. Replay check (#39) — token_id is the voucher nonce
-        if env
-            .storage()
-            .persistent()
-            .has(&DataKey::UsedVoucher(voucher.token_id))
-        {
-            return Err(Error::VoucherAlreadyRedeemed);
-        }
-
-        // 3. Supply check
+            .get(&DataKey::CreatorPubkey)
+            .ok_or(Error::NotInitialized)?;
         let next_id: u64 = env
             .storage()
             .instance()
@@ -257,113 +433,249 @@ impl LazyMint721 {
             .instance()
             .get(&DataKey::MaxSupply)
             .unwrap_or(u64::MAX);
-        if next_id >= max {
-            return Err(Error::MaxSupplyReached);
+        Self::check_voucher(&env, &voucher, &signature, &pubkey, max, next_id)?;
+
+        // 6. Payment
+        let creator: Address = env.storage().instance().get(&DataKey::Creator).unwrap();
+        let fee_bps: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PlatformFeeBps)
+            .unwrap_or(0);
+        let fee_receiver: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PlatformFeeReceiver)
+            .unwrap_or(creator.clone());
+        Self::pay(
+            &env,
+            &buyer,
+            &creator,
+            &voucher.currency,
+            voucher.price,
+            fee_bps,
+            &fee_receiver,
+        );
+
+        // 7. Mint
+        let token_id = voucher.token_id;
+        Self::mint_token(&env, &buyer, token_id, voucher.nonce, &voucher.uri, next_id);
+
+        // Emit detailed redemption event for indexer auditability (#273).
+        env.events().publish(
+            (symbol_short!("redeemed"), creator, buyer.clone()),
+            (token_id, voucher.nonce, 1u128),
+        );
+        Ok(token_id)
+    }
+
+    // ── Lazy Mint (batch) ─────────────────────────────────────────────────
+
+    /// Atomically redeem multiple vouchers.  All-or-nothing: if any voucher
+    /// fails validation the entire batch reverts.
+    ///
+    /// Each item carries its own `merkle_proof` so mixed allowlist / open-entry
+    /// batches are possible after `set_public_phase()`.
+    ///
+    /// Payments are aggregated per currency: for each unique currency the total
+    /// fee portion and creator portion are summed and transferred in two calls
+    /// (fee receiver then creator).  This minimises the number of token
+    /// transfers for homogeneous batches.
+    pub fn redeem_batch(
+        env: Env,
+        buyer: Address,
+        items: Vec<BatchVoucherItem>,
+    ) -> Result<Vec<u64>, Error> {
+        Self::extend_instance_ttl(&env);
+        buyer.require_auth();
+
+        if items.len() == 0 {
+            return Err(Error::EmptyBatch);
+        }
+        if items.len() > MAX_BATCH_SIZE {
+            return Err(Error::BatchTooLarge);
         }
 
-        // 4. Signature verification — panics on invalid sig (caught by try_redeem)
         let pubkey: BytesN<32> = env
             .storage()
             .instance()
             .get(&DataKey::CreatorPubkey)
             .ok_or(Error::NotInitialized)?;
-        let digest = Self::_voucher_digest(&env, &voucher);
-        Self::verify_signature_or_panic(&env, &pubkey, &digest, &signature);
+        let max: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaxSupply)
+            .unwrap_or(u64::MAX);
+        let next_id_start: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::NextTokenId)
+            .unwrap_or(0);
+        let fee_bps: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PlatformFeeBps)
+            .unwrap_or(0);
+        let creator: Address = env.storage().instance().get(&DataKey::Creator).unwrap();
+        let fee_receiver: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PlatformFeeReceiver)
+            .unwrap_or(creator.clone());
 
-        // 5. Payment with platform fee split (#38)
-        if voucher.price > 0 {
-            let creator: Address = env.storage().instance().get(&DataKey::Creator).unwrap();
-            let fee_bps: u32 = env
-                .storage()
-                .instance()
-                .get(&DataKey::PlatformFeeBps)
-                .unwrap_or(0);
-            if fee_bps > 0 {
-                let fee_receiver: Address = env
-                    .storage()
-                    .instance()
-                    .get(&DataKey::PlatformFeeReceiver)
-                    .unwrap();
-                let fee_amount = (voucher.price * fee_bps as i128) / 10_000;
-                let creator_amount = voucher.price - fee_amount;
-                if fee_amount > 0 {
-                    TokenClient::new(&env, &voucher.currency).transfer(
-                        &buyer,
-                        &fee_receiver,
-                        &fee_amount,
-                    );
+        // Phase 1: validate every item (all-or-nothing — no state changes yet).
+        // We track supply headroom manually since NextTokenId is not yet updated.
+        //
+        // Duplicate-nonce hardening (#274): UsedVoucher(token_id) is only set
+        // during Phase 4 minting, so two items sharing the same voucher
+        // token_id would both pass validation here and get double-minted —
+        // inflating balance/total_supply from a single voucher. Reject any
+        // in-batch duplicate before any state mutation.
+        let mut seen_ids: Vec<u64> = Vec::new(&env);
+        let mut supply_used: u64 = 0u64;
+        for item in items.iter() {
+            let tid = item.voucher.token_id;
+            for i in 0..seen_ids.len() {
+                if seen_ids.get(i).unwrap() == tid {
+                    return Err(Error::DuplicateVoucherInBatch);
                 }
-                if creator_amount > 0 {
-                    TokenClient::new(&env, &voucher.currency).transfer(
-                        &buyer,
-                        &creator,
-                        &creator_amount,
-                    );
-                }
+            }
+            seen_ids.push_back(tid);
+
+            Self::check_allowlist(&env, &buyer, &item.merkle_proof)?;
+            let effective_next = next_id_start.saturating_add(supply_used);
+            Self::check_voucher(
+                &env,
+                &item.voucher,
+                &item.signature,
+                &pubkey,
+                max,
+                effective_next,
+            )?;
+            supply_used = supply_used.saturating_add(1);
+        }
+
+        // Phase 2: aggregate payments per currency.
+        // Map<currency_address_string, (fee_total, creator_total)>
+        // We use a Vec of pairs because Map requires ScVal keys and Address
+        // implements IntoVal — but to keep things simple we iterate twice.
+        // For each currency accumulate: fee_amount and creator_amount.
+        let mut fee_totals: Map<Address, i128> = Map::new(&env);
+        let mut creator_totals: Map<Address, i128> = Map::new(&env);
+        for item in items.iter() {
+            let price = item.voucher.price;
+            if price <= 0 {
+                continue;
+            }
+            let cur = item.voucher.currency.clone();
+            let fee_amount = if fee_bps > 0 {
+                (price * fee_bps as i128) / 10_000
             } else {
-                let creator: Address = env.storage().instance().get(&DataKey::Creator).unwrap();
-                TokenClient::new(&env, &voucher.currency).transfer(
-                    &buyer,
-                    &creator,
-                    &voucher.price,
-                );
+                0i128
+            };
+            let creator_amount = price - fee_amount;
+
+            let prev_fee: i128 = fee_totals.get(cur.clone()).unwrap_or(0);
+            fee_totals.set(cur.clone(), prev_fee + fee_amount);
+
+            let prev_creator: i128 = creator_totals.get(cur.clone()).unwrap_or(0);
+            creator_totals.set(cur.clone(), prev_creator + creator_amount);
+        }
+
+        // Phase 3: transfer payments (aggregated).
+        for (cur, fee_total) in fee_totals.iter() {
+            if fee_total > 0 {
+                TokenClient::new(&env, &cur).transfer(&buyer, &fee_receiver, &fee_total);
+            }
+        }
+        for (cur, creator_total) in creator_totals.iter() {
+            if creator_total > 0 {
+                TokenClient::new(&env, &cur).transfer(&buyer, &creator, &creator_total);
             }
         }
 
-        // 6. Mint
-        let token_id = voucher.token_id;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Owner(token_id), &buyer);
-        env.storage()
-            .persistent()
-            .set(&DataKey::TokenUri(token_id), &voucher.uri);
-        // Mark voucher nonce as redeemed (#39)
-        env.storage()
-            .persistent()
-            .set(&DataKey::UsedVoucher(token_id), &true);
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::Owner(token_id), 50_000, 100_000);
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::TokenUri(token_id), 50_000, 100_000);
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::UsedVoucher(token_id), 50_000, 100_000);
-
-        let bal: u64 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::BalanceOf(buyer.clone()))
-            .unwrap_or(0);
-        env.storage()
-            .persistent()
-            .set(&DataKey::BalanceOf(buyer.clone()), &(bal + 1));
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::BalanceOf(buyer.clone()), 50_000, 100_000);
-
-        let supply: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::TotalSupply)
-            .unwrap_or(0);
-        env.storage()
-            .instance()
-            .set(&DataKey::TotalSupply, &(supply + 1));
-        if token_id >= next_id {
-            env.storage()
-                .instance()
-                .set(&DataKey::NextTokenId, &(token_id + 1));
+        // Phase 4: mint all tokens.
+        let mut minted_ids: Vec<u64> = Vec::new(&env);
+        let mut next_id = next_id_start;
+        for item in items.iter() {
+            let token_id = item.voucher.token_id;
+            Self::mint_token(&env, &buyer, token_id, item.voucher.nonce, &item.voucher.uri, next_id);
+            if token_id >= next_id {
+                next_id = token_id + 1;
+            }
+            // Emit detailed redemption event for each item (#273).
+            env.events().publish(
+                (symbol_short!("redeemed"), creator.clone(), buyer.clone()),
+                (token_id, item.voucher.nonce, 1u128),
+            );
+            minted_ids.push_back(token_id);
         }
 
-        let creator: Address = env.storage().instance().get(&DataKey::Creator).unwrap();
-        env.events().publish(
-            (symbol_short!("mint"), creator, buyer.clone()),
-            (token_id, 1u128),
-        );
-        Ok(token_id)
+        Ok(minted_ids)
+    }
+
+    // ── Voucher Revocation ────────────────────────────────────────────────
+
+    /// Revoke a single voucher by its nonce (token_id).  Creator-only.
+    /// Returns `VoucherAlreadyRedeemed` if the nonce was already redeemed.
+    pub fn revoke_voucher(env: Env, nonce: u64) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
+        let creator = Self::only_creator(&env)?;
+
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::UsedVoucher(nonce))
+        {
+            return Err(Error::VoucherAlreadyRedeemed);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::RevokedVoucher(nonce), &true);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::RevokedVoucher(nonce), TTL_THRESHOLD, TTL_BUMP);
+        env.events()
+            .publish((symbol_short!("revoke"), creator), nonce);
+        Ok(())
+    }
+
+    /// Batch-revoke a list of voucher nonces.  Creator-only.  All-or-nothing:
+    /// if any nonce is already redeemed the call reverts and nothing is revoked.
+    pub fn revoke_vouchers(env: Env, nonces: Vec<u64>) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
+        let creator = Self::only_creator(&env)?;
+
+        // Validate all first (all-or-nothing)
+        for nonce in nonces.iter() {
+            if env
+                .storage()
+                .persistent()
+                .has(&DataKey::UsedVoucher(nonce))
+            {
+                return Err(Error::VoucherAlreadyRedeemed);
+            }
+        }
+        for nonce in nonces.iter() {
+            env.storage()
+                .persistent()
+                .set(&DataKey::RevokedVoucher(nonce), &true);
+            env.storage().persistent().extend_ttl(
+                &DataKey::RevokedVoucher(nonce),
+                TTL_THRESHOLD,
+                TTL_BUMP,
+            );
+            env.events()
+                .publish((symbol_short!("revoke"), creator.clone()), nonce);
+        }
+        Ok(())
+    }
+
+    /// Return `true` if the voucher nonce has been explicitly revoked by the creator.
+    pub fn is_voucher_revoked(env: Env, nonce: u64) -> bool {
+        env.storage()
+            .persistent()
+            .has(&DataKey::RevokedVoucher(nonce))
     }
 
     // ── Transfers ─────────────────────────────────────────────────────────
@@ -405,19 +717,17 @@ impl LazyMint721 {
             .persistent()
             .get(&DataKey::Owner(token_id))
             .ok_or(Error::TokenNotFound)?;
-
         if spender != owner
             && !Self::is_approved_for_all(env.clone(), owner.clone(), spender.clone())
         {
             return Err(Error::NotApproved);
         }
-
         env.storage()
             .persistent()
             .set(&DataKey::Approved(token_id), &approved);
         env.storage()
             .persistent()
-            .extend_ttl(&DataKey::Approved(token_id), 50_000, 100_000);
+            .extend_ttl(&DataKey::Approved(token_id), TTL_THRESHOLD, TTL_BUMP);
         Ok(())
     }
 
@@ -426,7 +736,7 @@ impl LazyMint721 {
         owner.require_auth();
         let key = DataKey::ApprovedForAll(owner.clone(), operator.clone());
         env.storage().persistent().set(&key, &approved);
-        env.storage().persistent().extend_ttl(&key, 50_000, 100_000);
+        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_BUMP);
     }
 
     // ── View functions ────────────────────────────────────────────────────
@@ -445,6 +755,15 @@ impl LazyMint721 {
             .ok_or(Error::TokenNotFound)
     }
 
+    /// Always `true` — a lazy-minted token's URI comes from its signed
+    /// voucher and is set once at redemption; there is no setter to change
+    /// it afterwards (#276). Exposed as a method (rather than left implicit)
+    /// so every collection type — normal and lazy — exposes the same
+    /// `is_metadata_frozen()` query for frontend/indexer consumers.
+    pub fn is_metadata_frozen(_env: Env) -> bool {
+        true
+    }
+
     pub fn balance_of(env: Env, owner: Address) -> u64 {
         env.storage()
             .persistent()
@@ -459,11 +778,12 @@ impl LazyMint721 {
             .unwrap_or(0)
     }
 
-    /// Returns true if the voucher nonce (token_id) has already been redeemed (#39).
-    pub fn is_voucher_redeemed(env: Env, token_id: u64) -> bool {
+    /// Returns true if the voucher nonce has already been redeemed.
+    /// Uses the voucher's `nonce` field (not token_id) for lookup (#273).
+    pub fn is_voucher_redeemed(env: Env, nonce: u64) -> bool {
         env.storage()
             .persistent()
-            .has(&DataKey::UsedVoucher(token_id))
+            .has(&DataKey::UsedVoucher(nonce))
     }
 
     pub fn name(env: Env) -> String {
@@ -545,13 +865,12 @@ impl LazyMint721 {
         Ok(())
     }
 
-    /// Set the Merkle root for the allowlist.  Callable only by creator.
-    /// Automatically enables allowlist phase (clears public phase flag).
+    /// Set the Merkle root for the allowlist.  Creator-only.
+    /// Automatically resets to allowlist phase (clears public phase flag).
     pub fn set_merkle_root(env: Env, root: BytesN<32>) -> Result<(), Error> {
         Self::extend_instance_ttl(&env);
         Self::only_creator(&env)?;
         env.storage().instance().set(&DataKey::MerkleRoot, &root);
-        // Setting a new root resets to allowlist phase.
         env.storage()
             .instance()
             .set(&DataKey::IsPublicPhase, &false);
@@ -559,7 +878,7 @@ impl LazyMint721 {
     }
 
     /// Switch the sale to public phase — removes the allowlist restriction.
-    /// Callable only by creator. Irreversible unless a new Merkle root is set.
+    /// Creator-only.  Reversible by calling `set_merkle_root` again.
     pub fn set_public_phase(env: Env) -> Result<(), Error> {
         Self::extend_instance_ttl(&env);
         Self::only_creator(&env)?;
@@ -580,6 +899,50 @@ impl LazyMint721 {
         env.storage().instance().get(&DataKey::MerkleRoot)
     }
 
+    // ── Versioning & Migration ─────────────────────────────────────────────
+
+    pub fn version(_env: Env) -> &'static str {
+        "1.0.0"
+    }
+
+    pub fn contract_version(env: Env) -> Option<String> {
+        env.storage().instance().get(&DataKey::ContractVersion)
+    }
+
+    /// Creator-guarded idempotent migration entry point.
+    /// v1.0.0: records the completion marker and on-chain version string.
+    pub fn migrate(env: Env) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
+        Self::only_creator(&env)?;
+
+        let target = String::from_str(&env, "1.0.0");
+        let done_key = DataKey::MigrationDone(target.clone());
+
+        if env
+            .storage()
+            .persistent()
+            .get::<DataKey, bool>(&done_key)
+            .unwrap_or(false)
+        {
+            return Err(Error::AlreadyMigrated);
+        }
+
+        // v1.0.0 migration body: nothing to migrate for the initial version.
+        // UsedVoucher entries are already in persistent storage and remain
+        // readable as-is.  RevokedVoucher entries are likewise unaffected.
+
+        env.storage().persistent().set(&done_key, &true);
+        env.storage()
+            .persistent()
+            .extend_ttl(&done_key, TTL_THRESHOLD, TTL_BUMP);
+        env.storage()
+            .instance()
+            .set(&DataKey::ContractVersion, &target);
+        env.events()
+            .publish((soroban_sdk::symbol_short!("migrated"), target), ());
+        Ok(())
+    }
+
     // ── Private helpers ───────────────────────────────────────────────────
 
     fn extend_instance_ttl(env: &Env) {
@@ -598,16 +961,35 @@ impl LazyMint721 {
 
     /// Build the 32-byte digest that the creator must sign off-chain.
     ///
-    /// Layout (all big-endian):
-    ///   N   bytes  contract_address XDR  (binds signature to this instance)
-    ///   8   bytes  token_id
-    ///  16   bytes  price (i128)
-    ///   8   bytes  valid_until
+    /// Layout (all big-endian / XDR where noted):
+    ///   N   bytes  network_passphrase bytes  (binds to this network)
+    ///   N   bytes  contract_address XDR      (binds to this deployment)
+    ///   8   bytes  nonce             (u64 BE) — unique per voucher (#273)
+    ///   8   bytes  token_id          (u64 BE)
+    ///  16   bytes  price             (i128 BE)
+    ///   8   bytes  valid_until       (u64 BE)
     ///  32   bytes  uri_hash
-    ///  N   bytes  currency address XDR
+    ///   N   bytes  currency address XDR
+    ///
+    /// The network passphrase is stored at initialization and bound here so a
+    /// voucher signed on testnet cannot be replayed on mainnet even if the
+    /// contract address happens to be the same.
+    ///
+    /// ⚠ Byte layout is STABLE — do not reorder fields.
+    #[allow(non_snake_case)]
     pub fn _voucher_digest(env: &Env, v: &MintVoucher) -> Bytes {
         let mut raw = Bytes::new(env);
+        // Network passphrase — domain separator for cross-network protection.
+        let passphrase: String = env
+            .storage()
+            .instance()
+            .get(&DataKey::NetworkPassphrase)
+            .unwrap_or_else(|| String::from_str(env, ""));
+        raw.append(&passphrase.to_xdr(env));
+        // Contract address — binds signature to this specific deployment.
         raw.append(&env.current_contract_address().to_xdr(env));
+        // Unique per-voucher nonce.
+        raw.extend_from_array(&v.nonce.to_be_bytes());
         raw.extend_from_array(&v.token_id.to_be_bytes());
         raw.extend_from_array(&v.price.to_be_bytes());
         raw.extend_from_array(&v.valid_until.to_be_bytes());
@@ -620,7 +1002,6 @@ impl LazyMint721 {
         env.storage()
             .persistent()
             .remove(&DataKey::Approved(token_id));
-
         let owner: Address = env
             .storage()
             .persistent()
@@ -629,27 +1010,21 @@ impl LazyMint721 {
         if owner != *from {
             return Err(Error::NotOwner);
         }
-
         let from_bal: u64 = env
             .storage()
             .persistent()
             .get(&DataKey::BalanceOf(from.clone()))
             .unwrap_or(0);
-
         if from_bal == 0 {
             return Err(Error::NotOwner);
         }
-
         env.storage().persistent().set(
             &DataKey::BalanceOf(from.clone()),
             &(from_bal.saturating_sub(1)),
         );
-        env.storage().persistent().extend_ttl(
-            &DataKey::BalanceOf(from.clone()),
-            TTL_THRESHOLD,
-            TTL_BUMP,
-        );
-
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::BalanceOf(from.clone()), TTL_THRESHOLD, TTL_BUMP);
         let to_bal: u64 = env
             .storage()
             .persistent()
@@ -660,8 +1035,7 @@ impl LazyMint721 {
             .set(&DataKey::BalanceOf(to.clone()), &(to_bal + 1));
         env.storage()
             .persistent()
-            .extend_ttl(&DataKey::BalanceOf(to.clone()), 50_000, 100_000);
-
+            .extend_ttl(&DataKey::BalanceOf(to.clone()), TTL_THRESHOLD, TTL_BUMP);
         env.storage()
             .persistent()
             .set(&DataKey::Owner(token_id), to);

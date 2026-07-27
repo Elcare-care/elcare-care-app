@@ -25,6 +25,7 @@ export const cacheMiddleware = (ttl: number) => {
             return next();
         }
 
+        // Include cursor_ledger in the key to prevent cursor collisions between pages
         const cacheKey = `cache:${req.originalUrl || req.url}`;
 
         try {

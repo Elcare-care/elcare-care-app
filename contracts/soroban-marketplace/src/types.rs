@@ -62,8 +62,59 @@ pub enum MarketplaceError {
     OfferExpired = 34,
     /// A new offer would exceed MAX_OFFERS_PER_LISTING active (Pending) offers
     /// for this listing.  A cap bounds per-listing storage growth and keeps the
-    /// auto-reject sweep (ISSUE-031) economically viable.
+    /// auto-reject sweep economically viable.
     OfferLimitReached = 35,
+    /// `cancel_listings` was called with more ids than MAX_BATCH_CANCEL in a
+    /// single batch — split the request into smaller batches.
+    BatchTooLarge = 36,
+    /// `migrate` was called again for a version whose migration marker is
+    /// already recorded in persistent storage.
+    AlreadyMigrated = 37,
+    /// `purchase` was attempted by the listing's own artist (or a recipient of
+    /// the listing) — self-purchase is not allowed.
+    SelfPurchaseNotAllowed = 38,
+    /// A listing price violates the configured `[min, max]` price bounds.
+    PriceOutOfBounds = 39,
+    /// A checked arithmetic operation overflowed while computing fee splits.
+    ArithmeticOverflow = 40,
+    /// `accept_admin` was called after the pending admin proposal's `expires_at`
+    /// ledger timestamp has passed.  The proposal must be re-issued.
+    ///
+    /// NOTE: Issue #202 suggested discriminant 35, but 35/36 are already taken
+    /// (`OfferLimitReached`/`BatchTooLarge`); the next free codes 41/42 are used
+    /// instead so existing on-chain error codes are not renumbered.
+    AdminProposalExpired = 41,
+    /// `accept_admin` or `cancel_admin_proposal` was called when no admin
+    /// proposal is currently pending.
+    NoAdminProposalPending = 42,
+    /// A royalty `Recipient` has a `percentage` of zero basis points.
+    /// Every recipient in the list must contribute a non-zero share so that
+    /// the list cannot contain dead-weight entries that waste gas on every
+    /// settlement.
+    ZeroRecipientBps = 43,
+    /// The recipient list contains a duplicate address.  Each address may
+    /// appear at most once so payouts are unambiguous and the total bps
+    /// calculation cannot be confused by double-counting.
+    DuplicateRecipient = 44,
+    /// `admin_cancel_auction` was called on an auction that is not Active, or
+    /// `refund_losing_bid` was called on an auction that is not in a state
+    /// that permits refunds.
+    InvalidAuctionState = 45,
+    /// A bidder attempted to call `refund_losing_bid` for an auction where
+    /// they are the current highest bidder (their funds are still locked as
+    /// the winning escrow) or they have no bid to refund.
+    NoBidToRefund = 46,
+    /// The anti-sniping extension window is zero or would overflow the auction
+    /// end time.
+    InvalidExtensionWindow = 47,
+    /// The auction has reached its `max_extensions` cap and can no longer be
+    /// extended by the anti-sniping logic.
+    MaxExtensionsReached = 48,
+    /// `escrow_nft` was called by an account that does not own the token.
+    NotTokenOwner = 49,
+    /// The token is already held in marketplace escrow for another listing
+    /// or auction (double-listing guard).
+    TokenAlreadyEscrowed = 50,
 }
 
 #[contracttype]
@@ -75,16 +126,13 @@ pub enum ListingStatus {
 }
 
 /// Discriminant carried in the ListingCancelledEvent to indicate why a listing
-/// was cancelled. This improves provenance display and analytics for indexers.
+/// was cancelled.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum CancelReason {
-    /// The listing owner (artist) explicitly cancelled the listing
     Owner = 1,
-    /// The listing expired (time-based expiry, if implemented)
     Expired = 2,
-    /// Admin revoked the artist's permission, causing automatic cancellation
     AdminRevoked = 3,
 }
 
@@ -93,9 +141,28 @@ pub enum CancelReason {
 pub struct Recipient {
     pub address: Address,
     /// Share expressed in basis points (0 – 10 000).
-    /// The sum of all recipient `percentage` values plus the protocol fee bps
-    /// must not exceed 10 000 (100 %).
     pub percentage: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct BatchCreateListingInput {
+    pub price: i128,
+    pub currency: Symbol,
+    pub token: Address,
+    pub collection: Address,
+    pub token_id: u64,
+    pub recipients: soroban_sdk::Vec<Recipient>,
+    pub expires_at: Option<u64>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct BatchUpdateListingInput {
+    pub listing_id: u64,
+    pub new_price: i128,
+    pub new_token: Address,
+    pub new_recipients: soroban_sdk::Vec<Recipient>,
 }
 
 #[contracttype]
@@ -112,15 +179,7 @@ pub struct Listing {
     pub status: ListingStatus,
     pub owner: Option<Address>,
     pub created_at: u32,
-    /// Protocol fee in basis points (0-10000) snapshotted at listing creation.
-    /// This ensures the fee applied at purchase matches what was displayed when
-    /// the listing was created, regardless of subsequent admin fee changes.
     pub protocol_fee_bps: u32,
-    /// Optional expiry as a Unix ledger timestamp (seconds since epoch).
-    /// When `Some(t)` and `env.ledger().timestamp() >= t`, the listing is
-    /// considered expired and cannot be purchased.  `None` means no expiry
-    /// (the listing lives until cancelled or sold).  Listings created before
-    /// this field was introduced will deserialise as `None` automatically.
     pub expires_at: Option<u64>,
 }
 
@@ -146,36 +205,32 @@ pub struct Auction {
     pub end_time: u64,
     pub status: AuctionStatus,
     pub recipients: soroban_sdk::Vec<Recipient>,
-    /// Minimum amount by which a new bid must exceed the current highest bid,
-    /// snapshotted from the global setting at auction creation. The first bid is
-    /// instead gated by `reserve_price`.
     pub min_increment: i128,
-    /// How many seconds to extend the auction when a qualifying late bid arrives.
-    /// Snapshotted from the global setting at auction creation time.
     pub extension_window: u64,
-    /// If `end_time - now < extension_trigger` seconds at bid time, the auction
-    /// end is extended by `extension_window`. Snapshotted at creation time.
     pub extension_trigger: u64,
-    /// Protocol fee in basis points snapshotted from the global setting at
-    /// auction creation time. This ensures settlement math is fixed when the
-    /// auction is created, giving bidders and the creator certainty about the
-    /// net payout — consistent with how listings behave.
     pub protocol_fee_bps: u32,
+    /// Bid-history ring-buffer capacity snapshotted at auction creation time.
+    ///
+    /// Snapshotting here means a later admin change to the global
+    /// `BidHistoryCap` never retroactively shrinks or grows the history of
+    /// an already-running auction — each auction's ring-buffer behaviour is
+    /// fixed when it is created.
+    ///
+    /// Valid range: 1 – 200 (enforced by `set_bid_history_cap`).
+    pub bid_history_cap: u32,
+    /// Maximum number of times this auction's end time may be extended by
+    /// the anti-sniping logic.  0 = unlimited (legacy behaviour).
+    /// Snapshotted from the global `max_extensions` setting at creation time.
+    pub max_extensions: u32,
+    /// Running count of extensions applied so far.
+    pub extension_count: u32,
 }
 
-/// A single entry in the per-auction bounded bid history.
-///
-/// The history is capped to `BID_HISTORY_CAP` entries (see `contract.rs`).
-/// When the cap is reached the oldest entry is evicted so only the most
-/// recent N bids are ever persisted.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BidRecord {
-    /// The account that placed this bid.
     pub bidder: Address,
-    /// The bid amount (in the auction's payment token stroops).
     pub amount: i128,
-    /// The ledger sequence number at which this bid was recorded.
     pub ledger: u32,
 }
 
@@ -198,8 +253,5 @@ pub struct Offer {
     pub token: Address,
     pub status: OfferStatus,
     pub created_at: u32,
-    /// Optional expiry (Unix timestamp, seconds). When `Some(t)` and the
-    /// ledger timestamp >= t: `accept_offer` reverts, anyone may call
-    /// `reclaim_offer` to refund the offerer.  `None` = no expiry.
     pub expires_at: Option<u64>,
 }

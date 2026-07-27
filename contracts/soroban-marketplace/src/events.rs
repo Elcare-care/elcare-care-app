@@ -1,35 +1,46 @@
 // events.rs — Defines all contract event schemas for ELCARE-HUB Marketplace
 
-use soroban_sdk::{contracttype, symbol_short, Address, Env, Symbol};
+use soroban_sdk::{contracttype, Address, Env, Symbol};
 
-// Versioned event topics as Symbol constants
-pub const LISTING_CREATED: Symbol = symbol_short!("lst_crtd");
-pub const ARTWORK_SOLD: Symbol = symbol_short!("art_sold");
-pub const LISTING_CANCELLED: Symbol = symbol_short!("lst_cncl");
-pub const LISTING_UPDATED: Symbol = symbol_short!("lst_updt");
-pub const BID_PLACED: Symbol = symbol_short!("bid_plcd");
-pub const AUCTION_RESOLVED: Symbol = symbol_short!("auc_rslv");
-pub const AUCTION_CREATED: Symbol = symbol_short!("auc_crtd");
-pub const OFFER_MADE: Symbol = symbol_short!("ofr_made");
-pub const OFFER_ACCEPTED: Symbol = symbol_short!("ofr_accp");
-pub const OFFER_REJECTED: Symbol = symbol_short!("ofr_rjct");
-pub const OFFER_WITHDRAWN: Symbol = symbol_short!("ofr_wdrn");
-pub const ROYALTY_PAID: Symbol = symbol_short!("roy_paid");
-pub const ADMIN_TRANSFER_PROPOSED: Symbol = symbol_short!("adm_prop");
-pub const ADMIN_TRANSFERRED: Symbol = symbol_short!("adm_xfrd");
-pub const ARTIST_REVOKED: Symbol = symbol_short!("art_rvkd");
-pub const ARTIST_REINSTATED: Symbol = symbol_short!("art_rnst");
-pub const CONTRACT_PAUSED: Symbol = symbol_short!("ctr_psd");
-pub const CONTRACT_UNPAUSED: Symbol = symbol_short!("ctr_unpsd");
-pub const LISTING_PRICE_UPDATED: Symbol = symbol_short!("lst_pru");
-pub const LISTING_EXPIRED: Symbol = symbol_short!("lst_expd");
-pub const AUCTION_EXTENDED: Symbol = symbol_short!("auc_ext");
-pub const AUCTION_CANCELLED: Symbol = symbol_short!("auc_cncl");
-pub const PROTOCOL_FEE_COLLECTED: Symbol = symbol_short!("fee_cltd");
-pub const OFFER_RECLAIMED: Symbol = symbol_short!("ofr_rclm");
+// Versioned event topics as string constants
+pub const LISTING_CREATED: &str = "listing_created";
+pub const ARTWORK_SOLD: &str = "artwork_sold";
+pub const LISTING_CANCELLED: &str = "listing_cancelled";
+pub const LISTING_UPDATED: &str = "listing_updated";
+pub const BID_PLACED: &str = "bid_placed";
+pub const AUCTION_RESOLVED: &str = "auction_resolved";
+pub const AUCTION_CREATED: &str = "auction_created";
+pub const OFFER_MADE: &str = "offer_made";
+pub const OFFER_ACCEPTED: &str = "offer_accepted";
+pub const OFFER_REJECTED: &str = "offer_rejected";
+pub const OFFER_WITHDRAWN: &str = "offer_withdrawn";
+pub const ROYALTY_PAID: &str = "royalty_paid";
+pub const ADMIN_TRANSFER_PROPOSED: &str = "admin_transfer_proposed";
+pub const ADMIN_TRANSFERRED: &str = "admin_transferred";
+pub const ADMIN_PROPOSAL_CANCELLED: &str = "admin_proposal_cancelled";
+pub const ARTIST_REVOKED: &str = "artist_revoked";
+pub const ARTIST_REINSTATED: &str = "artist_reinstated";
+pub const CONTRACT_PAUSED: &str = "contract_paused";
+pub const CONTRACT_UNPAUSED: &str = "contract_unpaused";
+pub const LISTING_PRICE_UPDATED: &str = "listing_price_updated";
+pub const LISTING_EXPIRED: &str = "listing_expired";
+pub const AUCTION_EXTENDED: &str = "auction_extended";
+pub const AUCTION_CANCELLED: &str = "auction_cancelled";
+pub const PROTOCOL_FEE_COLLECTED: &str = "protocol_fee_collected";
+pub const OFFER_RECLAIMED: &str = "offer_reclaimed";
+pub const NFT_ESCROWED: &str = "nft_escrowed";
+pub const NFT_RELEASED: &str = "nft_released";
+// Granular pause events (Issue #205)
+pub const COLLECTION_PAUSED: &str = "collection_paused";
+pub const COLLECTION_UNPAUSED: &str = "collection_unpaused";
+pub const FUNCTION_PAUSED: &str = "function_paused";
+pub const FUNCTION_UNPAUSED: &str = "function_unpaused";
+// Royalty settlement snapshot event (Issue #270)
+pub const ROYALTY_SETTLEMENT: &str = "royalty_settlement";
+// Auction escrow recovery events (Issue #271)
+pub const AUCTION_BID_REFUNDED: &str = "auction_bid_refunded";
+pub const AUCTION_ADMIN_CANCELLED: &str = "auction_admin_cancelled";
 
-// Event data structs
-// Event data structs
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ListingCreatedEvent {
@@ -57,9 +68,7 @@ pub struct ArtworkSoldEvent {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ListingCancelledEvent {
     pub listing_id: u64,
-    /// The actor that triggered the cancellation (may be the artist, admin, or contract).
     pub cancelled_by: Address,
-    /// Discriminant indicating the reason for cancellation (Owner, Expired, AdminRevoked).
     pub reason: crate::types::CancelReason,
     pub ledger_sequence: u32,
 }
@@ -75,7 +84,6 @@ pub struct ListingUpdatedEvent {
     pub ledger_sequence: u32,
 }
 
-// Add more event structs as needed for other actions
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AuctionCreatedEvent {
@@ -107,86 +115,197 @@ pub struct AuctionFinalizedEvent {
 impl ListingCreatedEvent {
     #[allow(deprecated)]
     pub fn publish(self, env: &Env) {
-        env.events().publish((LISTING_CREATED,), self);
+        env.events().publish((soroban_sdk::Symbol::new(env, LISTING_CREATED),), self);
     }
 }
-
 impl ArtworkSoldEvent {
     #[allow(deprecated)]
     pub fn publish(self, env: &Env) {
-        env.events().publish((ARTWORK_SOLD,), self);
+        env.events().publish((soroban_sdk::Symbol::new(env, ARTWORK_SOLD),), self);
     }
 }
-
 impl ListingCancelledEvent {
     #[allow(deprecated)]
     pub fn publish(self, env: &Env) {
-        env.events().publish((LISTING_CANCELLED,), self);
+        env.events().publish((soroban_sdk::Symbol::new(env, LISTING_CANCELLED),), self);
     }
 }
-
 impl AuctionCreatedEvent {
     #[allow(deprecated)]
     pub fn publish(self, env: &Env) {
-        env.events().publish((AUCTION_CREATED,), self);
+        env.events().publish((soroban_sdk::Symbol::new(env, AUCTION_CREATED),), self);
     }
 }
-
 impl BidPlacedEvent {
     #[allow(deprecated)]
     pub fn publish(self, env: &Env) {
-        env.events().publish((BID_PLACED,), self);
+        env.events().publish((soroban_sdk::Symbol::new(env, BID_PLACED),), self);
     }
 }
-
 impl AuctionFinalizedEvent {
     #[allow(deprecated)]
     pub fn publish(self, env: &Env) {
-        env.events().publish((AUCTION_RESOLVED,), self);
+        env.events().publish((soroban_sdk::Symbol::new(env, AUCTION_RESOLVED),), self);
     }
 }
 
-/// Emitted when a qualifying late bid triggers the anti-sniping extension rule.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AuctionExtendedEvent {
     pub auction_id: u64,
-    /// The new end time after the extension has been applied.
+    /// End time before the extension was applied.
+    pub prev_end_time: u64,
     pub new_end_time: u64,
+    /// Which extension this is (1-based); allows consumers to detect cap proximity.
+    pub extension_count: u32,
 }
-
 impl AuctionExtendedEvent {
     #[allow(deprecated)]
     pub fn publish(self, env: &Env) {
-        env.events().publish((AUCTION_EXTENDED,), self);
+        env.events().publish((soroban_sdk::Symbol::new(env, AUCTION_EXTENDED),), self);
     }
 }
 
-/// Emitted when a creator cancels an auction that has received no bids.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AuctionCancelledEvent {
     pub auction_id: u64,
     pub cancelled_by: Address,
+    /// Reason code: "owner" | "admin" | "no_bids"
+    pub reason: soroban_sdk::Symbol,
 }
-
 impl AuctionCancelledEvent {
     #[allow(deprecated)]
     pub fn publish(self, env: &Env) {
-        env.events().publish((AUCTION_CANCELLED,), self);
+        env.events().publish((soroban_sdk::Symbol::new(env, AUCTION_CANCELLED),), self);
     }
+}
+
+/// Emitted when a losing bidder's escrowed funds are returned.
+/// Provides full audit trail for escrow reconciliation. (Issue #271)
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuctionBidRefundedEvent {
+    pub auction_id: u64,
+    pub bidder: Address,
+    pub amount: i128,
+    pub token: Address,
+    /// Reason code: "outbid" | "cancelled" | "admin_cancel"
+    pub reason: soroban_sdk::Symbol,
+    pub ledger_sequence: u32,
+}
+impl AuctionBidRefundedEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events().publish((soroban_sdk::Symbol::new(env, AUCTION_BID_REFUNDED),), self);
+    }
+}
+
+/// Emitted when admin force-cancels an active auction, including bids. (Issue #271)
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuctionAdminCancelledEvent {
+    pub auction_id: u64,
+    pub cancelled_by: Address,
+    pub refunded_amount: i128,
+    pub token: Address,
+    pub ledger_sequence: u32,
+}
+impl AuctionAdminCancelledEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events().publish((soroban_sdk::Symbol::new(env, AUCTION_ADMIN_CANCELLED),), self);
+    }
+}
+
+/// Emitted at settlement with a snapshot of the normalized recipient list. (Issue #270)
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoyaltySettlementEvent {
+    /// Listing or auction id.
+    pub id: u64,
+    /// Normalized recipients at the moment of settlement (read-only snapshot).
+    pub recipients: soroban_sdk::Vec<crate::types::Recipient>,
+    pub total_amount: i128,
+    pub token: Address,
+    pub ledger_sequence: u32,
+}
+impl RoyaltySettlementEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events().publish((soroban_sdk::Symbol::new(env, ROYALTY_SETTLEMENT),), self);
+    }
+}
+
+/// One `{address, amount}` entry of a settlement breakdown: the exact token
+/// amount transferred to `address` during payout distribution. (Issue #201)
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecipientPayout {
+    pub address: Address,
+    pub amount: i128,
+}
+
+/// Emitted after all sale transfers complete, carrying the actual amount each
+/// recipient received — unlike [`RoyaltySettlementEvent`], which only snapshots
+/// the configured bps splits. Recipient payouts (including any collection-level
+/// `royalty_info` receiver) sum to `sale_price - protocol_fee_amount`, so the
+/// distribution can be audited without replaying the transaction. (Issue #201)
+///
+/// The whole struct is published as the single event data `Val` under one
+/// `royalty_paid` topic; the recipients vector lives in the data field, so the
+/// event never exceeds Soroban's topic limits regardless of recipient count.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoyaltyPaidEvent {
+    /// Set for `buy_listing` / `accept_offer` settlements.
+    pub listing_id: Option<u64>,
+    /// Set for `finalize_auction` settlements.
+    pub auction_id: Option<u64>,
+    pub sale_price: i128,
+    pub protocol_fee_amount: i128,
+    pub token: Address,
+    pub recipients: soroban_sdk::Vec<RecipientPayout>,
+    pub ledger_sequence: u32,
+}
+impl RoyaltyPaidEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events().publish((soroban_sdk::Symbol::new(env, ROYALTY_PAID),), self);
+    }
+}
+
+/// Emit `royalty_paid` for a completed settlement. Exactly one of `listing_id`
+/// / `auction_id` should be `Some`.
+#[allow(clippy::too_many_arguments)]
+pub fn emit_royalty_paid(
+    env: &Env,
+    listing_id: Option<u64>,
+    auction_id: Option<u64>,
+    sale_price: i128,
+    protocol_fee_amount: i128,
+    token: Address,
+    recipients: soroban_sdk::Vec<RecipientPayout>,
+) {
+    RoyaltyPaidEvent {
+        listing_id,
+        auction_id,
+        sale_price,
+        protocol_fee_amount,
+        token,
+        recipients,
+        ledger_sequence: env.ledger().sequence(),
+    }
+    .publish(env);
 }
 
 impl ListingUpdatedEvent {
     #[allow(deprecated)]
     pub fn publish(self, env: &Env) {
-        env.events().publish((LISTING_UPDATED,), self);
+        env.events().publish((soroban_sdk::Symbol::new(env, LISTING_UPDATED),), self);
     }
 }
 
-/// Emitted when a seller updates the price of an active listing in-place via
-/// `update_listing_price`.  Both the old and new price are recorded so that
-/// indexers can reconstruct the full price history of every listing.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ListingPriceUpdatedEvent {
@@ -195,9 +314,13 @@ pub struct ListingPriceUpdatedEvent {
     pub new_price: i128,
     pub updated_by: Address,
 }
+impl ListingPriceUpdatedEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events().publish((LISTING_PRICE_UPDATED,), self);
+    }
+}
 
-/// Emitted when anyone calls `expire_listing` on a genuinely expired listing,
-/// transitioning it from Active → Expired/Cancelled.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ListingExpiredEvent {
@@ -206,17 +329,10 @@ pub struct ListingExpiredEvent {
     pub ledger_sequence: u32,
 }
 
-impl ListingPriceUpdatedEvent {
-    #[allow(deprecated)]
-    pub fn publish(self, env: &Env) {
-        env.events().publish((LISTING_PRICE_UPDATED,), self);
-    }
-}
-
 impl ListingExpiredEvent {
     #[allow(deprecated)]
     pub fn publish(self, env: &Env) {
-        env.events().publish((LISTING_EXPIRED,), self);
+        env.events().publish((soroban_sdk::Symbol::new(env, LISTING_EXPIRED),), self);
     }
 }
 
@@ -228,8 +344,11 @@ pub struct OfferMadeEvent {
     pub offerer: Address,
     pub amount: i128,
     pub token: Address,
+    /// Optional expiry (ledger timestamp) after which the offer can be
+    /// reclaimed; `None` when the offer never expires.  Emitted so the indexer
+    /// can surface countdown timers without a separate contract read.
+    pub expires_at: Option<u64>,
 }
-
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OfferAcceptedEvent {
@@ -238,7 +357,6 @@ pub struct OfferAcceptedEvent {
     pub offerer: Address,
     pub amount: i128,
 }
-
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OfferRejectedEvent {
@@ -246,7 +364,6 @@ pub struct OfferRejectedEvent {
     pub listing_id: u64,
     pub offerer: Address,
 }
-
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OfferWithdrawnEvent {
@@ -258,28 +375,25 @@ pub struct OfferWithdrawnEvent {
 impl OfferMadeEvent {
     #[allow(deprecated)]
     pub fn publish(self, env: &Env) {
-        env.events().publish((OFFER_MADE,), self);
+        env.events().publish((soroban_sdk::Symbol::new(env, OFFER_MADE),), self);
     }
 }
-
 impl OfferAcceptedEvent {
     #[allow(deprecated)]
     pub fn publish(self, env: &Env) {
-        env.events().publish((OFFER_ACCEPTED,), self);
+        env.events().publish((soroban_sdk::Symbol::new(env, OFFER_ACCEPTED),), self);
     }
 }
-
 impl OfferRejectedEvent {
     #[allow(deprecated)]
     pub fn publish(self, env: &Env) {
-        env.events().publish((OFFER_REJECTED,), self);
+        env.events().publish((soroban_sdk::Symbol::new(env, OFFER_REJECTED),), self);
     }
 }
-
 impl OfferWithdrawnEvent {
     #[allow(deprecated)]
     pub fn publish(self, env: &Env) {
-        env.events().publish((OFFER_WITHDRAWN,), self);
+        env.events().publish((soroban_sdk::Symbol::new(env, OFFER_WITHDRAWN),), self);
     }
 }
 
@@ -288,24 +402,21 @@ impl OfferWithdrawnEvent {
 pub struct ArtistRevokedEvent {
     pub artist: Address,
 }
-
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ArtistReinstatedEvent {
     pub artist: Address,
 }
-
 impl ArtistRevokedEvent {
     #[allow(deprecated)]
     pub fn publish(self, env: &Env) {
-        env.events().publish((ARTIST_REVOKED,), self);
+        env.events().publish((soroban_sdk::Symbol::new(env, ARTIST_REVOKED),), self);
     }
 }
-
 impl ArtistReinstatedEvent {
     #[allow(deprecated)]
     pub fn publish(self, env: &Env) {
-        env.events().publish((ARTIST_REINSTATED,), self);
+        env.events().publish((soroban_sdk::Symbol::new(env, ARTIST_REINSTATED),), self);
     }
 }
 
@@ -314,61 +425,151 @@ impl ArtistReinstatedEvent {
 pub struct AdminTransferProposedEvent {
     pub current_admin: Address,
     pub proposed_admin: Address,
+    /// Absolute ledger timestamp after which the proposal can no longer be
+    /// accepted.  Lets indexers/frontends render a countdown without a
+    /// separate view call.
+    pub expires_at: u64,
 }
-
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdminTransferredEvent {
     pub old_admin: Address,
     pub new_admin: Address,
 }
-
+/// Emitted when the current admin cancels a still-pending admin proposal via
+/// `cancel_admin_proposal` before it was accepted or expired.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminProposalCancelledEvent {
+    pub current_admin: Address,
+    pub cancelled_candidate: Address,
+}
 impl AdminTransferProposedEvent {
     #[allow(deprecated)]
     pub fn publish(self, env: &Env) {
-        env.events().publish((ADMIN_TRANSFER_PROPOSED,), self);
+        env.events().publish((soroban_sdk::Symbol::new(env, ADMIN_TRANSFER_PROPOSED),), self);
     }
 }
-
 impl AdminTransferredEvent {
     #[allow(deprecated)]
     pub fn publish(self, env: &Env) {
-        env.events().publish((ADMIN_TRANSFERRED,), self);
+        env.events().publish((soroban_sdk::Symbol::new(env, ADMIN_TRANSFERRED),), self);
+    }
+}
+impl AdminProposalCancelledEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events().publish((soroban_sdk::Symbol::new(env, ADMIN_PROPOSAL_CANCELLED),), self);
     }
 }
 
-// ── Protocol Fee Event ────────────────────────────────────────────────────────
+// ── Admin-transfer event emitters ─────────────────────────────────────────────
 //
-// Emitted from every settlement path (buy_artwork, finalize_auction,
-// accept_offer) so the treasury's revenue is independently observable
-// on-chain without requiring indexer inference.
+// Thin constructors so the contract layer emits admin-rotation events through a
+// single, named entry point (Issue #202) instead of building event structs
+// inline at each call site.
 
-/// Emitted once per settlement with the exact protocol-fee amount transferred
-/// to the treasury.  Carries enough context to identify the originating trade
-/// and reconcile treasury balances in real time.
+/// Emit `admin_transfer_proposed` for a newly-created rotation proposal.
+pub fn emit_admin_proposed(
+    env: &Env,
+    current_admin: Address,
+    proposed_admin: Address,
+    expires_at: u64,
+) {
+    AdminTransferProposedEvent {
+        current_admin,
+        proposed_admin,
+        expires_at,
+    }
+    .publish(env);
+}
+
+/// Emit `admin_transferred` once a proposal is accepted and authority moves.
+pub fn emit_admin_accepted(env: &Env, old_admin: Address, new_admin: Address) {
+    AdminTransferredEvent {
+        old_admin,
+        new_admin,
+    }
+    .publish(env);
+}
+
+/// Emit `admin_proposal_cancelled` when the current admin clears a pending
+/// proposal before acceptance/expiry.
+pub fn emit_admin_proposal_cancelled(
+    env: &Env,
+    current_admin: Address,
+    cancelled_candidate: Address,
+) {
+    AdminProposalCancelledEvent {
+        current_admin,
+        cancelled_candidate,
+    }
+    .publish(env);
+}
+
+// ── Per-collection fee events (Issue #322) ────────────────────────────────────
+
+pub const COLLECTION_FEE_SET: &str = "collection_fee_set";
+pub const COLLECTION_FEE_CLEARED: &str = "collection_fee_cleared";
+
+/// Emitted when an admin sets a per-collection protocol fee override.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CollectionFeeSetEvent {
+    pub collection: Address,
+    /// New override value in basis points (0–10 000).
+    pub bps: u32,
+}
+
+impl CollectionFeeSetEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, COLLECTION_FEE_SET),), self);
+    }
+}
+
+/// Emitted when an admin clears a per-collection protocol fee override,
+/// restoring global-fee fallback behaviour for that collection.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CollectionFeeClearedEvent {
+    pub collection: Address,
+}
+
+impl CollectionFeeClearedEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, COLLECTION_FEE_CLEARED),), self);
+    }
+}
+
+/// Emit `collection_fee_set` for a newly-configured collection-level override.
+pub fn emit_collection_fee_set(env: &Env, collection: Address, bps: u32) {
+    CollectionFeeSetEvent { collection, bps }.publish(env);
+}
+
+/// Emit `collection_fee_cleared` when the admin removes a collection-level
+/// override so the collection falls back to the global protocol fee.
+pub fn emit_collection_fee_cleared(env: &Env, collection: Address) {
+    CollectionFeeClearedEvent { collection }.publish(env);
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProtocolFeeCollectedEvent {
-    /// ID of the listing (for buy_artwork / accept_offer) or auction
-    /// (for finalize_auction) that generated the fee.
     pub listing_id: u64,
-    /// Raw token amount transferred to the treasury.  Zero when no treasury is
-    /// configured or when the computed fee rounds down to zero.
     pub amount: i128,
-    /// The payment token from which the fee was deducted.
     pub token: Address,
-    /// The treasury address that received the fee.
     pub treasury: Address,
 }
-
 impl ProtocolFeeCollectedEvent {
     #[allow(deprecated)]
     pub fn publish(self, env: &Env) {
-        env.events().publish((PROTOCOL_FEE_COLLECTED,), self);
+        env.events().publish((soroban_sdk::Symbol::new(env, PROTOCOL_FEE_COLLECTED),), self);
     }
 }
-
-// End of events
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -378,10 +579,165 @@ pub struct OfferReclaimedEvent {
     pub offerer: Address,
     pub amount: i128,
 }
-
 impl OfferReclaimedEvent {
     #[allow(deprecated)]
     pub fn publish(self, env: &Env) {
-        env.events().publish((OFFER_RECLAIMED,), self);
+        env.events().publish((soroban_sdk::Symbol::new(env, OFFER_RECLAIMED),), self);
     }
+}
+
+// ── Blocked-bidder Events (Issue #199) ────────────────────────────────────────
+
+/// Emitted when the auction creator or admin adds an address to the auction's
+/// blocked-bidder registry.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuctionBidderBlockedEvent {
+    pub auction_id: u64,
+    pub bidder: Address,
+}
+impl AuctionBidderBlockedEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events().publish((soroban_sdk::Symbol::new(env, AUCTION_BIDDER_BLOCKED),), self);
+    }
+}
+
+/// Emitted when a previously-blocked address is removed from the auction's
+/// blocked-bidder registry.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuctionBidderUnblockedEvent {
+    pub auction_id: u64,
+    pub bidder: Address,
+}
+impl AuctionBidderUnblockedEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events().publish((soroban_sdk::Symbol::new(env, AUCTION_BIDDER_UNBLOCKED),), self);
+    }
+}
+
+/// Emit `auction_bidder_blocked` for a newly-registered blocked address.
+pub fn emit_bidder_blocked(env: &Env, auction_id: u64, bidder: Address) {
+    AuctionBidderBlockedEvent { auction_id, bidder }.publish(env);
+}
+
+/// Emit `auction_bidder_unblocked` once an address is removed from the registry.
+pub fn emit_bidder_unblocked(env: &Env, auction_id: u64, bidder: Address) {
+    AuctionBidderUnblockedEvent { auction_id, bidder }.publish(env);
+}
+
+// ── NFT Escrow Events ─────────────────────────────────────────────────────────
+
+/// Emitted when an NFT is pulled into marketplace custody on create_listing /
+/// create_auction.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NftEscrowedEvent {
+    /// The listing_id or auction_id for which the token is held.
+    pub id: u64,
+    pub collection: Address,
+    pub token_id: u64,
+    pub seller: Address,
+    pub ledger_sequence: u32,
+}
+impl NftEscrowedEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events().publish((NFT_ESCROWED,), self);
+    }
+}
+
+/// Emitted when an escrowed NFT is released — to a buyer/winner on settlement,
+/// or back to the seller/creator on cancellation / expiry / no-bid finalize.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NftReleasedEvent {
+    /// The listing_id or auction_id that was holding the token.
+    pub id: u64,
+    pub collection: Address,
+    pub token_id: u64,
+    pub recipient: Address,
+    pub ledger_sequence: u32,
+}
+impl NftReleasedEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events().publish((NFT_RELEASED,), self);
+    }
+}
+
+// ── Granular pause events (Issue #205) ───────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CollectionPausedEvent {
+    pub collection: Address,
+}
+impl CollectionPausedEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, COLLECTION_PAUSED),), self);
+    }
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CollectionUnpausedEvent {
+    pub collection: Address,
+}
+impl CollectionUnpausedEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, COLLECTION_UNPAUSED),), self);
+    }
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FunctionPausedEvent {
+    pub function_name: soroban_sdk::Symbol,
+}
+impl FunctionPausedEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, FUNCTION_PAUSED),), self);
+    }
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FunctionUnpausedEvent {
+    pub function_name: soroban_sdk::Symbol,
+}
+impl FunctionUnpausedEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, FUNCTION_UNPAUSED),), self);
+    }
+}
+
+/// Emit collection_paused event.
+pub fn emit_collection_paused(env: &Env, collection: Address) {
+    CollectionPausedEvent { collection }.publish(env);
+}
+
+/// Emit collection_unpaused event.
+pub fn emit_collection_unpaused(env: &Env, collection: Address) {
+    CollectionUnpausedEvent { collection }.publish(env);
+}
+
+/// Emit function_paused event.
+pub fn emit_function_paused(env: &Env, function_name: soroban_sdk::Symbol) {
+    FunctionPausedEvent { function_name }.publish(env);
+}
+
+/// Emit function_unpaused event.
+pub fn emit_function_unpaused(env: &Env, function_name: soroban_sdk::Symbol) {
+    FunctionUnpausedEvent { function_name }.publish(env);
 }

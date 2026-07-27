@@ -28,9 +28,8 @@ const mockRedis = vi.hoisted(() => ({
 }));
 
 vi.mock('../db', () => ({ default: mockPrisma }));
-// The route module resolves this same instance as `redis` inside
-// src/realtime/index.ts, so the hub also runs in degraded mode here — no
-// live Redis is required for these HTTP-level tests.
+// routes.ts → poller.ts → prisma-write
+vi.mock('../prisma-write', () => ({ default: mockPrisma }));
 vi.mock('../redis.js', () => ({ default: mockRedis }));
 
 import router, { emitSSEEvent, _getSseBuffer, _getSseEventCounter, _resetSseState } from '../api/routes';

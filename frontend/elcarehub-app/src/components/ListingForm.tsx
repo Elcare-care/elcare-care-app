@@ -7,15 +7,16 @@
 import { useState, useEffect, useMemo } from "react";
 import { useCreateListing, useUpdateListing } from "@/hooks/useMarketplace";
 import { useWalletContext } from "@/context/WalletContext";
-import { Upload, CheckCircle, Loader2, Save, Plus, Trash2 } from "lucide-react";
+import { Upload, CheckCircle, Loader2, Save, Plus, Trash2, ShieldCheck, ShieldAlert } from "lucide-react";
 import { GuardButton } from "./WalletGuard";
 import { ArtworkMetadata, fetchMetadata } from "@/lib/ipfs";
-import { Listing, stroopsToXlm } from "@/lib/contract";
+import { Listing, stroopsToXlm, checkAndApproveMarketplace, isApprovedForAll } from "@/lib/contract";
 import { DEFAULT_TOKEN } from "@/config/tokens";
 import { useSupportedTokens } from "@/hooks/useSupportedTokens";
 import { ensureTokenOption, getDefaultSupportedToken } from "@/lib/token-support";
 import posthog from "posthog-js";
 import { isValidStellarAddress } from "@/lib/validation";
+import { config } from "@/lib/config";
 
 export const ART_CATEGORIES = [
   "Painting",
@@ -43,6 +44,7 @@ export interface RecipientInput {
 }
 
 interface FormState {
+  metadataCid: string;
   collectionAddress: string;
   nftTokenId: number;
   price: number;
@@ -51,6 +53,7 @@ interface FormState {
 }
 
 interface FieldErrors {
+  metadataCid?: string;
   collectionAddress?: string;
   nftTokenId?: string;
   price?: string;
@@ -73,6 +76,12 @@ interface ListingFormProps {
  */
 export function validateListingForm(form: FormState): FieldErrors {
   const errors: FieldErrors = {};
+
+  // Metadata CID — must be a valid IPFS CIDv0 or CIDv1
+  const cidError = validateIpfsCid(form.metadataCid);
+  if (cidError) {
+    errors.metadataCid = cidError;
+  }
 
   // Collection address — must be a non-empty, valid Stellar address
   if (!form.collectionAddress.trim()) {
@@ -140,6 +149,7 @@ export function validateListingForm(form: FormState): FieldErrors {
 
 export function isFormValid(errors: FieldErrors): boolean {
   const hasTopLevelError =
+    errors.metadataCid !== undefined ||
     errors.collectionAddress !== undefined ||
     errors.nftTokenId !== undefined ||
     errors.price !== undefined ||
@@ -166,6 +176,7 @@ export function ListingForm({ listing, onSuccess, onCancel }: ListingFormProps) 
     useUpdateListing(publicKey);
 
   const [form, setForm] = useState<FormState>({
+    metadataCid: "",
     collectionAddress: "",
     nftTokenId: 0,
     price: 10,
@@ -177,6 +188,16 @@ export function ListingForm({ listing, onSuccess, onCancel }: ListingFormProps) 
   const [successId, setSuccessId] = useState<number | null>(null);
   const [currentMetadata, setCurrentMetadata] = useState<ArtworkMetadata | null>(null);
   const [isFetchingMetadata, setIsFetchingMetadata] = useState(false);
+
+  // ── Marketplace approval state ────────────────────────────────────────
+  // Before listing, the marketplace must have operator approval on the
+  // selected collection so it can call transfer_from on behalf of the seller.
+
+  /** `null` = not yet checked, `true` = approved, `false` = not approved */
+  const [approvalStatus, setApprovalStatus] = useState<boolean | null>(null);
+  const [isCheckingApproval, setIsCheckingApproval] = useState(false);
+  const [isApprovingMarketplace, setIsApprovingMarketplace] = useState(false);
+  const [approvalError, setApprovalError] = useState<string | null>(null);
 
   const tokenOptions = listing
     ? ensureTokenOption(availableTokens, form.tokenAddress)
@@ -204,6 +225,7 @@ export function ListingForm({ listing, onSuccess, onCancel }: ListingFormProps) 
                 }))
               : [{ address: listing.artist, percentage: 100 }];
           setForm({
+            metadataCid: listing.metadata_cid ?? "",
             collectionAddress: listing.collection,
             nftTokenId: Number(listing.token_id),
             price: parseFloat(stroopsToXlm(listing.price)),
@@ -235,6 +257,59 @@ export function ListingForm({ listing, onSuccess, onCancel }: ListingFormProps) 
       }));
     }
   }, [form.tokenAddress, isEdit, tokenOptions]);
+
+  // ── Approval pre-check (create mode only) ────────────────────────────
+  // Re-run whenever the collection address or the connected wallet changes.
+  useEffect(() => {
+    if (isEdit || !publicKey || !isValidStellarAddress(form.collectionAddress.trim())) {
+      setApprovalStatus(null);
+      return;
+    }
+
+    let cancelled = false;
+    setIsCheckingApproval(true);
+    setApprovalStatus(null);
+    setApprovalError(null);
+
+    isApprovedForAll(form.collectionAddress.trim(), publicKey, config.contractId)
+      .then((approved) => {
+        if (!cancelled) setApprovalStatus(approved);
+      })
+      .catch(() => {
+        if (!cancelled) setApprovalStatus(false);
+      })
+      .finally(() => {
+        if (!cancelled) setIsCheckingApproval(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [form.collectionAddress, publicKey, isEdit]);
+
+  // ── Approve marketplace handler ───────────────────────────────────────
+  const handleApproveMarketplace = async () => {
+    if (!publicKey || !isValidStellarAddress(form.collectionAddress.trim())) return;
+    setIsApprovingMarketplace(true);
+    setApprovalError(null);
+    try {
+      await checkAndApproveMarketplace(
+        publicKey,
+        form.collectionAddress.trim(),
+        config.contractId
+      );
+      setApprovalStatus(true);
+      posthog.capture("Marketplace Approved", {
+        collection: form.collectionAddress.trim(),
+      });
+    } catch (err) {
+      setApprovalError(
+        err instanceof Error ? err.message : "Approval transaction failed."
+      );
+    } finally {
+      setIsApprovingMarketplace(false);
+    }
+  };
 
   // ── Field helpers ─────────────────────────────────────────
 
@@ -282,6 +357,10 @@ export function ListingForm({ listing, onSuccess, onCancel }: ListingFormProps) 
 
     if (!isFormValid(errors)) return;
 
+    // In create mode the marketplace must have operator approval before we
+    // can create a listing (it needs to call transfer_from at escrow time).
+    if (!isEdit && approvalStatus === false) return;
+
     if (isEdit && listing && currentMetadata) {
       const success = await update({
         listingId: listing.listing_id,
@@ -318,6 +397,8 @@ export function ListingForm({ listing, onSuccess, onCancel }: ListingFormProps) 
   };
 
   const isLoading = isCreating || isUpdating || isFetchingMetadata;
+  /** True when any async operation is in flight (including approval). */
+  const isAnyLoading = isLoading || isCheckingApproval || isApprovingMarketplace;
   const progress = isEdit ? updateProgress : createProgress;
   const error = isEdit ? updateError : createError;
 
@@ -345,6 +426,7 @@ export function ListingForm({ listing, onSuccess, onCancel }: ListingFormProps) 
                 setSubmitAttempted(false);
                 setTouched(new Set());
                 setForm({
+                  metadataCid: "",
                   collectionAddress: "",
                   nftTokenId: 0,
                   price: 10,
@@ -389,6 +471,36 @@ export function ListingForm({ listing, onSuccess, onCancel }: ListingFormProps) 
         <form onSubmit={handleSubmit} noValidate className="space-y-8">
           <div className="grid gap-6 sm:grid-cols-2">
 
+            {/* Metadata CID */}
+            <div className="sm:col-span-2 space-y-2">
+              <label className="block text-sm font-bold text-gray-950 uppercase tracking-wider font-inter">
+                Artwork Metadata CID *
+              </label>
+              <input
+                value={form.metadataCid}
+                onChange={(e) => setForm({ ...form, metadataCid: e.target.value })}
+                onBlur={() => markTouched("metadataCid")}
+                aria-invalid={shouldShowError("metadataCid") && !!errors.metadataCid}
+                aria-describedby={errors.metadataCid ? "err-metadata-cid" : undefined}
+                className={`w-full rounded-2xl border px-5 py-4 text-base font-mono focus:outline-none transition-all shadow-sm ${
+                  shouldShowError("metadataCid") && errors.metadataCid
+                    ? "border-red-400 bg-red-50/40 focus:border-red-500"
+                    : "border-gray-200 bg-gray-50/50 focus:border-brand-500 focus:bg-white"
+                }`}
+                placeholder="bafybeig… or Qm…"
+              />
+              {shouldShowError("metadataCid") && errors.metadataCid ? (
+                <p id="err-metadata-cid" className="text-sm text-red-600 mt-1" role="alert">
+                  {errors.metadataCid}
+                </p>
+              ) : (
+                <p className="text-xs text-gray-400 font-inter">
+                  CIDv1 starts with <code className="font-mono">b</code> (46–100 chars) or
+                  CIDv0 starts with <code className="font-mono">Qm</code> (46 chars).
+                </p>
+              )}
+            </div>
+
             {/* Collection Address */}
             <div className="sm:col-span-2 space-y-2">
               <label className="block text-sm font-bold text-gray-950 uppercase tracking-wider font-inter">
@@ -413,6 +525,62 @@ export function ListingForm({ listing, onSuccess, onCancel }: ListingFormProps) 
                 </p>
               )}
             </div>
+
+            {/* ── Marketplace Approval Step (create mode only) ── */}
+            {!isEdit && isValidStellarAddress(form.collectionAddress.trim()) && (
+              <div className="sm:col-span-2">
+                {isCheckingApproval ? (
+                  <div className="flex items-center gap-2 rounded-2xl bg-gray-50 border border-gray-200 px-5 py-3 text-sm text-gray-500 font-inter">
+                    <Loader2 size={15} className="animate-spin shrink-0" />
+                    Checking marketplace approval…
+                  </div>
+                ) : approvalStatus === true ? (
+                  <div
+                    role="status"
+                    className="flex items-center gap-2 rounded-2xl bg-green-50 border border-green-200 px-5 py-3 text-sm font-semibold text-green-700 font-inter"
+                  >
+                    <ShieldCheck size={16} className="shrink-0" />
+                    Marketplace is approved to transfer tokens from this collection.
+                  </div>
+                ) : approvalStatus === false ? (
+                  <div className="rounded-2xl border border-amber-200 bg-amber-50 px-5 py-4 space-y-3">
+                    <div className="flex items-start gap-2 text-sm text-amber-800 font-inter">
+                      <ShieldAlert size={16} className="shrink-0 mt-0.5" />
+                      <span>
+                        <strong className="font-bold">One-time approval required.</strong>{" "}
+                        Before listing, you need to allow the marketplace to transfer NFTs
+                        from this collection on your behalf. This is a single wallet
+                        transaction — you won&apos;t need to do it again for this collection.
+                      </span>
+                    </div>
+                    {approvalError && (
+                      <p className="text-xs text-red-600 font-inter" role="alert">
+                        {approvalError}
+                      </p>
+                    )}
+                    <GuardButton
+                      type="button"
+                      onClick={handleApproveMarketplace}
+                      disabled={isApprovingMarketplace}
+                      actionName="to approve the marketplace"
+                      className="flex items-center gap-2 rounded-xl bg-amber-600 px-5 py-2.5 text-sm font-bold text-white hover:bg-amber-700 disabled:opacity-50 transition-all"
+                    >
+                      {isApprovingMarketplace ? (
+                        <>
+                          <Loader2 size={14} className="animate-spin" />
+                          Approving…
+                        </>
+                      ) : (
+                        <>
+                          <ShieldCheck size={14} />
+                          Approve Marketplace
+                        </>
+                      )}
+                    </GuardButton>
+                  </div>
+                ) : null}
+              </div>
+            )}
 
             {/* NFT Token ID */}
             <div className="sm:col-span-2 space-y-2">
@@ -656,7 +824,7 @@ export function ListingForm({ listing, onSuccess, onCancel }: ListingFormProps) 
               <button
                 type="button"
                 onClick={onCancel}
-                disabled={isLoading}
+                disabled={isAnyLoading}
                 className="flex-1 rounded-2xl border border-gray-200 py-4 text-lg font-semibold text-gray-600 hover:bg-gray-50 transition-all disabled:opacity-50"
               >
                 Cancel
@@ -664,14 +832,19 @@ export function ListingForm({ listing, onSuccess, onCancel }: ListingFormProps) 
             )}
             <GuardButton
               type="submit"
-              disabled={isLoading || !hasTokenOptions || (submitAttempted && !formIsValid)}
+              disabled={
+                isAnyLoading ||
+                !hasTokenOptions ||
+                (submitAttempted && !formIsValid) ||
+                (!isEdit && approvalStatus === false)
+              }
               actionName={isEdit ? "to update your listing" : "to list your artwork"}
               className="flex-[2] flex items-center justify-center gap-3 rounded-2xl bg-brand-500 py-5 text-xl font-bold text-white shadow-2xl shadow-brand-500/30 hover:bg-brand-600 hover:scale-[1.01] transition-all active:scale-[0.98] disabled:opacity-50 disabled:hover:scale-100"
             >
-              {isLoading ? (
+              {isAnyLoading ? (
                 <>
                   <Loader2 size={24} className="animate-spin" />
-                  {progress || "Processing…"}
+                  {progress || (isCheckingApproval ? "Checking approval…" : isApprovingMarketplace ? "Approving…" : "Processing…")}
                 </>
               ) : (
                 <>

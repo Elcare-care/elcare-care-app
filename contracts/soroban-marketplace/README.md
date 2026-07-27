@@ -462,3 +462,13 @@ stellar contract invoke \
   --network testnet \
   -- pause
 ```
+
+---
+
+## Architecture & Debugging Guides
+
+For building WASM, running unit tests, and debugging contract errors, refer to:
+- 🏗️ **[Local Architecture](../../docs/guides/local-architecture.md)**
+- 🦀 **[Contract Testing Guide](../../docs/guides/contract-testing.md)**
+- 🚀 **[Deployment Guide](../../docs/guides/deployment.md)**
+- 🛡️ **[Security Triage Guide](../../docs/guides/security-triage.md)**

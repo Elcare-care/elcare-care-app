@@ -1,5 +1,7 @@
 import { rpc, Contract, TransactionBuilder, BASE_FEE, nativeToScVal, scValToNative } from '@stellar/stellar-sdk';
-import prisma from './db.js';
+// Write-path client: poller / parser writes use the dedicated 3-connection pool
+// so burst writes never starve the API read pool (db.ts, connection_limit=10).
+import prisma from './prisma-write.js';
 import { emitSSEEvent } from './api/routes.js';
 import dotenv from 'dotenv';
 import {
@@ -9,23 +11,116 @@ import {
   gapsCreatedTotal,
   openGapsGauge,
   openGapLedgersTotalGauge,
+  duplicateEventsCounter,
+  listingsCreatedTotal,
+  salesTotalCounter,
+  auctionFinalizationsTotal,
+  offersMadeTotal,
+  offersAcceptedTotal,
+  activeListingsGauge,
+  activeAuctionsGauge,
+  syncLagLedgersGauge,
+  eventProcessingDurationHistogram,
 } from './metrics.js';
-import { recordProgress } from './stall.js';
+import {
+  recordProgress,
+  recordDbWrite,
+  recordRpcFailure,
+  registerPollerLifecycle,
+  startWatchdog,
+} from './stall.js';
 import { collectMarketplaceEvents, MAX_LEDGER_WINDOW } from './event-sync.js';
-import { withRetry } from './retry.js';
+import { withRpcRetry } from './retry.js';
 import { logger } from './logger.js';
-import redis from './redis.js';
-import { loadConfig } from './config.js';
+import redis, { invalidatePattern, invalidateKey } from './redis.js';
+import { loadConfig, parseTrackedContracts } from './config.js';
+import { enqueueIpfsFetch } from './ipfs-cache.js';
+import { promoteConfirmedEvents, rollbackReorg } from './reorg.js';
 
 dotenv.config();
 
-const RPC_URL = process.env.STELLAR_RPC_URL || 'https://soroban-testnet.stellar.org';
-const CONTRACT_ID = process.env.MARKETPLACE_CONTRACT_ID || '';
-const LAUNCHPAD_CONTRACT_ID = process.env.LAUNCHPAD_CONTRACT_ID || '';
+// ── Re-org SSE event types ────────────────────────────────────────────────────
+
+/**
+ * Emitted on a normal (shallow) re-org that was successfully rolled back.
+ * Frontends should show a brief notification and trigger a data refresh.
+ */
+export interface ReorgEvent {
+  type: 'REORG';
+  from_ledger: number;
+  to_ledger: number;
+  timestamp: string;
+  depth: number;
+}
+
+/**
+ * Emitted when a re-org depth exceeds MAX_ROLLBACK_DEPTH.
+ * The poller halts; a human operator must call POST /admin/reorg-recovery
+ * to trigger manual recovery.
+ */
+export interface CriticalReorgEvent {
+  type: 'CRITICAL_REORG';
+  from_ledger: number;
+  to_ledger: number;
+  timestamp: string;
+  depth: number;
+  message: string;
+}
+
+// ── Poller halt state ─────────────────────────────────────────────────────────
+
+let _pollerHalted = false;
+let _haltReason: string | null = null;
+
+/** Returns true when the poller has been halted due to a critical re-org. */
+export function isPollerHalted(): boolean {
+  return _pollerHalted;
+}
+
+/** Returns the halt reason, or null if not halted. */
+export function getHaltReason(): string | null {
+  return _haltReason;
+}
+
+/**
+ * Resumes the poller after a critical re-org.  Called by the admin recovery
+ * endpoint (POST /admin/reorg-recovery) once an operator has verified the
+ * chain state and performed any necessary manual rollback.
+ */
+export function resumePoller(): void {
+  _pollerHalted = false;
+  _haltReason = null;
+  logger.info('poller: resumed by operator after critical re-org');
+}
+
+function emitReorgEvent(fromLedger: number, toLedger: number, depth: number): void {
+  const event: ReorgEvent = {
+    type: 'REORG',
+    from_ledger: fromLedger,
+    to_ledger: toLedger,
+    timestamp: new Date().toISOString(),
+    depth,
+  };
+  emitSSEEvent(event);
+}
+
+function emitCriticalReorgEvent(fromLedger: number, toLedger: number, depth: number): void {
+  const msg = `Re-org depth ${depth} exceeds MAX_ROLLBACK_DEPTH — poller halted. ` +
+    `Call POST /admin/reorg-recovery to resume after manual verification.`;
+  const event: CriticalReorgEvent = {
+    type: 'CRITICAL_REORG',
+    from_ledger: fromLedger,
+    to_ledger: toLedger,
+    timestamp: new Date().toISOString(),
+    depth,
+    message: msg,
+  };
+  emitSSEEvent(event);
+}
 
 export const MAX_REORG_DEPTH = 100;
 
-// ── LedgerGap persistence ─────────────────────────────────────────────────────
+const RPC_URL = process.env.STELLAR_RPC_URL || 'https://soroban-testnet.stellar.org';
 
 export type LedgerGapSource = 'rpc_window_skip' | 'reorg' | 'manual';
 
@@ -90,8 +185,27 @@ export function registerShutdownHook(fn: () => Promise<void>): void {
   shutdownHooks.push(fn);
 }
 
+/**
+ * Signal the polling loop(s) to stop after completing their current batch.
+ * Safe to call multiple times — subsequent calls are no-ops.
+ */
+export function stopPoller(): void {
+  if (!shuttingDown) {
+    shuttingDown = true;
+    logger.info('poller: stop requested — will exit after current batch');
+  }
+}
+
+/**
+ * Reset the shutdown flag so startPolling() can be called again after a
+ * watchdog-triggered restart.  Called internally by startPolling().
+ */
+function resetPollerShutdownFlag(): void {
+  shuttingDown = false;
+  shutdownStarted = false;
+}
 function getContractIds(): string[] {
-  return [CONTRACT_ID, LAUNCHPAD_CONTRACT_ID].filter(Boolean);
+  return parseTrackedContracts().map((c) => c.id).filter(Boolean);
 }
 
 function updateSyncMetrics(processedLedger: number, networkLatestLedger: number) {
@@ -119,6 +233,8 @@ export async function gracefulShutdown(): Promise<void> {
   if (shutdownStarted) return;
   shutdownStarted = true;
 
+  const shutdownTimeoutMs = parseInt(process.env.SHUTDOWN_TIMEOUT_MS || '30000', 10);
+
   console.log('[Shutdown] Closing resources: Prisma + Redis + registered hooks');
   const cleanup = Promise.allSettled([
     prisma.$disconnect(),
@@ -129,7 +245,7 @@ export async function gracefulShutdown(): Promise<void> {
   try {
     await Promise.race([
       cleanup,
-      new Promise((_, rej) => setTimeout(() => rej(new Error('shutdown timeout')), 10_000)),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('shutdown timeout')), shutdownTimeoutMs)),
     ]);
     logger.info('Shutdown: cleanup complete');
     process.exit(0);
@@ -178,6 +294,9 @@ export async function revertLedgers(safeAtLedger: number): Promise<void> {
       where: { id: 1 },
       data: { lastLedger: safeAtLedger, lastLedgerHash: null },
     });
+
+    // Issue #286: also rollback offer and bid state inside the transaction
+    await rollbackReorg(safeAtLedger, tx);
   });
   logger.info('Reorg: rollback complete', { resumeFromLedger: safeAtLedger + 1 });
 }
@@ -222,7 +341,9 @@ export async function findReorgSafePoint(
 
 export async function validateHashContinuity(
   syncState: { lastLedger: number; lastLedgerHash: string | null },
-  rpcServer: rpc.Server
+  rpcServer: rpc.Server,
+  maxRollbackDepth = 100,
+  reorgHaltOnDeep = true
 ): Promise<boolean> {
   // No stored hash (initial sync or prior hash fetch failure) — cannot detect re-org.
   if (syncState.lastLedger > 0 && syncState.lastLedgerHash) {
@@ -234,9 +355,33 @@ export async function validateHashContinuity(
       if (ledgersRes.ledgers && ledgersRes.ledgers.length > 0) {
         const networkLedger = ledgersRes.ledgers[0];
         if (networkLedger.hash !== syncState.lastLedgerHash) {
-          console.warn(`Chain re-org detected at ledger ${syncState.lastLedger}! DB hash: ${syncState.lastLedgerHash}, Network hash: ${networkLedger.hash}`);
+          logger.warn('Chain re-org detected', {
+            ledger: syncState.lastLedger,
+            dbHash: syncState.lastLedgerHash,
+            networkHash: networkLedger.hash,
+          });
+
           const safeLedger = await findReorgSafePoint(syncState.lastLedger, rpcServer);
+          const rollbackDepth = syncState.lastLedger - safeLedger;
+
+          // Guard: deep re-orgs halt the poller instead of executing a destructive rollback.
+          if (reorgHaltOnDeep && rollbackDepth > maxRollbackDepth) {
+            _pollerHalted = true;
+            _haltReason =
+              `Re-org depth ${rollbackDepth} exceeds MAX_ROLLBACK_DEPTH (${maxRollbackDepth}). ` +
+              `Manual operator recovery required via POST /admin/reorg-recovery.`;
+            logger.error('CRITICAL: Re-org depth exceeds MAX_ROLLBACK_DEPTH — halting poller', {
+              rollbackDepth,
+              maxRollbackDepth,
+              fromLedger: syncState.lastLedger,
+              toLedger: safeLedger,
+            });
+            emitCriticalReorgEvent(syncState.lastLedger, safeLedger, rollbackDepth);
+            return false;
+          }
+
           await revertLedgers(safeLedger);
+          emitReorgEvent(syncState.lastLedger, safeLedger, rollbackDepth);
           return false;
         }
       }
@@ -247,158 +392,411 @@ export async function validateHashContinuity(
   return true;
 }
 
-export async function startPolling() {
-  const config = loadConfig(); // Validates at startup; throws on invalid env values
-  const contractIds = getContractIds();
-  if (contractIds.length === 0) {
-    throw new Error('At least one of MARKETPLACE_CONTRACT_ID or LAUNCHPAD_CONTRACT_ID must be set');
+/**
+ * Seed TrackedContract rows from TRACKED_CONTRACTS (or legacy env vars) into
+ * the database. Uses upsert on contractId so re-runs are idempotent.
+ * Returns the full list of active contracts from the DB after seeding.
+ */
+export async function seedTrackedContracts() {
+  const fromEnv = parseTrackedContracts();
+  for (const c of fromEnv) {
+    await prisma.trackedContract.upsert({
+      where: { contractId: c.id },
+      create: {
+        contractId: c.id,
+        type: c.type,
+        label: c.label,
+        startLedger: c.startLedger,
+        lastLedger: c.startLedger,
+        active: true,
+      },
+      // Only update label/type — don't reset lastLedger for existing contracts
+      update: { label: c.label, type: c.type, active: true },
+    });
+  }
+  return prisma.trackedContract.findMany({ where: { active: true } });
+}
+
+/**
+ * Poll a single tracked contract indefinitely.
+ * Each contract maintains its own lastLedger / lastLedgerHash in TrackedContract.
+ *
+ * Checkpoint protocol (Issue #285):
+ *   1. openCheckpoint()  — record window in DB as "fetched" (RPC data retrieved)
+ *   2. markApplying()    — record window as "applying" before opening DB transaction
+ *   3. commitCheckpoint() inside the domain transaction — atomically advances cursor
+ *      and marks "committed"; if the process crashes the checkpoint stays "applying"
+ *      and startup recovery replays the window idempotently.
+ */
+async function pollContract(
+  contractRow: { id: number; contractId: string; lastLedger: number; lastLedgerHash: string | null },
+  config: ReturnType<typeof loadConfig>
+): Promise<void> {
+  let localErrors = 0;
+
+  // ── Startup recovery: replay any incomplete checkpoints ───────────────────
+  const stale = await findIncompleteCheckpoints(contractRow.contractId);
+  for (const cp of stale) {
+    if (cp.status === 'applying') {
+      await resetApplyingCheckpoint(cp);
+    }
+    logger.info('pollContract: replaying incomplete checkpoint on startup', {
+      contractId: contractRow.contractId,
+      checkpointId: cp.id,
+      windowStart: cp.windowStart,
+      windowEnd: cp.windowEnd,
+      status: cp.status,
+    });
   }
 
-  console.log(`Starting indexer poller for contract(s): ${contractIds.join(', ')} (pollIntervalMs=${config.pollIntervalMs}, maxLedgersPerCycle=${config.maxLedgersPerCycle})`);
-
   while (!shuttingDown) {
+    // If the poller has been halted due to a critical re-org, pause and wait for
+    // an operator to call POST /admin/reorg-recovery to clear the halt flag.
+    if (_pollerHalted) {
+      logger.warn('pollContract: poller halted due to critical re-org — waiting for operator recovery', {
+        contractId: contractRow.contractId,
+        reason: _haltReason,
+      });
+      await new Promise((resolve) => setTimeout(resolve, 10_000));
+      continue;
+    }
+
     try {
-      // 1. Get last indexed ledger — upsert avoids a unique-constraint violation
-      //    when two instances start simultaneously (race between findUnique + create).
-      let syncState = await prisma.syncState.upsert({
-        where: { id: 1 },
-        create: { id: 1, lastLedger: 0, lastLedgerHash: null },
-        update: {},
+      const contract = await prisma.trackedContract.findUnique({
+        where: { id: contractRow.id },
       });
 
-      // 2. Validate hash continuity on every poll
-      const isContinuous = await validateHashContinuity(syncState, server);
-      if (!isContinuous) {
-        continue; // Restart the loop immediately with the reverted state
+      if (!contract || !contract.active) {
+        logger.info('pollContract: contract deactivated, stopping loop', {
+          contractId: contractRow.contractId,
+        });
+        return;
       }
 
-      // 3. Resolve start ledger, clamping to the safe RPC window on every poll
-      let networkLatestLedger: number;
-      networkLatestLedger = await withRetry(
+      // Hash continuity check for this contract
+      if (contract.lastLedger > 0 && contract.lastLedgerHash) {
+        try {
+          const ledgersRes = await server.getLedgers({
+            startLedger: contract.lastLedger,
+            pagination: { limit: 1 },
+          });
+          if (ledgersRes.ledgers && ledgersRes.ledgers.length > 0) {
+            const networkHash = ledgersRes.ledgers[0].hash;
+            if (networkHash !== contract.lastLedgerHash) {
+              logger.warn('pollContract: reorg detected', {
+                contractId: contract.contractId,
+                ledger: contract.lastLedger,
+              });
+              const safeLedger = await findReorgSafePoint(contract.lastLedger, server);
+              const rollbackDepth = contract.lastLedger - safeLedger;
+
+              // Guard: deep re-orgs halt the poller.
+              if (config.reorgHaltOnDeep && rollbackDepth > config.maxRollbackDepth) {
+                _pollerHalted = true;
+                _haltReason =
+                  `Re-org depth ${rollbackDepth} exceeds MAX_ROLLBACK_DEPTH (${config.maxRollbackDepth}). ` +
+                  `Manual operator recovery required via POST /admin/reorg-recovery.`;
+                logger.error('CRITICAL: Re-org depth exceeds MAX_ROLLBACK_DEPTH — halting poller', {
+                  contractId: contract.contractId,
+                  rollbackDepth,
+                  maxRollbackDepth: config.maxRollbackDepth,
+                  fromLedger: contract.lastLedger,
+                  toLedger: safeLedger,
+                });
+                emitCriticalReorgEvent(contract.lastLedger, safeLedger, rollbackDepth);
+                continue; // loop back, where _pollerHalted will block
+              }
+
+              await revertLedgers(safeLedger);
+              await prisma.trackedContract.update({
+                where: { id: contract.id },
+                data: { lastLedger: safeLedger, lastLedgerHash: null },
+              });
+              emitReorgEvent(contract.lastLedger, safeLedger, rollbackDepth);
+              continue;
+            }
+          }
+        } catch (err) {
+          logger.error('pollContract: hash check failed', {
+            contractId: contract.contractId,
+            err: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+
+      const networkLatestLedger: number = await withRpcRetry(
         () => server.getLatestLedger().then((r) => r.sequence),
         { operation: 'getLatestLedger', maxAttempts: 5, baseDelayMs: 1_000 }
       );
+      // Successful RPC response — the consecutive-failure counter is reset by
+      // recordProgress() on every successful ledger advance.  We do NOT reset
+      // it here explicitly so that a run of empty batches (no new events) does
+      // not mask a lingering RPC instability signal.
 
       networkLatestLedgerGauge.set(networkLatestLedger);
 
-      if (syncState.lastLedger > 0 && networkLatestLedger < syncState.lastLedger) {
-        logger.warn('Network latest ledger moved behind indexed state', {
-          indexedLedger: syncState.lastLedger,
-          networkLatestLedger,
-        });
-        // Persist the gap caused by the reorg before reverting
-        await persistLedgerGap(networkLatestLedger + 1, syncState.lastLedger, 'reorg');
+      if (contract.lastLedger > 0 && networkLatestLedger < contract.lastLedger) {
+        await persistLedgerGap(networkLatestLedger + 1, contract.lastLedger, 'reorg');
         await revertLedgers(networkLatestLedger);
+        await prisma.trackedContract.update({
+          where: { id: contract.id },
+          data: { lastLedger: networkLatestLedger, lastLedgerHash: null },
+        });
         continue;
       }
 
       const windowFloor = networkLatestLedger - MAX_LEDGER_WINDOW;
-      let startLedger = syncState.lastLedger + 1;
-      let skippedRange: { from: number; to: number } | null = null;
+      let startLedger = contract.lastLedger + 1;
+
       if (startLedger < windowFloor) {
-        skippedRange = { from: startLedger, to: windowFloor - 1 };
-        logger.warn('Skipping ledger gap outside the live RPC window', {
-          skippedRange,
+        const skippedRange = { from: startLedger, to: windowFloor - 1 };
+        logger.warn('pollContract: skipping ledger gap outside RPC window', {
+          contractId: contract.contractId,
+          ...skippedRange,
           windowFloor,
-          networkLatest: networkLatestLedger,
         });
-        startLedger = windowFloor;
-        // Persist the reset so future polls don't re-request the stale range.
-        const resetState = await prisma.syncState.update({
-          where: { id: 1 },
+        await persistLedgerGap(skippedRange.from, skippedRange.to, 'rpc_window_skip');
+        await prisma.trackedContract.update({
+          where: { id: contract.id },
           data: { lastLedger: windowFloor - 1, lastLedgerHash: null },
         });
-
-        syncState = resetState;
-
-        // Persist gap so the repair worker can back-fill the skipped range.
-        await persistLedgerGap(skippedRange.from, skippedRange.to, 'rpc_window_skip');
-      }
-      // Cap how many ledgers we process per cycle to bound catch-up batch size.
-      const batchEndLedger = Math.min(networkLatestLedger, startLedger + config.maxLedgersPerCycle - 1);
-      const decodedEvents = await collectMarketplaceEvents(server, contractIds, startLedger, batchEndLedger);
-
-      let latestHash: string | null = null;
-      if (decodedEvents.length > 0) {
-        const maxLedger = Math.max(...decodedEvents.map((event) => event.ledgerSequence));
-        try {
-          const ledgersRes = await server.getLedgers({
-            startLedger: maxLedger,
-            pagination: { limit: 1 },
-          });
-          if (ledgersRes.ledgers && ledgersRes.ledgers.length > 0) {
-            latestHash = ledgersRes.ledgers[0].hash;
-          }
-        } catch (err) {
-          logger.error('Failed to fetch hash for ledger', { ledger: maxLedger, err });
-        }
-
-        const { updatedState, newEvents } = await prisma.$transaction(async (tx) => {
-          const toInsert = await applyDecodedEvents(decodedEvents, tx);
-          const updated = await tx.syncState.update({
-            where: { id: 1 },
-            data: buildSyncStateLedgerData(maxLedger, latestHash),
-          });
-
-          return { updatedState: updated, newEvents: toInsert };
-        });
-
-        updateSyncMetrics(updatedState.lastLedger, networkLatestLedger);
-        recordProgress();
-
-        for (const ev of newEvents) emitSSEEvent(ev);
-      } else if (batchEndLedger > syncState.lastLedger) {
-        try {
-          const ledgersRes = await server.getLedgers({
-            startLedger: batchEndLedger,
-            pagination: { limit: 1 },
-          });
-          if (ledgersRes.ledgers && ledgersRes.ledgers.length > 0) {
-            latestHash = ledgersRes.ledgers[0].hash;
-          }
-        } catch (err) {
-          console.error(`Failed to fetch hash for ledger ${batchEndLedger}:`, err);
-        }
-
-        const updatedState = await prisma.syncState.update({
-          where: { id: 1 },
-          data: buildSyncStateLedgerData(batchEndLedger, latestHash),
-        });
-
-        updateSyncMetrics(updatedState.lastLedger, networkLatestLedger);
-        recordProgress();
-      } else {
-        updateSyncMetrics(syncState.lastLedger, networkLatestLedger);
+        startLedger = windowFloor;
       }
 
-      consecutiveErrors = 0;
-    } catch (error) {
-      consecutiveErrors += 1;
-      const backoff = Math.min(
-        BASE_BACKOFF_MS * Math.pow(2, consecutiveErrors - 1),
-        MAX_BACKOFF_MS
+      const batchEndLedger = Math.min(
+        networkLatestLedger,
+        startLedger + config.maxLedgersPerCycle - 1
       );
-      logger.error('Error in polling loop', {
-        consecutiveErrors,
+
+      // ── Step 1: Fetch events from RPC ─────────────────────────────────────
+      const decodedEvents = await collectMarketplaceEvents(
+        server,
+        [contract.contractId],
+        startLedger,
+        batchEndLedger
+      );
+
+      // ── Step 2: Determine the window end and its hash ─────────────────────
+      const advanceTo =
+        decodedEvents.length > 0
+          ? Math.max(...decodedEvents.map((e) => e.ledgerSequence))
+          : batchEndLedger > contract.lastLedger
+          ? batchEndLedger
+          : null;
+
+      if (advanceTo !== null) {
+        let latestHash: string | null = null;
+        try {
+          const ledgersRes = await server.getLedgers({
+            startLedger: advanceTo,
+            pagination: { limit: 1 },
+          });
+          if (ledgersRes.ledgers && ledgersRes.ledgers.length > 0) {
+            latestHash = ledgersRes.ledgers[0].hash;
+          }
+        } catch (err) {
+          logger.error('pollContract: failed to fetch ledger hash', {
+            contractId: contract.contractId,
+            ledger: advanceTo,
+            err,
+          });
+        }
+
+        // ── Step 3: Open checkpoint (fetched) ─────────────────────────────
+        const checkpoint = await openCheckpoint(
+          contract.contractId,
+          startLedger,
+          advanceTo,
+        );
+
+        // ── Step 4: Mark applying before opening the DB transaction ───────
+        await markApplying(checkpoint);
+
+        // ── Step 5: Commit domain writes + cursor in ONE transaction ───────
+        let newEvents: any[] = [];
+        try {
+          newEvents = await prisma.$transaction(async (tx) => {
+            const inserted = decodedEvents.length > 0
+              ? await applyDecodedEvents(decodedEvents, tx)
+              : [];
+
+            // Atomically advance cursor + mark checkpoint committed.
+            await commitCheckpoint(
+              checkpoint,
+              inserted.length,
+              latestHash,
+              contract.id,
+              tx,
+            );
+
+            return inserted;
+          });
+          recordDbWrite();
+          for (const ev of newEvents) emitSSEEvent(ev);
+        }
+
+        const syncData = buildSyncStateLedgerData(advanceTo, latestHash);
+        await prisma.trackedContract.update({
+          where: { id: contract.id },
+          data: {
+            lastLedger: syncData.lastLedger,
+            ...(syncData.lastLedgerHash ? { lastLedgerHash: syncData.lastLedgerHash } : {}),
+          },
+        });
+        recordDbWrite();
+
+        latestLedgerProcessedGauge.set(advanceTo);
+        syncLatencyGauge.set(Math.max(0, networkLatestLedger - advanceTo));
+        recordProgress();
+
+        // Issue #286: promote events that are now CONFIRMATION_DEPTH ledgers old.
+        // Non-fatal — confirmation promotion failures must never crash the poller.
+        promoteConfirmedEvents(networkLatestLedger, config.confirmationDepth).catch((err) => {
+          logger.error('pollContract: failed to promote confirmed events', {
+            contractId: contract.contractId,
+            err: err instanceof Error ? err.message : String(err),
+          });
+        });
+      } else {
+        latestLedgerProcessedGauge.set(contract.lastLedger);
+        syncLatencyGauge.set(Math.max(0, networkLatestLedger - contract.lastLedger));
+      }
+
+      localErrors = 0;
+    } catch (error) {
+      localErrors += 1;
+      recordRpcFailure();
+      const backoff = Math.min(BASE_BACKOFF_MS * Math.pow(2, localErrors - 1), MAX_BACKOFF_MS);
+      logger.error('pollContract: error in loop', {
+        contractId: contractRow.contractId,
+        localErrors,
         backoffMs: backoff,
         err: error instanceof Error ? error.message : String(error),
-        stack: error instanceof Error ? error.stack : undefined,
       });
       await new Promise((resolve) => setTimeout(resolve, backoff));
       continue;
     }
 
-    consecutiveErrors = 0;
+    localErrors = 0;
     await new Promise((resolve) => setTimeout(resolve, config.pollIntervalMs));
   }
+}
+
+export async function startPolling() {
+  const config = loadConfig();
+
+  // Reset shutdown state so this function is safe to call again after a
+  // watchdog-triggered stopPoller() + startPolling() restart cycle.
+  resetPollerShutdownFlag();
+
+  const activeContracts = await seedTrackedContracts();
+  if (activeContracts.length === 0) {
+    throw new Error('No active tracked contracts found. Set TRACKED_CONTRACTS or MARKETPLACE_CONTRACT_ID.');
+  }
+
+  logger.info('startPolling: launching per-contract pollers', {
+    contracts: activeContracts.map((c) => ({
+      contractId: c.contractId,
+      label: c.label,
+      type: c.type,
+    })),
+    pollIntervalMs: config.pollIntervalMs,
+    maxLedgersPerCycle: config.maxLedgersPerCycle,
+  });
+
+  // Register lifecycle hooks so the stall watchdog can restart the poller.
+  // Uses a lazy-import pattern to avoid a circular dep (startPolling ← stall ← routes ← poller).
+  registerPollerLifecycle({
+    stopPoller,
+    startPoller: startPolling,
+  });
+
+  // Start the watchdog after registering lifecycle so it can act on FATAL stalls.
+  startWatchdog();
+
+  // Run one loop per contract concurrently; propagate first fatal failure
+  await Promise.all(
+    activeContracts.map((contract) =>
+      pollContract(
+        {
+          id: contract.id,
+          contractId: contract.contractId,
+          lastLedger: contract.lastLedger,
+          lastLedgerHash: contract.lastLedgerHash,
+        },
+        config
+      )
+    )
+  );
 
   if (shuttingDown) {
     await gracefulShutdown();
   }
 }
 
+
 async function fetchListingFromChain(_listingId: bigint): Promise<any | null> {
   return null;
+}
+
+/**
+ * Attempt to read already-fetched IPFS metadata for `cid` from the
+ * IpfsMetadata cache and write the human-readable fields (title, description,
+ * artistName) back onto the Listing row so the PostgreSQL tsvector trigger
+ * keeps the search index current.
+ *
+ * This runs fire-and-forget in the background immediately after a
+ * LISTING_CREATED event is processed.  If the IPFS metadata has not been
+ * fetched yet (cold start / first-ever listing for this CID) the function
+ * exits silently; the IpfsQueue worker will call this path again once the
+ * metadata lands.
+ *
+ * The function is idempotent — re-running it when the fields are already
+ * populated is a no-op thanks to the conditional check.
+ */
+export async function backfillListingMetadata(listingId: bigint, cid: string): Promise<void> {
+  if (!cid) return;
+
+  const metadata = await prisma.ipfsMetadata.findUnique({ where: { cid } });
+  if (!metadata) return; // not yet cached — queue worker will handle it
+
+  // Only update if at least one metadata field is present
+  const title       = typeof metadata.title       === 'string' ? metadata.title       : null;
+  const description = typeof metadata.description === 'string' ? metadata.description : null;
+  // artistName is not stored directly in IpfsMetadata; it may appear under
+  // common IPFS metadata keys like "artist", "creator", or "by".
+  const raw = metadata.raw as Record<string, unknown> | null;
+  const artistName: string | null =
+    (typeof raw?.artist  === 'string' ? raw.artist  : null) ??
+    (typeof raw?.creator === 'string' ? raw.creator : null) ??
+    (typeof raw?.by      === 'string' ? raw.by      : null) ??
+    null;
+
+  if (!title && !description && !artistName) return; // nothing to update
+
+  await prisma.listing.updateMany({
+    where: {
+      listingId,
+      // Only overwrite nulls — avoid clobbering manually-set values.
+      OR: [
+        { title:       null },
+        { description: null },
+        { artistName:  null },
+      ],
+    },
+    data: {
+      ...(title       !== null ? { title }       : {}),
+      ...(description !== null ? { description } : {}),
+      ...(artistName  !== null ? { artistName }  : {}),
+    },
+  });
+
+  logger.debug('[backfillListingMetadata] Updated listing search fields', {
+    listingId: listingId.toString(),
+    cid,
+    title,
+    artistName,
+  });
 }
 
 async function fetchAuctionFromChain(_auctionId: bigint): Promise<any | null> {
@@ -408,62 +806,36 @@ async function fetchAuctionFromChain(_auctionId: bigint): Promise<any | null> {
 export async function applyDecodedEvents(decodedEvents: any[], tx: any) {
   if (decodedEvents.length === 0) return [];
 
-  const toInsert: any[] = [];
+  // Use the idempotent batch writer — DB-level unique constraints ensure that
+  // concurrent workers or replayed windows cannot create duplicate rows.
+  // Any duplicate is counted as a benign replay (not an error).
+  const { newEvents } = await upsertEvents(decodedEvents, tx);
 
-  for (const event of decodedEvents) {
-    const eventHash: string = event.eventHash ?? '';
-
-    // Upsert on eventHash — the unique identity of this on-chain event.
-    // On conflict (duplicate) the update is a no-op; we detect it by checking
-    // whether the row's id changed (Prisma returns the upserted row).
-    const existing = eventHash
-      ? await tx.marketplaceEvent.findUnique({ where: { eventHash }, select: { id: true } })
-      : null;
-
-    if (existing) {
-      duplicateEventsCounter.inc();
-      logger.debug('[Dedup] Skipping duplicate event', {
-        eventHash,
-        eventType: event.eventType,
-        ledger: event.ledgerSequence,
-      });
-      continue;
-    }
-
-    await tx.marketplaceEvent.create({
-      data: {
-        listingId: event.listingId ?? null,
-        eventType: event.eventType,
-        actor: event.actor,
-        data: event.data,
-        ledgerSequence: event.ledgerSequence,
-        eventHash,
-      },
-    });
-
-    toInsert.push(event);
+  for (const event of newEvents) {
     await processEvent(event, tx, true);
   }
 
-  return toInsert;
+  return newEvents;
 }
 
 export async function processEvent(event: any, tx?: any, skipInsert = false) {
   const { eventType, listingId, actor, ledgerSequence, data } = event;
-
   const db = tx ?? prisma;
 
+  // ── Measure per-event-type processing time ────────────────────────────────
+  const eventStart = process.hrtime();
+  const recordEventDuration = () => {
+    const [s, ns] = process.hrtime(eventStart);
+    eventProcessingDurationHistogram.labels(eventType).observe(s + ns / 1e9);
+  };
+
   if (!skipInsert) {
-    await db.marketplaceEvent.create({
-      data: {
-        listingId,
-        eventType,
-        actor,
-        ledgerSequence,
-        data,
-        eventHash: event.eventHash ?? '',
-      },
-    });
+    const { skipped } = await (upsertEvents as any)([event], db);
+    if (skipped > 0) {
+      // This is a duplicate — all domain state is already correct from the prior write.
+      // Return early rather than double-applying business logic.
+      return;
+    }
   }
 
   // Handle deploy events (no listingId — collection deployments)
@@ -492,60 +864,97 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
           deployedAtLedger: ledgerSequence,
         },
       });
+      // Invalidate collections cache
+      invalidatePattern('cache:*/collections*').catch(() => {});
     }
+    recordEventDuration();
     return;
   }
 
-  // Update Listing state based on event type
-  if (!listingId) return;
+  // Update Listing/Collection state based on event type.
+  // Collection fee events carry no listingId — route them first, then guard
+  // the rest of the switch which requires a listingId.
+  if (eventType === 'COLLECTION_FEE_SET' || eventType === 'COLLECTION_FEE_CLEARED') {
+    const collectionAddr: string = data.collection?.toString() ?? '';
+    if (collectionAddr) {
+      if (eventType === 'COLLECTION_FEE_SET') {
+        const bps: number = Number(data.bps ?? 0);
+        await db.collection.updateMany({
+          where: { contractAddress: collectionAddr },
+          data: { feeBpsOverride: bps },
+        });
+      } else {
+        await db.collection.updateMany({
+          where: { contractAddress: collectionAddr },
+          data: { feeBpsOverride: null },
+        });
+      }
+      invalidatePattern('cache:*/collections*').catch(() => {});
+      invalidateKey(`cache:/collections/${collectionAddr}`).catch(() => {});
+    }
+    recordEventDuration();
+    if (!tx) emitSSEEvent(event);
+    return;
+  }
+
+  if (!listingId) { recordEventDuration(); return; }
 
   switch (eventType) {
     case 'LISTING_CREATED': {
       let chainListing = await fetchListingFromChain(listingId);
-      if (chainListing && !chainListing.artist) {
-        chainListing = null;
-      }
-      
-      const artist = chainListing ? chainListing.artist.toString() : data.artist;
-      const price = chainListing ? chainListing.price.toString() : data.price;
-      const currency = chainListing ? chainListing.currency.toString() : data.currency;
-      const collection = chainListing ? chainListing.collection.toString() : data.collection;
-      const nftTokenId = chainListing ? BigInt(chainListing.token_id) : BigInt(data.token_id);
-      const token = chainListing ? chainListing.token.toString() : (data.token || '');
-      
-      const recipients = chainListing 
-        ? chainListing.recipients.map((r: any) => ({
-            address: r.address.toString(),
-            percentage: Number(r.percentage)
-          }))
+      if (chainListing && !chainListing.artist) chainListing = null;
+
+      const artist     = chainListing ? chainListing.artist.toString()      : data.artist;
+      const price      = chainListing ? chainListing.price.toString()       : data.price;
+      const currency   = chainListing ? chainListing.currency.toString()    : data.currency;
+      const collection = chainListing ? chainListing.collection.toString()  : data.collection;
+      const nftTokenId = chainListing ? BigInt(chainListing.token_id)       : BigInt(data.token_id);
+      const token      = chainListing ? chainListing.token.toString()       : (data.token || '');
+      const recipients = chainListing
+        ? chainListing.recipients.map((r: any) => ({ address: r.address.toString(), percentage: Number(r.percentage) }))
         : [];
 
       await db.listing.upsert({
         where: { listingId },
         create: {
-          listingId,
-          artist,
-          owner: null,
-          price,
-          currency,
-          collection,
-          nftTokenId,
-          token,
-          status: 'Active' as const,
-          recipients,
-          createdAtLedger: ledgerSequence,
-          updatedAtLedger: ledgerSequence,
+          listingId, artist, owner: null, price, currency, collection,
+          nftTokenId, token, status: 'Active' as const, recipients,
+          createdAtLedger: ledgerSequence, updatedAtLedger: ledgerSequence,
         },
         update: {
-          artist,
-          price,
-          collection,
-          nftTokenId,
-          status: 'Active' as const,
-          recipients,
-          updatedAtLedger: ledgerSequence,
-        }
+          artist, price, collection, nftTokenId,
+          status: 'Active' as const, recipients, updatedAtLedger: ledgerSequence,
+        },
       });
+
+      // ── Metrics & cache invalidation ──────────────────────────────────────
+      listingsCreatedTotal.labels(collection ?? 'unknown').inc();
+      invalidatePattern('cache:*/listings*').catch(() => {});
+      invalidateKey(`cache:/listings/${listingId.toString()}`).catch(() => {});
+      // Refresh active-listing gauge asynchronously (best-effort)
+      prisma.listing.count({ where: { status: 'Active' } })
+        .then((n) => activeListingsGauge.set(n)).catch(() => {});
+
+      if (token) {
+        // Enqueue background IPFS fetch for the artwork CID.  When it
+        // completes, backfillListingMetadata() will update the Listing row's
+        // title/description/artistName columns so that full-text search picks
+        // them up on the next tsvector trigger update.
+        enqueueIpfsFetch(token).catch((err) => {
+          logger.warn('[processEvent] Failed to enqueue IPFS fetch', {
+            listingId: listingId?.toString(), token, err: err instanceof Error ? err.message : String(err),
+          });
+        });
+
+        // Attempt an immediate metadata population in the background so that
+        // listings indexed on a cold start get their search fields filled
+        // without waiting for the queue worker's next cycle.
+        backfillListingMetadata(listingId, token).catch((err) => {
+          logger.debug('[processEvent] Background metadata backfill failed (will retry via queue)', {
+            listingId: listingId?.toString(), token, err: err instanceof Error ? err.message : String(err),
+          });
+        });
+      }
       break;
     }
 
@@ -560,95 +969,137 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
         },
       });
       if (count === 0) logger.warn('LISTING_UPDATED: listing not found', { listingId: listingId?.toString(), ledger: ledgerSequence });
+      invalidatePattern('cache:*/listings*').catch(() => {});
+      invalidateKey(`cache:/listings/${listingId.toString()}`).catch(() => {});
+      break;
+    }
+
+    case 'LISTING_PRICE_UPDATED': {
+      // Persist a price-history row so the indexer maintains a full audit trail
+      // of every price change for this listing (Issue #213).
+      await db.priceHistory.create({
+        data: {
+          listingId,
+          oldPrice: String(data.old_price ?? '0'),
+          newPrice: String(data.new_price ?? '0'),
+          changedBy: String(data.updated_by ?? actor ?? ''),
+          changedAtLedger: ledgerSequence,
+        },
+      });
+      // Also keep the live Listing.price in sync when changed via update_listing_price
+      await db.listing.updateMany({
+        where: { listingId },
+        data: { price: String(data.new_price ?? '0'), updatedAtLedger: ledgerSequence },
+      });
+      invalidatePattern('cache:*/listings*').catch(() => {});
+      invalidateKey(`cache:/listings/${listingId.toString()}`).catch(() => {});
+      invalidateKey(`cache:/listings/${listingId.toString()}/price-history`).catch(() => {});
+      break;
+    }
+
+    case 'LISTING_EXPIRED': {
+      invalidatePattern('cache:*/listings*').catch(() => {});
+      invalidateKey(`cache:/listings/${listingId.toString()}`).catch(() => {});
       break;
     }
 
     case 'ARTWORK_SOLD': {
       const { count } = await db.listing.updateMany({
         where: { listingId },
-        data: {
-          status: 'Sold' as const,
-          owner: data.buyer,
-          updatedAtLedger: ledgerSequence,
-        },
+        data: { status: 'Sold' as const, owner: data.buyer, updatedAtLedger: ledgerSequence },
       });
       if (count === 0) logger.error('ARTWORK_SOLD: listing not found — sale not recorded', { listingId: listingId?.toString(), ledger: ledgerSequence });
+
+      // ── Metrics & cache invalidation ──────────────────────────────────────
+      salesTotalCounter.labels(data.token ?? 'unknown').inc();
+      invalidatePattern('cache:*/listings*').catch(() => {});
+      invalidateKey(`cache:/listings/${listingId.toString()}`).catch(() => {});
+      prisma.listing.count({ where: { status: 'Active' } })
+        .then((n) => activeListingsGauge.set(n)).catch(() => {});
+      break;
+    }
+
+    case 'ROYALTY_PAID': {
+      // Royalty audit trail (Issue #201): one RoyaltyPayment row per
+      // breakdown entry, written in a single atomic createMany. Field values
+      // arrive as strings via convertBigInts.
+      const isListing = data.listing_id !== undefined && data.listing_id !== null;
+      const isAuction = data.auction_id !== undefined && data.auction_id !== null;
+      const entries: Array<{ address: string; amount: string }> = Array.isArray(data.recipients)
+        ? data.recipients
+        : [];
+      if (entries.length > 0) {
+        await db.royaltyPayment.createMany({
+          data: entries.map((r) => ({
+            listingId: isListing ? BigInt(data.listing_id) : null,
+            auctionId: isAuction ? BigInt(data.auction_id) : null,
+            recipient: String(r.address),
+            amount: String(r.amount),
+            salePrice: String(data.sale_price),
+            ledgerSequence,
+          })),
+        });
+      }
+      for (const r of entries) {
+        invalidatePattern(`cache:*/wallets/${r.address}/royalty-breakdown*`).catch(() => {});
+      }
       break;
     }
 
     case 'LISTING_CANCELLED': {
       const { count } = await db.listing.updateMany({
         where: { listingId },
-        data: {
-          status: 'Cancelled' as const,
-          updatedAtLedger: ledgerSequence,
-        },
+        data: { status: 'Cancelled' as const, updatedAtLedger: ledgerSequence },
       });
       if (count === 0) logger.warn('LISTING_CANCELLED: listing not found', { listingId: listingId?.toString(), ledger: ledgerSequence });
+      invalidatePattern('cache:*/listings*').catch(() => {});
+      invalidateKey(`cache:/listings/${listingId.toString()}`).catch(() => {});
+      prisma.listing.count({ where: { status: 'Active' } })
+        .then((n) => activeListingsGauge.set(n)).catch(() => {});
       break;
     }
-    
+
     case 'AUCTION_CREATED': {
       let chainAuction = await fetchAuctionFromChain(listingId);
-      if (chainAuction && !chainAuction.creator) {
-        chainAuction = null;
-      }
-      
-      const creator = chainAuction ? chainAuction.creator.toString() : data.creator;
-      const reservePrice = chainAuction ? chainAuction.reserve_price.toString() : (data.reserve_price || '0');
-      const token = chainAuction ? chainAuction.token.toString() : (data.token || '');
-      const endTime = chainAuction ? BigInt(chainAuction.end_time) : BigInt(data.end_time || 0);
-      const collection = chainAuction ? chainAuction.collection.toString() : data.collection;
-      const nftTokenId = chainAuction ? BigInt(chainAuction.token_id) : BigInt(data.token_id || 0);
-      const recipients = chainAuction 
-        ? chainAuction.recipients.map((r: any) => ({
-            address: r.address.toString(),
-            percentage: Number(r.percentage)
-          }))
+      if (chainAuction && !chainAuction.creator) chainAuction = null;
+
+      const creator      = chainAuction ? chainAuction.creator.toString()         : data.creator;
+      const reservePrice = chainAuction ? chainAuction.reserve_price.toString()   : (data.reserve_price || '0');
+      const token        = chainAuction ? chainAuction.token.toString()           : (data.token || '');
+      const endTime      = chainAuction ? BigInt(chainAuction.end_time)           : BigInt(data.end_time || 0);
+      const collection   = chainAuction ? chainAuction.collection.toString()      : data.collection;
+      const nftTokenId   = chainAuction ? BigInt(chainAuction.token_id)           : BigInt(data.token_id || 0);
+      const recipients   = chainAuction
+        ? chainAuction.recipients.map((r: any) => ({ address: r.address.toString(), percentage: Number(r.percentage) }))
         : [];
 
       await db.auction.upsert({
         where: { auctionId: listingId },
         create: {
-          auctionId: listingId,
-          creator,
-          collection,
-          nftTokenId,
-          token,
-          reservePrice,
-          highestBid: '0',
-          highestBidder: null,
-          endTime,
-          status: 'Active' as const,
-          recipients,
-          createdAtLedger: ledgerSequence,
-          updatedAtLedger: ledgerSequence,
+          auctionId: listingId, creator, collection, nftTokenId, token, reservePrice,
+          highestBid: '0', highestBidder: null, endTime, status: 'Active' as const,
+          recipients, createdAtLedger: ledgerSequence, updatedAtLedger: ledgerSequence,
         },
         update: {
-          creator,
-          collection,
-          nftTokenId,
-          token,
-          reservePrice,
-          endTime,
-          status: 'Active' as const,
-          recipients,
-          updatedAtLedger: ledgerSequence,
-        }
+          creator, collection, nftTokenId, token, reservePrice, endTime,
+          status: 'Active' as const, recipients, updatedAtLedger: ledgerSequence,
+        },
       });
+
+      invalidatePattern('cache:*/auctions*').catch(() => {});
+      prisma.auction.count({ where: { status: 'Active' } })
+        .then((n) => activeAuctionsGauge.set(n)).catch(() => {});
       break;
     }
 
     case 'BID_PLACED': {
       const { count } = await db.auction.updateMany({
         where: { auctionId: listingId },
-        data: {
-          highestBid: data.bid_amount,
-          highestBidder: data.bidder,
-          updatedAtLedger: ledgerSequence,
-        }
+        data: { highestBid: data.bid_amount, highestBidder: data.bidder, updatedAtLedger: ledgerSequence },
       });
       if (count === 0) logger.warn('BID_PLACED: auction not found', { auctionId: listingId?.toString(), ledger: ledgerSequence });
+      invalidatePattern('cache:*/auctions*').catch(() => {});
+      invalidateKey(`cache:/auctions/${listingId.toString()}`).catch(() => {});
       break;
     }
 
@@ -660,25 +1111,36 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
           highestBid: data.amount,
           highestBidder: data.winner || null,
           updatedAtLedger: ledgerSequence,
-        }
+        },
       });
       if (count === 0) logger.error('AUCTION_RESOLVED: auction not found — resolution not recorded', { auctionId: listingId?.toString(), ledger: ledgerSequence });
+
+      auctionFinalizationsTotal.inc();
+      invalidatePattern('cache:*/auctions*').catch(() => {});
+      invalidateKey(`cache:/auctions/${listingId.toString()}`).catch(() => {});
+      prisma.auction.count({ where: { status: 'Active' } })
+        .then((n) => activeAuctionsGauge.set(n)).catch(() => {});
       break;
     }
 
-    case 'AUCTION_CANCELLED': {
-      const { count } = await db.auction.updateMany({
-        where: { auctionId: listingId },
-        data: {
-          status: 'Cancelled' as const,
-          updatedAtLedger: ledgerSequence,
-        },
-      });
-      if (count === 0) logger.warn('AUCTION_CANCELLED: auction not found', { auctionId: listingId?.toString(), ledger: ledgerSequence });
+    case 'AUCTION_CANCELLED':
+    case 'AUCTION_EXTENDED': {
+      if (eventType === 'AUCTION_CANCELLED') {
+        const { count } = await db.auction.updateMany({
+          where: { auctionId: listingId },
+          data: { status: 'Cancelled' as const, updatedAtLedger: ledgerSequence },
+        });
+        if (count === 0) logger.warn('AUCTION_CANCELLED: auction not found', { auctionId: listingId?.toString(), ledger: ledgerSequence });
+        prisma.auction.count({ where: { status: 'Active' } })
+          .then((n) => activeAuctionsGauge.set(n)).catch(() => {});
+      }
+      invalidatePattern('cache:*/auctions*').catch(() => {});
+      invalidateKey(`cache:/auctions/${listingId.toString()}`).catch(() => {});
       break;
     }
 
     case 'OFFER_MADE': {
+      const offerExpiresAt = data.expires_at != null ? BigInt(data.expires_at) : null;
       await db.offer.upsert({
         where: { offerId: BigInt(data.offer_id) },
         create: {
@@ -688,6 +1150,7 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
           amount: data.amount,
           token: data.token,
           status: 'Pending' as const,
+          expiresAt: offerExpiresAt,
           createdAtLedger: ledgerSequence,
           updatedAtLedger: ledgerSequence,
         },
@@ -697,54 +1160,78 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
           amount: data.amount,
           token: data.token,
           status: 'Pending' as const,
+          expiresAt: offerExpiresAt,
           updatedAtLedger: ledgerSequence,
-        }
+        },
       });
+      offersMadeTotal.inc();
+      invalidatePattern(`cache:*/offers*listing=${data.listing_id}*`).catch(() => {});
       break;
     }
 
     case 'OFFER_ACCEPTED': {
       await db.offer.update({
         where: { offerId: BigInt(data.offer_id) },
-        data: {
-          status: 'Accepted' as const,
-          updatedAtLedger: ledgerSequence,
-        }
+        data: { status: 'Accepted' as const, updatedAtLedger: ledgerSequence },
       });
       const { count: listingCount } = await db.listing.updateMany({
         where: { listingId: BigInt(data.listing_id) },
-        data: {
-          status: 'Sold' as const,
-          owner: data.offerer,
-          updatedAtLedger: ledgerSequence,
-        }
+        data: { status: 'Sold' as const, owner: data.offerer, updatedAtLedger: ledgerSequence },
       });
-      if (listingCount === 0) logger.error('OFFER_ACCEPTED: listing not found — offer accepted but listing not updated', { listingId: data.listing_id?.toString(), offerId: data.offer_id?.toString(), ledger: ledgerSequence });
+      if (listingCount === 0) logger.error('OFFER_ACCEPTED: listing not found', { listingId: data.listing_id?.toString(), offerId: data.offer_id?.toString(), ledger: ledgerSequence });
+
+      offersAcceptedTotal.inc();
+      salesTotalCounter.labels(data.token ?? 'unknown').inc();
+      invalidatePattern(`cache:*/offers*listing=${data.listing_id}*`).catch(() => {});
+      invalidatePattern('cache:*/listings*').catch(() => {});
+      invalidateKey(`cache:/listings/${data.listing_id?.toString()}`).catch(() => {});
+      prisma.listing.count({ where: { status: 'Active' } })
+        .then((n) => activeListingsGauge.set(n)).catch(() => {});
       break;
     }
 
     case 'OFFER_REJECTED': {
       await db.offer.update({
         where: { offerId: BigInt(data.offer_id) },
-        data: {
-          status: 'Rejected' as const,
-          updatedAtLedger: ledgerSequence,
-        }
+        data: { status: 'Rejected' as const, updatedAtLedger: ledgerSequence },
       });
+      invalidatePattern(`cache:*/offers*listing=${data.listing_id}*`).catch(() => {});
       break;
     }
 
-    case 'OFFER_WITHDRAWN': {
+    case 'OFFER_WITHDRAWN':
+    case 'OFFER_RECLAIMED': {
       await db.offer.update({
+        where: { offerId: BigInt(data.offer_id) },
+        data: { status: 'Withdrawn' as const, updatedAtLedger: ledgerSequence },
+      });
+      invalidatePattern(`cache:*/offers*listing=${data.listing_id}*`).catch(() => {});
+      break;
+    }
+
+    // An expired offer reclaimed by (or on behalf of) its offerer: the contract
+    // refunds the escrow and moves the offer to its Withdrawn terminal state.
+    // Without this case an expired-then-reclaimed offer stays Pending in the DB
+    // forever, misleading artists into thinking it is still acceptable.  The
+    // refunded `amount` travels with the persisted MarketplaceEvent's data.
+    case 'OFFER_RECLAIMED': {
+      const { count } = await db.offer.updateMany({
         where: { offerId: BigInt(data.offer_id) },
         data: {
           status: 'Withdrawn' as const,
           updatedAtLedger: ledgerSequence,
         }
       });
+      if (count === 0) logger.warn('OFFER_RECLAIMED: offer not found', { offerId: data.offer_id?.toString(), ledger: ledgerSequence });
       break;
     }
   }
+
+  // ── Update sync lag gauge ─────────────────────────────────────────────────
+  // (best-effort, non-blocking)
+  syncLagLedgersGauge.set(Math.max(0, (networkLatestLedgerGauge as any)._getValue?.() ?? 0));
+
+  recordEventDuration();
 
   // Broadcast to any connected SSE clients after the DB write is complete.
   if (!tx) emitSSEEvent(event);

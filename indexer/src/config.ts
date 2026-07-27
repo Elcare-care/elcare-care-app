@@ -1,5 +1,25 @@
 import { z } from 'zod';
 
+// ── Version metadata ─────────────────────────────────────────────────────────
+// Sourced from versions.toml at build time.  Dockerfile and CI set these via
+// build args or environment variables.  Fallback values allow local dev without
+// the build args present.
+
+export const VERSION = {
+  /** Application version — matches indexer/package.json */
+  app: process.env.INDEXER_VERSION || process.env.npm_package_version || '0.0.0-dev',
+  /** OpenAPI / REST API version — must match openapi.json info.version */
+  api: process.env.API_VERSION || '1.0.0',
+  /** Event schema version — bump when contract event fields change */
+  eventSchema: process.env.EVENT_SCHEMA_VERSION || '1',
+  /** Latest Prisma migration prefix (YYYYMMDDNNNNNN) */
+  dbMigration: process.env.DB_MIGRATION_VERSION || '20260724000000',
+  /** Git commit SHA embedded at build time */
+  gitSha: process.env.BUILD_SHA || 'unknown',
+  /** ISO-8601 build timestamp */
+  buildTime: process.env.BUILD_TIME || 'unknown',
+} as const;
+
 // ── Generic helpers ──────────────────────────────────────────────────────────
 
 function parsePositiveInt(name: string, raw: string | undefined, defaultVal: number): number {
@@ -11,15 +31,99 @@ function parsePositiveInt(name: string, raw: string | undefined, defaultVal: num
   return n;
 }
 
+// ── TrackedContract definition ───────────────────────────────────────────────
+
+export interface TrackedContractConfig {
+  id: string;
+  type: 'marketplace' | 'launchpad';
+  label: string;
+  startLedger: number;
+}
+
+const trackedContractSchema = z.object({
+  id: z.string().min(1),
+  type: z.enum(['marketplace', 'launchpad']),
+  label: z.string().default(''),
+  startLedger: z.number().int().min(0).default(0),
+});
+
+/**
+ * Parses the TRACKED_CONTRACTS environment variable.
+ *
+ * TRACKED_CONTRACTS should be a JSON array:
+ *   [{"id":"C...","type":"marketplace","label":"mainnet","startLedger":1000000}]
+ *
+ * Falls back to the legacy single-contract MARKETPLACE_CONTRACT_ID /
+ * LAUNCHPAD_CONTRACT_ID variables so existing deployments keep working
+ * without any config changes.
+ */
+export function parseTrackedContracts(): TrackedContractConfig[] {
+  const raw = process.env.TRACKED_CONTRACTS;
+
+  if (raw && raw.trim() !== '') {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      throw new Error(
+        '[indexer] TRACKED_CONTRACTS is not valid JSON. ' +
+          'Expected a JSON array: [{"id":"C...","type":"marketplace","label":"...","startLedger":0}]'
+      );
+    }
+
+    if (!Array.isArray(parsed)) {
+      throw new Error('[indexer] TRACKED_CONTRACTS must be a JSON array.');
+    }
+
+    const contracts: TrackedContractConfig[] = [];
+    for (const [i, item] of parsed.entries()) {
+      const result = trackedContractSchema.safeParse(item);
+      if (!result.success) {
+        const msgs = result.error.errors.map((e) => `${e.path.join('.')}: ${e.message}`).join('; ');
+        throw new Error(`[indexer] TRACKED_CONTRACTS[${i}] is invalid: ${msgs}`);
+      }
+      contracts.push(result.data as TrackedContractConfig);
+    }
+
+    if (contracts.length === 0) {
+      throw new Error('[indexer] TRACKED_CONTRACTS must contain at least one entry.');
+    }
+
+    return contracts;
+  }
+
+  // ── Legacy fallback ────────────────────────────────────────────────────────
+  const contracts: TrackedContractConfig[] = [];
+  if (process.env.MARKETPLACE_CONTRACT_ID) {
+    contracts.push({
+      id: process.env.MARKETPLACE_CONTRACT_ID,
+      type: 'marketplace',
+      label: 'marketplace',
+      startLedger: 0,
+    });
+  }
+  if (process.env.LAUNCHPAD_CONTRACT_ID) {
+    contracts.push({
+      id: process.env.LAUNCHPAD_CONTRACT_ID,
+      type: 'launchpad',
+      label: 'launchpad',
+      startLedger: 0,
+    });
+  }
+  return contracts;
+}
+
 // ── Required env-var list (non-keeper) ──────────────────────────────────────
 
 const REQUIRED_ENV_VARS = [
   'DATABASE_URL',
-  'MARKETPLACE_CONTRACT_ID',
   'REDIS_URL',
   'STELLAR_RPC_URL',
   'STELLAR_NETWORK',
 ] as const;
+
+// At least one of TRACKED_CONTRACTS or MARKETPLACE_CONTRACT_ID must be set.
+const CONTRACT_ENV_VARS = ['TRACKED_CONTRACTS', 'MARKETPLACE_CONTRACT_ID'] as const;
 
 /**
  * Validates that all required environment variables are present.
@@ -29,6 +133,13 @@ const REQUIRED_ENV_VARS = [
  */
 export function validateRequiredEnv(): void {
   const missing = REQUIRED_ENV_VARS.filter((name) => !process.env[name]);
+
+  // Must have either TRACKED_CONTRACTS or legacy MARKETPLACE_CONTRACT_ID
+  const hasContractConfig = CONTRACT_ENV_VARS.some((name) => process.env[name]);
+  if (!hasContractConfig) {
+    missing.push('MARKETPLACE_CONTRACT_ID (or TRACKED_CONTRACTS)' as any);
+  }
+
   if (missing.length > 0) {
     throw new Error(
       `[indexer] Missing required environment variables: ${missing.join(', ')}.\n` +
@@ -38,9 +149,39 @@ export function validateRequiredEnv(): void {
 }
 
 export function loadConfig() {
+  // MAX_ROLLBACK_DEPTH: the maximum number of ledgers the poller will roll back
+  // automatically when a re-org is detected.  If a re-org requires rolling back
+  // MORE than this many ledgers the poller halts and emits a CRITICAL_REORG SSE
+  // event rather than executing a potentially destructive deep rollback.
+  const maxRollbackDepth = parsePositiveInt(
+    'MAX_ROLLBACK_DEPTH',
+    process.env.MAX_ROLLBACK_DEPTH,
+    100
+  );
+
+  // REORG_HALT_ON_DEEP: when true (default) the poller halts on deep re-orgs
+  // instead of attempting them.  Set to "false" to disable the safety guard
+  // (not recommended for production).
+  const reorgHaltOnDeep = process.env.REORG_HALT_ON_DEEP !== 'false';
+
   return {
     pollIntervalMs: parsePositiveInt('POLL_INTERVAL_MS', process.env.POLL_INTERVAL_MS, 5000),
     maxLedgersPerCycle: parsePositiveInt('MAX_LEDGERS_PER_CYCLE', process.env.MAX_LEDGERS_PER_CYCLE, 1000),
+    shutdownTimeoutMs: parsePositiveInt('SHUTDOWN_TIMEOUT_MS', process.env.SHUTDOWN_TIMEOUT_MS, 30_000),
+    /**
+     * Issue #286: Number of ledgers that must accumulate on top of a window
+     * before its events are considered "confirmed" (finalized enough).
+     *
+     * Stellar testnet/mainnet achieves practical finality within 1-2 ledgers,
+     * but a conservative default of 10 gives a safety margin without
+     * meaningfully delaying UI visibility.
+     *
+     * Set to 0 to mark all events confirmed immediately (useful for testnet
+     * environments with no reorg risk).
+     *
+     * Configurable via CONFIRMATION_DEPTH environment variable.
+     */
+    confirmationDepth: parseInt(process.env.CONFIRMATION_DEPTH || '10', 10),
   };
 }
 

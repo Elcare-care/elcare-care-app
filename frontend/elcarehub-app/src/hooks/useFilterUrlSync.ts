@@ -12,7 +12,7 @@
 
 import { useCallback, useRef } from "react";
 import { useRouter, useSearchParams, usePathname } from "next/navigation";
-import type { Filters } from "@/components/SearchFilter";
+import type { Filters } from "@/components/FilterSidebar";
 
 /** Return type for {@link useFilterUrlSync}. */
 export interface FilterUrlSync {
@@ -29,18 +29,9 @@ export interface FilterUrlSync {
 }
 
 /**
- * Reads initial `Filters` from URL search params (`q`, `status`,
- * `category`, `minPrice`, `maxPrice`, `sort`, `page`) and
- * provides a `syncToUrl` function to push filter changes back
+ * Reads initial `Filters` from URL search params
+ * and provides a `syncToUrl` function to push filter changes back
  * to the URL with shallow routing.
- *
- * @example
- * ```tsx
- * const { initialFilters, initialPage, syncToUrl } = useFilterUrlSync();
- * const [filters, setFilters] = useState<Filters>(initialFilters);
- *
- * useEffect(() => { syncToUrl(filters, page); }, [filters, page]);
- * ```
  */
 export function useFilterUrlSync(): FilterUrlSync {
   const router = useRouter();
@@ -53,9 +44,10 @@ export function useFilterUrlSync(): FilterUrlSync {
   const initialFilters = useRef<Filters>({
     search: searchParams.get("q") ?? "",
     status: (searchParams.get("status") as Filters["status"]) ?? "All",
-    category: searchParams.get("category") ?? "All",
+    collection: searchParams.getAll("collection") ?? [],
     minPrice: searchParams.get("minPrice") ?? "",
     maxPrice: searchParams.get("maxPrice") ?? "",
+    artist: searchParams.get("artist") ?? "",
     sort: (searchParams.get("sort") as Filters["sort"]) ?? "newest",
   }).current;
 
@@ -69,10 +61,12 @@ export function useFilterUrlSync(): FilterUrlSync {
 
       if (filters.search) params.set("q", filters.search);
       if (filters.status !== "All") params.set("status", filters.status);
-      if (filters.category !== "All")
-        params.set("category", filters.category);
+      if (filters.collection && filters.collection.length > 0) {
+        filters.collection.forEach((c) => params.append("collection", c));
+      }
       if (filters.minPrice) params.set("minPrice", filters.minPrice);
       if (filters.maxPrice) params.set("maxPrice", filters.maxPrice);
+      if (filters.artist) params.set("artist", filters.artist);
       if (filters.sort !== "newest") params.set("sort", filters.sort);
       if (page > 1) params.set("page", String(page));
 

@@ -2,11 +2,64 @@
 use crate::types::{Auction, BidRecord, Listing, Offer};
 use soroban_sdk::{contracttype, Address, Env, Vec};
 
+/// Identifies one of the growing id-collections kept by the marketplace.
+///
+/// Every index is stored as a sequence of fixed-capacity pages
+/// (`DataKey::IndexPage(id, page_no)`) plus a single length key
+/// (`DataKey::IndexLen(id)`), so no individual storage entry grows unboundedly
+/// with protocol usage.  Page count is derived from the length
+/// (`ceil(len / INDEX_PAGE_SIZE)`), so no separate page-count key is needed.
+#[contracttype]
+#[derive(Clone)]
+pub enum IndexId {
+    /// Global set of currently-active listing ids (supports swap-removal).
+    ActiveListings,
+    /// All listing ids ever created by an artist (append-only).
+    ArtistListings(Address),
+    /// All auction ids ever created by an artist (append-only).
+    ArtistAuctions(Address),
+    /// All offer ids ever made by an offerer (append-only).
+    OffererOffers(Address),
+    /// All offer ids ever made on a listing (append-only).
+    ListingOffers(u64),
+}
+
+/// A pending two-step admin rotation.
+///
+/// Stored under `DataKey::PendingAdmin` between `transfer_admin` (propose) and
+/// `accept_admin`.  `expires_at` is an absolute ledger timestamp (seconds); once
+/// `env.ledger().timestamp()` passes it, `accept_admin` reverts with
+/// `AdminProposalExpired` so a proposal can never leave governance half-locked
+/// forever.  The current admin can clear a live proposal early via
+/// `cancel_admin_proposal`.
+#[contracttype]
+#[derive(Clone)]
+pub struct PendingAdminProposal {
+    /// Address invited to become the new admin.
+    pub candidate: Address,
+    /// Absolute ledger timestamp after which the proposal can no longer be
+    /// accepted.
+    pub expires_at: u64,
+}
+
+/// Resumable progress marker for a versioned storage migration.
+#[contracttype]
+#[derive(Clone)]
+pub struct MigrationProgress {
+    /// Which migration phase is in progress (see `contract::migrate_step`).
+    pub phase: u32,
+    /// Position within the phase (last fully-processed item id/index).
+    pub cursor: u64,
+}
+
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
     ListingCount,
     Listing(u64),
+    /// LEGACY (pre-1.1.0): monolithic `Vec<u64>` per-artist listing index.
+    /// Superseded by `IndexPage(IndexId::ArtistListings(..), _)`; only read by
+    /// `migrate` and removed once migrated.
     ArtistListings(Address),
     Admin,
     TokenWhitelist,
@@ -14,57 +67,253 @@ pub enum DataKey {
     ProtocolFeeBps,
     AuctionCount,
     Auction(u64),
+    /// LEGACY (pre-1.1.0): monolithic per-artist auction index (see above).
     ArtistAuctions(Address),
     RevokedArtist(Address),
     OfferCount,
     Offer(u64),
+    /// LEGACY (pre-1.1.0): monolithic per-listing offer index (see above).
     ListingOffers(u64),
+    /// LEGACY (pre-1.1.0): monolithic per-offerer offer index (see above).
     OffererOffers(Address),
     ListingLock(u64),
     AuctionLock(u64),
     IsPaused,
+    /// Per-collection pause flag. When present, operations on this collection
+    /// are blocked regardless of the global pause state.
+    CollectionPaused(Address),
+    /// Per-function pause flag. Stored as a Symbol key; when present, the named
+    /// entry-point is blocked regardless of global or collection pause state.
+    FunctionPaused(soroban_sdk::Symbol),
     PendingAdmin,
+    /// LEGACY (pre-1.1.0): monolithic active-listings index (see above).
     ActiveListings,
     MinBidIncrement,
-    /// Global extension window in seconds (anti-sniping: how long to add).
     AuctionExtensionWindow,
-    /// Global extension trigger threshold in seconds (anti-sniping: fires when
-    /// `end_time - now < threshold` at bid time).
     AuctionExtensionTrigger,
-    /// Bounded bid history for a specific auction (capped to BID_HISTORY_CAP entries).
     AuctionBids(u64),
     MinPrice,
     MaxPrice,
     MigrationDone(soroban_sdk::String),
+    /// Global admin-configurable bid-history ring-buffer capacity.
+    /// Default: 50.  Valid range: 1 – 200.
+    /// Each new auction snapshots this value into `Auction::bid_history_cap`
+    /// so changes here never affect in-progress auctions.
+    BidHistoryCap,
+    /// Global cap on the number of times any single auction's end time may be
+    /// extended by anti-sniping logic.  0 = unlimited (legacy behaviour).
+    /// Each new auction snapshots this value into `Auction::max_extensions`.
+    AuctionMaxExtensions,
+    /// One fixed-capacity page (`Vec<u64>`, at most `INDEX_PAGE_SIZE` entries)
+    /// of the identified index.
+    IndexPage(IndexId, u32),
+    /// Total number of elements stored across all pages of the index.
+    IndexLen(IndexId),
+    /// Current position of an active listing inside the ActiveListings index,
+    /// enabling O(1) swap-removal.  Exists iff the listing is in the index.
+    ActiveListingPos(u64),
+    /// Bounded (≤ MAX_OFFERS_PER_LISTING) list of the listing's *Pending* offer
+    /// ids.  Its length is the pending-offer counter used by `make_offer` for
+    /// O(1) cap enforcement; entries are removed on every terminal transition.
+    ListingPendingOffers(u64),
+    /// Resume position for the batched `cancel_artist_listings` operation:
+    /// number of entries of the artist-listings index already processed.
+    ArtistCancelCursor(Address),
+    /// Resumable progress of the versioned `migrate`/`migrate_step` operation.
+    MigrationCursor(soroban_sdk::String),
+    /// Escrow record for a `(collection, token_id)` currently held in
+    /// marketplace custody.  Exists iff the token is escrowed for an active
+    /// listing or auction; a double-listing guard reads it and settlement /
+    /// cancellation clears it.
+    EscrowedToken(Address, u64),
+    /// Bounded (≤ MAX_BLOCKED_BIDDERS) list of addresses barred from bidding
+    /// on this auction (anti-shill-bidding registry, Issue #199).  Kept as a
+    /// separate per-auction key — not a field on `Auction` — so auctions that
+    /// never block anyone pay no extra storage.
+    AuctionBlockedBidders(u64),
+}
+
+/// Custody record for an NFT held by the marketplace, keyed by
+/// `DataKey::EscrowedToken(collection, token_id)`.  Written by `escrow_nft`
+/// and removed by `release_nft`.
+#[contracttype]
+#[derive(Clone)]
+pub struct EscrowRecord {
+    /// True if the token backs a fixed-price listing; false for an auction.
+    pub is_listing: bool,
+    /// The listing_id or auction_id the escrow is bound to.
+    pub id: u64,
 }
 
 pub const LEDGER_TTL_BUMP: u32 = 432_000;
 pub const LEDGER_TTL_THRESHOLD: u32 = 144_000;
 pub const REENTRANCY_LOCK_TTL: u32 = 100;
 
-// ── Centralized TTL helpers ──────────────────────────────────
-//
-// All persistent entries use the same LEDGER_TTL_THRESHOLD / LEDGER_TTL_BUMP
-// constants so there is a single place to tune the eviction window.
-// Callers should prefer `bump_entry_ttl` over open-coding extend_ttl so that
-// a future change to the constants is reflected automatically everywhere.
-
-/// Bump (extend) the TTL of any persistent DataKey to the standard window.
-/// No-op if the entry does not exist.
 pub fn bump_entry_ttl(env: &Env, key: &DataKey) {
     env.storage()
         .persistent()
         .extend_ttl(key, LEDGER_TTL_THRESHOLD, LEDGER_TTL_BUMP);
 }
 
-/// Explicitly bump the ActiveListings index TTL.  Call this whenever the index
-/// is read in a hot path (e.g. get_active_listing_ids) to prevent eviction of
-/// a large, frequently accessed entry.
-pub fn bump_active_listings_ttl(env: &Env) {
-    bump_entry_ttl(env, &DataKey::ActiveListings);
+// ── Paged index engine ───────────────────────────────────────
+//
+// Each `IndexId` collection is a sequence of fixed-capacity pages.  Element
+// `i` lives in page `i / INDEX_PAGE_SIZE` at offset `i % INDEX_PAGE_SIZE`.
+// Appending touches only the last page; swap-removal touches at most the
+// page holding the removed slot plus the last page.  Emptied pages are
+// deleted so dead keys do not accumulate.
+
+/// Maximum number of ids held by one index page.
+pub const INDEX_PAGE_SIZE: u32 = 100;
+
+fn index_page_key(id: &IndexId, page: u32) -> DataKey {
+    DataKey::IndexPage(id.clone(), page)
 }
 
-// ── Counter helpers ──────────────────────────────────────────
+fn index_len_key(id: &IndexId) -> DataKey {
+    DataKey::IndexLen(id.clone())
+}
+
+/// Total number of elements in the index.
+pub fn index_len(env: &Env, id: &IndexId) -> u32 {
+    let key = index_len_key(id);
+    let len = env
+        .storage()
+        .persistent()
+        .get::<DataKey, u32>(&key)
+        .unwrap_or(0);
+    // Keep the length entry alive alongside its pages — it is read on every
+    // index access, making it the hottest entry of the index.
+    if len > 0 {
+        bump_entry_ttl(env, &key);
+    }
+    len
+}
+
+fn set_index_len(env: &Env, id: &IndexId, len: u32) {
+    let key = index_len_key(id);
+    if len == 0 {
+        env.storage().persistent().remove(&key);
+    } else {
+        env.storage().persistent().set(&key, &len);
+        bump_entry_ttl(env, &key);
+    }
+}
+
+/// Load one page of the index (empty vec if the page does not exist).
+pub fn index_load_page(env: &Env, id: &IndexId, page: u32) -> Vec<u64> {
+    let key = index_page_key(id, page);
+    let value = env
+        .storage()
+        .persistent()
+        .get::<DataKey, Vec<u64>>(&key)
+        .unwrap_or_else(|| Vec::new(env));
+    if !value.is_empty() {
+        bump_entry_ttl(env, &key);
+    }
+    value
+}
+
+fn index_store_page(env: &Env, id: &IndexId, page: u32, entries: &Vec<u64>) {
+    let key = index_page_key(id, page);
+    if entries.is_empty() {
+        // Dead pages are removed as soon as they empty out.
+        env.storage().persistent().remove(&key);
+    } else {
+        env.storage().persistent().set(&key, entries);
+        bump_entry_ttl(env, &key);
+    }
+}
+
+/// Append `value` to the end of the index. O(1): reads/writes only the last
+/// page and the length key.
+pub fn index_append(env: &Env, id: &IndexId, value: u64) {
+    let len = index_len(env, id);
+    let page = len / INDEX_PAGE_SIZE;
+    let mut entries = index_load_page(env, id, page);
+    entries.push_back(value);
+    index_store_page(env, id, page, &entries);
+    set_index_len(env, id, len + 1);
+}
+
+/// Read the element at logical position `pos`, or `None` when out of range.
+pub fn index_get(env: &Env, id: &IndexId, pos: u32) -> Option<u64> {
+    if pos >= index_len(env, id) {
+        return None;
+    }
+    index_load_page(env, id, pos / INDEX_PAGE_SIZE).get(pos % INDEX_PAGE_SIZE)
+}
+
+/// Remove the element at logical position `pos` by moving the last element of
+/// the index into its slot (swap-remove).  Returns `Some(moved_value)` when an
+/// element was relocated into `pos`, `None` when `pos` was the last element.
+///
+/// NOTE: this deliberately does not preserve insertion order — the caller must
+/// treat the index as an unordered set once removals occur.
+pub fn index_swap_remove(env: &Env, id: &IndexId, pos: u32) -> Option<u64> {
+    let len = index_len(env, id);
+    if pos >= len {
+        return None;
+    }
+    let last = len - 1;
+    let last_page_no = last / INDEX_PAGE_SIZE;
+    let last_off = last % INDEX_PAGE_SIZE;
+    let mut last_page = index_load_page(env, id, last_page_no);
+    let last_val = last_page.get(last_off).unwrap();
+
+    let moved = if pos == last {
+        last_page.remove(last_off);
+        index_store_page(env, id, last_page_no, &last_page);
+        None
+    } else {
+        let pos_page_no = pos / INDEX_PAGE_SIZE;
+        let pos_off = pos % INDEX_PAGE_SIZE;
+        if pos_page_no == last_page_no {
+            last_page.set(pos_off, last_val);
+            last_page.remove(last_off);
+            index_store_page(env, id, last_page_no, &last_page);
+        } else {
+            last_page.remove(last_off);
+            index_store_page(env, id, last_page_no, &last_page);
+            let mut pos_page = index_load_page(env, id, pos_page_no);
+            pos_page.set(pos_off, last_val);
+            index_store_page(env, id, pos_page_no, &pos_page);
+        }
+        Some(last_val)
+    };
+    set_index_len(env, id, last);
+    moved
+}
+
+/// Read up to `limit` elements starting at logical position `start`.
+/// Positions past the end yield an empty vector.
+pub fn index_range(env: &Env, id: &IndexId, start: u32, limit: u32) -> Vec<u64> {
+    let mut out = Vec::new(env);
+    let len = index_len(env, id);
+    if start >= len || limit == 0 {
+        return out;
+    }
+    let end = start.saturating_add(limit).min(len);
+    let mut page_no = start / INDEX_PAGE_SIZE;
+    let mut entries = index_load_page(env, id, page_no);
+    for pos in start..end {
+        let p = pos / INDEX_PAGE_SIZE;
+        if p != page_no {
+            page_no = p;
+            entries = index_load_page(env, id, page_no);
+        }
+        out.push_back(entries.get(pos % INDEX_PAGE_SIZE).unwrap());
+    }
+    out
+}
+
+/// Read the whole index.  Unbounded in the number of pages — reserved for
+/// view functions and tests; transaction paths must use `index_range`.
+pub fn index_all(env: &Env, id: &IndexId) -> Vec<u64> {
+    index_range(env, id, 0, index_len(env, id))
+}
+
+// ── Counters ─────────────────────────────────────────────────
 
 pub fn get_listing_count(env: &Env) -> u64 {
     env.storage()
@@ -112,7 +361,7 @@ pub fn increment_offer_count(env: &Env) -> u64 {
     count
 }
 
-// ── CRUD methods ─────────────────────────────────────────────
+// ── CRUD ─────────────────────────────────────────────────────
 
 pub fn save_listing(env: &Env, listing: &Listing) {
     let key = DataKey::Listing(listing.listing_id);
@@ -159,143 +408,206 @@ pub fn load_offer(env: &Env, offer_id: u64) -> Option<Offer> {
     res
 }
 
-// ── Indices ──────────────────────────────────────────────────
+// ── Indices (paged) ──────────────────────────────────────────
 
 pub fn add_artist_listing_id(env: &Env, artist: &Address, listing_id: u64) {
-    let key = DataKey::ArtistListings(artist.clone());
-    let mut ids = env
-        .storage()
-        .persistent()
-        .get::<_, Vec<u64>>(&key)
-        .unwrap_or_else(|| Vec::new(env));
-    ids.push_back(listing_id);
-    env.storage().persistent().set(&key, &ids);
-    bump_entry_ttl(env, &key);
+    index_append(env, &IndexId::ArtistListings(artist.clone()), listing_id);
 }
 
 pub fn get_artist_listing_ids(env: &Env, artist: &Address) -> Vec<u64> {
-    let key = DataKey::ArtistListings(artist.clone());
-    let value = env
-        .storage()
-        .persistent()
-        .get::<_, Vec<u64>>(&key)
-        .unwrap_or_else(|| Vec::new(env));
-    if !value.is_empty() {
-        bump_entry_ttl(env, &key);
-    }
-    value
+    index_all(env, &IndexId::ArtistListings(artist.clone()))
 }
 
 // ── Active listings index ────────────────────────────────────
+//
+// The only index that shrinks.  A per-listing position key
+// (`ActiveListingPos`) makes removal O(1): read the position, swap the last
+// element into the vacated slot, fix up the moved element's position key.
+// Consequence (deliberate, documented): once removals occur, the index is an
+// unordered set — pagination order is stable between removals but is no
+// longer strict insertion order.
 
 pub fn add_to_active_listings(env: &Env, listing_id: u64) {
-    let key = DataKey::ActiveListings;
-    let mut ids = env
-        .storage()
-        .persistent()
-        .get::<_, Vec<u64>>(&key)
-        .unwrap_or_else(|| Vec::new(env));
-    ids.push_back(listing_id);
-    env.storage().persistent().set(&key, &ids);
-    bump_entry_ttl(env, &key);
+    let idx = IndexId::ActiveListings;
+    let pos_key = DataKey::ActiveListingPos(listing_id);
+    // Idempotency guard: never double-insert an id already in the index.
+    if env.storage().persistent().has(&pos_key) {
+        return;
+    }
+    let pos = index_len(env, &idx);
+    index_append(env, &idx, listing_id);
+    env.storage().persistent().set(&pos_key, &pos);
+    bump_entry_ttl(env, &pos_key);
 }
 
 pub fn remove_from_active_listings(env: &Env, listing_id: u64) {
-    let key = DataKey::ActiveListings;
-    let ids = env
-        .storage()
-        .persistent()
-        .get::<_, Vec<u64>>(&key)
-        .unwrap_or_else(|| Vec::new(env));
-    let mut updated = Vec::new(env);
-    for id in ids.iter() {
-        if id != listing_id {
-            updated.push_back(id);
-        }
+    let idx = IndexId::ActiveListings;
+    let pos_key = DataKey::ActiveListingPos(listing_id);
+    let pos = match env.storage().persistent().get::<DataKey, u32>(&pos_key) {
+        Some(p) => p,
+        None => return, // not in the index — nothing to do
+    };
+    // Defensive consistency check: the slot must actually hold this id.
+    if index_get(env, &idx, pos) != Some(listing_id) {
+        return;
     }
-    env.storage().persistent().set(&key, &updated);
-    bump_entry_ttl(env, &key);
+    if let Some(moved) = index_swap_remove(env, &idx, pos) {
+        let moved_key = DataKey::ActiveListingPos(moved);
+        env.storage().persistent().set(&moved_key, &pos);
+        bump_entry_ttl(env, &moved_key);
+    }
+    env.storage().persistent().remove(&pos_key);
 }
 
+pub fn active_listings_len(env: &Env) -> u32 {
+    index_len(env, &IndexId::ActiveListings)
+}
+
+pub fn get_active_listing_ids_range(env: &Env, start: u32, limit: u32) -> Vec<u64> {
+    index_range(env, &IndexId::ActiveListings, start, limit)
+}
+
+/// Whole active index — used by tests and migration assertions only; the
+/// contract's read surface pages through `get_active_listing_ids_range`.
+#[allow(dead_code)]
 pub fn get_active_listing_ids(env: &Env) -> Vec<u64> {
-    let key = DataKey::ActiveListings;
-    let value = env
-        .storage()
-        .persistent()
-        .get::<_, Vec<u64>>(&key)
-        .unwrap_or_else(|| Vec::new(env));
-    // Always bump the active-listings index on read — it is a hot path accessed
-    // every time get_active_listings / get_active_listings_page is called.
-    bump_entry_ttl(env, &key);
-    value
+    index_all(env, &IndexId::ActiveListings)
 }
 
 pub fn add_artist_auction_id(env: &Env, artist: &Address, auction_id: u64) {
-    let key = DataKey::ArtistAuctions(artist.clone());
-    let mut ids = env
+    index_append(env, &IndexId::ArtistAuctions(artist.clone()), auction_id);
+}
+
+pub fn get_artist_auction_ids(env: &Env, artist: &Address) -> Vec<u64> {
+    index_all(env, &IndexId::ArtistAuctions(artist.clone()))
+}
+
+pub fn add_listing_offer_id(env: &Env, listing_id: u64, offer_id: u64) {
+    index_append(env, &IndexId::ListingOffers(listing_id), offer_id);
+}
+
+pub fn load_listing_offers(env: &Env, listing_id: u64) -> Vec<u64> {
+    index_all(env, &IndexId::ListingOffers(listing_id))
+}
+
+pub fn add_offerer_offer_id(env: &Env, offerer: &Address, offer_id: u64) {
+    index_append(env, &IndexId::OffererOffers(offerer.clone()), offer_id);
+}
+
+pub fn load_offerer_offers(env: &Env, offerer: &Address) -> Vec<u64> {
+    index_all(env, &IndexId::OffererOffers(offerer.clone()))
+}
+
+// ── Pending-offer tracking ───────────────────────────────────
+//
+// A single bounded entry per listing (≤ MAX_OFFERS_PER_LISTING ids).  Its
+// length is the pending-offer counter: `make_offer` enforces the cap with one
+// storage read instead of loading every historical offer.  Every terminal
+// transition (accept / reject / withdraw / reclaim / auto-reject during
+// buy_artwork or cancellation) removes the offer id here, and the refund
+// sweeps iterate this bounded list instead of the full per-listing history.
+
+pub fn load_pending_offer_ids(env: &Env, listing_id: u64) -> Vec<u64> {
+    let key = DataKey::ListingPendingOffers(listing_id);
+    let value = env
         .storage()
         .persistent()
-        .get::<_, Vec<u64>>(&key)
+        .get::<DataKey, Vec<u64>>(&key)
         .unwrap_or_else(|| Vec::new(env));
-    ids.push_back(auction_id);
+    if !value.is_empty() {
+        bump_entry_ttl(env, &key);
+    }
+    value
+}
+
+/// Number of currently-Pending offers on the listing (O(1) storage reads).
+pub fn pending_offer_count(env: &Env, listing_id: u64) -> u32 {
+    load_pending_offer_ids(env, listing_id).len()
+}
+
+pub fn add_pending_offer(env: &Env, listing_id: u64, offer_id: u64) {
+    let key = DataKey::ListingPendingOffers(listing_id);
+    let mut ids = load_pending_offer_ids(env, listing_id);
+    ids.push_back(offer_id);
     env.storage().persistent().set(&key, &ids);
     bump_entry_ttl(env, &key);
 }
 
-pub fn get_artist_auction_ids(env: &Env, artist: &Address) -> Vec<u64> {
-    let key = DataKey::ArtistAuctions(artist.clone());
-    let value = env
-        .storage()
-        .persistent()
-        .get::<_, Vec<u64>>(&key)
-        .unwrap_or_else(|| Vec::new(env));
-    if !value.is_empty() {
-        bump_entry_ttl(env, &key);
+/// Remove `offer_id` from the listing's pending set.  No-op when absent (e.g.
+/// offers created before the 1.1.0 migration ran).  The entry is deleted when
+/// the last pending offer leaves.
+pub fn remove_pending_offer(env: &Env, listing_id: u64, offer_id: u64) {
+    let key = DataKey::ListingPendingOffers(listing_id);
+    let ids = load_pending_offer_ids(env, listing_id);
+    if let Some(i) = ids.first_index_of(offer_id) {
+        let mut updated = ids;
+        updated.remove(i);
+        if updated.is_empty() {
+            env.storage().persistent().remove(&key);
+        } else {
+            env.storage().persistent().set(&key, &updated);
+            bump_entry_ttl(env, &key);
+        }
     }
-    value
 }
 
-pub fn save_listing_offers(env: &Env, listing_id: u64, ids: &Vec<u64>) {
-    let key = DataKey::ListingOffers(listing_id);
-    env.storage().persistent().set(&key, ids);
+/// Drop the whole pending set (used when a listing reaches a terminal state
+/// and all its pending offers were swept in the same invocation).
+pub fn clear_pending_offers(env: &Env, listing_id: u64) {
+    env.storage()
+        .persistent()
+        .remove(&DataKey::ListingPendingOffers(listing_id));
+}
+
+// ── NFT escrow records ───────────────────────────────────────
+//
+// One persistent entry per `(collection, token_id)` in marketplace custody.
+// `escrow_nft` writes it (after a double-listing guard read); `release_nft`
+// removes it once the token leaves custody.
+
+pub fn get_escrow_record(env: &Env, collection: &Address, token_id: u64) -> Option<EscrowRecord> {
+    let key = DataKey::EscrowedToken(collection.clone(), token_id);
+    let res = env.storage().persistent().get::<DataKey, EscrowRecord>(&key);
+    if res.is_some() {
+        bump_entry_ttl(env, &key);
+    }
+    res
+}
+
+pub fn set_escrow_record(env: &Env, collection: &Address, token_id: u64, record: &EscrowRecord) {
+    let key = DataKey::EscrowedToken(collection.clone(), token_id);
+    env.storage().persistent().set(&key, record);
     bump_entry_ttl(env, &key);
 }
 
-pub fn load_listing_offers(env: &Env, listing_id: u64) -> Vec<u64> {
-    let key = DataKey::ListingOffers(listing_id);
-    let value = env
-        .storage()
+pub fn clear_escrow_record(env: &Env, collection: &Address, token_id: u64) {
+    env.storage()
         .persistent()
-        .get::<_, Vec<u64>>(&key)
-        .unwrap_or_else(|| Vec::new(env));
-    // Bump on read — listing-offer indexes are accessed during every purchase and
-    // cancellation path, making them hot entries prone to accidental eviction.
-    if !value.is_empty() {
-        bump_entry_ttl(env, &key);
-    }
-    value
+        .remove(&DataKey::EscrowedToken(collection.clone(), token_id));
 }
 
-pub fn save_offerer_offers(env: &Env, offerer: &Address, ids: &Vec<u64>) {
-    let key = DataKey::OffererOffers(offerer.clone());
-    env.storage().persistent().set(&key, ids);
+// ── Batched cancel_artist_listings cursor ────────────────────
+
+pub fn get_artist_cancel_cursor(env: &Env, artist: &Address) -> u32 {
+    env.storage()
+        .persistent()
+        .get::<DataKey, u32>(&DataKey::ArtistCancelCursor(artist.clone()))
+        .unwrap_or(0)
+}
+
+pub fn set_artist_cancel_cursor(env: &Env, artist: &Address, cursor: u32) {
+    let key = DataKey::ArtistCancelCursor(artist.clone());
+    env.storage().persistent().set(&key, &cursor);
     bump_entry_ttl(env, &key);
 }
 
-pub fn load_offerer_offers(env: &Env, offerer: &Address) -> Vec<u64> {
-    let key = DataKey::OffererOffers(offerer.clone());
-    let value = env
-        .storage()
+pub fn clear_artist_cancel_cursor(env: &Env, artist: &Address) {
+    env.storage()
         .persistent()
-        .get::<_, Vec<u64>>(&key)
-        .unwrap_or_else(|| Vec::new(env));
-    if !value.is_empty() {
-        bump_entry_ttl(env, &key);
-    }
-    value
+        .remove(&DataKey::ArtistCancelCursor(artist.clone()));
 }
 
-// ── Moderation & Configuration storage ────────────────────
+// ── Moderation & Config ────────────────────────────────────
 
 pub fn set_artist_revocation_storage(env: &Env, artist: &Address) {
     let key = DataKey::RevokedArtist(artist.clone());
@@ -364,8 +676,6 @@ pub fn get_min_bid_increment_storage(env: &Env) -> Option<i128> {
     }
     value
 }
-
-// ── Anti-sniping config ──────────────────────────────────────
 
 pub fn set_auction_extension_window_storage(env: &Env, window: u64) {
     env.storage()
@@ -439,17 +749,20 @@ pub fn release_auction_lock(env: &Env, auction_id: u64) {
     env.storage().temporary().remove(&key);
 }
 
-// ── Admin transfer helpers ───────────────────────────────────
+// ── Admin transfer ───────────────────────────────────────────
 
-pub fn set_pending_admin_storage(env: &Env, pending: &Address) {
+pub fn set_pending_admin_storage(env: &Env, pending: &PendingAdminProposal) {
     env.storage()
         .persistent()
         .set(&DataKey::PendingAdmin, pending);
     bump_entry_ttl(env, &DataKey::PendingAdmin);
 }
 
-pub fn get_pending_admin_storage(env: &Env) -> Option<Address> {
-    let value = env.storage().persistent().get(&DataKey::PendingAdmin);
+pub fn get_pending_admin_storage(env: &Env) -> Option<PendingAdminProposal> {
+    let value = env
+        .storage()
+        .persistent()
+        .get::<DataKey, PendingAdminProposal>(&DataKey::PendingAdmin);
     if value.is_some() {
         bump_entry_ttl(env, &DataKey::PendingAdmin);
     }
@@ -460,14 +773,8 @@ pub fn clear_pending_admin_storage(env: &Env) {
     env.storage().persistent().remove(&DataKey::PendingAdmin);
 }
 
-// ── Auction bid history ──────────────────────────────────────
+// ── Bid history ──────────────────────────────────────────────
 
-/// Append `record` to the bounded bid history for `auction_id`.
-///
-/// The history vector is capped to `cap` entries.  When the vector is already
-/// at capacity the oldest entry (index 0) is evicted before the new one is
-/// pushed, so the vector always holds the most recent <= N bids in
-/// chronological (oldest-to-newest) order.
 pub fn append_bid_record(env: &Env, auction_id: u64, record: &BidRecord, cap: u32) {
     let key = DataKey::AuctionBids(auction_id);
     let mut history = env
@@ -475,8 +782,6 @@ pub fn append_bid_record(env: &Env, auction_id: u64, record: &BidRecord, cap: u3
         .persistent()
         .get::<DataKey, soroban_sdk::Vec<BidRecord>>(&key)
         .unwrap_or_else(|| soroban_sdk::Vec::new(env));
-
-    // Evict the oldest entry when the history is already full.
     if history.len() >= cap {
         let mut trimmed = soroban_sdk::Vec::new(env);
         for i in 1..history.len() {
@@ -484,14 +789,11 @@ pub fn append_bid_record(env: &Env, auction_id: u64, record: &BidRecord, cap: u3
         }
         history = trimmed;
     }
-
     history.push_back(record.clone());
     env.storage().persistent().set(&key, &history);
     bump_entry_ttl(env, &key);
 }
 
-/// Load the bounded bid history for `auction_id`.  Returns an empty vector if
-/// no bids have been placed yet or the key has been evicted.
 pub fn load_auction_bids(env: &Env, auction_id: u64) -> soroban_sdk::Vec<BidRecord> {
     let key = DataKey::AuctionBids(auction_id);
     let value = env
@@ -503,6 +805,36 @@ pub fn load_auction_bids(env: &Env, auction_id: u64) -> soroban_sdk::Vec<BidReco
         bump_entry_ttl(env, &key);
     }
     value
+}
+
+// ── Blocked bidders (Issue #199) ─────────────────────────────
+
+pub fn load_blocked_bidders(env: &Env, auction_id: u64) -> Vec<Address> {
+    let key = DataKey::AuctionBlockedBidders(auction_id);
+    let value = env
+        .storage()
+        .persistent()
+        .get::<DataKey, Vec<Address>>(&key)
+        .unwrap_or_else(|| Vec::new(env));
+    if !value.is_empty() {
+        bump_entry_ttl(env, &key);
+    }
+    value
+}
+
+pub fn save_blocked_bidders(env: &Env, auction_id: u64, list: &Vec<Address>) {
+    let key = DataKey::AuctionBlockedBidders(auction_id);
+    if list.is_empty() {
+        // Drop the entry entirely so an emptied registry costs nothing.
+        env.storage().persistent().remove(&key);
+    } else {
+        env.storage().persistent().set(&key, list);
+        bump_entry_ttl(env, &key);
+    }
+}
+
+pub fn is_bidder_blocked(env: &Env, auction_id: u64, bidder: &Address) -> bool {
+    load_blocked_bidders(env, auction_id).contains(bidder)
 }
 
 pub fn set_paused(env: &Env, paused: bool) {
@@ -517,15 +849,104 @@ pub fn is_paused(env: &Env) -> bool {
         .unwrap_or(false)
 }
 
+// ── Granular pause helpers (Issue #205) ──────────────────────────────────────
+//
+// Three independent circuit-breaker axes:
+//   1. Global flag           — DataKey::IsPaused (existing)
+//   2. Per-collection flag   — DataKey::CollectionPaused(address)
+//   3. Per-function flag     — DataKey::FunctionPaused(symbol)
+//
+// is_paused_for() returns true when ANY of the three axes fires.
+
+/// Pause a specific collection.
+pub fn set_collection_paused(env: &Env, collection: &Address, paused: bool) {
+    let key = DataKey::CollectionPaused(collection.clone());
+    if paused {
+        env.storage().persistent().set(&key, &true);
+        bump_entry_ttl(env, &key);
+    } else {
+        env.storage().persistent().remove(&key);
+    }
+}
+
+/// Return whether the given collection is individually paused.
+pub fn is_collection_paused(env: &Env, collection: &Address) -> bool {
+    let key = DataKey::CollectionPaused(collection.clone());
+    let paused = env
+        .storage()
+        .persistent()
+        .get::<DataKey, bool>(&key)
+        .unwrap_or(false);
+    if paused {
+        bump_entry_ttl(env, &key);
+    }
+    paused
+}
+
+/// Pause a specific entry-point function by its symbol name.
+pub fn set_function_paused(env: &Env, func: &soroban_sdk::Symbol, paused: bool) {
+    let key = DataKey::FunctionPaused(func.clone());
+    if paused {
+        env.storage().persistent().set(&key, &true);
+        bump_entry_ttl(env, &key);
+    } else {
+        env.storage().persistent().remove(&key);
+    }
+}
+
+/// Return whether the given function symbol is individually paused.
+pub fn is_function_paused(env: &Env, func: &soroban_sdk::Symbol) -> bool {
+    let key = DataKey::FunctionPaused(func.clone());
+    let paused = env
+        .storage()
+        .persistent()
+        .get::<DataKey, bool>(&key)
+        .unwrap_or(false);
+    if paused {
+        bump_entry_ttl(env, &key);
+    }
+    paused
+}
+
+/// Composite pause check: returns true when ANY of the three circuit-breakers
+/// is active for the given (optional) collection and function context.
+///
+/// Call sites:
+///   - Global-only check:           is_paused_for(env, None, None)
+///   - Collection-scoped check:     is_paused_for(env, Some(&col), None)
+///   - Function-scoped check:       is_paused_for(env, None, Some(&func))
+///   - Full context check:          is_paused_for(env, Some(&col), Some(&func))
+pub fn is_paused_for(
+    env: &Env,
+    collection: Option<&Address>,
+    func: Option<&soroban_sdk::Symbol>,
+) -> bool {
+    // Global flag (cheapest read — check first).
+    if is_paused(env) {
+        return true;
+    }
+    // Per-function flag.
+    if let Some(f) = func {
+        if is_function_paused(env, f) {
+            return true;
+        }
+    }
+    // Per-collection flag.
+    if let Some(c) = collection {
+        if is_collection_paused(env, c) {
+            return true;
+        }
+    }
+    false
+}
+
 // ── Price bounds ─────────────────────────────────────────────
 
-/// Persist the global minimum price bound (in payment-token stroops).
 pub fn set_min_price_storage(env: &Env, min: i128) {
     env.storage().persistent().set(&DataKey::MinPrice, &min);
     bump_entry_ttl(env, &DataKey::MinPrice);
 }
 
-/// Retrieve the global minimum price bound, or `None` if not set.
 pub fn get_min_price_storage(env: &Env) -> Option<i128> {
     let value = env.storage().persistent().get(&DataKey::MinPrice);
     if value.is_some() {
@@ -534,13 +955,11 @@ pub fn get_min_price_storage(env: &Env) -> Option<i128> {
     value
 }
 
-/// Persist the global maximum price bound (in payment-token stroops).
 pub fn set_max_price_storage(env: &Env, max: i128) {
     env.storage().persistent().set(&DataKey::MaxPrice, &max);
     bump_entry_ttl(env, &DataKey::MaxPrice);
 }
 
-/// Retrieve the global maximum price bound, or `None` if not set.
 pub fn get_max_price_storage(env: &Env) -> Option<i128> {
     let value = env.storage().persistent().get(&DataKey::MaxPrice);
     if value.is_some() {
@@ -551,15 +970,12 @@ pub fn get_max_price_storage(env: &Env) -> Option<i128> {
 
 // ── Migration marker ─────────────────────────────────────────
 
-/// Record that the migration for `version` has been executed.
-/// After this call, `is_migration_done` returns `true` for the same version.
 pub fn set_migration_done(env: &Env, version: &soroban_sdk::String) {
     let key = DataKey::MigrationDone(version.clone());
     env.storage().persistent().set(&key, &true);
     bump_entry_ttl(env, &key);
 }
 
-/// Returns `true` if the migration for `version` has already been applied.
 pub fn is_migration_done(env: &Env, version: &soroban_sdk::String) -> bool {
     let key = DataKey::MigrationDone(version.clone());
     let done = env
@@ -571,4 +987,89 @@ pub fn is_migration_done(env: &Env, version: &soroban_sdk::String) -> bool {
         bump_entry_ttl(env, &key);
     }
     done
+}
+
+/// Load the resumable migration progress for `version` (phase 0, cursor 0
+/// when the migration has not started yet).
+pub fn get_migration_progress(env: &Env, version: &soroban_sdk::String) -> MigrationProgress {
+    env.storage()
+        .persistent()
+        .get::<DataKey, MigrationProgress>(&DataKey::MigrationCursor(version.clone()))
+        .unwrap_or(MigrationProgress { phase: 0, cursor: 0 })
+}
+
+pub fn set_migration_progress(env: &Env, version: &soroban_sdk::String, progress: &MigrationProgress) {
+    let key = DataKey::MigrationCursor(version.clone());
+    env.storage().persistent().set(&key, progress);
+    bump_entry_ttl(env, &key);
+}
+
+pub fn clear_migration_progress(env: &Env, version: &soroban_sdk::String) {
+    env.storage()
+        .persistent()
+        .remove(&DataKey::MigrationCursor(version.clone()));
+}
+
+/// Read-and-delete a legacy (pre-1.1.0) monolithic `Vec<u64>` index entry.
+/// Returns `None` when the key does not exist (already migrated or never
+/// written).  Used exclusively by the 1.1.0 storage migration.
+pub fn take_legacy_index_vec(env: &Env, key: &DataKey) -> Option<Vec<u64>> {
+    let value = env.storage().persistent().get::<DataKey, Vec<u64>>(key);
+    if value.is_some() {
+        env.storage().persistent().remove(key);
+    }
+    value
+}
+
+// ── Bid-history cap ──────────────────────────────────────────
+
+/// Default bid-history ring-buffer capacity.
+pub const DEFAULT_BID_HISTORY_CAP: u32 = 50;
+/// Maximum allowed bid-history cap.  Kept at 200 so the O(n) eviction
+/// shift (see `append_bid_record`) stays within acceptable compute limits.
+pub const MAX_BID_HISTORY_CAP: u32 = 200;
+
+/// Persist the global bid-history cap.
+pub fn set_bid_history_cap_storage(env: &Env, cap: u32) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::BidHistoryCap, &cap);
+    bump_entry_ttl(env, &DataKey::BidHistoryCap);
+}
+
+/// Read the global bid-history cap, defaulting to `DEFAULT_BID_HISTORY_CAP`.
+pub fn get_bid_history_cap_storage(env: &Env) -> u32 {
+    let value = env
+        .storage()
+        .persistent()
+        .get::<DataKey, u32>(&DataKey::BidHistoryCap);
+    if value.is_some() {
+        bump_entry_ttl(env, &DataKey::BidHistoryCap);
+    }
+    value.unwrap_or(DEFAULT_BID_HISTORY_CAP)
+}
+
+// ── Auction max-extensions cap ───────────────────────────────
+
+/// Default: 0 = unlimited extensions (legacy behaviour preserved).
+pub const DEFAULT_AUCTION_MAX_EXTENSIONS: u32 = 0;
+
+/// Persist the global auction max-extensions cap.
+pub fn set_auction_max_extensions_storage(env: &Env, max: u32) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::AuctionMaxExtensions, &max);
+    bump_entry_ttl(env, &DataKey::AuctionMaxExtensions);
+}
+
+/// Read the global auction max-extensions cap.
+pub fn get_auction_max_extensions_storage(env: &Env) -> u32 {
+    let value = env
+        .storage()
+        .persistent()
+        .get::<DataKey, u32>(&DataKey::AuctionMaxExtensions);
+    if value.is_some() {
+        bump_entry_ttl(env, &DataKey::AuctionMaxExtensions);
+    }
+    value.unwrap_or(DEFAULT_AUCTION_MAX_EXTENSIONS)
 }

@@ -102,6 +102,10 @@ jobs:
 
   contracts:
     name: Build and Test Contracts
+    # Guard: the WASM build and `cargo test` below run against the whole
+    # workspace and MUST keep including `contracts/launchpad` (soroban-launchpad).
+    # Do not narrow these to a `-p` subset — the launchpad crate once bit-rotted
+    # into an uncompilable state because nothing in CI exercised it.
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository
@@ -148,6 +152,8 @@ jobs:
       - name: Run Lint
         run: npm run lint
         working-directory: frontend/elcarehub-app
+      - name: Validate Contract Error Coverage
+        run: node scripts/contract-errors/validate-error-coverage.mjs
       - name: Run Build
         run: npm run build
         working-directory: frontend/elcarehub-app
@@ -210,29 +216,7 @@ jobs:
   indexer-integration:
     name: Indexer Integration Tests
     runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:15-alpine
-        env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: marketplace_indexer_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U postgres"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-      redis:
-        image: redis:7-alpine
-        ports:
-          - 6379:6379
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
+    timeout-minutes: 5
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -253,12 +237,9 @@ jobs:
       - name: Run Integration Tests
         run: npm run test:integration
         working-directory: indexer
-        env:
-          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/marketplace_indexer_test?schema=public
-          REDIS_URL: redis://localhost:6379
 
   indexer:
-    name: Build and Test Indexer
+    name: Build and Test Indexer (${{ matrix.node-version }})
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -286,6 +267,56 @@ jobs:
       - name: Run Build
         run: npm run build
         working-directory: indexer
+      - name: Check Event Catalog
+        run: npx vitest src/__tests__/event-catalog.test.ts --run
+        working-directory: indexer
       - name: Run Tests
         run: npm run test
         working-directory: indexer
+
+  check-openapi:
+    name: Check OpenAPI Spec (Indexer)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Cache NPM dependencies
+        uses: actions/cache@v4
+        with:
+          path: indexer/node_modules
+          key: ${{ runner.os }}-indexer-20-${{ hashFiles('indexer/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-indexer-20-
+      - name: Install Dependencies
+        run: npm ci
+        working-directory: indexer
+      - name: Generate OpenAPI spec
+        run: npm run generate-openapi
+        working-directory: indexer
+      - name: Diff against committed openapi.json
+        run: |
+          if ! git diff --exit-code openapi.json; then
+            echo ""
+            echo "ERROR: openapi.json is out of sync with the route definitions."
+            echo "Run 'npm run generate-openapi' in the indexer directory and commit the result."
+            exit 1
+          fi
+        working-directory: indexer
+
+  release-validate:
+    name: Release Version Validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Validate Version Consistency
+        run: |
+          bash scripts/validate-compatibility.sh
