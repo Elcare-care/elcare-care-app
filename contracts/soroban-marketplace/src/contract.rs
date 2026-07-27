@@ -979,9 +979,18 @@ impl MarketplaceContract {
 
     pub fn add_token_to_whitelist(env: Env, token: Address) {
         Self::require_admin(&env);
+        // Boundary validation (Issue #282): reject the marketplace's own
+        // address before it can ever land in the whitelist. Decimals/asset
+        // identity for the token are the off-chain registry's job (see
+        // `validate_token_asset` doc comment); this is deliberately a cheap,
+        // on-chain-only sanity check.
+        Self::validate_token_asset(&env, &token, None);
         let key = crate::storage::DataKey::TokenWhitelist;
         let mut wl = env.storage().persistent()
             .get::<_, Vec<Address>>(&key).unwrap_or(Vec::new(&env));
+        // Idempotent by design: re-whitelisting an already-present token is a
+        // no-op rather than an error, so an admin re-running a setup script
+        // can never accidentally create duplicate entries.
         if !wl.contains(&token) { wl.push_back(token); env.storage().persistent().set(&key, &wl); }
     }
 
@@ -1281,6 +1290,7 @@ impl MarketplaceContract {
         if duration < MIN_AUCTION_DURATION {
             panic_with_error!(&env, MarketplaceError::InvalidAuctionDuration);
         }
+        Self::validate_token_asset(&env, &token, Some(&collection));
         if !Self::is_token_whitelisted(&env, &token) {
             panic_with_error!(&env, MarketplaceError::TokenNotWhitelisted);
         }
@@ -1584,6 +1594,7 @@ impl MarketplaceContract {
         }
         if listing.artist == offerer { panic_with_error!(&env, MarketplaceError::CannotOfferOwnListing); }
         if amount <= 0 { panic_with_error!(&env, MarketplaceError::InsufficientOfferAmount); }
+        Self::validate_token_asset(&env, &token, Some(&listing.collection));
         if !Self::is_token_whitelisted(&env, &token) {
             panic_with_error!(&env, MarketplaceError::TokenNotWhitelisted);
         }

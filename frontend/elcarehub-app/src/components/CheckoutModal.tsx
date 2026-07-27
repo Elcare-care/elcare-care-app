@@ -30,7 +30,7 @@ import {
 } from "lucide-react";
 import { Listing, getProtocolFee } from "@/lib/contract";
 import { useSupportedTokens } from "@/hooks/useSupportedTokens";
-import { TokenConfig, getTokenConfigByAddress } from "@/config/tokens";
+import { TokenConfig, getTokenConfigByAddress, baseUnitsToDisplay } from "@/config/tokens";
 import { resolveSupportedTokens, getDefaultSupportedToken } from "@/lib/token-support";
 import { calculateSettlementPreview, isPreviewStillValid, SettlementPreview } from "@/lib/settlement";
 import { useFreshListing, preflightConflictMessage } from "@/hooks/useFreshListing";
