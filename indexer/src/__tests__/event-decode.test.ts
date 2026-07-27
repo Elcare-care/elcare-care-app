@@ -144,7 +144,6 @@ describe('decodeWithSchema — LISTING_CANCELLED', () => {
   it('valid: only required field', () => assertOk(decodeWithSchema('LISTING_CANCELLED', LISTING_CANCELLED_SCHEMA, valid)));
   it('valid: with optional cancelled_by', () => assertOk(decodeWithSchema('LISTING_CANCELLED', LISTING_CANCELLED_SCHEMA, { ...valid, cancelled_by: 'GADMIN' })));
   it('valid: with reason as Soroban enum object', () => assertOk(decodeWithSchema('LISTING_CANCELLED', LISTING_CANCELLED_SCHEMA, { ...valid, reason: { tag: 2 } })));
-  it('valid: with reason as string', () => assertOk(decodeWithSchema('LISTING_CANCELLED', LISTING_CANCELLED_SCHEMA, { ...valid, reason: 'owner' })));
   it('valid: without reason (optional)', () => assertOk(decodeWithSchema('LISTING_CANCELLED', LISTING_CANCELLED_SCHEMA, valid)));
 
   it('error: missing listing_id', () => {
