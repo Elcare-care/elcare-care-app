@@ -9,6 +9,20 @@ import {
   handleMetrics,
   requestLogger,
   httpRequestDurationMicroseconds,
+  // Issue #299 — new correctness & business metrics
+  reconciliationMismatchesTotal,
+  unresolvedEscrowGauge,
+  deadLetterEventsTotal,
+  deadLetterAgeSecondsGauge,
+  reorgRollbacksTotal,
+  reorgDepthGauge,
+  ingestionLagSeconds,
+  finalizedLagSeconds,
+  eventReplaysTotal,
+  cacheHitsTotal,
+  cacheMissesTotal,
+  cacheInvalidationsTotal,
+  apiErrorsTotal,
 } from '../metrics';
 
 // We can construct a minimal Express app to verify the middleware and handler
@@ -92,5 +106,90 @@ describe('Prometheus Metrics API & Middleware', () => {
     expect(res.text).toContain('indexer_latest_ledger_processed 5200');
     expect(res.text).toContain('indexer_network_latest_ledger 5200');
     expect(res.text).toContain('indexer_sync_latency_ledgers 0');
+  });
+});
+
+// ── Issue #299: new correctness & business metrics ────────────────────────────
+
+describe('Issue #299 — new correctness & business metrics registration', () => {
+  it('exports reconciliation_mismatches_total from /metrics', async () => {
+    reconciliationMismatchesTotal.inc({ kind: 'listing', field: 'status' });
+    const res = await request(app).get('/metrics').expect(200);
+    expect(res.text).toContain('elcarehub_reconciliation_mismatches_total');
+  });
+
+  it('exports unresolved_escrow_listings gauge', async () => {
+    unresolvedEscrowGauge.set(3);
+    const res = await request(app).get('/metrics').expect(200);
+    expect(res.text).toContain('elcarehub_unresolved_escrow_listings 3');
+  });
+
+  it('exports dead_letter_events_total counter', async () => {
+    deadLetterEventsTotal.inc({ event_type: 'ARTWORK_SOLD' });
+    const res = await request(app).get('/metrics').expect(200);
+    expect(res.text).toContain('elcarehub_dead_letter_events_total');
+  });
+
+  it('exports dead_letter_age_seconds gauge', async () => {
+    deadLetterAgeSecondsGauge.set(120);
+    const res = await request(app).get('/metrics').expect(200);
+    expect(res.text).toContain('elcarehub_dead_letter_age_seconds 120');
+  });
+
+  it('exports reorg_rollbacks_total counter', async () => {
+    reorgRollbacksTotal.inc({ depth_bucket: '<10' });
+    const res = await request(app).get('/metrics').expect(200);
+    expect(res.text).toContain('elcarehub_reorg_rollbacks_total');
+  });
+
+  it('exports reorg_depth_current gauge', async () => {
+    reorgDepthGauge.set(5);
+    const res = await request(app).get('/metrics').expect(200);
+    expect(res.text).toContain('elcarehub_reorg_depth_current 5');
+  });
+
+  it('exports ingestion_lag_seconds histogram', async () => {
+    ingestionLagSeconds.observe(2.5);
+    const res = await request(app).get('/metrics').expect(200);
+    expect(res.text).toContain('elcarehub_ingestion_lag_seconds');
+  });
+
+  it('exports finalized_lag_seconds histogram', async () => {
+    finalizedLagSeconds.observe(8);
+    const res = await request(app).get('/metrics').expect(200);
+    expect(res.text).toContain('elcarehub_finalized_lag_seconds');
+  });
+
+  it('exports event_replays_total counter', async () => {
+    eventReplaysTotal.inc({ reason: 'reorg' });
+    const res = await request(app).get('/metrics').expect(200);
+    expect(res.text).toContain('elcarehub_event_replays_total');
+  });
+
+  it('exports cache_hits_total and cache_misses_total counters', async () => {
+    cacheHitsTotal.inc({ key_prefix: 'listings' });
+    cacheMissesTotal.inc({ key_prefix: 'listings' });
+    const res = await request(app).get('/metrics').expect(200);
+    expect(res.text).toContain('elcarehub_cache_hits_total');
+    expect(res.text).toContain('elcarehub_cache_misses_total');
+  });
+
+  it('exports cache_invalidations_total counter', async () => {
+    cacheInvalidationsTotal.inc({ scope: 'pattern' });
+    const res = await request(app).get('/metrics').expect(200);
+    expect(res.text).toContain('elcarehub_cache_invalidations_total');
+  });
+
+  it('exports api_errors_total counter', async () => {
+    apiErrorsTotal.inc({ error_class: 'db_error', method: 'GET' });
+    const res = await request(app).get('/metrics').expect(200);
+    expect(res.text).toContain('elcarehub_api_errors_total');
+  });
+
+  it('prevents duplicate metric registration (no duplicate-name error)', async () => {
+    // If prom-client throws on duplicate name, this would fail. Exporting again
+    // must not throw — the registry returns the same instance.
+    const { reconciliationMismatchesTotal: same } = await import('../metrics');
+    expect(same).toBeDefined();
   });
 });

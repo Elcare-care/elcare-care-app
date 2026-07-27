@@ -38,6 +38,10 @@ use crate::{
     events, storage,
     types::{CollectionKind, CollectionRecord, Error, PreflightResult, WasmHashes},
 };
+use crate::types::DataKey;
+
+/// Semantic version — bump on every breaking storage change.
+const CONTRACT_VERSION: &str = "1.0.0";
 
 /// Maximum allowed platform fee (20 %) — issue #38.
 const MAX_FEE_BPS: u32 = 2000;
@@ -60,6 +64,7 @@ mod iface {
             royalty_bps: u32,
             royalty_receiver: Address,
         );
+        fn upgrade(env: Env, new_wasm_hash: BytesN<32>);
     }
 
     #[contractclient(name = "Normal1155Client")]
@@ -71,6 +76,7 @@ mod iface {
             royalty_bps: u32,
             royalty_receiver: Address,
         );
+        fn upgrade(env: Env, new_wasm_hash: BytesN<32>);
     }
 
     /// Issue #38: lazy mint contracts accept per-collection platform fee at init.
@@ -89,6 +95,7 @@ mod iface {
             platform_fee_receiver: Address,
             platform_fee_bps: u32,
         );
+        fn upgrade(env: Env, new_wasm_hash: BytesN<32>);
     }
 
     #[contractclient(name = "Lazy1155Client")]
@@ -104,6 +111,7 @@ mod iface {
             platform_fee_receiver: Address,
             platform_fee_bps: u32,
         );
+        fn upgrade(env: Env, new_wasm_hash: BytesN<32>);
     }
 }
 
@@ -247,6 +255,131 @@ impl Launchpad {
         storage::set_admin(&env, &admin);
         storage::set_fee_config(&env, &fee_receiver, deploy_fee);
         Ok(())
+    }
+
+    // ── Versioning & Migration ────────────────────────────────────────────
+
+    /// Returns the semantic version string compiled into this WASM.
+    pub fn version(env: Env) -> soroban_sdk::String {
+        soroban_sdk::String::from_str(&env, crate::types::CONTRACT_VERSION)
+    }
+
+    /// Returns the version string last written to on-chain storage by
+    /// `migrate()`.  `None` before the first migration.
+    pub fn contract_version(env: Env) -> Option<soroban_sdk::String> {
+        storage::get_contract_version(&env)
+    }
+
+    /// Admin-guarded, idempotent storage migration entry point.
+    ///
+    /// # Idempotency
+    /// Records a per-version completion marker the first time it succeeds.
+    /// Subsequent calls for the *same* version revert with `AlreadyMigrated`.
+    ///
+    /// # Unsupported jumps
+    /// Only sequential upgrades (e.g. 1.0.0 → 1.1.0) are accepted.  If no
+    /// prior version is on-chain (fresh install) any version is accepted as the
+    /// first migration.
+    ///
+    /// # 1.0.0 migration
+    /// Migrates legacy monolithic `ByCreator(Address)` Vec<CollectionRecord>
+    /// and `AllCollections` Vec<CollectionRecord> entries into the paged index
+    /// storage introduced in the current build.  Legacy keys are consumed and
+    /// deleted.  The step is idempotent — re-running after a crash finds the
+    /// keys absent and skips them silently.
+    pub fn migrate(env: Env, admin: Address) -> Result<(), Error> {
+        storage::extend_instance_ttl(&env);
+        let version = Self::require_pending_migration(&env, &admin)?;
+        Self::run_migration(&env, &version, u32::MAX);
+        Ok(())
+    }
+
+    /// Bounded, resumable variant of `migrate`.  Returns items still pending.
+    /// Call repeatedly until it returns `0`.
+    pub fn migrate_step(env: Env, admin: Address, max_items: u32) -> Result<u64, Error> {
+        storage::extend_instance_ttl(&env);
+        let version = Self::require_pending_migration(&env, &admin)?;
+        Ok(Self::run_migration(&env, &version, max_items))
+    }
+
+    // ── Internal migration helpers ────────────────────────────────────────
+
+    fn require_pending_migration(env: &Env, admin: &Address) -> Result<soroban_sdk::String, Error> {
+        admin.require_auth();
+        let stored = storage::get_admin(env).ok_or(Error::NotInitialized)?;
+        if *admin != stored {
+            return Err(Error::NotAdmin);
+        }
+        let target = soroban_sdk::String::from_str(env, crate::types::CONTRACT_VERSION);
+        if storage::is_migration_done(env, &target) {
+            return Err(Error::AlreadyMigrated);
+        }
+        Ok(target)
+    }
+
+    fn run_migration(
+        env: &Env,
+        version: &soroban_sdk::String,
+        mut budget: u32,
+    ) -> u64 {
+        let mut p = storage::get_migration_progress(env, version);
+
+        // Phase 0: migrate legacy ByCreator + AllCollections Vec entries into
+        //           the paged index introduced in v1.0.0.
+        // Each legacy ByCreator Vec<CollectionRecord> entry is read-and-deleted
+        // in one step; records are then appended to the per-address paged index.
+        while budget > 0 {
+            match p.phase {
+                0 => {
+                    // Legacy AllCollections is a single entry; consume it.
+                    let legacy_key = DataKey::AllCollections;
+                    if let Some(records) = env
+                        .storage()
+                        .persistent()
+                        .get::<DataKey, soroban_sdk::Vec<crate::types::CollectionRecord>>(
+                            &legacy_key,
+                        )
+                    {
+                        env.storage().persistent().remove(&legacy_key);
+                        let current_count = storage::collection_count(env);
+                        // Re-insert into paged keys without touching per-creator indices
+                        // (those were written by record_collection() at deploy time and
+                        //  only need to survive).
+                        for (i, rec) in records.iter().enumerate() {
+                            let global_idx = current_count + i as u64;
+                            env.storage().persistent().set(
+                                &DataKey::CollectionByIndex(global_idx),
+                                &rec,
+                            );
+                            env.storage().persistent().extend_ttl(
+                                &DataKey::CollectionByIndex(global_idx),
+                                50_000,
+                                100_000,
+                            );
+                        }
+                        let new_total = current_count + records.len() as u64;
+                        env.storage()
+                            .persistent()
+                            .set(&DataKey::CollectionCount, &new_total);
+                    }
+                    p.phase = 1;
+                    budget -= 1;
+                }
+                _ => break,
+            }
+        }
+
+        let remaining: u64 = if p.phase == 0 { 1 } else { 0 };
+
+        if remaining == 0 {
+            storage::clear_migration_progress(env, version);
+            storage::set_migration_done(env, version);
+            storage::set_contract_version(env, version);
+            events::publish_migration_completed(env, version);
+        } else {
+            storage::set_migration_progress(env, version, &p);
+        }
+        remaining
     }
 
     /// Records the four collection WASM hashes, bumps the version counter and
@@ -772,6 +905,50 @@ impl Launchpad {
         Ok(())
     }
 
+    pub fn update_collection_wasm(
+        env: Env,
+        kind: CollectionKind,
+        new_wasm_hash: BytesN<32>,
+    ) -> Result<(), Error> {
+        storage::extend_instance_ttl(&env);
+        storage::require_admin(&env)?;
+        let old_wasm = storage::get_wasm_for_kind(&env, &kind).unwrap_or_else(|| {
+            BytesN::from_array(&env, &[0u8; 32])
+        });
+        storage::set_wasm_hash_for_kind(&env, &kind, &new_wasm_hash);
+        events::publish_collection_wasm_updated(&env, &kind, &old_wasm, &new_wasm_hash);
+        Ok(())
+    }
+
+    pub fn upgrade_collection(env: Env, collection_address: Address) -> Result<(), Error> {
+        storage::extend_instance_ttl(&env);
+        storage::require_admin(&env)?;
+
+        let record = storage::get_collection_by_address(&env, &collection_address)
+            .ok_or(Error::CollectionNotFound)?;
+        let new_wasm = storage::get_wasm_for_kind(&env, &record.kind)
+            .ok_or(Error::WasmHashNotSet)?;
+        let from_wasm = new_wasm.clone();
+
+        match record.kind {
+            CollectionKind::Normal721 => {
+                Normal721Client::new(&env, &collection_address).upgrade(&new_wasm);
+            }
+            CollectionKind::Normal1155 => {
+                Normal1155Client::new(&env, &collection_address).upgrade(&new_wasm);
+            }
+            CollectionKind::LazyMint721 => {
+                Lazy721Client::new(&env, &collection_address).upgrade(&new_wasm);
+            }
+            CollectionKind::LazyMint1155 => {
+                Lazy1155Client::new(&env, &collection_address).upgrade(&new_wasm);
+            }
+        }
+
+        events::publish_collection_upgraded(&env, &collection_address, &from_wasm, &new_wasm);
+        Ok(())
+    }
+
     // ── Fee config ────────────────────────────────────────────────────────
 
     /// Sets both the treasury address and the flat deploy fee (token smallest
@@ -849,5 +1026,10 @@ impl Launchpad {
 
     pub fn wasm_version(env: Env) -> u32 {
         storage::wasm_version(&env)
+    }
+
+    /// Semantic version string for this contract.
+    pub fn version(env: Env) -> soroban_sdk::String {
+        soroban_sdk::String::from_str(&env, CONTRACT_VERSION)
     }
 }

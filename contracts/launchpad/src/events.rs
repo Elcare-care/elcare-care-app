@@ -120,3 +120,15 @@ pub fn publish_wasm_hashes_set(
         ),
     );
 }
+
+/// Emitted when a versioned migration completes successfully.
+///
+/// Topics: ("migrated", version: String)
+/// Data:   ()
+#[allow(deprecated)]
+pub fn publish_migration_completed(env: &Env, version: &soroban_sdk::String) {
+    env.events().publish(
+        (soroban_sdk::symbol_short!("migrated"), version.clone()),
+        (),
+    );
+}
