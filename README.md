@@ -440,6 +440,7 @@ ElcareHub handles on-chain value on behalf of artists and collectors. We take se
 - **Incident runbook:** [docs/INCIDENT_RUNBOOK.md](docs/INCIDENT_RUNBOOK.md) — pause procedure, admin key rotation, indexer re-org recovery, and secret rotation.
 - **Operational runbooks:** [docs/runbooks/](docs/runbooks/README.md) — detailed procedures for stalled ingestion, reorgs, DB/Redis outage, compromised keys, Pinata outage, wallet issues, and deployment config errors.
 - **Secret inventory:** [docs/secret-inventory.md](docs/secret-inventory.md) — every secret classified with storage location, owner, and rotation schedule.
+- **Reliability program:** [docs/reliability/](docs/reliability/README.md) — quarterly reviews, domain owners, scored backlog, and decision records aligned with `versions.toml`.
 
 ## Contributing
 

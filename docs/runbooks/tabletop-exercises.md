@@ -111,6 +111,9 @@ No live systems are modified during a tabletop exercise.
 
 ## Runbook Gap Tracking
 
+Track exercise findings in the [reliability backlog](../reliability/backlog.md) (IDs REL-001–REL-003
+below). Close or retire GitHub issues with the same rationale when addressed.
+
 Issues discovered during tabletop exercises that require runbook updates:
 
 | Issue | Runbook | Priority | Status |

@@ -56,6 +56,9 @@ export function WalletGuard({
             <p className="mt-2 text-sm text-gray-500 max-w-xs mx-auto">
                 {actionName}, you must connect your Freighter wallet on the correct network.
             </p>
+            <p className="mt-1 text-xs text-gray-400 max-w-xs mx-auto">
+                Public data like listings, auctions, and collections are still visible without a wallet.
+            </p>
             <button
                 onClick={() => setIsModalOpen(true)}
                 className="mt-6 inline-flex items-center gap-2 rounded-xl bg-brand-500 px-8 py-3.5 text-base font-bold text-white shadow-xl shadow-brand-500/30 hover:bg-brand-600 transition-all hover:scale-105 active:scale-95"
@@ -66,7 +69,7 @@ export function WalletGuard({
 
             {isWrongNetwork && (
                 <p className="mt-4 text-xs font-semibold text-terracotta-600 flex items-center justify-center gap-1.5">
-                    <AlertTriangle size={14} /> Wrong network detected!
+                    <AlertTriangle size={14} /> Wrong network detected — please switch to the correct network and reconnect.
                 </p>
             )}
         </div>

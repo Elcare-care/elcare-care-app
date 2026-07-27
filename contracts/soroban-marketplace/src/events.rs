@@ -35,6 +35,11 @@ pub const COLLECTION_PAUSED: &str = "collection_paused";
 pub const COLLECTION_UNPAUSED: &str = "collection_unpaused";
 pub const FUNCTION_PAUSED: &str = "function_paused";
 pub const FUNCTION_UNPAUSED: &str = "function_unpaused";
+// Role-based authorization events (Issue #267)
+pub const ROLE_TRANSFER_PROPOSED: &str = "role_transfer_proposed";
+pub const ROLE_TRANSFERRED: &str = "role_transferred";
+pub const ROLE_PROPOSAL_CANCELLED: &str = "role_proposal_cancelled";
+pub const ROLE_MIGRATED: &str = "role_migrated";
 // Royalty settlement snapshot event (Issue #270)
 pub const ROYALTY_SETTLEMENT: &str = "royalty_settlement";
 // Auction escrow recovery events (Issue #271)
@@ -763,49 +768,123 @@ pub fn emit_function_unpaused(env: &Env, function_name: soroban_sdk::Symbol) {
     FunctionUnpausedEvent { function_name }.publish(env);
 }
 
-// ── Bounded maintenance / TTL observability events (Issue #280) ─────────────
+// ── Role-based authorization events (Issue #267) ─────────────────────────────
 
-/// Emitted once at the end of every bounded maintenance call
-/// (`extend_active_ttls`, `cleanup_expired_locks`) summarizing how much work
-/// was actually done this invocation, so operators/indexers can track sweep
-/// progress and cadence without polling contract state.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CleanupSummaryEvent {
-    /// Which maintenance operation ran: "ttl_extend" | "lock_cleanup".
-    pub kind: Symbol,
-    /// Number of records/ids actually processed this call (bounded by
-    /// `MAX_MAINTENANCE_ITEMS`; see `contract.rs`).
-    pub items_processed: u32,
-    pub ledger_sequence: u32,
+pub struct RoleTransferProposedEvent {
+    pub role: crate::types::RoleType,
+    pub current_authority: Address,
+    pub proposed_authority: Address,
+    pub expires_at: u64,
 }
-impl CleanupSummaryEvent {
+impl RoleTransferProposedEvent {
     #[allow(deprecated)]
     pub fn publish(self, env: &Env) {
         env.events()
-            .publish((soroban_sdk::Symbol::new(env, CLEANUP_SUMMARY),), self);
+            .publish((soroban_sdk::Symbol::new(env, ROLE_TRANSFER_PROPOSED),), self);
     }
 }
 
-/// Emitted when the `extend_active_ttls` sweep finds an id still present in
-/// a live index/id-space (the `ActiveListings` index, or the sequential
-/// auction id space) whose stored status is no longer Active, or whose
-/// record is missing entirely. This is an index/state consistency signal —
-/// not a routine event — surfaced so a maintenance call that "chose not to"
-/// re-extend a record's TTL is observable rather than silently doing
-/// nothing.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TtlAnomalyEvent {
-    /// "listing" | "auction"
-    pub subject: Symbol,
-    pub id: u64,
-    pub ledger_sequence: u32,
+pub struct RoleTransferredEvent {
+    pub role: crate::types::RoleType,
+    pub old_authority: Address,
+    pub new_authority: Address,
 }
-impl TtlAnomalyEvent {
+impl RoleTransferredEvent {
     #[allow(deprecated)]
     pub fn publish(self, env: &Env) {
         env.events()
-            .publish((soroban_sdk::Symbol::new(env, TTL_ANOMALY),), self);
+            .publish((soroban_sdk::Symbol::new(env, ROLE_TRANSFERRED),), self);
     }
+}
+
+/// Emitted when the current holder of a role cancels a still-pending
+/// transfer proposal before it was accepted or expired.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoleProposalCancelledEvent {
+    pub role: crate::types::RoleType,
+    pub current_authority: Address,
+    pub cancelled_candidate: Address,
+}
+impl RoleProposalCancelledEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, ROLE_PROPOSAL_CANCELLED),), self);
+    }
+}
+
+/// Emitted by `migrate_roles` when a previously-unassigned role is given an
+/// explicit holder for the first time (single-admin → role-separated
+/// migration path, Issue #267).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoleMigratedEvent {
+    pub role: crate::types::RoleType,
+    pub authority: Address,
+}
+impl RoleMigratedEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, ROLE_MIGRATED),), self);
+    }
+}
+
+/// Emit `role_transfer_proposed` for a newly-created role rotation proposal.
+pub fn emit_role_proposed(
+    env: &Env,
+    role: crate::types::RoleType,
+    current_authority: Address,
+    proposed_authority: Address,
+    expires_at: u64,
+) {
+    RoleTransferProposedEvent {
+        role,
+        current_authority,
+        proposed_authority,
+        expires_at,
+    }
+    .publish(env);
+}
+
+/// Emit `role_transferred` once a role proposal is accepted and authority moves.
+pub fn emit_role_accepted(
+    env: &Env,
+    role: crate::types::RoleType,
+    old_authority: Address,
+    new_authority: Address,
+) {
+    RoleTransferredEvent {
+        role,
+        old_authority,
+        new_authority,
+    }
+    .publish(env);
+}
+
+/// Emit `role_proposal_cancelled` when the current holder clears a pending
+/// role proposal before acceptance/expiry.
+pub fn emit_role_proposal_cancelled(
+    env: &Env,
+    role: crate::types::RoleType,
+    current_authority: Address,
+    cancelled_candidate: Address,
+) {
+    RoleProposalCancelledEvent {
+        role,
+        current_authority,
+        cancelled_candidate,
+    }
+    .publish(env);
+}
+
+/// Emit `role_migrated` when `migrate_roles` assigns an explicit holder to a
+/// role that was previously falling back to `Admin`.
+pub fn emit_role_migrated(env: &Env, role: crate::types::RoleType, authority: Address) {
+    RoleMigratedEvent { role, authority }.publish(env);
 }

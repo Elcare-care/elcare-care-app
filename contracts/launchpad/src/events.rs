@@ -86,6 +86,17 @@ pub fn publish_paused(env: &Env, admin: &Address, paused: bool) {
         .publish((symbol_short!("paused"),), (admin.clone(), paused));
 }
 
+/// Emitted when the admin assigns the `EmergencyPause` role to a new address
+/// (Issue #267).
+///
+/// Topics: ("pauser", "set")
+/// Data:   (pauser: Address)
+#[allow(deprecated)]
+pub fn publish_emergency_pauser_updated(env: &Env, pauser: &Address) {
+    env.events()
+        .publish((symbol_short!("pauser"), symbol_short!("set")), pauser.clone());
+}
+
 /// Emitted when the admin records a new set of collection WASM hashes.
 ///
 /// Topics: ("wasm_set", version: u32)

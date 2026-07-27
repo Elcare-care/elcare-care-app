@@ -49,7 +49,10 @@ import {
   Flag,
   ChevronLeft,
   ChevronRight,
+  Ban,
+  X,
 } from "lucide-react";
+import { Breadcrumb } from "@/components/Breadcrumb";
 
 // ── useAuctionCountdown ──────────────────────────────────────
 //
@@ -734,18 +737,19 @@ export default function AuctionDetailPage() {
     );
   }
 
+  const artworkTitle = metadata?.title ?? `Auction #${auction.auction_id}`;
+
   return (
     <div className="min-h-screen bg-gray-50">
-      {/* Back nav */}
+      {/* Back nav + Breadcrumb */}
       <div className="pt-20 pb-4">
         <div className="mx-auto max-w-6xl px-4 sm:px-6">
-          <Link
-            href="/auctions"
-            className="inline-flex items-center gap-1.5 text-sm text-gray-500 hover:text-brand-600 transition-colors"
-          >
-            <ArrowLeft size={14} />
-            All Auctions
-          </Link>
+          <Breadcrumb
+            items={[
+              { label: "Auctions", href: "/auctions" },
+              { label: artworkTitle },
+            ]}
+          />
         </div>
       </div>
 
