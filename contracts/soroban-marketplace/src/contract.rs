@@ -26,7 +26,12 @@ use crate::{
         set_artist_revocation_storage, set_auction_extension_trigger_storage,
         set_auction_extension_window_storage, set_auction_max_extensions_storage,
         set_max_price_storage, set_migration_done,
-        set_min_price_storage, set_pending_admin_storage, PendingAdminProposal,
+        set_min_price_storage, set_pending_admin_storage,
+        load_pending_offer_ids, pending_offer_count,
+        set_artist_cancel_cursor, get_artist_auction_cancel_cursor,
+        set_artist_auction_cancel_cursor, clear_artist_auction_cancel_cursor,
+        IndexId, index_len,
+        PendingAdminProposal,
     },
     types::{
         Auction, AuctionStatus, BatchCreateListingInput, BatchUpdateListingInput, BidRecord,
@@ -61,6 +66,11 @@ const MIN_AUCTION_DURATION: u64 = 3_600; // 1 hour
 const MAX_BATCH_CANCEL: u32 = 10;
 
 const MAX_OFFERS_PER_LISTING: u32 = 50;
+
+/// Maximum listings + auctions cancelled in a single `revoke_artist` invocation.
+/// If the artist has more items the contract emits `RevocationIncompleteEvent`
+/// and the caller must invoke `revoke_artist` again to continue the sweep.
+const REVOCATION_CLEANUP_CAP: u32 = 100;
 
 #[contract]
 pub struct MarketplaceContract;
@@ -578,18 +588,146 @@ impl MarketplaceContract {
 
     // ── Artist Moderation ────────────────────────────────────
 
+    /// Revoke an artist and immediately begin cascading cleanup.
+    ///
+    /// On the first call (or after a reinstate → re-revoke cycle) the function:
+    ///   1. Marks the artist as revoked in storage.
+    ///   2. Iterates up to `REVOCATION_CLEANUP_CAP` active listings owned by
+    ///      the artist, cancelling each (offer refunds + escrow return).
+    ///   3. Continues iterating into the artist's auctions (within the same
+    ///      budget), cancelling each and refunding the current highest bidder.
+    ///   4. Emits `ArtistRevokedEvent` and, when items remain, a
+    ///      `RevocationIncompleteEvent` so the caller knows to invoke again.
+    ///
+    /// Subsequent calls advance the cursor until all items are processed.
+    /// The function is idempotent: calling it on an already-revoked artist with
+    /// no remaining items is a no-op.
     pub fn revoke_artist(env: Env, artist: Address) {
         Self::require_admin(&env);
         set_artist_revocation_storage(&env, &artist);
-        #[allow(deprecated)]
-        env.events().publish((crate::events::ARTIST_REVOKED,), artist);
+
+        // Emit the revocation event using the typed struct (not the raw address).
+        ArtistRevokedEvent { artist: artist.clone() }.publish(&env);
+
+        // ── Cascade: cancel listings ─────────────────────────────────────────
+        let admin = {
+            let key = crate::storage::DataKey::Admin;
+            env.storage().persistent()
+                .get::<_, Address>(&key)
+                .expect("admin not set")
+        };
+
+        let listing_idx = IndexId::ArtistListings(artist.clone());
+        let listing_total = index_len(&env, &listing_idx);
+        let mut cursor = crate::storage::get_artist_cancel_cursor(&env, &artist);
+        let mut budget = REVOCATION_CLEANUP_CAP;
+
+        // Phase 1 — listings
+        while cursor < listing_total && budget > 0 {
+            let listing_id = crate::storage::index_get(&env, &listing_idx, cursor).unwrap();
+            cursor += 1;
+            budget -= 1;
+            if let Some(mut listing) = load_listing(&env, listing_id) {
+                if listing.status == ListingStatus::Active {
+                    // Refund all pending offers
+                    for offer_id in load_pending_offer_ids(&env, listing_id).iter() {
+                        if let Some(mut offer) = load_offer(&env, offer_id) {
+                            if offer.status == OfferStatus::Pending {
+                                offer.status = OfferStatus::Rejected;
+                                save_offer(&env, &offer);
+                                TokenClient::new(&env, &offer.token).transfer(
+                                    &env.current_contract_address(),
+                                    &offer.offerer,
+                                    &offer.amount,
+                                );
+                            }
+                        }
+                    }
+                    clear_pending_offers(&env, listing_id);
+                    listing.status = ListingStatus::Cancelled;
+                    save_listing(&env, &listing);
+                    remove_from_active_listings(&env, listing_id);
+                    ListingCancelledEvent {
+                        listing_id,
+                        cancelled_by: admin.clone(),
+                        reason: CancelReason::AdminRevoked,
+                        ledger_sequence: env.ledger().sequence(),
+                    }.publish(&env);
+                    escrow::release_nft(
+                        &env, &listing.collection, listing.token_id,
+                        &listing.artist, env.ledger().sequence(), listing_id,
+                    );
+                }
+            }
+        }
+        set_artist_cancel_cursor(&env, &artist, cursor);
+
+        // Phase 2 — auctions (within remaining budget)
+        let auction_idx = IndexId::ArtistAuctions(artist.clone());
+        let auction_total = index_len(&env, &auction_idx);
+        let mut auction_cursor = crate::storage::get_artist_auction_cancel_cursor(&env, &artist);
+
+        while auction_cursor < auction_total && budget > 0 {
+            let auction_id = crate::storage::index_get(&env, &auction_idx, auction_cursor).unwrap();
+            auction_cursor += 1;
+            budget -= 1;
+            if let Some(mut auction) = load_auction(&env, auction_id) {
+                if auction.status == AuctionStatus::Active {
+                    // Refund current highest bidder if any
+                    if let Some(ref bidder) = auction.highest_bidder.clone() {
+                        let refund = auction.highest_bid;
+                        if refund > 0 {
+                            TokenClient::new(&env, &auction.token).transfer(
+                                &env.current_contract_address(),
+                                bidder,
+                                &refund,
+                            );
+                            AuctionBidRefundedEvent {
+                                auction_id,
+                                bidder: bidder.clone(),
+                                amount: refund,
+                                token: auction.token.clone(),
+                                reason: Symbol::new(&env, "admin_revoke"),
+                                ledger_sequence: env.ledger().sequence(),
+                            }.publish(&env);
+                        }
+                    }
+                    auction.status = AuctionStatus::Cancelled;
+                    save_auction(&env, &auction);
+                    AuctionCancelledEvent {
+                        auction_id,
+                        cancelled_by: admin.clone(),
+                        reason: Symbol::new(&env, "admin_revoke"),
+                    }.publish(&env);
+                    escrow::release_nft(
+                        &env, &auction.collection, auction.token_id,
+                        &auction.creator, env.ledger().sequence(), auction_id,
+                    );
+                }
+            }
+        }
+        crate::storage::set_artist_auction_cancel_cursor(&env, &artist, auction_cursor);
+
+        // ── Emit incomplete signal if items remain ───────────────────────────
+        let listings_remaining = listing_total.saturating_sub(cursor) as u64;
+        let auctions_remaining = auction_total.saturating_sub(auction_cursor) as u64;
+        let total_remaining = listings_remaining + auctions_remaining;
+        if total_remaining > 0 {
+            RevocationIncompleteEvent {
+                artist: artist.clone(),
+                remaining: total_remaining,
+                ledger_sequence: env.ledger().sequence(),
+            }.publish(&env);
+        }
     }
 
     pub fn reinstate_artist(env: Env, artist: Address) {
         Self::require_admin(&env);
         remove_artist_revocation_storage(&env, &artist);
-        #[allow(deprecated)]
-        env.events().publish((crate::events::ARTIST_REINSTATED,), artist);
+        // Clear any in-progress revocation cursors on reinstatement
+        crate::storage::clear_artist_cancel_cursor(&env, &artist);
+        crate::storage::clear_artist_auction_cancel_cursor(&env, &artist);
+        ArtistReinstatedEvent { artist }.publish(&env);
     }
 
     pub fn is_artist_revoked(env: Env, artist: Address) -> bool {

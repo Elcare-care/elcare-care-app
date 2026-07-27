@@ -8852,3 +8852,212 @@ fn test_global_pause_still_blocks_collection_aware_functions() {
         &valid_recipients(&env, &artist), &None::<u64>,
     ).is_err());
 }
+
+// ════════════════════════════════════════════════════════════
+// SECTION 18: Issue #214 — revoke_artist cascade cleanup
+// ════════════════════════════════════════════════════════════
+
+/// Helper: create a fresh collection, mint token `token_no` to `artist`,
+/// then create a listing for that token.  Returns (listing_id, collection_id).
+fn create_listing_with_token(
+    env: &Env,
+    client: &MarketplaceContractClient,
+    artist: &Address,
+    token_id: &Address,
+    token_no: u64,
+) -> (u64, Address) {
+    let col = env.register(mock_nft::MockNft, ());
+    MockNftClient::new(env, &col).set_owner(&token_no, artist);
+    let lid = client.create_listing(
+        artist,
+        &10_000_000_i128,
+        &symbol_short!("XLM"),
+        token_id,
+        &col,
+        &token_no,
+        &valid_recipients(env, artist),
+        &None::<u64>,
+    );
+    (lid, col)
+}
+
+#[test]
+fn test_revoke_artist_cancels_active_listing() {
+    let (env, client, artist, _buyer, token_id, _cid, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let (lid, _col) = create_listing_with_token(&env, &client, &artist, &token_id, 1);
+    assert_eq!(client.get_listing(&lid).status, ListingStatus::Active);
+
+    client.revoke_artist(&artist);
+
+    let listing = client.get_listing(&lid);
+    assert_eq!(
+        listing.status,
+        ListingStatus::Cancelled,
+        "revoke_artist must cancel the artist's active listing"
+    );
+}
+
+#[test]
+fn test_revoke_artist_emits_listing_cancelled_with_admin_revoked_reason() {
+    let (env, client, artist, _buyer, token_id, _cid, _collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    create_listing_with_token(&env, &client, &artist, &token_id, 1);
+    client.revoke_artist(&artist);
+
+    assert!(
+        has_event_with_topic(&env.events().all(), "lst_cncl"),
+        "revoke_artist must emit ListingCancelledEvent"
+    );
+}
+
+#[test]
+fn test_revoke_artist_refunds_offers_on_cancelled_listing() {
+    let (env, client, artist, buyer, token_id, _cid, _collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let (lid, _col) = create_listing_with_token(&env, &client, &artist, &token_id, 1);
+    // Buyer places an offer; their funds go into escrow
+    let offer_amount = 5_000_000_i128;
+    client.make_offer(&buyer, &lid, &offer_amount, &token_id, &None);
+
+    let tc = soroban_sdk::token::TokenClient::new(&env, &token_id);
+    let buyer_before = tc.balance(&buyer);
+
+    client.revoke_artist(&artist);
+
+    // Offer should be refunded (buyer balance restored)
+    let buyer_after = tc.balance(&buyer);
+    assert_eq!(
+        buyer_after,
+        buyer_before + offer_amount,
+        "pending offer must be refunded when listing is cancelled by revocation"
+    );
+}
+
+#[test]
+fn test_revoke_artist_cancels_active_auction_and_refunds_bidder() {
+    let (env, client, artist, buyer, token_id, _cid, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let col = collection_id.clone();
+    MockNftClient::new(&env, &col).set_owner(&1u64, &artist);
+
+    let aid = client.create_auction(
+        &artist,
+        &token_id,
+        &col,
+        &1u64,
+        &1_000_000_i128,
+        &3_600u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    let bid_amount = 2_000_000_i128;
+    client.place_bid(&buyer, &aid, &bid_amount);
+
+    let tc = soroban_sdk::token::TokenClient::new(&env, &token_id);
+    let buyer_before = tc.balance(&buyer);
+
+    client.revoke_artist(&artist);
+
+    // Auction must be Cancelled
+    assert_eq!(
+        client.get_auction(&aid).status,
+        AuctionStatus::Cancelled,
+        "revoke_artist must cancel the artist's active auction"
+    );
+    // Bidder must be refunded
+    let buyer_after = tc.balance(&buyer);
+    assert_eq!(
+        buyer_after,
+        buyer_before + bid_amount,
+        "highest bidder must be refunded when auction is cancelled by revocation"
+    );
+}
+
+#[test]
+fn test_revoke_artist_emits_auction_bid_refunded_event() {
+    let (env, client, artist, buyer, token_id, _cid, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    MockNftClient::new(&env, &collection_id).set_owner(&1u64, &artist);
+    let aid = client.create_auction(
+        &artist, &token_id, &collection_id, &1u64,
+        &1_000_000_i128, &3_600u64, &valid_recipients(&env, &artist),
+    );
+    client.place_bid(&buyer, &aid, &2_000_000_i128);
+    client.revoke_artist(&artist);
+
+    assert!(
+        has_event_with_topic(&env.events().all(), "auction_bid_refunded"),
+        "AuctionBidRefundedEvent must be emitted when active auction bid is refunded on revocation"
+    );
+}
+
+#[test]
+fn test_revoke_artist_no_active_listings_is_noop() {
+    let (env, client, artist, _buyer, token_id, _cid, _collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    // Artist has no listings at all — revoke must not panic
+    client.revoke_artist(&artist);
+    assert!(client.is_artist_revoked(&artist));
+}
+
+#[test]
+fn test_revoke_artist_emits_artist_revoked_event() {
+    let (env, client, artist, _buyer, _token_id, _cid, _collection_id) = setup();
+    client.set_admin(&artist);
+    client.revoke_artist(&artist);
+
+    assert!(
+        has_event_with_topic(&env.events().all(), "artist_revoked"),
+        "ArtistRevokedEvent must be emitted on revocation"
+    );
+}
+
+#[test]
+fn test_reinstate_clears_revocation_and_cursors() {
+    let (env, client, artist, _buyer, token_id, _cid, _collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    client.revoke_artist(&artist);
+    assert!(client.is_artist_revoked(&artist));
+
+    client.reinstate_artist(&artist);
+    assert!(
+        !client.is_artist_revoked(&artist),
+        "artist must not be revoked after reinstatement"
+    );
+}
+
+#[test]
+fn test_revoke_artist_auction_no_bids_no_refund_event() {
+    let (env, client, artist, _buyer, token_id, _cid, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    MockNftClient::new(&env, &collection_id).set_owner(&1u64, &artist);
+    let aid = client.create_auction(
+        &artist, &token_id, &collection_id, &1u64,
+        &1_000_000_i128, &3_600u64, &valid_recipients(&env, &artist),
+    );
+
+    client.revoke_artist(&artist);
+
+    // Auction cancelled but no AuctionBidRefundedEvent since there were no bids
+    assert_eq!(client.get_auction(&aid).status, AuctionStatus::Cancelled);
+    assert!(
+        !has_event_with_topic(&env.events().all(), "auction_bid_refunded"),
+        "no refund event should be emitted when auction had no bids"
+    );
+}
