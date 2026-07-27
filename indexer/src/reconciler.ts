@@ -551,6 +551,11 @@ export async function startReconciler() {
         error: err instanceof Error ? err.message : String(err),
       });
     }
+    try {
+      await runAccountingReconciliation(server, CONTRACT_ID);
+    } catch (err) {
+      console.error('[Reconciler] Accounting run failed:', err);
+    }
   };
 
   await tick();

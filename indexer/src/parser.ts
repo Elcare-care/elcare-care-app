@@ -57,6 +57,10 @@ const TOPIC_MAP: Record<string, string> = {
   'offer_reclaimed':  'OFFER_RECLAIMED',
   'royalty_paid':  'ROYALTY_PAID',
   'protocol_fee_collected':  'PROTOCOL_FEE_COLLECTED',
+  // Royalty settlement snapshot (Issue #270); backs accounting reconciliation
+  // (Issue #279) — previously unmapped, so these events were silently
+  // dropped by resolveEventType() and never reached the database.
+  'royalty_settlement':  'ROYALTY_SETTLEMENT',
   'artist_revoked':  'ARTIST_REVOKED',
   'artist_reinstated':  'ARTIST_REINSTATED',
   'admin_transfer_proposed':  'ADMIN_TRANSFER_PROPOSED',
@@ -166,6 +170,10 @@ export function parseMarketplaceEvent(
     listingId = BigInt(obj.listing_id as bigint | number | string);
   } else if (obj.auction_id !== undefined && obj.auction_id !== null) {
     listingId = BigInt(obj.auction_id as bigint | number | string);
+  } else if (obj.id !== undefined && obj.id !== null) {
+    // Dual-purpose `id` field (listing_id or auction_id depending on which
+    // settlement path fired) used by RoyaltySettlementEvent (Issue #270/#279).
+    listingId = BigInt(obj.id as bigint | number | string);
   }
 
   let actor = '';

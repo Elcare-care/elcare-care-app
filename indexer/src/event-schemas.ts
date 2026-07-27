@@ -472,6 +472,19 @@ export const PROTOCOL_FEE_COLLECTED_SCHEMA: ContractEventSchema = {
   ],
 };
 
+// Royalty settlement snapshot (Issue #270); backs the accounting
+// reconciliation added by Issue #279 — see RoyaltySettlementData above.
+export const ROYALTY_SETTLEMENT_SCHEMA: ContractEventSchema = {
+  type: 'ROYALTY_SETTLEMENT',
+  data: [
+    { name: 'id', type: 'bigint' },
+    { name: 'recipients', type: 'array', optional: true },
+    { name: 'total_amount', type: 'bigint' },
+    { name: 'token', type: 'string' },
+    { name: 'ledger_sequence', type: 'bigint', optional: true },
+  ],
+};
+
 export const ARTIST_REVOKED_SCHEMA: ContractEventSchema = {
   type: 'ARTIST_REVOKED',
   data: [{ name: 'artist', type: 'string' }],
@@ -599,6 +612,7 @@ export const SCHEMA_REGISTRY: Map<string, ContractEventSchema> = new Map([
   ['OFFER_RECLAIMED', OFFER_RECLAIMED_SCHEMA],
   ['ROYALTY_PAID', ROYALTY_PAID_SCHEMA],
   ['PROTOCOL_FEE_COLLECTED', PROTOCOL_FEE_COLLECTED_SCHEMA],
+  ['ROYALTY_SETTLEMENT', ROYALTY_SETTLEMENT_SCHEMA],
   ['ARTIST_REVOKED', ARTIST_REVOKED_SCHEMA],
   ['ARTIST_REINSTATED', ARTIST_REINSTATED_SCHEMA],
   ['ADMIN_TRANSFER_PROPOSED', ADMIN_TRANSFER_PROPOSED_SCHEMA],
