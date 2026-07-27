@@ -1089,6 +1089,36 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
       break;
     }
 
+    // ── Issue #214: cascade Cancelled on all artist listings + auctions ──────
+    case 'ARTIST_REVOKED': {
+      const revokedArtist = String(data.artist ?? actor ?? '');
+      if (revokedArtist) {
+        const [listingResult, auctionResult] = await Promise.all([
+          db.listing.updateMany({
+            where: { artist: revokedArtist, status: 'Active' },
+            data: { status: 'Cancelled' as const, updatedAtLedger: ledgerSequence },
+          }),
+          db.auction.updateMany({
+            where: { creator: revokedArtist, status: 'Active' },
+            data: { status: 'Cancelled' as const, updatedAtLedger: ledgerSequence },
+          }),
+        ]);
+        logger.info('ARTIST_REVOKED: cascaded cancellations', {
+          artist: revokedArtist,
+          listingsCancelled: listingResult.count,
+          auctionsCancelled: auctionResult.count,
+          ledger: ledgerSequence,
+        });
+        invalidatePattern('cache:*/listings*').catch(() => {});
+        invalidatePattern('cache:*/auctions*').catch(() => {});
+        prisma.listing.count({ where: { status: 'Active' } })
+          .then((n) => activeListingsGauge.set(n)).catch(() => {});
+        prisma.auction.count({ where: { status: 'Active' } })
+          .then((n) => activeAuctionsGauge.set(n)).catch(() => {});
+      }
+      break;
+    }
+
     case 'AUCTION_CREATED': {
       let chainAuction = await fetchAuctionFromChain(listingId, event.contractId);
       if (chainAuction && !chainAuction.creator) chainAuction = null;

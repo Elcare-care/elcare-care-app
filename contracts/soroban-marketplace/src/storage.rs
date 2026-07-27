@@ -119,6 +119,9 @@ pub enum DataKey {
     /// Resume position for the batched `cancel_artist_listings` operation:
     /// number of entries of the artist-listings index already processed.
     ArtistCancelCursor(Address),
+    /// Resume position for the batched auction cancellation on revocation
+    /// (Issue #214): number of entries of the artist-auctions index processed.
+    ArtistAuctionCancelCursor(Address),
     /// Resumable progress of the versioned `migrate`/`migrate_step` operation.
     MigrationCursor(soroban_sdk::String),
     /// Escrow record for a `(collection, token_id)` currently held in
@@ -605,6 +608,27 @@ pub fn clear_artist_cancel_cursor(env: &Env, artist: &Address) {
     env.storage()
         .persistent()
         .remove(&DataKey::ArtistCancelCursor(artist.clone()));
+}
+
+// ── Batched cancel_artist_auctions cursor (Issue #214) ───────
+
+pub fn get_artist_auction_cancel_cursor(env: &Env, artist: &Address) -> u32 {
+    env.storage()
+        .persistent()
+        .get::<DataKey, u32>(&DataKey::ArtistAuctionCancelCursor(artist.clone()))
+        .unwrap_or(0)
+}
+
+pub fn set_artist_auction_cancel_cursor(env: &Env, artist: &Address, cursor: u32) {
+    let key = DataKey::ArtistAuctionCancelCursor(artist.clone());
+    env.storage().persistent().set(&key, &cursor);
+    bump_entry_ttl(env, &key);
+}
+
+pub fn clear_artist_auction_cancel_cursor(env: &Env, artist: &Address) {
+    env.storage()
+        .persistent()
+        .remove(&DataKey::ArtistAuctionCancelCursor(artist.clone()));
 }
 
 // ── Moderation & Config ────────────────────────────────────
