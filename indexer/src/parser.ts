@@ -13,6 +13,11 @@ export interface DecodedEvent {
   contractId: string;
   txHash: string;
   eventIndex: number;
+  // Globally unique RPC event id; falls back to eventHash when the RPC omits it
+  eventId: string;
+  // Transaction application order within the ledger — with eventIndex this
+  // gives a total intra-ledger order: (ledgerSequence, txIndex, eventIndex)
+  txIndex: number;
 }
 
 /**
@@ -30,10 +35,9 @@ export function computeEventHash(
     .digest('hex');
 }
 
-/** Re-exported for callers that want to inspect decode failures directly. */
-export type { DecodeResult };
-
-// Map contract symbols to human-readable types
+// Map contract symbols to human-readable types.
+// Covers all 24 symbols in contracts/soroban-marketplace/src/events.rs plus
+// the 4 launchpad deploy symbols.
 const TOPIC_MAP: Record<string, string> = {
   'listing_created':  'LISTING_CREATED',
   'artwork_sold':  'ARTWORK_SOLD',
@@ -76,39 +80,59 @@ const TOPIC_MAP: Record<string, string> = {
   'dep_l1155': 'DEPLOY_LAZY_1155',
 };
 
-/**
- * Decode a single raw topic XDR string to its native symbol string.
- * Falls back to the raw string value when XDR parsing throws.
- */
-function decodeTopic(raw: string): string {
-  try {
-    const scVal = xdr.ScVal.fromXDR(raw, 'base64');
-    return scValToNative(scVal) as string;
-  } catch {
-    return raw;
+/** All event type names this parser can produce (exported for tests/UI). */
+export const KNOWN_EVENT_TYPES: readonly string[] = Object.values(TOPIC_MAP);
+
+const DEPLOY_TYPES = new Set([
+  'DEPLOY_NORMAL_721',
+  'DEPLOY_NORMAL_1155',
+  'DEPLOY_LAZY_721',
+  'DEPLOY_LAZY_1155',
+]);
+
+// The first key present in the payload wins. The first five preserve the
+// legacy precedence (e.g. art_sold carries both artist and buyer — artist
+// remains the recorded actor); the rest cover the newly mapped topics per
+// their structs in events.rs.
+const ACTOR_KEYS = [
+  'artist',
+  'creator',
+  'offerer',
+  'bidder',
+  'buyer',
+  'cancelled_by',    // lst_cncl / auc_cncl
+  'updated_by',      // lst_pru
+  'new_admin',       // adm_xfrd: the accepting admin performed the transfer
+  'current_admin',   // adm_prop: the proposing admin
+  'admin',           // ctr_psd / ctr_unpsd (payload shape depends on contract)
+] as const;
+
+function extractActor(eventType: string, nativeData: any): string {
+  if (DEPLOY_TYPES.has(eventType)) {
+    // Deploy events publish a (creator, collection_address) tuple
+    if (Array.isArray(nativeData) && nativeData.length >= 1 && nativeData[0] != null) {
+      return nativeData[0].toString();
+    }
+    return '';
   }
+  if (nativeData === null || typeof nativeData !== 'object' || Array.isArray(nativeData)) {
+    return '';
+  }
+  for (const key of ACTOR_KEYS) {
+    const value = nativeData[key];
+    if (value !== undefined && value !== null) return value.toString();
+  }
+  return '';
 }
 
-/**
- * Resolve the human-readable event type from the topics array.
- *
- * Marketplace contract: topics = [kind_symbol]
- * Launchpad contract:   topics = ["deploy", kind_tag_symbol]
- *
- * Returns null when the topic does not map to any known event type.
- */
-function resolveEventType(topics: string[]): string | null {
-  if (topics.length === 0) return null;
-
-  const first = decodeTopic(topics[0]);
-
-  // Launchpad deploy events use a 2-topic layout: ("deploy", tag)
-  if (first === 'deploy' && topics.length >= 2) {
-    const tag = decodeTopic(topics[1]);
-    return TOPIC_MAP[tag] ?? null;
+function extractListingId(nativeData: any): bigint | null {
+  if (nativeData === null || typeof nativeData !== 'object' || Array.isArray(nativeData)) {
+    return null;
   }
-
-  return TOPIC_MAP[first] ?? null;
+  if (nativeData.listing_id !== undefined) return BigInt(nativeData.listing_id);
+  // Auction events carry auction_id; it shares the marketplace id space
+  if (nativeData.auction_id !== undefined) return BigInt(nativeData.auction_id);
+  return null;
 }
 
 export function parseMarketplaceEvent(
@@ -117,7 +141,9 @@ export function parseMarketplaceEvent(
   ledger: number,
   contractId: string = '',
   txHash: string = '',
-  eventIndex: number = 0
+  eventIndex: number = 0,
+  eventId: string = '',
+  txIndex: number = 0
 ): DecodedEvent | null {
   const type = resolveEventType(topics);
   if (!type) return null;
@@ -156,6 +182,9 @@ export function parseMarketplaceEvent(
   else if (obj.offerer)  actor = String(obj.offerer);
   else if (obj.bidder)   actor = String(obj.bidder);
   else if (obj.buyer)    actor = String(obj.buyer);
+  // Collection fee events carry no personal actor — use the collection address
+  // as a stable identifier so the MarketplaceEvent.actor column is never empty.
+  else if (obj.collection) actor = String(obj.collection);
 
   // For deploy events the value is a 2-tuple [creator, contract_address]
   if (
@@ -181,11 +210,15 @@ export function parseMarketplaceEvent(
     listingId,
     actor,
     ledgerSequence: ledger,
-    data: convertBigInts(nativeData),
-    eventHash: computeEventHash(contractId, ledger, txHash, eventIndex),
+    // Coalesce void payloads (e.g. ctr_psd) so the required Json column
+    // always receives a value.
+    data: convertBigInts(nativeData) ?? {},
+    eventHash,
     contractId,
     txHash,
     eventIndex,
+    eventId: eventId || eventHash,
+    txIndex,
   };
 }
 
@@ -210,8 +243,9 @@ export class SchemaDecodeError extends Error {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /**
- * Recursively converts BigInt values to strings so the data payload is safe
- * for JSON storage (Prisma Json column).
+ * Helper to convert BigInts in an object to strings for JSON storage if needed,
+ * though Prisma handles BigInt natively in some cases.
+ * For 'Json' field in Prisma, we should convert them to strings or numbers.
  */
 function convertBigInts(obj: unknown): unknown {
   if (typeof obj === 'bigint') return obj.toString();

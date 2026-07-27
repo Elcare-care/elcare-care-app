@@ -42,6 +42,22 @@ pub struct PendingAdminProposal {
     pub expires_at: u64,
 }
 
+/// A pending two-step role-authority rotation (Issue #267).
+///
+/// Stored under `DataKey::PendingRole(role)` between `propose_role_transfer`
+/// and `accept_role_transfer`, mirroring [`PendingAdminProposal`]'s semantics:
+/// `expires_at` bounds how long a proposal can sit unaccepted, and the current
+/// holder can clear it early via `cancel_role_proposal`.
+#[contracttype]
+#[derive(Clone)]
+pub struct PendingRoleProposal {
+    /// Address invited to become the new holder of the role.
+    pub candidate: Address,
+    /// Absolute ledger timestamp after which the proposal can no longer be
+    /// accepted.
+    pub expires_at: u64,
+}
+
 /// Resumable progress marker for a versioned storage migration.
 #[contracttype]
 #[derive(Clone)]
@@ -119,6 +135,9 @@ pub enum DataKey {
     /// Resume position for the batched `cancel_artist_listings` operation:
     /// number of entries of the artist-listings index already processed.
     ArtistCancelCursor(Address),
+    /// Resume position for the batched auction cancellation on revocation
+    /// (Issue #214): number of entries of the artist-auctions index processed.
+    ArtistAuctionCancelCursor(Address),
     /// Resumable progress of the versioned `migrate`/`migrate_step` operation.
     MigrationCursor(soroban_sdk::String),
     /// Escrow record for a `(collection, token_id)` currently held in
@@ -126,19 +145,11 @@ pub enum DataKey {
     /// listing or auction; a double-listing guard reads it and settlement /
     /// cancellation clears it.
     EscrowedToken(Address, u64),
-    /// Lifetime, monotonic total of protocol fee amounts actually collected
-    /// (transferred to the treasury), keyed by payment token address.
-    /// See "Accounting counters" (Issue #279) for the immutability contract.
-    ProtocolFeeTotal(Address),
-    /// Lifetime, monotonic total of the gross settlement value (`total_amount`
-    /// as emitted on `RoyaltySettlementEvent`) across every successful
-    /// purchase / auction-finalize / offer-accept, keyed by payment token
-    /// address. See "Accounting counters" (Issue #279).
-    RoyaltyTotal(Address),
-    /// Lifetime, monotonic count of successful settlements (purchase,
-    /// auction-finalize-with-winner, offer-accept), keyed by payment token
-    /// address. See "Accounting counters" (Issue #279).
-    SettlementCount(Address),
+    /// Bounded (≤ MAX_BLOCKED_BIDDERS) list of addresses barred from bidding
+    /// on this auction (anti-shill-bidding registry, Issue #199).  Kept as a
+    /// separate per-auction key — not a field on `Auction` — so auctions that
+    /// never block anyone pay no extra storage.
+    AuctionBlockedBidders(u64),
 }
 
 /// Custody record for an NFT held by the marketplace, keyed by
@@ -720,6 +731,27 @@ pub fn clear_artist_cancel_cursor(env: &Env, artist: &Address) {
         .remove(&DataKey::ArtistCancelCursor(artist.clone()));
 }
 
+// ── Batched cancel_artist_auctions cursor (Issue #214) ───────
+
+pub fn get_artist_auction_cancel_cursor(env: &Env, artist: &Address) -> u32 {
+    env.storage()
+        .persistent()
+        .get::<DataKey, u32>(&DataKey::ArtistAuctionCancelCursor(artist.clone()))
+        .unwrap_or(0)
+}
+
+pub fn set_artist_auction_cancel_cursor(env: &Env, artist: &Address, cursor: u32) {
+    let key = DataKey::ArtistAuctionCancelCursor(artist.clone());
+    env.storage().persistent().set(&key, &cursor);
+    bump_entry_ttl(env, &key);
+}
+
+pub fn clear_artist_auction_cancel_cursor(env: &Env, artist: &Address) {
+    env.storage()
+        .persistent()
+        .remove(&DataKey::ArtistAuctionCancelCursor(artist.clone()));
+}
+
 // ── Moderation & Config ────────────────────────────────────
 
 pub fn set_artist_revocation_storage(env: &Env, artist: &Address) {
@@ -886,6 +918,51 @@ pub fn clear_pending_admin_storage(env: &Env) {
     env.storage().persistent().remove(&DataKey::PendingAdmin);
 }
 
+// ── Role-based authorization (Issue #267) ────────────────────
+
+pub fn get_role_storage(env: &Env, role: &crate::types::RoleType) -> Option<Address> {
+    let key = DataKey::Role(role.clone());
+    let value = env.storage().persistent().get::<DataKey, Address>(&key);
+    if value.is_some() {
+        bump_entry_ttl(env, &key);
+    }
+    value
+}
+
+pub fn set_role_storage(env: &Env, role: &crate::types::RoleType, authority: &Address) {
+    let key = DataKey::Role(role.clone());
+    env.storage().persistent().set(&key, authority);
+    bump_entry_ttl(env, &key);
+}
+
+pub fn set_pending_role_storage(
+    env: &Env,
+    role: &crate::types::RoleType,
+    pending: &PendingRoleProposal,
+) {
+    let key = DataKey::PendingRole(role.clone());
+    env.storage().persistent().set(&key, pending);
+    bump_entry_ttl(env, &key);
+}
+
+pub fn get_pending_role_storage(
+    env: &Env,
+    role: &crate::types::RoleType,
+) -> Option<PendingRoleProposal> {
+    let key = DataKey::PendingRole(role.clone());
+    let value = env.storage().persistent().get::<DataKey, PendingRoleProposal>(&key);
+    if value.is_some() {
+        bump_entry_ttl(env, &key);
+    }
+    value
+}
+
+pub fn clear_pending_role_storage(env: &Env, role: &crate::types::RoleType) {
+    env.storage()
+        .persistent()
+        .remove(&DataKey::PendingRole(role.clone()));
+}
+
 // ── Bid history ──────────────────────────────────────────────
 
 pub fn append_bid_record(env: &Env, auction_id: u64, record: &BidRecord, cap: u32) {
@@ -918,6 +995,36 @@ pub fn load_auction_bids(env: &Env, auction_id: u64) -> soroban_sdk::Vec<BidReco
         bump_entry_ttl(env, &key);
     }
     value
+}
+
+// ── Blocked bidders (Issue #199) ─────────────────────────────
+
+pub fn load_blocked_bidders(env: &Env, auction_id: u64) -> Vec<Address> {
+    let key = DataKey::AuctionBlockedBidders(auction_id);
+    let value = env
+        .storage()
+        .persistent()
+        .get::<DataKey, Vec<Address>>(&key)
+        .unwrap_or_else(|| Vec::new(env));
+    if !value.is_empty() {
+        bump_entry_ttl(env, &key);
+    }
+    value
+}
+
+pub fn save_blocked_bidders(env: &Env, auction_id: u64, list: &Vec<Address>) {
+    let key = DataKey::AuctionBlockedBidders(auction_id);
+    if list.is_empty() {
+        // Drop the entry entirely so an emptied registry costs nothing.
+        env.storage().persistent().remove(&key);
+    } else {
+        env.storage().persistent().set(&key, list);
+        bump_entry_ttl(env, &key);
+    }
+}
+
+pub fn is_bidder_blocked(env: &Env, auction_id: u64, bidder: &Address) -> bool {
+    load_blocked_bidders(env, auction_id).contains(bidder)
 }
 
 pub fn set_paused(env: &Env, paused: bool) {
@@ -1130,50 +1237,6 @@ pub fn get_bid_history_cap_storage(env: &Env) -> u32 {
         bump_entry_ttl(env, &DataKey::BidHistoryCap);
     }
     value.unwrap_or(DEFAULT_BID_HISTORY_CAP)
-}
-
-// ── Escrow record ────────────────────────────────────────────
-
-/// A lightweight record written when an NFT is pulled into escrow and
-/// deleted when the NFT is released.  Supports the double-listing guard
-/// and the `get_escrow` view function.
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct EscrowRecord {
-    /// `true` → held for a listing; `false` → held for an auction.
-    pub is_listing: bool,
-    /// The listing_id or auction_id holding the token.
-    pub id: u64,
-}
-
-#[contracttype]
-#[derive(Clone)]
-pub enum EscrowKey {
-    EscrowedToken(Address, u64),
-}
-
-pub fn set_escrow_record(env: &Env, collection: &Address, token_id: u64, record: &EscrowRecord) {
-    let key = EscrowKey::EscrowedToken(collection.clone(), token_id);
-    env.storage().persistent().set(&key, record);
-    env.storage()
-        .persistent()
-        .extend_ttl(&key, LEDGER_TTL_THRESHOLD, LEDGER_TTL_BUMP);
-}
-
-pub fn get_escrow_record(env: &Env, collection: &Address, token_id: u64) -> Option<EscrowRecord> {
-    let key = EscrowKey::EscrowedToken(collection.clone(), token_id);
-    let value = env.storage().persistent().get::<EscrowKey, EscrowRecord>(&key);
-    if value.is_some() {
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, LEDGER_TTL_THRESHOLD, LEDGER_TTL_BUMP);
-    }
-    value
-}
-
-pub fn clear_escrow_record(env: &Env, collection: &Address, token_id: u64) {
-    let key = EscrowKey::EscrowedToken(collection.clone(), token_id);
-    env.storage().persistent().remove(&key);
 }
 
 // ── Auction max-extensions cap ───────────────────────────────

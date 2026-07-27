@@ -75,7 +75,7 @@ describe('wallet-adapter', () => {
       const adapter = createExtensionAdapter(mockState, mockSign);
       const result = await adapter.signTransaction('tx');
 
-      expect(mockSign).toHaveBeenCalledWith('tx');
+      expect(mockSign).toHaveBeenCalledWith('tx', undefined);
       expect(result).toBe('signed-tx');
     });
   });

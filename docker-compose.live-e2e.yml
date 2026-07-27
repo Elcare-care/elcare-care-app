@@ -1,0 +1,103 @@
+# ─────────────────────────────────────────────────────────────
+# docker-compose.live-e2e.yml
+#
+# The live integration environment: PostgreSQL + Redis + indexer +
+# frontend, wired to a real (disposable testnet) deployment of the
+# marketplace/launchpad contracts. Driven by scripts/live-e2e/setup.sh,
+# which generates scripts/live-e2e/.env.live-e2e — don't invoke this
+# file directly without that env file, it won't have contract IDs.
+#
+# Isolated from the indexer's own indexer/docker-compose.yml (used for
+# indexer-only local dev) via distinct host ports, container names, and
+# volumes so both can run side by side without colliding.
+# ─────────────────────────────────────────────────────────────
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: elcarehub-live-e2e-postgres
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=marketplace_indexer_live
+    ports:
+      - "5433:5432"
+    volumes:
+      - live_e2e_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: elcarehub-live-e2e-redis
+    ports:
+      - "6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  indexer:
+    build: ./indexer
+    container_name: elcarehub-live-e2e-indexer
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/marketplace_indexer_live?schema=public
+      - REDIS_URL=redis://redis:6379
+      - PORT=4000
+      - STELLAR_NETWORK=${STELLAR_NETWORK}
+      - STELLAR_RPC_URL=${STELLAR_RPC_URL}
+      - STELLAR_HORIZON_URL=${STELLAR_HORIZON_URL}
+      - MARKETPLACE_CONTRACT_ID=${MARKETPLACE_CONTRACT_ID}
+      - LAUNCHPAD_CONTRACT_ID=${LAUNCHPAD_CONTRACT_ID}
+      # Real testnet ledgers close every ~5s; poll a bit faster than the
+      # default so seeded events show up quickly and tests don't need
+      # generous artificial waits to see fresh state.
+      - POLL_INTERVAL_MS=2000
+      - CONFIRMATION_DEPTH=1
+      - CORS_ORIGIN=http://localhost:3100
+    ports:
+      - "4100:4000"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:4000/health | grep -q '\"status\"'"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
+
+  frontend:
+    build:
+      context: ./frontend/elcarehub-app
+      dockerfile: Dockerfile.live-e2e
+      args:
+        NEXT_PUBLIC_CONTRACT_ID: ${MARKETPLACE_CONTRACT_ID}
+        NEXT_PUBLIC_LAUNCHPAD_CONTRACT_ID: ${LAUNCHPAD_CONTRACT_ID}
+        NEXT_PUBLIC_STELLAR_NETWORK: ${STELLAR_NETWORK}
+        NEXT_PUBLIC_STELLAR_RPC_URL: ${STELLAR_RPC_URL}
+        NEXT_PUBLIC_STELLAR_HORIZON_URL: ${STELLAR_HORIZON_URL}
+        NEXT_PUBLIC_STELLAR_NETWORK_PASSPHRASE: ${STELLAR_NETWORK_PASSPHRASE}
+        NEXT_PUBLIC_INDEXER_URL: http://localhost:4100
+    container_name: elcarehub-live-e2e-frontend
+    depends_on:
+      indexer:
+        condition: service_healthy
+    ports:
+      - "3100:3000"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000 || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+
+volumes:
+  live_e2e_postgres_data:

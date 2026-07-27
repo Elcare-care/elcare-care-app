@@ -1,14 +1,20 @@
 // ─────────────────────────────────────────────────────────────
 // lib/ipfs.ts — IPFS upload helpers via Pinata REST API
+//
+// Issue #307 / #42 enhancements:
+//   • Returns uploadId and contentHash from routes for workflow tracking
+//   • isDuplicate flag surfaces idempotency information to callers
+//   • Preserves gateway fallback + metadata fetch behaviour
 // ─────────────────────────────────────────────────────────────
 //
 // Artwork metadata schema (stored on IPFS):
 // {
-//   "title": "…",
+//   "title":       "…",
 //   "description": "…",
-//   "artist": "…",
-//   "image": "ipfs://CID",
-//   "year": "2024"
+//   "artist":      "…",
+//   "image":       "ipfs://CID",
+//   "year":        "2024",
+//   "category":    "…"
 // }
 // ─────────────────────────────────────────────────────────────
 
@@ -24,19 +30,119 @@ export interface ArtworkMetadata {
   image: string;
   year: string;
   category: string;
+  // Issue #68: Inclusive artwork metadata and alt-text requirements
+  /**
+   * Meaningful alt text describing the artwork for screen-reader users.
+   * Required unless isDecorativeImage is true.
+   * Should describe content, not merely repeat the title.
+   */
+  altText?: string;
+  /**
+   * Set true only when the image is purely decorative and conveys no
+   * information. When true, the rendered <img> uses alt="" and no altText
+   * is required.
+   */
+  isDecorativeImage?: boolean;
+  /** Human-readable creator name; may differ from the artist's wallet address. */
+  creator?: string;
+  /** Material and technique, e.g. "Oil on canvas", "Digital illustration". */
+  medium?: string;
+  /** Physical or digital dimensions, e.g. "60×80 cm", "4096×4096 px". */
+  dimensions?: string;
+  /**
+   * Cultural, geographic, or historical context that helps viewers understand
+   * the work's origin and significance. Creators should describe this
+   * respectfully and accurately, using terms the originating community uses.
+   */
+  culturalContext?: string;
+  /**
+   * Attribution or credit for referenced source material.
+   * Required when the work builds on or depicts existing cultural property.
+   */
+  attribution?: string;
+  /** License under which the work is released, e.g. "CC BY-SA 4.0", "All Rights Reserved". */
+  license?: string;
+  /** Optional content advisory describing potentially sensitive subject matter. */
+  contentAdvisory?: string;
 }
 
-/** Result of any IPFS upload */
+// ── Metadata validation (Issue #68) ──────────────────────────────────────────
+
+export type MetadataValidationError =
+  | "MISSING_TITLE"
+  | "MISSING_ARTIST"
+  | "MISSING_ALT_TEXT"
+  | "ALT_TEXT_TOO_LONG"
+  | "MISSING_IMAGE";
+
+export interface MetadataValidationResult {
+  valid: boolean;
+  errors: MetadataValidationError[];
+  messages: string[];
+}
+
+const ALT_TEXT_MAX_LENGTH = 300;
+
+/**
+ * Validates artwork metadata before IPFS upload.
+ * Enforced both client-side (fast feedback) and server-side (upload route).
+ */
+export function validateArtworkMetadata(
+  metadata: Partial<ArtworkMetadata>
+): MetadataValidationResult {
+  const errors: MetadataValidationError[] = [];
+  const messages: string[] = [];
+
+  if (!metadata.title?.trim()) {
+    errors.push("MISSING_TITLE");
+    messages.push("Title is required.");
+  }
+  if (!metadata.artist?.trim()) {
+    errors.push("MISSING_ARTIST");
+    messages.push("Artist address is required.");
+  }
+  if (!metadata.image?.trim()) {
+    errors.push("MISSING_IMAGE");
+    messages.push("Image CID is required.");
+  }
+  if (!metadata.isDecorativeImage) {
+    if (!metadata.altText?.trim()) {
+      errors.push("MISSING_ALT_TEXT");
+      messages.push(
+        "Alt text is required for non-decorative images. Describe what the artwork shows, not just its title."
+      );
+    } else if (metadata.altText.length > ALT_TEXT_MAX_LENGTH) {
+      errors.push("ALT_TEXT_TOO_LONG");
+      messages.push(
+        `Alt text must be ${ALT_TEXT_MAX_LENGTH} characters or fewer (${metadata.altText.length} given).`
+      );
+    }
+  }
+
+  return { valid: errors.length === 0, errors, messages };
+}
+
+/** Result of any IPFS upload (enriched with idempotency info) */
 export interface IpfsUploadResult {
   cid: string;
   url: string;
+  /** Server-assigned upload ID for workflow/reconciliation tracking */
+  uploadId: string;
+  /** SHA-256 hex digest of the uploaded content */
+  contentHash: string;
+  /**
+   * True when Pinata already had this exact content pinned.
+   * The same CID is returned — no duplicate pin is created.
+   */
+  isDuplicate: boolean;
 }
 
 // ── Upload a File (image) ─────────────────────────────────────
 
 /**
  * Uploads an artwork image to IPFS via Pinata.
- * Returns the raw CID string.
+ * Validates file size and MIME type server-side before pinning.
+ * Returns a stable CID even on retried/duplicate requests.
  */
 export async function uploadImageToIPFS(
   file: File,
@@ -46,14 +152,23 @@ export async function uploadImageToIPFS(
   formData.append("file", file);
   formData.append("name", name ?? file.name);
 
-  const res = await axios.post("/api/ipfs/upload-image", formData, {
+  const res = await axios.post<{
+    cid: string;
+    uploadId: string;
+    contentHash: string;
+    isDuplicate: boolean;
+    mimeType: string;
+  }>("/api/ipfs/upload-image", formData, {
     maxBodyLength: Infinity,
   });
 
-  const cid: string = res.data.cid;
+  const { cid, uploadId, contentHash, isDuplicate } = res.data;
   return {
     cid,
     url: `${config.pinataGateway}/ipfs/${cid}`,
+    uploadId,
+    contentHash,
+    isDuplicate,
   };
 }
 
@@ -61,21 +176,30 @@ export async function uploadImageToIPFS(
 
 /**
  * Uploads artwork metadata JSON to IPFS via Pinata.
- * Returns the CID of the metadata file.
+ * Validates the metadata schema server-side before pinning.
+ * Returns a stable CID even on retried/duplicate requests.
  */
 export async function uploadMetadataToIPFS(
   metadata: ArtworkMetadata,
   name?: string
 ): Promise<IpfsUploadResult> {
-  const res = await axios.post("/api/ipfs/upload-metadata", {
+  const res = await axios.post<{
+    cid: string;
+    uploadId: string;
+    contentHash: string;
+    isDuplicate: boolean;
+  }>("/api/ipfs/upload-metadata", {
     metadata,
     name: name ?? `${metadata.title}-metadata.json`,
   });
 
-  const cid: string = res.data.cid;
+  const { cid, uploadId, contentHash, isDuplicate } = res.data;
   return {
     cid,
     url: `${config.pinataGateway}/ipfs/${cid}`,
+    uploadId,
+    contentHash,
+    isDuplicate,
   };
 }
 
@@ -107,11 +231,13 @@ export function getGatewayUrls(
 
   const primary = primaryGateway ?? config.pinataGateway;
   const seen = new Set<string>();
-  return [primary, ...DEFAULT_FALLBACK_GATEWAYS].filter((gw) => {
-    if (seen.has(gw)) return false;
-    seen.add(gw);
-    return true;
-  }).map((gw) => `${gw.replace(/\/$/, "")}/ipfs/${clean}`);
+  return [primary, ...DEFAULT_FALLBACK_GATEWAYS]
+    .filter((gw) => {
+      if (seen.has(gw)) return false;
+      seen.add(gw);
+      return true;
+    })
+    .map((gw) => `${gw.replace(/\/$/, "")}/ipfs/${clean}`);
 }
 
 // ── Fetch metadata ────────────────────────────────────────────
@@ -119,10 +245,18 @@ export function getGatewayUrls(
 /**
  * Fetches and parses artwork metadata JSON from IPFS.
  * `cid` can be a raw CID string or an "ipfs://CID" URI.
+ * Tries the primary gateway first, then falls back to public gateways.
  */
 export async function fetchMetadata(cid?: string): Promise<ArtworkMetadata> {
   if (!cid) {
-    return { title: "Unknown Artwork", description: "", artist: "Unknown", image: "", year: "", category: "" };
+    return {
+      title: "Unknown Artwork",
+      description: "",
+      artist: "Unknown",
+      image: "",
+      year: "",
+      category: "",
+    };
   }
   const cleanCid = normalizeIpfsUri(cid);
   const urls = getGatewayUrls(cleanCid);

@@ -33,6 +33,7 @@ import { SUPPORTED_TOKENS, TokenConfig } from "@/config/tokens";
 import { GuardButton } from "@/components/WalletGuard";
 import { useAcceptOffer, useRejectOffer } from "@/hooks/useOffers";
 import { useModalA11y } from "@/hooks/useModalA11y";
+import { StatusAnnouncer } from "@/components/a11y/StatusAnnouncer";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -66,12 +67,22 @@ function MakeOfferModal({
   isSubmitting,
   error,
 }: MakeOfferModalProps) {
-  const { dialogRef, titleId } = useModalA11y(isOpen, onClose);
+  const { dialogRef, titleId, descriptionId } = useModalA11y(isOpen, onClose);
   const [amount, setAmount] = useState("");
   const [tokenAddress, setTokenAddress] = useState(defaultToken);
   const [expiryDate, setExpiryDate] = useState("");
   const [localError, setLocalError] = useState<string | null>(null);
   const [success, setSuccess] = useState(false);
+  const amountErrorId = `${titleId}-amount-error`;
+
+  const statusMessage = isSubmitting
+    ? "Placing your offer. Please check your wallet for a signature request."
+    : success
+    ? "Offer placed successfully."
+    : localError || error
+    ? `Error: ${localError || error}`
+    : "";
+  const statusPoliteness = !isSubmitting && (localError || error) ? "assertive" : "polite";
 
   // Reset state when modal opens
   useEffect(() => {
@@ -129,17 +140,20 @@ function MakeOfferModal({
         role="dialog"
         aria-modal="true"
         aria-labelledby={titleId}
+        aria-describedby={descriptionId}
         data-testid="make-offer-modal"
         tabIndex={-1}
         className="relative w-full max-w-md overflow-hidden rounded-3xl bg-midnight-900 border border-white/10 shadow-2xl outline-none animate-scale-in"
       >
+        <StatusAnnouncer message={statusMessage} politeness={statusPoliteness} />
+
         {/* Header */}
         <div className="flex items-center justify-between border-b border-white/5 p-6">
           <div>
             <h2 id={titleId} className="text-lg font-bold text-white font-display">
               Make an Offer
             </h2>
-            <p className="text-[11px] text-white/30 mt-0.5">
+            <p id={descriptionId} className="text-[11px] text-white/30 mt-0.5">
               Listing #{listingId}
             </p>
           </div>
@@ -173,7 +187,9 @@ function MakeOfferModal({
               value={amount}
               onChange={(e) => setAmount(e.target.value)}
               required
-              className="w-full rounded-2xl bg-white/5 border border-white/10 px-5 py-4 text-white text-lg font-bold placeholder-white/20 focus:outline-none focus:border-brand-500 transition"
+              aria-invalid={!!(localError || error)}
+              aria-describedby={localError || error ? amountErrorId : undefined}
+              className="w-full rounded-2xl bg-white/5 border border-white/10 px-5 py-4 text-white text-lg font-bold placeholder-white/20 focus:outline-none focus:border-brand-500 transition aria-[invalid=true]:border-terracotta-500"
             />
           </div>
 
@@ -238,10 +254,12 @@ function MakeOfferModal({
           {/* Error */}
           {(localError || error) && (
             <div
+              id={amountErrorId}
+              role="alert"
               className="flex items-center gap-2 rounded-xl border border-terracotta-500/20 bg-terracotta-500/10 px-4 py-3 text-xs text-terracotta-400"
               data-testid="offer-modal-error"
             >
-              <AlertCircle size={14} />
+              <AlertCircle size={14} aria-hidden="true" />
               {localError || error}
             </div>
           )}
@@ -249,10 +267,11 @@ function MakeOfferModal({
           {/* Success */}
           {success && (
             <div
+              role="status"
               className="flex items-center gap-2 rounded-xl border border-mint-500/20 bg-mint-500/10 px-4 py-3 text-xs text-mint-400"
               data-testid="offer-modal-success"
             >
-              <CheckCircle size={14} />
+              <CheckCircle size={14} aria-hidden="true" />
               Offer placed successfully!
             </div>
           )}

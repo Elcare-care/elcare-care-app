@@ -86,6 +86,17 @@ pub fn publish_paused(env: &Env, admin: &Address, paused: bool) {
         .publish((symbol_short!("paused"),), (admin.clone(), paused));
 }
 
+/// Emitted when the admin assigns the `EmergencyPause` role to a new address
+/// (Issue #267).
+///
+/// Topics: ("pauser", "set")
+/// Data:   (pauser: Address)
+#[allow(deprecated)]
+pub fn publish_emergency_pauser_updated(env: &Env, pauser: &Address) {
+    env.events()
+        .publish((symbol_short!("pauser"), symbol_short!("set")), pauser.clone());
+}
+
 /// Emitted when the admin records a new set of collection WASM hashes.
 ///
 /// Topics: ("wasm_set", version: u32)
@@ -107,5 +118,17 @@ pub fn publish_wasm_hashes_set(
             lazy_721.clone(),
             lazy_1155.clone(),
         ),
+    );
+}
+
+/// Emitted when a versioned migration completes successfully.
+///
+/// Topics: ("migrated", version: String)
+/// Data:   ()
+#[allow(deprecated)]
+pub fn publish_migration_completed(env: &Env, version: &soroban_sdk::String) {
+    env.events().publish(
+        (soroban_sdk::symbol_short!("migrated"), version.clone()),
+        (),
     );
 }

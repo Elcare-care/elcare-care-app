@@ -10,6 +10,7 @@ import { RootErrorBoundary } from "@/components/RootErrorBoundary";
 import { ToastProvider } from "@/components/ToastProvider";
 import { CSPostHogProvider } from "@/providers/PostHogProvider";
 import { E2eMockChainInit } from "@/components/E2eMockChainInit";
+import { ReorgNotifier } from "@/components/ReorgNotifier";
 
 export const metadata: Metadata = {
   title: "ELCARE-HUB — African Art on Stellar",
@@ -19,6 +20,11 @@ export const metadata: Metadata = {
     title: "ELCARE-HUB",
     description: "Decentralized marketplace for African art on Stellar",
     type: "website",
+  },
+  other: {
+    "elcarehub:version": process.env.NEXT_PUBLIC_APP_VERSION || "unknown",
+    "elcarehub:api-version": process.env.NEXT_PUBLIC_INDEXER_API_VERSION || "unknown",
+    "elcarehub:event-schema": process.env.NEXT_PUBLIC_EVENT_SCHEMA_VERSION || "unknown",
   },
 };
 
@@ -35,6 +41,7 @@ export default function RootLayout({
             <ToastProvider>
               <RootErrorBoundary>
                 <E2eMockChainInit />
+                <ReorgNotifier />
                 <Navbar />
                 <main className="w-full">{children}</main>
                 <footer className="bg-midnight-950 border-t border-white/5 py-10 text-center text-sm text-white/30">
@@ -80,9 +87,21 @@ export default function RootLayout({
                       >
                         Help
                       </a>
+                      {" "}·{" "}
+                      <a
+                        href="/privacy"
+                        className="text-brand-400/70 hover:text-brand-400 hover:underline transition-colors"
+                      >
+                        Privacy
+                      </a>
                     </p>
                     <p className="mt-3 text-xs text-white/15">
                       Celebrating African art and heritage through blockchain technology.
+                      {process.env.NEXT_PUBLIC_APP_VERSION && (
+                        <span className="ml-2 text-white/10">
+                          v{process.env.NEXT_PUBLIC_APP_VERSION}
+                        </span>
+                      )}
                     </p>
                   </div>
                 </footer>

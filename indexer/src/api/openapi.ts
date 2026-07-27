@@ -25,7 +25,8 @@ export const ListingSchema = registry.register(
     listingId:       bigIntString.openapi({ description: 'Unique listing ID' }),
     artist:          z.string().openapi({ example: 'GABC...XYZ', description: 'Seller / artist Stellar address' }),
     owner:           z.string().nullable().openapi({ example: 'GABC...XYZ', description: 'Current owner address, null before first sale' }),
-    price:           z.string().openapi({ example: '10.0000000', description: 'Listing price as a decimal string (7 dp)' }),
+    price:           z.string().openapi({ example: '100000000', description: 'RAW on-chain price in the token\'s base units (i128, unscaled — e.g. stroops for a 7-decimal token). The contract never scales this value; see `priceDecimal` for the human-readable form.' }),
+    priceDecimal:    z.string().openapi({ example: '10.0000000', description: 'Human-readable price, computed as price / 10^decimals using the payment token\'s known decimal precision (see docs/guides/payment-tokens.md). Safe to display directly.' }),
     currency:        z.string().openapi({ example: 'XLM' }),
     collection:      z.string().openapi({ example: 'CABC...DEF', description: 'Collection contract address' }),
     nftTokenId:      bigIntString.openapi({ description: 'NFT token ID within the collection' }),
@@ -47,8 +48,10 @@ export const AuctionSchema = registry.register(
     collection:      z.string().openapi({ example: 'CABC...DEF' }),
     nftTokenId:      bigIntString,
     token:           z.string().openapi({ example: 'CABC...DEF', description: 'Payment token contract address' }),
-    reservePrice:    z.string().openapi({ example: '5.0000000', description: 'Minimum acceptable bid' }),
-    highestBid:      z.string().openapi({ example: '7.5000000', description: 'Current highest bid amount' }),
+    reservePrice:    z.string().openapi({ example: '50000000', description: 'RAW minimum acceptable bid in the token\'s base units (unscaled i128). See `reservePriceDecimal` for the human-readable form.' }),
+    reservePriceDecimal: z.string().openapi({ example: '5.0000000', description: 'Human-readable reserve price (reservePrice / 10^decimals).' }),
+    highestBid:      z.string().openapi({ example: '75000000', description: 'RAW current highest bid in the token\'s base units (unscaled i128). See `highestBidDecimal` for the human-readable form.' }),
+    highestBidDecimal: z.string().openapi({ example: '7.5000000', description: 'Human-readable highest bid (highestBid / 10^decimals).' }),
     highestBidder:   z.string().nullable().openapi({ example: 'GABC...XYZ', description: 'Address of the current highest bidder' }),
     endTime:         bigIntString.openapi({ description: 'Auction end time as Unix timestamp string' }),
     status:          z.enum(['Active', 'Finalized', 'Cancelled']).openapi({ example: 'Active' }),
@@ -66,7 +69,8 @@ export const OfferSchema = registry.register(
     offerId:         bigIntString.openapi({ description: 'Unique offer ID' }),
     listingId:       bigIntString.openapi({ description: 'Listing this offer targets' }),
     offerer:         z.string().openapi({ example: 'GABC...XYZ', description: 'Address that placed the offer' }),
-    amount:          z.string().openapi({ example: '8.0000000', description: 'Offered amount as a decimal string' }),
+    amount:          z.string().openapi({ example: '80000000', description: 'RAW offered amount in the token\'s base units (unscaled i128). See `amountDecimal` for the human-readable form.' }),
+    amountDecimal:   z.string().openapi({ example: '8.0000000', description: 'Human-readable offer amount (amount / 10^decimals).' }),
     token:           z.string().openapi({ example: 'CABC...DEF', description: 'Payment token contract address' }),
     status:          z.enum(['Pending', 'Accepted', 'Rejected', 'Withdrawn']).openapi({ example: 'Pending' }),
     expiresAt:       bigIntString.optional().openapi({ description: 'Ledger timestamp after which the offer can be reclaimed; absent when it never expires', example: '1735689600' }),
@@ -114,6 +118,30 @@ export const RoyaltyStatsSchema = registry.register(
     payoutCount: z.number().int().openapi({ example: 5, description: 'Number of secondary sales that generated royalties' }),
     lastPayout:  z.number().int().openapi({ example: 1705320000000, description: 'Unix timestamp (ms) of the most recent royalty payout, 0 if none' }),
   }).openapi('RoyaltyStats'),
+);
+
+export const RoyaltyPaymentSchema = registry.register(
+  'RoyaltyPayment',
+  z.object({
+    id:             z.number().int().openapi({ example: 1 }),
+    listingId:      z.string().nullable().openapi({ example: '7', description: 'Listing id for fixed-price / offer settlements, null for auctions' }),
+    auctionId:      z.string().nullable().openapi({ example: null, description: 'Auction id for auction settlements, null otherwise' }),
+    recipient:      z.string().openapi({ example: 'GABC...XYZ' }),
+    amount:         z.string().openapi({ example: '6650000.0000000', description: 'Amount this recipient received (decimal string)' }),
+    salePrice:      z.string().openapi({ example: '10000000.0000000', description: 'Total sale price of the settlement' }),
+    ledgerSequence: z.number().int().openapi({ example: 50000000 }),
+    createdAt:      isoDateTime,
+  }).openapi('RoyaltyPayment'),
+);
+
+export const RoyaltyBreakdownSchema = registry.register(
+  'RoyaltyBreakdown',
+  z.object({
+    payments: z.array(RoyaltyPaymentSchema),
+    total:    z.number().int().openapi({ example: 12, description: 'Total matching rows (independent of pagination)' }),
+    limit:    z.number().int().openapi({ example: 50 }),
+    offset:   z.number().int().openapi({ example: 0 }),
+  }).openapi('RoyaltyBreakdown'),
 );
 
 export const StatsSchema = registry.register(
@@ -363,6 +391,27 @@ registry.registerPath({
   request: { params: z.object({ address: z.string().openapi({ description: 'Artist Stellar address' }) }) },
   responses: {
     200: { description: 'Royalty statistics', content: { 'application/json': { schema: RoyaltyStatsSchema } } },
+  },
+});
+
+// GET /wallets/:address/royalty-breakdown
+registry.registerPath({
+  method: 'get',
+  path: '/wallets/{address}/royalty-breakdown',
+  tags: ['Wallets'],
+  summary: 'Get the per-sale royalty payout audit trail for a recipient',
+  description: 'Paginated RoyaltyPayment rows sourced from on-chain ROYALTY_PAID events, newest-first. Supports an inclusive ledger-sequence window via `from`/`to`. Cached for 60 seconds.',
+  request: {
+    params: z.object({ address: z.string().openapi({ description: 'Recipient Stellar address' }) }),
+    query: z.object({
+      from:   z.number().int().optional().openapi({ description: 'Inclusive lower ledger-sequence bound' }),
+      to:     z.number().int().optional().openapi({ description: 'Inclusive upper ledger-sequence bound' }),
+      limit:  z.number().int().optional().openapi({ description: 'Page size (default 50, max 1000)' }),
+      offset: z.number().int().optional().openapi({ description: 'Rows to skip (max 10000)' }),
+    }),
+  },
+  responses: {
+    200: { description: 'Royalty payout breakdown', content: { 'application/json': { schema: RoyaltyBreakdownSchema } } },
   },
 });
 

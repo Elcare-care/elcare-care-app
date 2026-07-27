@@ -5,7 +5,7 @@ import Link from "next/link";
 import { Navbar } from "@/components/Navbar";
 import { useCollectionDetail } from "@/hooks/useLaunchpad";
 import { useWalletContext } from "@/context/WalletContext";
-import { Loader2, ShieldCheck, User, Percent, Database, Package, ArrowLeft, Plus } from "lucide-react";
+import { Loader2, ShieldCheck, User, Percent, Database, Package, ArrowLeft, Plus, Lock, Unlock } from "lucide-react";
 
 export default function CollectionDetailClient({ address }: { address: string }) {
   const { metadata, isLoading, error } = useCollectionDetail(address);
@@ -49,6 +49,29 @@ export default function CollectionDetailClient({ address }: { address: string })
                     </span>
                     <span className="px-4 py-1.5 rounded-full bg-blue-100 text-blue-700 text-xs font-black uppercase tracking-widest">
                       {metadata.symbol || "ERC-1155"}
+                    </span>
+                    {/* Issue #276: explicit mutable/frozen metadata label */}
+                    <span
+                      className={`inline-flex items-center gap-1.5 px-4 py-1.5 rounded-full text-xs font-black uppercase tracking-widest ${
+                        metadata.isMetadataFrozen
+                          ? "bg-gray-900 text-white"
+                          : "bg-amber-100 text-amber-700"
+                      }`}
+                      title={
+                        metadata.isMetadataFrozen
+                          ? "Metadata is permanently frozen and cannot be changed"
+                          : "The creator can still update this collection's metadata"
+                      }
+                    >
+                      {metadata.isMetadataFrozen ? (
+                        <>
+                          <Lock size={12} /> Metadata Frozen
+                        </>
+                      ) : (
+                        <>
+                          <Unlock size={12} /> Metadata Mutable
+                        </>
+                      )}
                     </span>
                   </div>
                   <h1 className="text-5xl font-display font-black text-gray-900 mb-6 leading-tight">

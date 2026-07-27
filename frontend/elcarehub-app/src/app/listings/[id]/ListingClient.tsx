@@ -27,6 +27,9 @@ import { OfferPanel } from "@/components/OfferPanel";
 import { PriceHistoryChart } from "@/components/PriceHistoryChart";
 import { SocialShare } from "@/components/SocialShare";
 import { GuardButton } from "@/components/WalletGuard";
+import { ResourceState } from "@/components/PageStates";
+import { Breadcrumb } from "@/components/Breadcrumb";
+import { categorizePageError, PageStateError } from "@/lib/pageState";
 import {
     ArrowLeft,
     ExternalLink,
@@ -80,7 +83,7 @@ export default function ListingDetailPage({ id }: ListingClientProps) {
     const [auction, setAuction] = useState<Auction | null>(null);
     const [metadata, setMetadata] = useState<ArtworkMetadata | null>(null);
     const [isLoading, setIsLoading] = useState(true);
-    const [error, setError] = useState<string | null>(null);
+    const [pageError, setPageError] = useState<PageStateError | null>(null);
     const [activeTab, setActiveTab] = useState<'details' | 'history' | 'offers'>('details');
 
     // Hooks
@@ -118,35 +121,55 @@ export default function ListingDetailPage({ id }: ListingClientProps) {
     // Bid state
     const [bidAmount, setBidAmount] = useState("");
 
-    useEffect(() => {
-        const loadData = async () => {
-            if (!id) return;
-            setIsLoading(true);
-            setError(null);
+    const loadData = useCallback(async () => {
+        if (!id) return;
+        setIsLoading(true);
+        setPageError(null);
+
+        let l: Listing | null = null;
+        let a: Auction | null = null;
+        let listingErr: unknown = null;
+        let auctionErr: unknown = null;
+
+        try { l = await getListing(Number(id)); setListing(l); } catch (e) { listingErr = e; }
+        try { a = await getAuction(Number(id)); setAuction(a); } catch (e) { auctionErr = e; }
+
+        if (!l && !a) {
+            // Both lookups failed. Distinguish "this id genuinely doesn't exist"
+            // from "the indexer/RPC is having trouble" — never claim not-found
+            // when we can't actually confirm absence, per the state contract in
+            // lib/pageState.ts.
+            const opts = {
+                resourceLabel: "artwork",
+                notFoundMessage: "The artwork you are looking for does not exist or has been removed.",
+            };
+            const candidates = [listingErr, auctionErr]
+                .filter((e): e is unknown => e != null)
+                .map((e) => categorizePageError(e, opts));
+            const definitive =
+                candidates.find((c) => c.category !== "not-found") ??
+                candidates[0] ??
+                categorizePageError(new Error("Artwork not found"), opts);
+            setPageError(definitive);
+            setIsLoading(false);
+            return;
+        }
+
+        const cid = l?.metadata_cid || a?.metadata_cid;
+        if (cid) {
             try {
-                let l: Listing | null = null;
-                let a: Auction | null = null;
-
-                try { l = await getListing(Number(id)); setListing(l); } catch {}
-                try { a = await getAuction(Number(id)); setAuction(a); } catch {}
-
-                if (!l && !a) throw new Error("Artwork not found");
-
-                const cid = l?.metadata_cid || a?.metadata_cid;
-                if (cid) {
-                    try {
-                        const m = await fetchMetadata(cid);
-                        setMetadata(m);
-                    } catch {}
-                }
-            } catch (err: any) {
-                setError(err.message || "Failed to load artwork details");
-            } finally {
-                setIsLoading(false);
+                const m = await fetchMetadata(cid);
+                setMetadata(m);
+            } catch {
+                // Metadata (IPFS) is best-effort — the listing/auction itself loaded fine.
             }
-        };
-        loadData();
+        }
+        setIsLoading(false);
     }, [id]);
+
+    useEffect(() => {
+        loadData();
+    }, [loadData]);
 
     const handleBuy = async () => {
         if (!listing) return;
@@ -174,27 +197,48 @@ export default function ListingDetailPage({ id }: ListingClientProps) {
 
     if (isLoading) {
         return (
-            <div className="flex flex-col items-center justify-center py-40 gap-4">
-                <div className="h-16 w-16 animate-spin rounded-full border-4 border-brand-200 border-t-brand-500" />
+            <div role="status" aria-live="polite" className="flex flex-col items-center justify-center py-40 gap-4">
+                <div className="h-16 w-16 animate-spin rounded-full border-4 border-brand-200 border-t-brand-500" aria-hidden="true" />
                 <p className="text-brand-300 font-display italic">Summoning artwork from the savanna...</p>
             </div>
         );
     }
 
-    if (error || (!listing && !auction)) {
+    if (pageError) {
+        // Not-found is a dead end (navigate away); unavailable/unauthorized are
+        // recoverable, so they get a retry button instead. Never conflate the two —
+        // an indexer outage must not read as "this artwork doesn't exist."
+        const isDeadEnd = pageError.category === "not-found" || pageError.category === "unauthorized";
+        const heading =
+            pageError.category === "not-found"
+                ? "Artwork Not Found"
+                : pageError.category === "unauthorized"
+                ? "Access Restricted"
+                : "Temporarily Unavailable";
+
         return (
-            <div className="py-32 flex flex-col items-center text-center">
+            <div role="alert" className="py-32 flex flex-col items-center text-center">
                 <div className="w-20 h-20 bg-terracotta-500/10 rounded-full flex items-center justify-center mb-6">
-                    <AlertCircle size={40} className="text-terracotta-500" />
+                    <AlertCircle size={40} className="text-terracotta-500" aria-hidden="true" />
                 </div>
-                <h2 className="text-2xl font-display font-bold text-white mb-2">Artwork Not Found</h2>
-                <p className="text-white/60 mb-8 max-w-md">{error ?? "The listing you are looking for does not exist or has been removed."}</p>
-                <button
-                    onClick={() => router.push('/')}
-                    className="px-8 py-3 rounded-xl bg-brand-500 text-white font-bold hover:bg-brand-600 transition-all shadow-lg shadow-brand-500/20"
-                >
-                    Return to Marketplace
-                </button>
+                <h2 className="text-2xl font-display font-bold text-white mb-2">{heading}</h2>
+                <p className="text-white/60 mb-8 max-w-md">{pageError.message}</p>
+                <div className="flex items-center gap-3">
+                    {!isDeadEnd && pageError.retryable && (
+                        <button
+                            onClick={() => loadData()}
+                            className="px-8 py-3 rounded-xl border border-white/20 text-white font-bold hover:bg-white/5 transition-all"
+                        >
+                            Try Again
+                        </button>
+                    )}
+                    <button
+                        onClick={() => router.push('/')}
+                        className="px-8 py-3 rounded-xl bg-brand-500 text-white font-bold hover:bg-brand-600 transition-all shadow-lg shadow-brand-500/20"
+                    >
+                        Return to Marketplace
+                    </button>
+                </div>
             </div>
         );
     }
@@ -221,6 +265,14 @@ export default function ListingDetailPage({ id }: ListingClientProps) {
 
     return (
         <div className="min-h-screen bg-midnight-950 text-white pb-20 pt-24 px-4 sm:px-6 lg:px-8">
+            {/* Breadcrumb */}
+            <Breadcrumb
+                items={[
+                    { label: "Discover", href: "/explore" },
+                    { label: metadata?.title ?? `Artwork #${id}` },
+                ]}
+                className="mb-8"
+            />
 
             <div className="grid gap-12 lg:grid-cols-2 lg:items-start">
                 {/* LEFT COLUMN: Media, Tabs & Description */}
@@ -230,7 +282,11 @@ export default function ListingDetailPage({ id }: ListingClientProps) {
                         {imageUrl ? (
                             <Image
                                 src={imageUrl}
-                                alt={metadata?.title ?? "Artwork"}
+                                alt={
+                                    metadata?.isDecorativeImage
+                                        ? ""
+                                        : (metadata?.altText ?? metadata?.title ?? "Artwork")
+                                }
                                 fill
                                 className="object-cover transition-transform duration-700 group-hover:scale-105"
                                 priority

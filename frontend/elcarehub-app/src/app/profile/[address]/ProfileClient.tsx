@@ -1,13 +1,13 @@
 "use client";
 
 import { useEffect, useState, useMemo } from "react";
+import Link from "next/link";
 import { useWalletContext } from "@/context/WalletContext";
 import { WalletGuard } from "@/components/WalletGuard";
-import { useArtistListings, useMarketplace } from "@/hooks/useMarketplace";
+import { useArtistListings, useMarketplace, useCancelListings } from "@/hooks/useMarketplace";
 import { useUserActivity } from "@/hooks/useUserActivity";
 import { useCreatorCollections } from "@/hooks/useLaunchpad";
 import { ListingCard } from "@/components/ListingCard";
-import Link from "next/link";
 import {
     History,
     Package,
@@ -22,6 +22,9 @@ import {
     Activity,
     Layers,
     Coins,
+    XCircle,
+    CheckSquare2,
+    Square,
 } from "lucide-react";
 import { Listing } from "@/lib/contract";
 import { ActivityEvent } from "@/lib/indexer";
@@ -44,9 +47,10 @@ export default function ProfileClient({ address }: ProfileClientProps) {
     } = useUserActivity(isOwnProfile ? publicKey : address);
 
     const { listings: allListings, isLoading: loadingAll } = useMarketplace();
-    const { listings: myArtistListings, isLoading: loadingArtist } = useArtistListings(
+    const { listings: myArtistListings, isLoading: loadingArtist, refresh } = useArtistListings(
         isOwnProfile ? publicKey : address
     );
+    const { cancelMany, isCancelling: isBatchCancelling } = useCancelListings(isOwnProfile ? publicKey : null);
     const { collections, isLoading: loadingCollections } = useCreatorCollections(
         isOwnProfile ? publicKey : address
     );
@@ -91,6 +95,9 @@ export default function ProfileClient({ address }: ProfileClientProps) {
                         royaltyStats={royaltyStats}
                         activities={activities}
                         isGlobalLoading={isGlobalLoading}
+                        refreshListings={refresh}
+                        cancelMany={cancelMany}
+                        isBatchCancelling={isBatchCancelling}
                     />
                 </WalletGuard>
             ) : (
@@ -107,6 +114,9 @@ export default function ProfileClient({ address }: ProfileClientProps) {
                     royaltyStats={royaltyStats}
                     activities={activities}
                     isGlobalLoading={isGlobalLoading}
+                    refreshListings={refresh}
+                    cancelMany={cancelMany}
+                    isBatchCancelling={isBatchCancelling}
                 />
             )}
         </div>
@@ -126,6 +136,9 @@ interface ProfileContentProps {
     royaltyStats: any;
     activities: ActivityEvent[];
     isGlobalLoading: boolean;
+    refreshListings: () => Promise<void>;
+    cancelMany: (listingIds: number[]) => Promise<boolean>;
+    isBatchCancelling: boolean;
 }
 
 const TABS: { id: ProfileTab; label: string; icon: React.ReactNode; ownOnly?: boolean }[] = [
@@ -160,11 +173,54 @@ function ProfileContent({
     royaltyStats,
     activities,
     isGlobalLoading,
+    refreshListings,
+    cancelMany,
+    isBatchCancelling,
 }: ProfileContentProps) {
     const visibleTabs = TABS.filter((t) => !t.ownOnly || isOwnProfile);
+    const [selectedIds, setSelectedIds] = useState<number[]>([]);
+
+    const toggleSelection = (listingId: number) => {
+        setSelectedIds((current) =>
+            current.includes(listingId)
+                ? current.filter((id) => id !== listingId)
+                : [...current, listingId]
+        );
+    };
+
+    const handleBatchCancel = async () => {
+        if (selectedIds.length === 0) return;
+        await cancelMany(selectedIds);
+        setSelectedIds([]);
+        await refreshListings();
+    };
+
+    const selectAllActive = () => {
+        setSelectedIds(activeListings.map((listing) => listing.listing_id));
+    };
+
+    const clearSelection = () => {
+        setSelectedIds([]);
+    };
 
     return (
         <div className="relative z-10 mx-auto max-w-7xl px-4 sm:px-6 lg:px-8">
+            {/* Breadcrumb */}
+            {!isOwnProfile && displayAddress && (
+                <nav aria-label="Breadcrumb" className="mb-6">
+                    <ol role="list" className="flex items-center gap-1 text-sm text-white/50">
+                        <li>
+                            <Link href="/explore" className="hover:text-brand-400 transition-colors">Discover</Link>
+                        </li>
+                        <li aria-hidden="true" className="text-white/25">/</li>
+                        <li>
+                            <span aria-current="page" className="text-white/90 font-medium truncate max-w-[160px] inline-block">
+                                {displayAddress?.slice(0, 6)}…{displayAddress?.slice(-4)}
+                            </span>
+                        </li>
+                    </ol>
+                </nav>
+            )}
             {/* Profile Header */}
             <div className="relative mb-12 overflow-hidden rounded-[3rem] bg-midnight-900 border border-white/5 shadow-2xl p-8 sm:p-12">
                 <div className="absolute -top-24 -right-24 h-64 w-64 rounded-full bg-brand-500/10 blur-[100px]" />
@@ -266,8 +322,38 @@ function ProfileContent({
 
                         {activeTab === "listings" && (
                             activeListings.length > 0 ? (
-                                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6">
-                                    {activeListings.map((l) => <ListingCard key={l.listing_id} listing={l} />)}
+                                <div className="space-y-4">
+                                    {selectedIds.length > 0 && (
+                                        <div className="flex flex-wrap items-center justify-between gap-3 rounded-[2rem] border border-white/10 bg-white/[0.04] px-4 py-3">
+                                            <p className="text-sm text-white/70">{selectedIds.length} selected</p>
+                                            <div className="flex flex-wrap gap-2">
+                                                <button onClick={selectAllActive} className="rounded-xl bg-white/5 px-3 py-2 text-sm font-semibold text-white/70 hover:bg-white/10">Select all active</button>
+                                                <button onClick={clearSelection} className="rounded-xl bg-white/5 px-3 py-2 text-sm font-semibold text-white/70 hover:bg-white/10">Clear</button>
+                                                <button onClick={handleBatchCancel} disabled={isBatchCancelling} className="flex items-center gap-2 rounded-xl bg-terracotta-500/20 px-3 py-2 text-sm font-semibold text-terracotta-400 border border-terracotta-500/20 hover:bg-terracotta-500/30 disabled:opacity-50">
+                                                    <XCircle size={16} />
+                                                    Cancel selected
+                                                </button>
+                                            </div>
+                                        </div>
+                                    )}
+                                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6">
+                                        {activeListings.map((l) => {
+                                            const isSelected = selectedIds.includes(l.listing_id);
+                                            return (
+                                                <div key={l.listing_id} className="relative">
+                                                    <button
+                                                        type="button"
+                                                        onClick={() => toggleSelection(l.listing_id)}
+                                                        className="absolute right-3 top-3 z-10 rounded-lg border border-white/10 bg-midnight-900/80 p-2 text-white/60"
+                                                        aria-label={`Toggle selection for listing ${l.listing_id}`}
+                                                    >
+                                                        {isSelected ? <CheckSquare2 size={18} className="text-brand-400" /> : <Square size={18} />}
+                                                    </button>
+                                                    <ListingCard listing={l} />
+                                                </div>
+                                            );
+                                        })}
+                                    </div>
                                 </div>
                             ) : (
                                 <EmptyState icon={<Tag size={48} />} title="No active listings" subtitle={isOwnProfile ? "Create your first listing" : "This artist has no active listings"} />
