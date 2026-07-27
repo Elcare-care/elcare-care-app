@@ -43,7 +43,7 @@ const cursorFields = {
 export const listingsQuerySchema = z.object({
   artist:   optionalStellarAddress,
   owner:    optionalStellarAddress,
-  status:   z.enum(['Active', 'Sold', 'Cancelled', 'Auction']).optional(),
+  status:   z.enum(['Active', 'Sold', 'Cancelled', 'Auction', 'expired']).optional(),
   search:   optionalString,
   minPrice: z.coerce.number().nonnegative().optional(),
   maxPrice: z.coerce.number().nonnegative().optional(),

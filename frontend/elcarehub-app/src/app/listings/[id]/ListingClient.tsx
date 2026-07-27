@@ -38,6 +38,7 @@ import {
     Calendar,
     Hash,
     Clock,
+    Hourglass,
     Gavel,
     History,
     ShieldCheck,
@@ -248,6 +249,7 @@ export default function ListingDetailPage({ id }: ListingClientProps) {
     const isOwn = publicKey === artist;
     const status = listing?.status || auction?.status;
     const isActive = status === "Active";
+    const isExpired = status === "Cancelled" && !!listing?.expires_at && listing.expires_at < Date.now() / 1000;
 
     const priceDisplay = listing
         ? stroopsToXlm(listing.price)
@@ -303,9 +305,10 @@ export default function ListingDetailPage({ id }: ListingClientProps) {
                         <div className={`absolute top-6 right-6 px-4 py-1.5 rounded-full text-xs font-bold tracking-widest uppercase backdrop-blur-md shadow-xl border ${
                             status === "Active" ? "bg-mint-500/20 text-mint-400 border-mint-500/30" :
                             status === "Sold" || status === "Finalized" ? "bg-brand-500/20 text-brand-400 border-brand-500/30" :
+                            isExpired ? "bg-orange-500/20 text-orange-400 border-orange-500/30" :
                             "bg-terracotta-500/20 text-terracotta-400 border-terracotta-500/30"
                         }`}>
-                            {status}
+                            {isExpired ? "Expired" : status}
                         </div>
 
                         {/* Type Badge */}
@@ -566,6 +569,15 @@ export default function ListingDetailPage({ id }: ListingClientProps) {
                                     <div className="p-6 rounded-2xl bg-white/5 border border-white/10 text-center">
                                         <p className="text-white/40 font-bold italic">
                                             This asset has been privately collected.
+                                        </p>
+                                    </div>
+                                )}
+
+                                {isExpired && (
+                                    <div className="p-6 rounded-2xl bg-orange-500/10 border border-orange-500/20 text-center flex items-center justify-center gap-3" data-testid="expired-banner">
+                                        <Hourglass size={18} className="text-orange-400" />
+                                        <p className="text-orange-400 font-bold italic">
+                                            This listing has expired and is no longer available.
                                         </p>
                                     </div>
                                 )}

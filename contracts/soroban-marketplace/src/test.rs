@@ -398,6 +398,52 @@ fn test_expire_listing_before_expiry_fails() {
     client.expire_listing(&id);
 }
 
+#[test]
+fn test_expire_listing_emits_listing_cancelled_event() {
+    let (env, client, artist, _, token_id, _cid, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    let now = env.ledger().timestamp();
+    let id = client.create_listing(
+        &artist, &5_000_000_i128, &symbol_short!("XLM"),
+        &token_id, &collection_id, &1u64,
+        &valid_recipients(&env, &artist), &Some(now + 1000),
+    );
+    env.ledger().set_timestamp(now + 2000);
+    client.expire_listing(&id);
+    assert!(
+        has_event_with_topic(&env.events().all(), "lst_cncl"),
+        "ListingCancelledEvent was not emitted"
+    );
+    assert!(
+        has_event_with_topic(&env.events().all(), "lst_expd"),
+        "ListingExpiredEvent was not emitted"
+    );
+}
+
+#[test]
+fn test_buy_artwork_expired_listing_returns_false_and_cancels() {
+    let (env, client, artist, buyer, token_id, _cid, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    let now = env.ledger().timestamp();
+    let id = client.create_listing(
+        &artist, &5_000_000_i128, &symbol_short!("XLM"),
+        &token_id, &collection_id, &1u64,
+        &valid_recipients(&env, &artist), &Some(now + 1000),
+    );
+    env.ledger().set_timestamp(now + 2000);
+    let result = client.buy_artwork(&buyer, &id);
+    assert!(!result);
+    assert_eq!(client.get_listing(&id).status, ListingStatus::Cancelled);
+    assert!(client.get_escrow(&collection_id, &1u64).is_none());
+    assert_eq!(MockNftClient::new(&env, &collection_id).owner_of(&1u64), artist);
+    assert!(
+        has_event_with_topic(&env.events().all(), "lst_cncl"),
+        "ListingCancelledEvent was not emitted on buy_artwork expired path"
+    );
+}
+
 // ════════════════════════════════════════════════════════════
 // SECTION 6: Auction escrow — create / cancel / finalize
 // ════════════════════════════════════════════════════════════
