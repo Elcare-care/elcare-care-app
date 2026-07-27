@@ -81,8 +81,8 @@ export function emitSSEEvent(event: any) {
   const dataStr = JSON.stringify(event, (_k, v) => typeof v === 'bigint' ? v.toString() : v);
   const payload: SSEEvent = { id, data: dataStr };
 
-  sseBuffer.push(payload);
-  if (sseBuffer.length > SSE_BUFFER_SIZE) sseBuffer.shift();
+import { hub, emitSSEEvent, closeSSEClients, ensureRealtimeStarted } from '../realtime/index.js';
+export { emitSSEEvent, closeSSEClients };
 
   const frame = `id: ${id}\ndata: ${dataStr}\n\n`;
   for (const [client] of sseClients) {
