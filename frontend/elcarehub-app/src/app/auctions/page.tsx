@@ -7,6 +7,7 @@
 import { useState, useMemo, useEffect } from "react";
 import Link from "next/link";
 import Image from "next/image";
+import { useRouter, useSearchParams } from "next/navigation";
 import { useAuctions } from "@/hooks/useAuctions";
 import { Auction, stroopsToXlm } from "@/lib/contract";
 import { fetchMetadata, cidToGatewayUrl, ArtworkMetadata } from "@/lib/ipfs";
@@ -158,7 +159,20 @@ function AuctionCard({ auction }: { auction: Auction }) {
 
 export default function AuctionsPage() {
   const { auctions, isLoading, error, refresh } = useAuctions();
-  const [tab, setTab] = useState<Tab>("all");
+  const router = useRouter();
+  const searchParams = useSearchParams();
+
+  // Tab state backed by URL: /auctions?status=Active
+  const tabParam = searchParams.get("status") as Tab | null;
+  const [tab, setTab] = useState<Tab>(tabParam ?? "all");
+
+  const handleTabChange = (newTab: Tab) => {
+    setTab(newTab);
+    const params = new URLSearchParams();
+    if (newTab !== "all") params.set("status", newTab);
+    const qs = params.toString();
+    router.replace(qs ? `/auctions?${qs}` : "/auctions", { scroll: false });
+  };
 
   const [metadataMap, setMetadataMap] = useState<
     Map<string, ArtworkMetadata | null>
@@ -235,7 +249,7 @@ export default function AuctionsPage() {
                 return (
                   <button
                     key={key}
-                    onClick={() => setTab(key)}
+                    onClick={() => handleTabChange(key)}
                     className={`rounded-full px-4 py-1.5 text-sm font-medium transition-all ${
                       isActive
                         ? "bg-brand-500 text-white shadow-md shadow-brand-500/20"
@@ -293,7 +307,7 @@ export default function AuctionsPage() {
             <EmptyState
               title={`No ${tab.toLowerCase()} auctions`}
               description={`No ${tab.toLowerCase()} auctions at the moment.`}
-              action={{ label: "View All Auctions", onClick: () => setTab("all") }}
+              action={{ label: "View All Auctions", onClick: () => handleTabChange("all") }}
             />
           ) : (
             <EmptyState

@@ -715,6 +715,48 @@ impl MarketplaceContract {
     // Any active axis blocks the affected operations.  Global pause
     // still blocks everything; collection and function pauses are
     // additive narrow restrictions layered on top.
+    //
+    // ── State-transition matrix (narrowly-scoped emergency pause) ──
+    //
+    // A pause is meant to stop *new* risk exposure, not trap funds or NFTs
+    // that are already committed to the contract.  Every public entry point
+    // falls into exactly one of the two buckets below.
+    //
+    // Blocked when paused (subject to global / collection / function axes,
+    // via `require_not_paused` or `require_not_paused_ctx`) — these create
+    // new exposure (new escrow, new payment flow, new price commitment):
+    //   - create_listing        (collection + function axis)
+    //   - update_listing        (global axis)
+    //   - update_listing_price  (global axis)
+    //   - buy_artwork           (collection + function axis)
+    //   - create_auction        (collection + function axis)
+    //   - place_bid             (collection + function axis)
+    //   - make_offer            (collection + function axis)
+    //   - accept_offer          (global axis — a purchase-like state
+    //                            transition, not fund recovery, so it stays
+    //                            gated like buy_artwork)
+    //
+    // Always available regardless of pause state (fund recovery / cleanup —
+    // these return escrowed tokens or NFTs to their rightful owner, or tidy
+    // up state that is already terminal/expired, so blocking them would trap
+    // user funds during exactly the incident a pause is meant to contain):
+    //   - cancel_listing            (artist reclaims NFT from escrow)
+    //   - cancel_listings           (batch form of the above)
+    //   - cancel_artist_listings    (admin-driven revocation cleanup sweep)
+    //   - expire_listing            (permissionless; already unguarded)
+    //   - cancel_auction            (creator reclaims NFT, no-bid only)
+    //   - finalize_auction          (settles an already-ended auction —
+    //                                explicitly called out by the issue)
+    //   - admin_cancel_auction      (admin emergency unwind + bidder refund)
+    //   - withdraw_offer            (offerer reclaims escrowed funds)
+    //   - reject_offer              (artist rejects offer, funds return to
+    //                                the offerer)
+    //   - reclaim_offer             (offerer reclaims funds from an offer
+    //                                that expired without action)
+    //
+    // These cleanup paths deliberately skip *all three* pause axes (global,
+    // collection, function) — they exist precisely so a paused incident
+    // doesn't also freeze user funds/state in limbo.
 
     /// Pause all operations for a specific collection.
     pub fn pause_collection(env: Env, admin: Address, collection: Address) {
@@ -758,18 +800,146 @@ impl MarketplaceContract {
 
     // ── Artist Moderation ────────────────────────────────────
 
+    /// Revoke an artist and immediately begin cascading cleanup.
+    ///
+    /// On the first call (or after a reinstate → re-revoke cycle) the function:
+    ///   1. Marks the artist as revoked in storage.
+    ///   2. Iterates up to `REVOCATION_CLEANUP_CAP` active listings owned by
+    ///      the artist, cancelling each (offer refunds + escrow return).
+    ///   3. Continues iterating into the artist's auctions (within the same
+    ///      budget), cancelling each and refunding the current highest bidder.
+    ///   4. Emits `ArtistRevokedEvent` and, when items remain, a
+    ///      `RevocationIncompleteEvent` so the caller knows to invoke again.
+    ///
+    /// Subsequent calls advance the cursor until all items are processed.
+    /// The function is idempotent: calling it on an already-revoked artist with
+    /// no remaining items is a no-op.
     pub fn revoke_artist(env: Env, artist: Address) {
         Self::require_role_auth(&env, RoleType::CollectionAdmin);
         set_artist_revocation_storage(&env, &artist);
-        #[allow(deprecated)]
-        env.events().publish((crate::events::ARTIST_REVOKED,), artist);
+
+        // Emit the revocation event using the typed struct (not the raw address).
+        ArtistRevokedEvent { artist: artist.clone() }.publish(&env);
+
+        // ── Cascade: cancel listings ─────────────────────────────────────────
+        let admin = {
+            let key = crate::storage::DataKey::Admin;
+            env.storage().persistent()
+                .get::<_, Address>(&key)
+                .expect("admin not set")
+        };
+
+        let listing_idx = IndexId::ArtistListings(artist.clone());
+        let listing_total = index_len(&env, &listing_idx);
+        let mut cursor = crate::storage::get_artist_cancel_cursor(&env, &artist);
+        let mut budget = REVOCATION_CLEANUP_CAP;
+
+        // Phase 1 — listings
+        while cursor < listing_total && budget > 0 {
+            let listing_id = crate::storage::index_get(&env, &listing_idx, cursor).unwrap();
+            cursor += 1;
+            budget -= 1;
+            if let Some(mut listing) = load_listing(&env, listing_id) {
+                if listing.status == ListingStatus::Active {
+                    // Refund all pending offers
+                    for offer_id in load_pending_offer_ids(&env, listing_id).iter() {
+                        if let Some(mut offer) = load_offer(&env, offer_id) {
+                            if offer.status == OfferStatus::Pending {
+                                offer.status = OfferStatus::Rejected;
+                                save_offer(&env, &offer);
+                                TokenClient::new(&env, &offer.token).transfer(
+                                    &env.current_contract_address(),
+                                    &offer.offerer,
+                                    &offer.amount,
+                                );
+                            }
+                        }
+                    }
+                    clear_pending_offers(&env, listing_id);
+                    listing.status = ListingStatus::Cancelled;
+                    save_listing(&env, &listing);
+                    remove_from_active_listings(&env, listing_id);
+                    ListingCancelledEvent {
+                        listing_id,
+                        cancelled_by: admin.clone(),
+                        reason: CancelReason::AdminRevoked,
+                        ledger_sequence: env.ledger().sequence(),
+                    }.publish(&env);
+                    escrow::release_nft(
+                        &env, &listing.collection, listing.token_id,
+                        &listing.artist, env.ledger().sequence(), listing_id,
+                    );
+                }
+            }
+        }
+        set_artist_cancel_cursor(&env, &artist, cursor);
+
+        // Phase 2 — auctions (within remaining budget)
+        let auction_idx = IndexId::ArtistAuctions(artist.clone());
+        let auction_total = index_len(&env, &auction_idx);
+        let mut auction_cursor = crate::storage::get_artist_auction_cancel_cursor(&env, &artist);
+
+        while auction_cursor < auction_total && budget > 0 {
+            let auction_id = crate::storage::index_get(&env, &auction_idx, auction_cursor).unwrap();
+            auction_cursor += 1;
+            budget -= 1;
+            if let Some(mut auction) = load_auction(&env, auction_id) {
+                if auction.status == AuctionStatus::Active {
+                    // Refund current highest bidder if any
+                    if let Some(ref bidder) = auction.highest_bidder.clone() {
+                        let refund = auction.highest_bid;
+                        if refund > 0 {
+                            TokenClient::new(&env, &auction.token).transfer(
+                                &env.current_contract_address(),
+                                bidder,
+                                &refund,
+                            );
+                            AuctionBidRefundedEvent {
+                                auction_id,
+                                bidder: bidder.clone(),
+                                amount: refund,
+                                token: auction.token.clone(),
+                                reason: Symbol::new(&env, "admin_revoke"),
+                                ledger_sequence: env.ledger().sequence(),
+                            }.publish(&env);
+                        }
+                    }
+                    auction.status = AuctionStatus::Cancelled;
+                    save_auction(&env, &auction);
+                    AuctionCancelledEvent {
+                        auction_id,
+                        cancelled_by: admin.clone(),
+                        reason: Symbol::new(&env, "admin_revoke"),
+                    }.publish(&env);
+                    escrow::release_nft(
+                        &env, &auction.collection, auction.token_id,
+                        &auction.creator, env.ledger().sequence(), auction_id,
+                    );
+                }
+            }
+        }
+        crate::storage::set_artist_auction_cancel_cursor(&env, &artist, auction_cursor);
+
+        // ── Emit incomplete signal if items remain ───────────────────────────
+        let listings_remaining = listing_total.saturating_sub(cursor) as u64;
+        let auctions_remaining = auction_total.saturating_sub(auction_cursor) as u64;
+        let total_remaining = listings_remaining + auctions_remaining;
+        if total_remaining > 0 {
+            RevocationIncompleteEvent {
+                artist: artist.clone(),
+                remaining: total_remaining,
+                ledger_sequence: env.ledger().sequence(),
+            }.publish(&env);
+        }
     }
 
     pub fn reinstate_artist(env: Env, artist: Address) {
         Self::require_role_auth(&env, RoleType::CollectionAdmin);
         remove_artist_revocation_storage(&env, &artist);
-        #[allow(deprecated)]
-        env.events().publish((crate::events::ARTIST_REINSTATED,), artist);
+        // Clear any in-progress revocation cursors on reinstatement
+        crate::storage::clear_artist_cancel_cursor(&env, &artist);
+        crate::storage::clear_artist_auction_cancel_cursor(&env, &artist);
+        ArtistReinstatedEvent { artist }.publish(&env);
     }
 
     pub fn is_artist_revoked(env: Env, artist: Address) -> bool {
@@ -859,7 +1029,7 @@ impl MarketplaceContract {
     /// call reverts.  Per listing the refund-then-cancel semantics match
     /// `cancel_listing`.  Returns the number of listings cancelled.
     pub fn cancel_listings(env: Env, owner: Address, listing_ids: Vec<u64>) -> u32 {
-        Self::require_not_paused(&env);
+        // Fund-recovery / cleanup op — always available, ignores all pause axes.
         owner.require_auth();
 
         if listing_ids.len() > MAX_BATCH_CANCEL {
@@ -876,10 +1046,19 @@ impl MarketplaceContract {
     // ── Token Whitelist ──────────────────────────────────────
 
     pub fn add_token_to_whitelist(env: Env, token: Address) {
-        Self::require_role_auth(&env, RoleType::ProtocolConfig);
+        Self::require_admin(&env);
+        // Boundary validation (Issue #282): reject the marketplace's own
+        // address before it can ever land in the whitelist. Decimals/asset
+        // identity for the token are the off-chain registry's job (see
+        // `validate_token_asset` doc comment); this is deliberately a cheap,
+        // on-chain-only sanity check.
+        Self::validate_token_asset(&env, &token, None);
         let key = crate::storage::DataKey::TokenWhitelist;
         let mut wl = env.storage().persistent()
             .get::<_, Vec<Address>>(&key).unwrap_or(Vec::new(&env));
+        // Idempotent by design: re-whitelisting an already-present token is a
+        // no-op rather than an error, so an admin re-running a setup script
+        // can never accidentally create duplicate entries.
         if !wl.contains(&token) { wl.push_back(token); env.storage().persistent().set(&key, &wl); }
     }
 
@@ -1130,7 +1309,7 @@ impl MarketplaceContract {
     // ── cancel_listing ───────────────────────────────────────
     // Effects first, then release_nft (Interaction)
     pub fn cancel_listing(env: Env, artist: Address, listing_id: u64) -> bool {
-        Self::require_not_paused(&env);
+        // Fund-recovery / cleanup op — always available, ignores all pause axes.
         artist.require_auth();
         Self::cancel_listing_inner(&env, &artist, listing_id)
     }
@@ -1179,6 +1358,7 @@ impl MarketplaceContract {
         if duration < MIN_AUCTION_DURATION {
             panic_with_error!(&env, MarketplaceError::InvalidAuctionDuration);
         }
+        Self::validate_token_asset(&env, &token, Some(&collection));
         if !Self::is_token_whitelisted(&env, &token) {
             panic_with_error!(&env, MarketplaceError::TokenNotWhitelisted);
         }
@@ -1323,7 +1503,7 @@ impl MarketplaceContract {
     // CEI: lock → checks → effects → emit → interactions (payout + release_nft) → unlock
     // With escrow: NFT source is always the contract — no seller-side surprise.
     pub fn finalize_auction(env: Env, caller: Address, auction_id: u64) {
-        Self::require_not_paused(&env);
+        // Fund-recovery / cleanup op — always available, ignores all pause axes.
         caller.require_auth();
         // RAII guard — cleared by Drop whether the function returns normally or panics.
         let _guard = AuctionReentrancyScope::new(&env, auction_id);
@@ -1386,7 +1566,7 @@ impl MarketplaceContract {
     // ── cancel_auction ───────────────────────────────────────
     // Only no-bid auctions can be cancelled; releases NFT back to creator
     pub fn cancel_auction(env: Env, creator: Address, auction_id: u64) {
-        Self::require_not_paused(&env);
+        // Fund-recovery / cleanup op — always available, ignores all pause axes.
         creator.require_auth();
         let mut auction = load_auction(&env, auction_id)
             .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::AuctionNotFound));
@@ -1479,6 +1659,7 @@ impl MarketplaceContract {
         }
         if listing.artist == offerer { panic_with_error!(&env, MarketplaceError::CannotOfferOwnListing); }
         if amount <= 0 { panic_with_error!(&env, MarketplaceError::InsufficientOfferAmount); }
+        Self::validate_token_asset(&env, &token, Some(&listing.collection));
         if !Self::is_token_whitelisted(&env, &token) {
             panic_with_error!(&env, MarketplaceError::TokenNotWhitelisted);
         }
@@ -1523,7 +1704,7 @@ impl MarketplaceContract {
     }
 
     pub fn withdraw_offer(env: Env, offerer: Address, offer_id: u64) {
-        Self::require_not_paused(&env);
+        // Fund-recovery / cleanup op — always available, ignores all pause axes.
         offerer.require_auth();
         let mut offer = load_offer(&env, offer_id)
             .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::OfferNotFound));
@@ -1547,7 +1728,8 @@ impl MarketplaceContract {
     }
 
     pub fn reject_offer(env: Env, artist: Address, offer_id: u64) {
-        Self::require_not_paused(&env);
+        // Fund-recovery / cleanup op (returns escrowed funds to the offerer) —
+        // always available, ignores all pause axes.
         artist.require_auth();
         let mut offer = load_offer(&env, offer_id)
             .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::OfferNotFound));
@@ -1678,7 +1860,7 @@ impl MarketplaceContract {
     }
 
     pub fn reclaim_offer(env: Env, offer_id: u64) {
-        Self::require_not_paused(&env);
+        // Fund-recovery / cleanup op — always available, ignores all pause axes.
         let mut offer = load_offer(&env, offer_id)
             .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::OfferNotFound));
         if offer.status != OfferStatus::Pending {

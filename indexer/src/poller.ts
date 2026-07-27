@@ -1,4 +1,5 @@
 import { rpc, Contract, TransactionBuilder, BASE_FEE, nativeToScVal, scValToNative } from '@stellar/stellar-sdk';
+import { fetchRawListingFromChain, fetchRawAuctionFromChain } from './chain-state.js';
 // Write-path client: poller / parser writes use the dedicated 3-connection pool
 // so burst writes never starve the API read pool (db.ts, connection_limit=10).
 import prisma from './prisma-write.js';
@@ -644,6 +645,12 @@ async function pollContract(
           });
           recordDbWrite();
           for (const ev of newEvents) emitSSEEvent(ev);
+        } catch (txErr) {
+          logger.error('pollContract: domain write transaction failed', {
+            contractId: contract.contractId,
+            err: txErr instanceof Error ? txErr.message : String(txErr),
+          });
+          throw txErr;
         }
 
         const syncData = buildSyncStateLedgerData(advanceTo, latestHash);
@@ -746,8 +753,10 @@ export async function startPolling() {
 }
 
 
-async function fetchListingFromChain(_listingId: bigint): Promise<any | null> {
-  return null;
+async function fetchListingFromChain(listingId: bigint, contractId?: string): Promise<any | null> {
+  const cid = contractId || process.env.MARKETPLACE_CONTRACT_ID || '';
+  if (!cid) return null;
+  return fetchRawListingFromChain(server, cid, listingId);
 }
 
 /**
@@ -810,8 +819,10 @@ export async function backfillListingMetadata(listingId: bigint, cid: string): P
   });
 }
 
-async function fetchAuctionFromChain(_auctionId: bigint): Promise<any | null> {
-  return null;
+async function fetchAuctionFromChain(auctionId: bigint, contractId?: string): Promise<any | null> {
+  const cid = contractId || process.env.MARKETPLACE_CONTRACT_ID || '';
+  if (!cid) return null;
+  return fetchRawAuctionFromChain(server, cid, auctionId);
 }
 
 /** Resolves the globally unique identity of a decoded event (RPC id preferred). */
@@ -917,7 +928,7 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
 
   switch (eventType) {
     case 'LISTING_CREATED': {
-      let chainListing = await fetchListingFromChain(listingId);
+      let chainListing = await fetchListingFromChain(listingId, event.contractId);
       if (chainListing && !chainListing.artist) chainListing = null;
 
       const artist     = chainListing ? chainListing.artist.toString()      : data.artist;
@@ -961,7 +972,7 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
         // them up on the next tsvector trigger update.
         enqueueIpfsFetch(token).catch((err) => {
           logger.warn('[processEvent] Failed to enqueue IPFS fetch', {
-            listingId: listingId?.toString(), token, err: err instanceof Error ? err.message : String(err),
+            eventType, listingId: listingId?.toString(), ledger: ledgerSequence, token, err: err instanceof Error ? err.message : String(err),
           });
         });
 
@@ -987,7 +998,7 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
           updatedAtLedger: ledgerSequence,
         },
       });
-      if (count === 0) logger.warn('LISTING_UPDATED: listing not found', { listingId: listingId?.toString(), ledger: ledgerSequence });
+      if (count === 0) logger.warn('LISTING_UPDATED: listing not found', { eventType, listingId: listingId?.toString(), ledger: ledgerSequence });
       invalidatePattern('cache:*/listings*').catch(() => {});
       invalidateKey(`cache:/listings/${listingId.toString()}`).catch(() => {});
       break;
@@ -1027,7 +1038,7 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
         where: { listingId },
         data: { status: 'Sold' as const, owner: data.buyer, updatedAtLedger: ledgerSequence },
       });
-      if (count === 0) logger.error('ARTWORK_SOLD: listing not found — sale not recorded', { listingId: listingId?.toString(), ledger: ledgerSequence });
+      if (count === 0) logger.error('ARTWORK_SOLD: listing not found — sale not recorded', { eventType, listingId: listingId?.toString(), ledger: ledgerSequence });
 
       // ── Metrics & cache invalidation ──────────────────────────────────────
       salesTotalCounter.labels(data.token ?? 'unknown').inc();
@@ -1070,7 +1081,7 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
         where: { listingId },
         data: { status: 'Cancelled' as const, updatedAtLedger: ledgerSequence },
       });
-      if (count === 0) logger.warn('LISTING_CANCELLED: listing not found', { listingId: listingId?.toString(), ledger: ledgerSequence });
+      if (count === 0) logger.warn('LISTING_CANCELLED: listing not found', { eventType, listingId: listingId?.toString(), ledger: ledgerSequence });
       invalidatePattern('cache:*/listings*').catch(() => {});
       invalidateKey(`cache:/listings/${listingId.toString()}`).catch(() => {});
       prisma.listing.count({ where: { status: 'Active' } })
@@ -1078,8 +1089,38 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
       break;
     }
 
+    // ── Issue #214: cascade Cancelled on all artist listings + auctions ──────
+    case 'ARTIST_REVOKED': {
+      const revokedArtist = String(data.artist ?? actor ?? '');
+      if (revokedArtist) {
+        const [listingResult, auctionResult] = await Promise.all([
+          db.listing.updateMany({
+            where: { artist: revokedArtist, status: 'Active' },
+            data: { status: 'Cancelled' as const, updatedAtLedger: ledgerSequence },
+          }),
+          db.auction.updateMany({
+            where: { creator: revokedArtist, status: 'Active' },
+            data: { status: 'Cancelled' as const, updatedAtLedger: ledgerSequence },
+          }),
+        ]);
+        logger.info('ARTIST_REVOKED: cascaded cancellations', {
+          artist: revokedArtist,
+          listingsCancelled: listingResult.count,
+          auctionsCancelled: auctionResult.count,
+          ledger: ledgerSequence,
+        });
+        invalidatePattern('cache:*/listings*').catch(() => {});
+        invalidatePattern('cache:*/auctions*').catch(() => {});
+        prisma.listing.count({ where: { status: 'Active' } })
+          .then((n) => activeListingsGauge.set(n)).catch(() => {});
+        prisma.auction.count({ where: { status: 'Active' } })
+          .then((n) => activeAuctionsGauge.set(n)).catch(() => {});
+      }
+      break;
+    }
+
     case 'AUCTION_CREATED': {
-      let chainAuction = await fetchAuctionFromChain(listingId);
+      let chainAuction = await fetchAuctionFromChain(listingId, event.contractId);
       if (chainAuction && !chainAuction.creator) chainAuction = null;
 
       const creator      = chainAuction ? chainAuction.creator.toString()         : data.creator;
@@ -1137,7 +1178,7 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
         where: { auctionId: listingId },
         data: { highestBid: data.bid_amount, highestBidder: data.bidder, updatedAtLedger: ledgerSequence },
       });
-      if (count === 0) logger.warn('BID_PLACED: auction not found', { auctionId: listingId?.toString(), ledger: ledgerSequence });
+      if (count === 0) logger.warn('BID_PLACED: auction not found', { eventType, auctionId: listingId?.toString(), ledger: ledgerSequence });
       invalidatePattern('cache:*/auctions*').catch(() => {});
       invalidateKey(`cache:/auctions/${listingId.toString()}`).catch(() => {});
       break;
@@ -1153,7 +1194,7 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
           updatedAtLedger: ledgerSequence,
         },
       });
-      if (count === 0) logger.error('AUCTION_RESOLVED: auction not found — resolution not recorded', { auctionId: listingId?.toString(), ledger: ledgerSequence });
+      if (count === 0) logger.error('AUCTION_RESOLVED: auction not found — resolution not recorded', { eventType, auctionId: listingId?.toString(), ledger: ledgerSequence });
 
       auctionFinalizationsTotal.inc();
       invalidatePattern('cache:*/auctions*').catch(() => {});
@@ -1170,7 +1211,7 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
           where: { auctionId: listingId },
           data: { status: 'Cancelled' as const, updatedAtLedger: ledgerSequence },
         });
-        if (count === 0) logger.warn('AUCTION_CANCELLED: auction not found', { auctionId: listingId?.toString(), ledger: ledgerSequence });
+        if (count === 0) logger.warn('AUCTION_CANCELLED: auction not found', { eventType, auctionId: listingId?.toString(), ledger: ledgerSequence });
         prisma.auction.count({ where: { status: 'Active' } })
           .then((n) => activeAuctionsGauge.set(n)).catch(() => {});
       }
@@ -1223,7 +1264,7 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
         where: { listingId: BigInt(data.listing_id) },
         data: { status: 'Sold' as const, owner: data.offerer, updatedAtLedger: ledgerSequence },
       });
-      if (listingCount === 0) logger.error('OFFER_ACCEPTED: listing not found', { listingId: data.listing_id?.toString(), offerId: data.offer_id?.toString(), ledger: ledgerSequence });
+      if (listingCount === 0) logger.error('OFFER_ACCEPTED: listing not found', { eventType, listingId: data.listing_id?.toString(), offerId: data.offer_id?.toString(), ledger: ledgerSequence });
 
       offersAcceptedTotal.inc();
       salesTotalCounter.labels(data.token ?? 'unknown').inc();
@@ -1267,7 +1308,7 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
           updatedAtLedger: ledgerSequence,
         }
       });
-      if (count === 0) logger.warn('OFFER_RECLAIMED: offer not found', { offerId: data.offer_id?.toString(), ledger: ledgerSequence });
+      if (count === 0) logger.warn('OFFER_RECLAIMED: offer not found', { eventType, offerId: data.offer_id?.toString(), ledger: ledgerSequence });
       break;
     }
 

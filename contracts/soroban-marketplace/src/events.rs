@@ -45,6 +45,8 @@ pub const ROYALTY_SETTLEMENT: &str = "royalty_settlement";
 // Auction escrow recovery events (Issue #271)
 pub const AUCTION_BID_REFUNDED: &str = "auction_bid_refunded";
 pub const AUCTION_ADMIN_CANCELLED: &str = "auction_admin_cancelled";
+// Revocation cascade incomplete signal (Issue #214)
+pub const REVOCATION_INCOMPLETE: &str = "revocation_incomplete";
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -724,6 +726,25 @@ impl FunctionUnpausedEvent {
     pub fn publish(self, env: &Env) {
         env.events()
             .publish((soroban_sdk::Symbol::new(env, FUNCTION_UNPAUSED),), self);
+    }
+}
+
+/// Emitted when `revoke_artist` reaches the 100-item cap before finishing the
+/// cascade cleanup.  The caller should invoke `revoke_artist` again to continue
+/// processing the remaining listings / auctions. (Issue #214)
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RevocationIncompleteEvent {
+    pub artist: Address,
+    /// Number of listings / auctions that still need to be cancelled.
+    pub remaining: u64,
+    pub ledger_sequence: u32,
+}
+impl RevocationIncompleteEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, REVOCATION_INCOMPLETE),), self);
     }
 }
 

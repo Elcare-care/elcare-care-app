@@ -84,7 +84,9 @@ This contract manages the complete lifecycle of on-chain marketplace listings, a
 | `set_admin(new_admin)` | admin | Immediate admin transfer |
 | `propose_admin(proposed)` | admin | Step 1 of 2-step transfer |
 | `accept_admin()` | proposed | Step 2 of 2-step transfer |
-| `pause()` / `unpause()` | admin | Circuit breaker — blocks all state changes |
+| `pause()` / `unpause()` | admin | Global circuit breaker — see [Pause & Circuit Breakers](#pause--circuit-breakers) for exactly which operations it blocks (fund-recovery/cleanup ops always remain available) |
+| `pause_collection(collection)` / `unpause_collection(collection)` | admin | Per-collection circuit breaker — additive restriction layered on top of the global pause |
+| `pause_function(function_name)` / `unpause_function(function_name)` | admin | Per-function circuit breaker (`create_listing`, `buy_artwork`, `create_auction`, `place_bid`, `make_offer`) — additive restriction layered on top of the global pause |
 | `add_token(token)` / `remove_token(token)` | admin | Manage payment token whitelist |
 | `revoke_artist(artist)` / `reinstate_artist(artist)` | admin | Artist access control |
 | `set_treasury(address)` / `set_fee_bps(bps)` | admin | Update protocol fee config |
@@ -92,6 +94,32 @@ This contract manages the complete lifecycle of on-chain marketplace listings, a
 | `migrate(admin)` | admin | Idempotent storage migration for upgrades |
 | `set_price_bounds(admin, min, max)` | admin | Set global min/max listing price |
 | `get_price_bounds()` | — | Returns `(Option<i128>, Option<i128>)` |
+
+### Pause & Circuit Breakers
+
+Pausing exists to stop *new* risk exposure during an incident — it must not trap
+funds or NFTs that are already committed to the contract. There are three
+independent, additive pause axes (global, per-collection, per-function); any
+active axis blocks the operations it covers. Fund-recovery / cleanup
+operations ignore **all three** axes entirely, so users can always get their
+funds and NFTs back even while the marketplace is paused.
+
+| Blocked while paused (new exposure) | Always available (fund recovery / cleanup) |
+|---|---|
+| `create_listing` | `cancel_listing` |
+| `update_listing` | `cancel_listings` (batch) |
+| `update_listing_price` | `cancel_artist_listings` (admin revocation cleanup) |
+| `buy_artwork` | `expire_listing` |
+| `create_auction` | `cancel_auction` |
+| `place_bid` | `finalize_auction` |
+| `make_offer` | `admin_cancel_auction` |
+| `accept_offer` | `withdraw_offer` |
+| | `reject_offer` |
+| | `reclaim_offer` |
+
+All pause checks fail with the single stable `ContractPaused` (23) error
+code, so the frontend can map any pause-related rejection to one actionable
+message regardless of which axis fired.
 
 ---
 

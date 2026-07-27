@@ -276,7 +276,13 @@ function MetricsDashboard({ publicKey }: { publicKey: string }) {
           <div className="rounded-[2rem] bg-white/[0.03] border border-white/5 p-6 space-y-2">
             <p className="text-[10px] uppercase tracking-widest font-bold text-white/40">Total Volume</p>
             <p className="text-4xl font-display font-bold text-white">
-              {stroopsToXlm(BigInt(Math.round(parseFloat(metrics.totalVolume))))}
+              {/* Issue #282: metrics.totalVolume is the RAW on-chain base-unit
+                  (stroops) sum as a string — routing it through
+                  parseFloat/Math.round first (as this used to) both loses
+                  precision for large sums and double-applies the stroops→XLM
+                  scaling, since stroopsToXlm already divides by 10^7. Parse
+                  the integer part directly as a BigInt instead. */}
+              {stroopsToXlm(BigInt(metrics.totalVolume.split(".")[0] || "0"))}
               <span className="ml-2 text-sm font-normal text-brand-400">XLM</span>
             </p>
           </div>
@@ -295,6 +301,61 @@ function MetricsDashboard({ publicKey }: { publicKey: string }) {
   );
 }
 
+// ── BidRefundBanner ───────────────────────────────────────────────────────────
+//
+// Shown on the dashboard when the indexer records an AUCTION_BID_REFUNDED
+// event for the connected wallet — notifying bidders their funds were returned
+// because the artist was suspended (Issue #214).
+
+function useBidRefundNotifications(publicKey: string | null) {
+  const [refunds, setRefunds] = useState<ActivityEvent[]>([]);
+
+  useEffect(() => {
+    if (!publicKey) return;
+    getWalletActivity(publicKey)
+      .then((events) => {
+        const refundEvents = events.filter(
+          (e) => (e as any).type === "AUCTION_BID_REFUNDED" ||
+                  (e.type === "SALE" && (e as any).reason === "admin_revoke")
+        );
+        setRefunds(refundEvents);
+      })
+      .catch(() => {});
+  }, [publicKey]);
+
+  return refunds;
+}
+
+function BidRefundBanner({ refunds, onDismiss }: { refunds: ActivityEvent[]; onDismiss: () => void }) {
+  if (refunds.length === 0) return null;
+  return (
+    <div
+      className="mb-8 flex items-start gap-4 rounded-[2rem] border border-amber-500/20 bg-amber-500/10 p-5"
+      role="alert"
+      data-testid="bid-refund-banner"
+    >
+      <div className="shrink-0 mt-0.5 w-9 h-9 rounded-full bg-amber-500/20 flex items-center justify-center">
+        <AlertTriangle size={18} className="text-amber-400" />
+      </div>
+      <div className="flex-1 min-w-0">
+        <p className="text-sm font-bold text-amber-300">Auction bid{refunds.length > 1 ? "s" : ""} refunded</p>
+        <p className="mt-1 text-xs text-amber-400/80 leading-relaxed">
+          {refunds.length === 1
+            ? "One of your bids was refunded because the auction was cancelled — the artist's account was suspended by the platform. Your funds have been returned to your wallet."
+            : `${refunds.length} of your bids were refunded because their auctions were cancelled due to artist suspension. Your funds have been returned to your wallet.`}
+        </p>
+      </div>
+      <button
+        onClick={onDismiss}
+        className="shrink-0 text-amber-400/60 hover:text-amber-300 transition-colors text-lg leading-none"
+        aria-label="Dismiss refund notification"
+      >
+        ×
+      </button>
+    </div>
+  );
+}
+
 export default function DashboardPage() {
   const { publicKey } = useWalletContext();
   const { listings, isLoading, refresh } = useArtistListings(publicKey);
@@ -303,6 +364,8 @@ export default function DashboardPage() {
   const [tab, setTab] = useState<Tab>("listings");
   const [editingListing, setEditingListing] = useState<Listing | null>(null);
   const [selectedIds, setSelectedIds] = useState<number[]>([]);
+  const bidRefunds = useBidRefundNotifications(publicKey);
+  const [refundsDismissed, setRefundsDismissed] = useState(false);
   const activeCnt = listings.filter((l: Listing) => l.status === "Active").length;
   const soldCnt = listings.filter((l: Listing) => l.status === "Sold").length;
   const activeListings = listings.filter((l: Listing) => l.status === "Active");
@@ -342,6 +405,14 @@ export default function DashboardPage() {
 
       <WalletGuard actionName="To access your artist dashboard">
         <div className="relative z-10 mx-auto max-w-7xl px-4 sm:px-6 lg:px-8">
+
+          {/* Bid refund notification banner (Issue #214) */}
+          {!refundsDismissed && (
+            <BidRefundBanner
+              refunds={bidRefunds}
+              onDismiss={() => setRefundsDismissed(true)}
+            />
+          )}
 
           <div className="relative mb-12 overflow-hidden rounded-[3rem] bg-midnight-900 border border-white/5 shadow-2xl p-8 sm:p-12">
             <div className="absolute -top-24 -right-24 h-64 w-64 rounded-full bg-brand-500/10 blur-[100px]" />

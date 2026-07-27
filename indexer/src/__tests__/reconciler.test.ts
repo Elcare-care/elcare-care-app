@@ -8,10 +8,12 @@ const mockPrisma = vi.hoisted(() => ({
 }));
 
 const mockPrismaWrite = vi.hoisted(() => ({
-  $transaction: vi.fn().mockImplementation(async (fn: any) => fn(mockPrismaWrite)),
-  listing:      { update: vi.fn().mockResolvedValue({}) },
-  auction:      { update: vi.fn().mockResolvedValue({}) },
+  $transaction:         vi.fn().mockImplementation(async (fn: any) => fn(mockPrismaWrite)),
+  listing:              { update: vi.fn().mockResolvedValue({}) },
+  auction:              { update: vi.fn().mockResolvedValue({}) },
   reconciliationRepair: { create: vi.fn().mockResolvedValue({}) },
+  reconciliationRun:    { create: vi.fn().mockResolvedValue({ id: 42 }), update: vi.fn().mockResolvedValue({}) },
+  discrepancy:          { create: vi.fn().mockResolvedValue({ id: 1 }), update: vi.fn().mockResolvedValue({}) },
 }));
 
 vi.mock('../db',           () => ({ default: mockPrisma }));
@@ -34,6 +36,8 @@ const sampleAuction = (overrides = {}) => ({
   auctionId:       BigInt(1),
   status:          'Active',
   highestBid:      { toString: () => '0.0000000' },
+  highestBidder:   null,
+  endTime:         { toString: () => '1700000000' },
   updatedAtLedger: 500,
   ...overrides,
 });
@@ -46,14 +50,18 @@ beforeEach(() => {
   mockPrismaWrite.listing.update.mockResolvedValue({});
   mockPrismaWrite.auction.update.mockResolvedValue({});
   mockPrismaWrite.reconciliationRepair.create.mockResolvedValue({});
+  mockPrismaWrite.reconciliationRun.create.mockResolvedValue({ id: 42 });
+  mockPrismaWrite.reconciliationRun.update.mockResolvedValue({});
+  mockPrismaWrite.discrepancy.create.mockResolvedValue({ id: 1 });
+  mockPrismaWrite.discrepancy.update.mockResolvedValue({});
 });
 
-// ── Stub functions ────────────────────────────────────────────────────────────
+// ── Exports ───────────────────────────────────────────────────────────────────
 
-describe('fetchListingOnChain / fetchAuctionOnChain stubs', () => {
-  it('returns null (stub — real implementation requires contract ABI)', async () => {
-    expect(await fetchListingOnChain(mockServer, 'CONTRACT', BigInt(1))).toBeNull();
-    expect(await fetchAuctionOnChain(mockServer, 'CONTRACT', BigInt(1))).toBeNull();
+describe('fetchListingOnChain / fetchAuctionOnChain exports', () => {
+  it('are exported from reconciler as callable functions', () => {
+    expect(typeof fetchListingOnChain).toBe('function');
+    expect(typeof fetchAuctionOnChain).toBe('function');
   });
 });
 
@@ -70,7 +78,8 @@ describe('runReconciliation', () => {
     expect(result.sampledAuctions).toBe(1);
     expect(result.discrepancies).toHaveLength(0);
     expect(result.repairs).toBe(0);
-    expect(result.dryRun).toBe(false);
+    // Default dryRun = !AUTO_REPAIR; RECONCILER_AUTO_REPAIR is unset in tests → dryRun=true
+    expect(result.dryRun).toBe(true);
   });
 
   it('detects a listing status mismatch', async () => {

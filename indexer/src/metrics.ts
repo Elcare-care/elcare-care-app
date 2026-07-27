@@ -1,6 +1,13 @@
 import client from 'prom-client';
 import express from 'express';
 import { logger } from './logger.js';
+import { requestIdMiddleware } from './api/request-id-middleware.js';
+
+// Re-exported under its old name for backwards compatibility with existing
+// call sites/imports. The plain-text console.log implementation that used to
+// live here has been replaced by the structured JSON + correlation-ID
+// middleware in ./api/request-id-middleware.ts — see that file for behavior.
+export { requestIdMiddleware as requestLogger };
 
 // Enable default metrics (CPU, memory, etc.)
 client.collectDefaultMetrics();
@@ -178,24 +185,8 @@ export const eventProcessingDurationHistogram = new client.Histogram({
   buckets: [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1],
 });
 
-// Request logging middleware
-export function requestLogger(req: express.Request, res: express.Response, next: express.NextFunction) {
-  const startTime = Date.now();
-
-  res.on('finish', () => {
-    const latency = Date.now() - startTime;
-    const statusClass = res.statusCode < 400 ? '2xx/3xx' : res.statusCode < 500 ? '4xx' : '5xx';
-    
-    // Skip logging for health checks and metrics
-    if (req.path !== '/health' && req.path !== '/metrics' && req.path !== '/readyz') {
-      console.log(
-        `${req.method} ${req.path} ${res.statusCode} ${latency}ms`
-      );
-    }
-  });
-
-  next();
-}
+// Structured request logging (JSON, with correlation IDs) lives in
+// ./api/request-id-middleware.ts — this file only owns Prometheus metrics.
 
 // Middleware to track HTTP response times
 export function metricsMiddleware(req: express.Request, res: express.Response, next: express.NextFunction) {
@@ -376,6 +367,20 @@ export const reconcilerRepairsTotal = new client.Counter({
 export const reconcilerDriftGauge = new client.Gauge({
   name: 'indexer_reconciler_drift_records',
   help: 'Number of records with detected drift in the most recent reconciliation run',
+});
+
+/** Total reconciliation runs completed, labelled by outcome and dry_run mode. */
+export const reconcilerRunsTotal = new client.Counter({
+  name: 'indexer_reconciler_runs_total',
+  help: 'Total reconciliation runs completed, by outcome (ok | error) and dry_run mode',
+  labelNames: ['outcome', 'dry_run'],
+});
+
+/** Total records skipped during a reconciliation run, by skip reason. */
+export const reconcilerSkippedTotal = new client.Counter({
+  name: 'indexer_reconciler_skipped_total',
+  help: 'Total records skipped during reconciliation, by reason (rpc_error | budget_exhausted | decode_error)',
+  labelNames: ['reason'],
 });
 
 // ── Expose metrics handler ────────────────────────────────────────────────────

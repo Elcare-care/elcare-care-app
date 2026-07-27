@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, useCallback } from "react";
 import {
   useDeployCollection,
   useDeploySalt,
@@ -9,7 +9,7 @@ import {
 } from "@/hooks/useLaunchpad";
 import { useWalletContext } from "@/context/WalletContext";
 import { useToast } from "@/components/ToastProvider";
-import { Loader2, Rocket, CheckCircle, ArrowRight, ArrowLeft, Check } from "lucide-react";
+import { Loader2, Rocket, CheckCircle, ArrowRight, ArrowLeft, Check, AlertTriangle, Info, ExternalLink, Save, X } from "lucide-react";
 import { GuardButton } from "./WalletGuard";
 import { CollectionKind } from "@/lib/launchpad";
 import { DEFAULT_TOKEN } from "@/config/tokens";
@@ -17,6 +17,39 @@ import { useSupportedTokens } from "@/hooks/useSupportedTokens";
 import { getDefaultSupportedToken } from "@/lib/token-support";
 
 const STEPS = ["Collection Kind", "Details", "Economics", "Review"] as const;
+
+const DRAFT_KEY = "elcarehub:collection-draft";
+
+interface DraftForm {
+  name: string;
+  symbol: string;
+  kind: CollectionKind;
+  maxSupply: number;
+  royaltyBps: number;
+  currencyAddress: string;
+}
+
+function loadDraft(publicKey: string | null): DraftForm | null {
+  if (!publicKey || typeof localStorage === "undefined") return null;
+  try {
+    const raw = localStorage.getItem(`${DRAFT_KEY}:${publicKey}`);
+    if (!raw) return null;
+    return JSON.parse(raw) as DraftForm;
+  } catch {
+    return null;
+  }
+}
+
+function saveDraft(publicKey: string, form: DraftForm): void {
+  if (typeof localStorage === "undefined") return;
+  // Never store royaltyReceiver — it is a wallet address the user may not want persisted
+  localStorage.setItem(`${DRAFT_KEY}:${publicKey}`, JSON.stringify(form));
+}
+
+function clearDraft(publicKey: string): void {
+  if (typeof localStorage === "undefined") return;
+  localStorage.removeItem(`${DRAFT_KEY}:${publicKey}`);
+}
 
 const KIND_OPTIONS = [
   { id: "Normal721", label: "Standard 721", desc: "Classic one-of-a-kind NFTs" },
@@ -35,6 +68,9 @@ export function CollectionForm() {
 
   const [step, setStep] = useState(0);
   const [successAddress, setSuccessAddress] = useState<string | null>(null);
+  const [successTxHash, setSuccessTxHash] = useState<string | null>(null);
+  const [draftEnabled, setDraftEnabled] = useState(true);
+  const [hasDraft, setHasDraft] = useState(false);
   const [form, setForm] = useState({
     name: "",
     symbol: "",
@@ -45,6 +81,37 @@ export function CollectionForm() {
     currencyAddress: DEFAULT_TOKEN.address,
   });
 
+  // Load saved draft on mount (opt-in: only when a wallet is connected)
+  useEffect(() => {
+    if (!publicKey) return;
+    const draft = loadDraft(publicKey);
+    if (draft) {
+      setHasDraft(true);
+    }
+  }, [publicKey]);
+
+  const restoreDraft = useCallback(() => {
+    if (!publicKey) return;
+    const draft = loadDraft(publicKey);
+    if (!draft) return;
+    setForm((prev) => ({
+      ...prev,
+      name: draft.name,
+      symbol: draft.symbol,
+      kind: draft.kind,
+      maxSupply: draft.maxSupply,
+      royaltyBps: draft.royaltyBps,
+      currencyAddress: draft.currencyAddress,
+    }));
+    setHasDraft(false);
+  }, [publicKey]);
+
+  const discardDraft = useCallback(() => {
+    if (!publicKey) return;
+    clearDraft(publicKey);
+    setHasDraft(false);
+  }, [publicKey]);
+
   useEffect(() => {
     if (supportedTokens.length === 0) return;
     if (!supportedTokens.some((token) => token.address === form.currencyAddress)) {
@@ -54,6 +121,20 @@ export function CollectionForm() {
       }));
     }
   }, [form.currencyAddress, supportedTokens]);
+
+  // Auto-save draft whenever non-sensitive form fields change
+  useEffect(() => {
+    if (!draftEnabled || !publicKey) return;
+    const draft: DraftForm = {
+      name: form.name,
+      symbol: form.symbol,
+      kind: form.kind,
+      maxSupply: form.maxSupply,
+      royaltyBps: form.royaltyBps,
+      currencyAddress: form.currencyAddress,
+    };
+    saveDraft(publicKey, draft);
+  }, [draftEnabled, publicKey, form.name, form.symbol, form.kind, form.maxSupply, form.royaltyBps, form.currencyAddress]);
 
   const is721 = form.kind.includes("721");
 
@@ -125,6 +206,8 @@ export function CollectionForm() {
     if (addr) {
       pushToast("Collection deployed successfully!", "success");
       setSuccessAddress(addr);
+      // Draft fulfilled — clear it so the next collection starts fresh
+      if (publicKey) clearDraft(publicKey);
     } else {
       pushToast(error || "Deployment failed. Please try again.", "error");
     }
@@ -132,33 +215,152 @@ export function CollectionForm() {
 
   if (successAddress) {
     return (
-      <div className="max-w-xl mx-auto flex flex-col items-center gap-6 rounded-3xl border border-green-100 bg-white p-12 text-center shadow-2xl shadow-green-900/5">
-        <div className="rounded-full bg-green-50 p-4">
-          <CheckCircle size={56} className="text-green-500" />
-        </div>
-        <div className="space-y-2">
-          <h3 className="text-3xl font-display font-bold text-gray-900">
-            Collection Deployed!
-          </h3>
-          <p className="text-gray-500 font-inter">
-            Your collection has been successfully created on the Stellar network.
-          </p>
-          <div className="mt-4 p-4 bg-gray-50 rounded-2xl break-all font-mono text-sm text-gray-600 border border-gray-100">
+      <div className="max-w-xl mx-auto flex flex-col gap-6 rounded-3xl border border-green-100 bg-white p-10 shadow-2xl shadow-green-900/5">
+        <div className="flex flex-col items-center text-center gap-4">
+          <div className="rounded-full bg-green-50 p-4">
+            <CheckCircle size={56} className="text-green-500" />
+          </div>
+          <div>
+            <h3 className="text-3xl font-display font-bold text-gray-900">
+              Collection Deployed!
+            </h3>
+            <p className="text-gray-500 font-inter mt-1">
+              Your collection is live on the Stellar network.
+            </p>
+          </div>
+          <div className="w-full p-4 bg-gray-50 rounded-2xl break-all font-mono text-sm text-gray-600 border border-gray-100">
             {successAddress}
           </div>
         </div>
-        <a
-          href={`/launchpad/collections/${successAddress}`}
-          className="w-full flex items-center justify-center gap-2 rounded-2xl bg-brand-500 px-6 py-4 text-lg font-bold text-white hover:bg-brand-600 shadow-lg shadow-brand-500/20 transition-all hover:scale-[1.02] active:scale-[0.98]"
-        >
-          View Collection <ArrowRight size={20} />
-        </a>
+
+        {/* Post-deployment checklist */}
+        <div className="rounded-2xl border border-brand-100 bg-brand-50/40 p-5">
+          <h4 className="text-sm font-bold text-brand-700 uppercase tracking-wider mb-3">
+            What to do next
+          </h4>
+          <ul className="space-y-2 text-sm text-gray-700">
+            <li className="flex items-start gap-2">
+              <Check size={14} className="mt-0.5 text-green-500 shrink-0" />
+              <span>Collection address confirmed on-chain — copy it for future reference.</span>
+            </li>
+            <li className="flex items-start gap-2">
+              <Check size={14} className="mt-0.5 text-green-500 shrink-0" />
+              <span>Verify royalty receiver address matches your intended wallet before listing tokens.</span>
+            </li>
+            <li className="flex items-start gap-2">
+              <Info size={14} className="mt-0.5 text-brand-500 shrink-0" />
+              <span>
+                Name, symbol, and max supply are <strong>immutable</strong> — they cannot be changed after deployment.
+              </span>
+            </li>
+          </ul>
+        </div>
+
+        {/* Action links */}
+        <div className="flex flex-col gap-3">
+          <a
+            href={`/launchpad/collections/${successAddress}`}
+            className="flex items-center justify-center gap-2 rounded-2xl bg-brand-500 px-6 py-4 text-base font-bold text-white hover:bg-brand-600 shadow-lg shadow-brand-500/20 transition-all hover:scale-[1.02] active:scale-[0.98]"
+            data-testid="view-collection-link"
+          >
+            View Collection <ArrowRight size={18} />
+          </a>
+          <a
+            href="/launchpad/my-collections"
+            className="flex items-center justify-center gap-2 rounded-xl border border-gray-200 px-6 py-3 text-sm font-bold text-gray-700 hover:bg-gray-50 transition-all"
+          >
+            <ExternalLink size={14} />
+            My Collections
+          </a>
+          <a
+            href="/launchpad/create"
+            className="flex items-center justify-center gap-2 rounded-xl border border-gray-200 px-6 py-3 text-sm font-bold text-gray-700 hover:bg-gray-50 transition-all"
+          >
+            <Rocket size={14} />
+            Deploy Another Collection
+          </a>
+        </div>
       </div>
     );
   }
 
   return (
     <div className="max-w-3xl mx-auto px-4 py-8">
+      {/* Draft restore banner */}
+      {hasDraft && (
+        <div
+          role="alert"
+          data-testid="draft-restore-banner"
+          className="mb-6 flex items-start justify-between gap-4 rounded-2xl border border-brand-100 bg-brand-50/60 px-5 py-4"
+        >
+          <div className="flex items-start gap-3">
+            <Save size={18} className="mt-0.5 text-brand-500 shrink-0" />
+            <div>
+              <p className="text-sm font-bold text-brand-700">Unsaved draft found</p>
+              <p className="text-xs text-brand-600 mt-0.5">
+                You have a saved collection draft. Restore it or start fresh.
+              </p>
+            </div>
+          </div>
+          <div className="flex items-center gap-2 shrink-0">
+            <button
+              type="button"
+              onClick={restoreDraft}
+              className="rounded-xl bg-brand-500 px-4 py-2 text-xs font-bold text-white hover:bg-brand-600 transition-colors"
+              data-testid="restore-draft-btn"
+            >
+              Restore
+            </button>
+            <button
+              type="button"
+              onClick={discardDraft}
+              className="rounded-xl border border-gray-200 px-3 py-2 text-xs font-bold text-gray-600 hover:bg-gray-50 transition-colors"
+              data-testid="discard-draft-btn"
+            >
+              <X size={12} />
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Draft persistence notice */}
+      <div className="mb-4 flex items-center justify-between text-xs text-gray-400 font-inter">
+        <span>
+          {draftEnabled
+            ? "Draft auto-saved locally. No sensitive data is stored."
+            : "Draft saving is off."}
+        </span>
+        <button
+          type="button"
+          onClick={() => {
+            setDraftEnabled((v) => !v);
+            if (draftEnabled && publicKey) clearDraft(publicKey);
+          }}
+          className="underline hover:text-gray-600 transition-colors"
+          data-testid="toggle-draft-btn"
+        >
+          {draftEnabled ? "Disable draft" : "Enable draft"}
+        </button>
+      </div>
+
+      {/* Wallet/network preflight notice */}
+      {!publicKey && (
+        <div
+          role="alert"
+          data-testid="wallet-required-notice"
+          className="mb-6 flex items-start gap-3 rounded-2xl border border-amber-100 bg-amber-50 px-5 py-4"
+        >
+          <AlertTriangle size={18} className="mt-0.5 text-amber-500 shrink-0" />
+          <div>
+            <p className="text-sm font-bold text-amber-700">Wallet required</p>
+            <p className="text-xs text-amber-600 mt-0.5">
+              Connect your wallet before deploying. The deploying address will be
+              the collection administrator and royalty receiver by default.
+            </p>
+          </div>
+        </div>
+      )}
+
       {/* Step indicator */}
       <div className="flex items-center justify-between mb-10">
         {STEPS.map((label, i) => (
@@ -238,9 +440,21 @@ export function CollectionForm() {
             <h2 className="text-2xl font-display font-bold text-gray-900 mb-2">
               Collection Details
             </h2>
-            <p className="text-gray-500 font-inter mb-8">
+            <p className="text-gray-500 font-inter mb-4">
               Name and describe your collection.
             </p>
+            <div
+              role="note"
+              data-testid="immutable-choice-warning"
+              className="mb-6 flex items-start gap-3 rounded-xl border border-amber-100 bg-amber-50/70 px-4 py-3"
+            >
+              <AlertTriangle size={15} className="mt-0.5 text-amber-500 shrink-0" />
+              <p className="text-xs text-amber-700 font-inter leading-snug">
+                <strong>These choices are immutable.</strong> Name, symbol, and max
+                supply are written into the contract at deployment and cannot be
+                changed afterwards. Review them carefully before proceeding.
+              </p>
+            </div>
             <div className="space-y-6">
               <div className="space-y-2">
                 <label className="block text-sm font-bold text-gray-950 uppercase tracking-wider font-inter">

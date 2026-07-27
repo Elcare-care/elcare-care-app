@@ -170,8 +170,25 @@ pub struct BatchUpdateListingInput {
 pub struct Listing {
     pub listing_id: u64,
     pub artist: Address,
+    /// Opaque base-unit amount denominated in `token` (e.g. stroops for
+    /// native XLM, or the equivalent smallest unit for a whitelisted SAC).
+    /// The contract performs no decimal scaling — see the `token` field doc
+    /// below and `Contract::validate_token_asset`. Decimal/precision policy
+    /// for display purposes lives in the off-chain token registry
+    /// (frontend `config/tokens.ts`, indexer token metadata), not on-chain.
     pub price: i128,
     pub currency: Symbol,
+    /// Address of the payment asset contract accepted for this listing —
+    /// either the native XLM Stellar Asset Contract or another SAC present
+    /// in the admin-managed whitelist (`get_token_whitelist`). All amounts
+    /// (`price`, bids, offer amounts) are base units of this token's own
+    /// `decimals()` (7, for both native XLM and any classic-asset SAC on
+    /// Stellar); the contract treats them as opaque i128 values and never
+    /// rescales them. Validated at write time by `is_token_whitelisted` and
+    /// `validate_token_asset` — an unsupported or obviously-wrong asset
+    /// address (e.g. equal to the collection or to this contract) is
+    /// rejected before the listing/auction/offer can ever be created, so it
+    /// can never reach settlement.
     pub token: Address,
     pub collection: Address,
     pub token_id: u64,

@@ -34,6 +34,7 @@ import {
   apiRequestDurationHistogram,
 } from '../metrics.js';
 import { TTL } from '../cache-warmer.js';
+import { withDecimalAmounts } from '../token-metadata.js';
 
 // ── SSE registry ───────────────────────────────────────────────────────────────
 
@@ -81,8 +82,9 @@ export function emitSSEEvent(event: any) {
   const dataStr = JSON.stringify(event, (_k, v) => typeof v === 'bigint' ? v.toString() : v);
   const payload: SSEEvent = { id, data: dataStr };
 
-import { hub, emitSSEEvent, closeSSEClients, ensureRealtimeStarted } from '../realtime/index.js';
-export { emitSSEEvent, closeSSEClients };
+  // Maintain a bounded replay buffer for reconnecting clients
+  sseBuffer.push(payload);
+  if (sseBuffer.length > SSE_BUFFER_SIZE) sseBuffer.shift();
 
   const frame = `id: ${id}\ndata: ${dataStr}\n\n`;
   for (const [client] of sseClients) {
@@ -118,28 +120,6 @@ export function apiDurationMiddleware(req: Request, res: Response, next: NextFun
   next();
 }
 
-// Per-client heartbeat timers so idle proxies don't drop the connection.
-const sseHeartbeats: Map<Response, ReturnType<typeof setInterval>> = new Map();
-
-function setupSSEHeartbeat(res: Response): void {
-  const timer = setInterval(() => {
-    try {
-      res.write(`: heartbeat\n\n`);
-    } catch {
-      cleanupSSEClient(res);
-    }
-  }, SSE_HEARTBEAT_MS);
-  sseHeartbeats.set(res, timer);
-  sseClients.set(res, 0);
-}
-
-function cleanupSSEClient(res: Response): void {
-  const timer = sseHeartbeats.get(res);
-  if (timer) clearInterval(timer);
-  sseHeartbeats.delete(res);
-  sseClients.delete(res);
-}
-
 const router = Router();
 
 router.use(etagMiddleware);
@@ -167,6 +147,27 @@ const serialize = (obj: any) =>
   JSON.parse(JSON.stringify(obj, (key, value) =>
     typeof value === 'bigint' ? value.toString() : value
   ));
+
+// ── Raw + human-readable money fields (Issue #282) ────────────────────────────
+//
+// Listing/Auction/Offer rows carry raw on-chain base-unit amounts (see
+// token-metadata.ts for why the Decimal(32,7) columns are NOT already
+// human-scaled). These helpers serialize a row/array and attach a
+// `<field>Decimal` sibling for every money field, computed from the row's
+// own `token` address, so API consumers get both the raw and human forms
+// without guessing at precision.
+const LISTING_MONEY_FIELDS = [['price', 'token']] as const;
+const AUCTION_MONEY_FIELDS = [
+  ['reservePrice', 'token'],
+  ['highestBid', 'token'],
+] as const;
+const OFFER_MONEY_FIELDS = [['amount', 'token']] as const;
+
+const serializeListing = (row: any) => withDecimalAmounts(serialize(row), LISTING_MONEY_FIELDS);
+const serializeListings = (rows: any[]) => serialize(rows).map((row: any) => withDecimalAmounts(row, LISTING_MONEY_FIELDS));
+const serializeAuction = (row: any) => withDecimalAmounts(serialize(row), AUCTION_MONEY_FIELDS);
+const serializeAuctions = (rows: any[]) => serialize(rows).map((row: any) => withDecimalAmounts(row, AUCTION_MONEY_FIELDS));
+const serializeOffers = (rows: any[]) => serialize(rows).map((row: any) => withDecimalAmounts(row, OFFER_MONEY_FIELDS));
 
 // ── GET /events (SSE) ─────────────────────────────────────────────────────────
 
@@ -344,9 +345,9 @@ router.get('/listings', cacheMiddleware(TTL.LISTINGS_LIST), validateQuery(listin
     res.setHeader('X-Total-Count', String(total));
 
     if (limit !== undefined || offset !== undefined || cursor_ledger !== undefined) {
-      return res.json({ listings: serialize(results), total });
+      return res.json({ listings: serializeListings(results), total });
     }
-    res.json(serialize(results));
+    res.json(serializeListings(results));
   } catch (err) {
     next(internalError('Failed to fetch listings'));
   }
@@ -367,7 +368,7 @@ router.get('/listings/:id', cacheMiddleware(TTL.LISTING_DETAIL), async (req: Req
       ? await prisma.ipfsMetadata.findUnique({ where: { cid: listing.token } }).catch(() => null)
       : null;
 
-    return res.json(serialize({ ...listing, ipfsMetadata: ipfsMetadata ?? null }));
+    return res.json(serializeListing({ ...listing, ipfsMetadata: ipfsMetadata ?? null }));
   } catch (err) {
     next(internalError('Failed to fetch listing details'));
   }
@@ -537,7 +538,7 @@ router.get('/auctions', cacheMiddleware(TTL.AUCTIONS_LIST), validateQuery(auctio
     const nextCursor = results.length === take ? String(results[results.length - 1].updatedAtLedger) : '';
     res.setHeader('X-Next-Cursor', nextCursor);
     res.setHeader('X-Total-Count', String(total));
-    res.json(serialize(results));
+    res.json(serializeAuctions(results));
   } catch (err) {
     next(internalError('Failed to fetch auctions'));
   }
@@ -629,7 +630,7 @@ router.get('/offers', validateQuery(offersQuerySchema), async (req: Request, res
     const nextCursor = results.length === take ? String(results[results.length - 1].updatedAtLedger) : '';
     res.setHeader('X-Next-Cursor', nextCursor);
     res.setHeader('X-Total-Count', String(total));
-    res.json(serialize(results));
+    res.json(serializeOffers(results));
   } catch (err) {
     next(internalError('Failed to fetch offers'));
   }
@@ -1058,6 +1059,22 @@ router.get('/artists/:address/metrics', cacheMiddleware(60), validateQuery(artis
     });
   } catch (err) {
     next(internalError('Failed to fetch artist metrics'));
+  }
+});
+
+// ── GET /reconciliation/status ────────────────────────────────────────────────
+//
+// Returns the last ReconciliationRun with its counts and the most recent
+// field-level discrepancies.  Returns { lastRun: null } when no run has been
+// recorded yet.
+
+router.get('/reconciliation/status', async (_req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { getReconciliationStatus } = await import('../reconciler.js');
+    const status = await getReconciliationStatus();
+    res.json(status);
+  } catch (err) {
+    next(internalError('Failed to fetch reconciliation status'));
   }
 });
 

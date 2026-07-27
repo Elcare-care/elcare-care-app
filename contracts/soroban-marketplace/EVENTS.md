@@ -157,6 +157,30 @@ The JSON block below defines the exact topics and data schemas for all events. I
     "topic": "contract_unpaused",
     "data_schema": {}
   },
+  "COLLECTION_PAUSED": {
+    "topic": "collection_paused",
+    "data_schema": {
+      "collection": "Address"
+    }
+  },
+  "COLLECTION_UNPAUSED": {
+    "topic": "collection_unpaused",
+    "data_schema": {
+      "collection": "Address"
+    }
+  },
+  "FUNCTION_PAUSED": {
+    "topic": "function_paused",
+    "data_schema": {
+      "function_name": "Symbol"
+    }
+  },
+  "FUNCTION_UNPAUSED": {
+    "topic": "function_unpaused",
+    "data_schema": {
+      "function_name": "Symbol"
+    }
+  },
   "LISTING_PRICE_UPDATED": {
     "topic": "listing_price_updated",
     "data_schema": {
