@@ -632,6 +632,48 @@ impl MarketplaceContract {
     // Any active axis blocks the affected operations.  Global pause
     // still blocks everything; collection and function pauses are
     // additive narrow restrictions layered on top.
+    //
+    // ── State-transition matrix (narrowly-scoped emergency pause) ──
+    //
+    // A pause is meant to stop *new* risk exposure, not trap funds or NFTs
+    // that are already committed to the contract.  Every public entry point
+    // falls into exactly one of the two buckets below.
+    //
+    // Blocked when paused (subject to global / collection / function axes,
+    // via `require_not_paused` or `require_not_paused_ctx`) — these create
+    // new exposure (new escrow, new payment flow, new price commitment):
+    //   - create_listing        (collection + function axis)
+    //   - update_listing        (global axis)
+    //   - update_listing_price  (global axis)
+    //   - buy_artwork           (collection + function axis)
+    //   - create_auction        (collection + function axis)
+    //   - place_bid             (collection + function axis)
+    //   - make_offer            (collection + function axis)
+    //   - accept_offer          (global axis — a purchase-like state
+    //                            transition, not fund recovery, so it stays
+    //                            gated like buy_artwork)
+    //
+    // Always available regardless of pause state (fund recovery / cleanup —
+    // these return escrowed tokens or NFTs to their rightful owner, or tidy
+    // up state that is already terminal/expired, so blocking them would trap
+    // user funds during exactly the incident a pause is meant to contain):
+    //   - cancel_listing            (artist reclaims NFT from escrow)
+    //   - cancel_listings           (batch form of the above)
+    //   - cancel_artist_listings    (admin-driven revocation cleanup sweep)
+    //   - expire_listing            (permissionless; already unguarded)
+    //   - cancel_auction            (creator reclaims NFT, no-bid only)
+    //   - finalize_auction          (settles an already-ended auction —
+    //                                explicitly called out by the issue)
+    //   - admin_cancel_auction      (admin emergency unwind + bidder refund)
+    //   - withdraw_offer            (offerer reclaims escrowed funds)
+    //   - reject_offer              (artist rejects offer, funds return to
+    //                                the offerer)
+    //   - reclaim_offer             (offerer reclaims funds from an offer
+    //                                that expired without action)
+    //
+    // These cleanup paths deliberately skip *all three* pause axes (global,
+    // collection, function) — they exist precisely so a paused incident
+    // doesn't also freeze user funds/state in limbo.
 
     /// Pause all operations for a specific collection.
     pub fn pause_collection(env: Env, admin: Address, collection: Address) {
@@ -919,7 +961,7 @@ impl MarketplaceContract {
     /// call reverts.  Per listing the refund-then-cancel semantics match
     /// `cancel_listing`.  Returns the number of listings cancelled.
     pub fn cancel_listings(env: Env, owner: Address, listing_ids: Vec<u64>) -> u32 {
-        Self::require_not_paused(&env);
+        // Fund-recovery / cleanup op — always available, ignores all pause axes.
         owner.require_auth();
 
         if listing_ids.len() > MAX_BATCH_CANCEL {
@@ -1190,7 +1232,7 @@ impl MarketplaceContract {
     // ── cancel_listing ───────────────────────────────────────
     // Effects first, then release_nft (Interaction)
     pub fn cancel_listing(env: Env, artist: Address, listing_id: u64) -> bool {
-        Self::require_not_paused(&env);
+        // Fund-recovery / cleanup op — always available, ignores all pause axes.
         artist.require_auth();
         Self::cancel_listing_inner(&env, &artist, listing_id)
     }
@@ -1383,7 +1425,7 @@ impl MarketplaceContract {
     // CEI: lock → checks → effects → emit → interactions (payout + release_nft) → unlock
     // With escrow: NFT source is always the contract — no seller-side surprise.
     pub fn finalize_auction(env: Env, caller: Address, auction_id: u64) {
-        Self::require_not_paused(&env);
+        // Fund-recovery / cleanup op — always available, ignores all pause axes.
         caller.require_auth();
         // RAII guard — cleared by Drop whether the function returns normally or panics.
         let _guard = AuctionReentrancyScope::new(&env, auction_id);
@@ -1446,7 +1488,7 @@ impl MarketplaceContract {
     // ── cancel_auction ───────────────────────────────────────
     // Only no-bid auctions can be cancelled; releases NFT back to creator
     pub fn cancel_auction(env: Env, creator: Address, auction_id: u64) {
-        Self::require_not_paused(&env);
+        // Fund-recovery / cleanup op — always available, ignores all pause axes.
         creator.require_auth();
         let mut auction = load_auction(&env, auction_id)
             .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::AuctionNotFound));
@@ -1586,7 +1628,7 @@ impl MarketplaceContract {
     }
 
     pub fn withdraw_offer(env: Env, offerer: Address, offer_id: u64) {
-        Self::require_not_paused(&env);
+        // Fund-recovery / cleanup op — always available, ignores all pause axes.
         offerer.require_auth();
         let mut offer = load_offer(&env, offer_id)
             .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::OfferNotFound));
@@ -1610,7 +1652,8 @@ impl MarketplaceContract {
     }
 
     pub fn reject_offer(env: Env, artist: Address, offer_id: u64) {
-        Self::require_not_paused(&env);
+        // Fund-recovery / cleanup op (returns escrowed funds to the offerer) —
+        // always available, ignores all pause axes.
         artist.require_auth();
         let mut offer = load_offer(&env, offer_id)
             .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::OfferNotFound));
@@ -1741,7 +1784,7 @@ impl MarketplaceContract {
     }
 
     pub fn reclaim_offer(env: Env, offer_id: u64) {
-        Self::require_not_paused(&env);
+        // Fund-recovery / cleanup op — always available, ignores all pause axes.
         let mut offer = load_offer(&env, offer_id)
             .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::OfferNotFound));
         if offer.status != OfferStatus::Pending {
