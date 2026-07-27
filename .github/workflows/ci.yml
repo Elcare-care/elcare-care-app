@@ -212,6 +212,14 @@ jobs:
           name: playwright-report
           path: frontend/elcarehub-app/playwright-report/
           retention-days: 14
+      - name: Upload Playwright Snapshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-snapshots
+          path: frontend/elcarehub-app/tests/e2e/snapshots/
+          retention-days: 14
+          if-no-files-found: ignore
 
   indexer-integration:
     name: Indexer Integration Tests
@@ -273,6 +281,19 @@ jobs:
       - name: Run Tests
         run: npm run test
         working-directory: indexer
+      - name: Run Tests with Coverage
+        run: npx vitest run --coverage
+        working-directory: indexer
+        env:
+          CI: true
+        continue-on-error: true
+      - name: Upload Indexer Coverage Report
+        if: always() && matrix.node-version == 20
+        uses: actions/upload-artifact@v4
+        with:
+          name: indexer-coverage-node20
+          path: indexer/coverage/
+          retention-days: 14
 
   check-openapi:
     name: Check OpenAPI Spec (Indexer)

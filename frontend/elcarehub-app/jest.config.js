@@ -51,10 +51,17 @@ module.exports = {
   coverageDirectory: 'coverage',
   coverageReporters: ['text', 'text-summary', 'lcov', 'json-summary'],
   coverageThreshold: {
+    // ── Global thresholds (ratchet — do not lower without explicit review) ────
+    // These are set at or near the current baseline. Bump them as coverage
+    // improves. See docs/COVERAGE_POLICY.md for the ratchet process.
     global:                               { statements: 60, branches: 50, functions: 55, lines: 60 },
+    // ── Per-file thresholds for high-risk financial paths ─────────────────────
     './src/components/CheckoutModal.tsx': { statements: 90, branches: 75, functions: 85, lines: 90 },
     './src/components/ListingCard.tsx':   { statements: 90, branches: 75, functions: 85, lines: 90 },
     './src/hooks/useMarketplace.ts':      { statements: 55, branches: 45, functions: 50, lines: 55 },
     './src/lib/contract.ts':              { statements: 15, branches: 10, functions: 10, lines: 15 },
+    // Work item C additions
+    './src/lib/disclosures.ts':           { statements: 80, branches: 70, functions: 75, lines: 80 },
+    './src/lib/support.ts':               { statements: 80, branches: 70, functions: 75, lines: 80 },
   },
 }
