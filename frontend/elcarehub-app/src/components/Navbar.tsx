@@ -10,6 +10,7 @@ import { useWalletContext } from "@/context/WalletContext";
 import { Wallet, Store, LayoutDashboard, Menu, X, AlertTriangle, LogOut, ShieldCheck, Tag, Inbox, Compass, User, Gavel, Settings, HelpCircle, Rocket, ChevronDown } from "lucide-react";
 import { ConnectWalletModal } from "./ConnectWalletModal";
 import { WalletMenu } from "./WalletMenu";
+import { NotificationCenter } from "./NotificationCenter";
 
 export function Navbar() {
   const { publicKey, isConnected, isConnecting, disconnect, isWrongNetwork, status, balance, isLoadingBalance } =
@@ -143,7 +144,8 @@ export function Navbar() {
 
 
           {/* Desktop wallet button */}
-          <div className="hidden md:flex items-center gap-4">
+          <div className="hidden md:flex items-center gap-3">
+            {isConnected && <NotificationCenter />}
             {isConnected ? (
               <div className="flex items-center gap-3">
                 {isWrongNetwork ? (
