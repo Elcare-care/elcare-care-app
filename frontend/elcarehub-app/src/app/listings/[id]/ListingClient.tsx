@@ -577,8 +577,8 @@ export default function ListingDetailPage({ id }: ListingClientProps) {
                                     </div>
                                 )}
 
-                                {/* Secondary Actions: Share + Provenance */}
-                                <div className="flex gap-3 pt-6">
+                                {/* Secondary Actions: Share + Provenance + Report */}
+                                <div className="flex gap-3 pt-6 flex-wrap">
                                     {/* Social share buttons */}
                                     <SocialShare
                                         title={metadata?.title ?? `Listing #${id}`}
@@ -595,6 +595,16 @@ export default function ListingDetailPage({ id }: ListingClientProps) {
                                         <History size={14} />
                                         <span className="hidden sm:inline">Provenance</span>
                                     </button>
+                                    {/* Work item B: link to support center with pre-filled context */}
+                                    <a
+                                        href={`/support?listing_id=${id}${listing?.metadata_cid ? `&cid=${listing.metadata_cid}` : ''}`}
+                                        title="Report an issue with this listing"
+                                        data-testid="report-issue-link"
+                                        className="h-11 px-4 rounded-xl bg-white/5 hover:bg-white/10 transition-all border border-white/10 flex items-center gap-2 text-xs font-bold text-white/60"
+                                    >
+                                        <AlertCircle size={14} />
+                                        <span className="hidden sm:inline">Report Issue</span>
+                                    </a>
                                 </div>
                             </div>
                         </div>

@@ -13,11 +13,14 @@ Thank you for contributing. This guide covers development workflow, testing expe
 
 Jest collects coverage in CI for `frontend/elcarehub-app`. Thresholds are set at the **current baseline** so CI does not break unexpectedly; raise them when you add meaningful tests.
 
+The full policy — including per-component thresholds, exclusions, the ratchet process, and high-risk path requirements — is documented in **[docs/COVERAGE_POLICY.md](docs/COVERAGE_POLICY.md)**.
+
 | Scope | Policy |
 |-------|--------|
 | **Global** | Minimum ~60% statements/lines, ~50% branches, ~55% functions |
-| **Critical paths** | Higher floors on checkout, listing cards, marketplace hooks, and contract helpers |
-| **Ratchet** | When adding tests in an area, bump that area's threshold in `jest.config.js` |
+| **Critical paths** | Higher floors on checkout, listing cards, marketplace hooks, contract helpers, disclosures, and support validation |
+| **Ratchet** | When adding tests in an area, bump that area's threshold in `jest.config.js` in the same PR |
+| **High-risk paths** | New financial actions must include targeted tests; see COVERAGE_POLICY.md |
 
 ### Commands
 
