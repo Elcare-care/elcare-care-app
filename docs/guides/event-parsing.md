@@ -47,6 +47,10 @@ Soroban smart contracts emit events composed of XDR-encoded topics and data payl
 - [`contracts/soroban-marketplace/src/events.rs`](../../contracts/soroban-marketplace/src/events.rs): Rust contract event definitions and topic constants — the versioning policy is documented at the top of this file.
 - [`contracts/launchpad/src/events.rs`](../../contracts/launchpad/src/events.rs): launchpad deploy/admin/fee events (tuple-shaped, not `#[contracttype]` structs).
 
+> `price` / `amount` / `reserve_price` / `winning_bid` payload fields above are always **raw i128
+> base units** (unscaled) — see [`payment-tokens.md`](./payment-tokens.md) for the canonical
+> decimal policy and how the indexer API exposes both raw and human-readable amounts.
+
 ---
 
 ## 3. Topic Mappings

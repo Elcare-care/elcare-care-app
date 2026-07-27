@@ -336,6 +336,23 @@ export interface ContractUnpausedData {
   unpaused_by?: string;
 }
 
+/** Granular pause events (Issue #205 + narrowly-scoped pause follow-up) */
+export interface CollectionPausedData {
+  collection: string;
+}
+
+export interface CollectionUnpausedData {
+  collection: string;
+}
+
+export interface FunctionPausedData {
+  function_name: string;
+}
+
+export interface FunctionUnpausedData {
+  function_name: string;
+}
+
 /** Deploy events emit a 2-tuple [creator_address, contract_address] */
 export interface DeployData {
   0: string;
@@ -619,6 +636,19 @@ export const ROYALTY_SETTLEMENT_SCHEMA: ContractEventSchema = {
   ],
 };
 
+// Royalty settlement snapshot (Issue #270); backs the accounting
+// reconciliation added by Issue #279 — see RoyaltySettlementData above.
+export const ROYALTY_SETTLEMENT_SCHEMA: ContractEventSchema = {
+  type: 'ROYALTY_SETTLEMENT',
+  data: [
+    { name: 'id', type: 'bigint' },
+    { name: 'recipients', type: 'array', optional: true },
+    { name: 'total_amount', type: 'bigint' },
+    { name: 'token', type: 'string' },
+    { name: 'ledger_sequence', type: 'bigint', optional: true },
+  ],
+};
+
 export const ARTIST_REVOKED_SCHEMA: ContractEventSchema = {
   type: 'ARTIST_REVOKED',
   data: [{ name: 'artist', type: 'string' }],
@@ -682,6 +712,26 @@ export const CONTRACT_UNPAUSED_SCHEMA: ContractEventSchema = {
   data: [{ name: 'unpaused_by', type: 'string', optional: true }],
 };
 
+export const COLLECTION_PAUSED_SCHEMA: ContractEventSchema = {
+  type: 'COLLECTION_PAUSED',
+  data: [{ name: 'collection', type: 'string' }],
+};
+
+export const COLLECTION_UNPAUSED_SCHEMA: ContractEventSchema = {
+  type: 'COLLECTION_UNPAUSED',
+  data: [{ name: 'collection', type: 'string' }],
+};
+
+export const FUNCTION_PAUSED_SCHEMA: ContractEventSchema = {
+  type: 'FUNCTION_PAUSED',
+  data: [{ name: 'function_name', type: 'string' }],
+};
+
+export const FUNCTION_UNPAUSED_SCHEMA: ContractEventSchema = {
+  type: 'FUNCTION_UNPAUSED',
+  data: [{ name: 'function_name', type: 'string' }],
+};
+
 /**
  * Deploy events from the launchpad contract emit a 2-element tuple
  * [creator_address, deployed_contract_address].  scValToNative returns a plain
@@ -727,8 +777,6 @@ export const SCHEMA_REGISTRY: Map<string, ContractEventSchema> = new Map([
   ['ROYALTY_PAID', ROYALTY_PAID_SCHEMA],
   ['PROTOCOL_FEE_COLLECTED', PROTOCOL_FEE_COLLECTED_SCHEMA],
   ['ROYALTY_SETTLEMENT', ROYALTY_SETTLEMENT_SCHEMA],
-  ['AUCTION_BID_REFUNDED', AUCTION_BID_REFUNDED_SCHEMA],
-  ['AUCTION_ADMIN_CANCELLED', AUCTION_ADMIN_CANCELLED_SCHEMA],
   ['ARTIST_REVOKED', ARTIST_REVOKED_SCHEMA],
   ['ARTIST_REINSTATED', ARTIST_REINSTATED_SCHEMA],
   ['ADMIN_TRANSFER_PROPOSED', ADMIN_TRANSFER_PROPOSED_SCHEMA],

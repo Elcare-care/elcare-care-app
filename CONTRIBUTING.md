@@ -81,28 +81,52 @@ When introducing schema updates, new event topics, smart contract entry points, 
 2. Verify all path links and environment variable names match the repository.
 3. Ensure no example command or log output requests or prints un-redacted secrets.
 
-### Contract event schema changes (Issue #278)
+## Reliability backlog
 
-Any PR that changes a contract event's shape (`contracts/*/src/events.rs`) or the
-matching indexer schema (`indexer/src/event-schemas.ts`) must, in the same PR:
-
-1. Follow the additive-only versioning policy documented at the top of
-   `contracts/soroban-marketplace/src/events.rs` and in
-   `docs/guides/event-parsing.md` §5 — bump `EVENT_SCHEMA_VERSION` /
-   `SUPPORTED_SCHEMA_VERSIONS` together, never independently.
-2. Update the version catalog table in `docs/guides/event-parsing.md` §5.
-3. Update (or add) the fixture for that event type in
-   `indexer/src/__tests__/parser.test.ts` to cover both the pre-change and
-   post-change payload shape.
-
-**Follow-up (not yet enforced):** a CI check that fails the build when
-`events.rs` changes without a corresponding fixture/schema update in the same
-diff would close this gap mechanically instead of relying on review. That is
-out of scope for Issue #278 (which focused on the versioning mechanism
-itself) and is tracked as follow-up work — reviewers should manually verify
-the three steps above until it lands.
+Cross-cutting reliability work (contracts, indexer, caches, UX, security, a11y, privacy, support) is
+tracked in [docs/reliability/backlog.md](docs/reliability/backlog.md). Domain owners and the
+[quarterly review process](docs/reliability/quarterly-review-process.md) apply when triaging
+long-lived GitHub issues: close obsolete items with rationale, or link them to a backlog ID.
 
 ## Commit messages
 
 Follow [Conventional Commits](https://www.conventionalcommits.org/), e.g. `feat(frontend): add checkout coverage thresholds`.
 
+
+## Contract changes and threat-model review
+
+Any pull request that modifies files under `contracts/` — entry points, settlement logic, authorization, signatures, storage layout, events, or deployment scripts — **must** include a completed threat-model record and an independent review before it can merge.
+
+### Process
+
+1. **Copy the template** — `docs/threat-model-template.md`
+2. **Save it** as `docs/threat-models/TM-YYYY-MM-DD-short-description.md`
+3. **Complete all sections** — work through every row in section 4 (the threat checklist) and every box in section 6 (flow-specific review)
+4. **Log open findings** in section 7 with severity, owner, and residual risk
+5. **Get an independent review** — a second engineer who did not author the change must sign section 8
+6. **Link the record** in the PR description under "Contract change review"
+7. **Commit the record** to the same branch so the CI gate can find it
+
+### CI enforcement
+
+`.github/workflows/contract-threat-model-gate.yml` runs on every PR that touches `contracts/**/src/*.rs`. It fails if:
+
+- No file was added or modified under `docs/threat-models/`
+- The threat-model file still contains the unfilled template stub in the reviewer sign-off (section 8)
+
+The gate is a **required status check** — add it to your branch protection rules alongside the existing contract and frontend checks.
+
+### Severity guidance
+
+| Severity | Description |
+|---|---|
+| Critical | Can drain funds or take full admin control |
+| High | Significant value at risk; requires specific but realistic conditions |
+| Medium | Limited impact or requires unlikely attacker preconditions |
+| Low | Informational; acknowledged risk with no immediate action |
+
+High and Critical findings must be mitigated or have a documented accepted-risk decision before merge. Medium and Low findings may be accepted with a tracking issue.
+
+### Reference examples
+
+See `docs/threat-models/TM-2026-07-27-marketplace-purchase-auction-offer-lazy-mint.md` for an annotated example covering the core marketplace flows.
