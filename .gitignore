@@ -22,6 +22,12 @@ scripts/deploy/.env.deploy
 .stellar/
 scripts/deploy/.stellar/
 
+# Live integration environment — generated secrets/state, never commit
+scripts/live-e2e/.env.live-e2e
+scripts/live-e2e/seed_ids.env
+scripts/live-e2e/artifacts/
+frontend/elcarehub-app/playwright-report-live/
+
 # Vercel deployment metadata
 .vercel/
 **/.vercel/

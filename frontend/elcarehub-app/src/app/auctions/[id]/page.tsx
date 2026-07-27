@@ -25,10 +25,12 @@ import {
   type BidHistoryRecord,
 } from "@/lib/indexer";
 import { getReadableErrorMessage } from "@/lib/errors";
+import { categorizePageError, PageStateError } from "@/lib/pageState";
 import { useWalletContext } from "@/context/WalletContext";
 import { usePlaceBid } from "@/hooks/usePlaceBid";
 import { useFinalizeAuction } from "@/hooks/useAuctions";
 import { GuardButton } from "@/components/WalletGuard";
+import { ResourceState } from "@/components/PageStates";
 import { config } from "@/lib/config";
 import {
   ArrowLeft,
@@ -558,7 +560,7 @@ export default function AuctionDetailPage() {
   const [auction, setAuction] = useState<Auction | null>(null);
   const [metadata, setMetadata] = useState<ArtworkMetadata | null>(null);
   const [isLoading, setIsLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const [pageError, setPageError] = useState<PageStateError | null>(null);
   const [activeTab, setActiveTab] = useState<"details" | "bids">("details");
   const [bidAmountXlm, setBidAmountXlm] = useState("");
   const [bidSuccess, setBidSuccess] = useState(false);
@@ -579,7 +581,7 @@ export default function AuctionDetailPage() {
   const loadData = useCallback(async () => {
     if (!id) return;
     setIsLoading(true);
-    setError(null);
+    setPageError(null);
     try {
       const auctionData = await getAuction(Number(id));
       setAuction(auctionData);
@@ -588,7 +590,14 @@ export default function AuctionDetailPage() {
       const meta = await fetchMetadata(auctionData.metadata_cid).catch(() => null);
       setMetadata(meta);
     } catch (err) {
-      setError(getReadableErrorMessage(err, "Failed to load auction"));
+      // Distinguishes "this auction id doesn't exist" from "the indexer/RPC
+      // is unreachable" so an outage never masquerades as a 404.
+      setPageError(
+        categorizePageError(err, {
+          resourceLabel: "auction",
+          notFoundMessage: "This auction does not exist or has been removed.",
+        })
+      );
     } finally {
       setIsLoading(false);
     }
@@ -691,7 +700,8 @@ export default function AuctionDetailPage() {
     return (
       <div className="min-h-screen bg-gray-50 pt-24">
         <div className="mx-auto max-w-6xl px-4 sm:px-6">
-          <div className="animate-pulse grid gap-8 lg:grid-cols-2">
+          <div role="status" aria-live="polite" className="animate-pulse grid gap-8 lg:grid-cols-2">
+            <span className="sr-only">Loading auction…</span>
             <div className="aspect-square rounded-3xl bg-gray-200" />
             <div className="space-y-4 pt-4">
               <div className="h-8 w-3/4 rounded-xl bg-gray-200" />
@@ -705,22 +715,21 @@ export default function AuctionDetailPage() {
     );
   }
 
-  if (error || !auction) {
+  if (pageError || !auction) {
     return (
-      <div className="flex min-h-screen flex-col items-center justify-center gap-4 bg-gray-50 pt-24">
-        <div className="flex h-16 w-16 items-center justify-center rounded-2xl bg-red-50 text-red-500">
-          <AlertCircle size={32} />
-        </div>
-        <h2 className="text-lg font-bold text-gray-900">
-          {error ?? "Auction not found"}
-        </h2>
-        <button
-          onClick={() => router.push("/auctions")}
-          className="flex items-center gap-2 rounded-xl bg-brand-500 px-6 py-2.5 text-sm font-bold text-white hover:bg-brand-600 transition-all"
-        >
-          <ArrowLeft size={14} />
-          Back to Auctions
-        </button>
+      <div className="flex min-h-screen flex-col items-center justify-center bg-gray-50 pt-24">
+        <ResourceState
+          isLoading={false}
+          error={
+            pageError ??
+            categorizePageError(new Error("Auction not found"), {
+              resourceLabel: "auction",
+              notFoundMessage: "This auction does not exist or has been removed.",
+            })
+          }
+          onRetry={loadData}
+          notFoundAction={{ label: "Back to Auctions", href: "/auctions" }}
+        />
       </div>
     );
   }
