@@ -4,7 +4,17 @@ import { createContext, useContext, ReactNode, useMemo, useCallback, useEffect, 
 import { useWallet, WalletState, WalletStatus } from "@/hooks/useWallet";
 import { useMagicWallet, MagicWalletState } from "@/hooks/useMagicWallet";
 import { useLobstrWallet } from "@/hooks/useLobstrWallet";
-import { saveWalletProvider, loadWalletProvider, clearWalletProvider } from "@/lib/wallet-persistence";
+import { 
+  saveWalletState, 
+  loadWalletState, 
+  clearWalletState, 
+  clearPendingActionState,
+  WalletConnectorId,
+  // Legacy imports for backwards compat
+  loadWalletProvider,
+  clearWalletProvider,
+} from "@/lib/wallet-persistence";
+import { getWalletPreferences } from "@/lib/wallet-preferences";
 
 export type WalletType = "freighter" | "lobstr" | "magic" | null;
 
@@ -41,28 +51,38 @@ export function WalletProvider({ children }: { children: ReactNode }) {
   const magic = useMagicWallet();
   const [initialized, setInitialized] = useState(false);
 
-  // Auto-reconnect on mount
+  // Auto-reconnect on mount (respects user preference and expiration)
   useEffect(() => {
     const reconnect = async () => {
-      const savedProvider = loadWalletProvider();
-      if (!savedProvider) {
+      const prefs = getWalletPreferences();
+      
+      // If user disabled auto-connect or remember-wallet, skip
+      if (!prefs.autoConnect || !prefs.rememberWallet) {
         setInitialized(true);
         return;
       }
 
+      // Try to load persisted wallet state
+      const savedWallet = loadWalletState();
+      if (!savedWallet) {
+        setInitialized(true);
+        return;
+      }
+
+      // If state is expired or corrupted, it will have been cleared by loadWalletState
       try {
-        if (savedProvider === 'freighter' && freighter.isInstalled) {
+        if (savedWallet.connectorId === 'freighter' && freighter.isInstalled) {
           await freighter.connect();
-        } else if (savedProvider === 'lobstr' && lobstr.isInstalled) {
+        } else if (savedWallet.connectorId === 'lobstr' && lobstr.isInstalled) {
           await lobstr.connect();
-        } else if (savedProvider === 'magic') {
+        } else if (savedWallet.connectorId === 'magic') {
           await magic.refresh();
         } else {
-          clearWalletProvider();
+          clearWalletState();
         }
       } catch (err) {
         console.error('Auto-reconnect failed:', err);
-        clearWalletProvider();
+        clearWalletState();
       } finally {
         setInitialized(true);
       }
@@ -105,37 +125,54 @@ export function WalletProvider({ children }: { children: ReactNode }) {
   }, [freighter]);
 
   const disconnect = useCallback(() => {
+    // Clear pending action state on disconnect (safety: prevents orphaned state)
+    clearPendingActionState();
+    
     freighter.disconnect();
     lobstr.disconnect();
     // Magic logout is async; fire and forget
     if (magic.isConnected) magic.logout().catch(console.error);
-    clearWalletProvider();
+    clearWalletState();
   }, [freighter, lobstr, magic]);
 
   const refresh = useCallback(async () => {
     await Promise.all([freighter.refresh(), lobstr.refresh()]);
   }, [freighter, lobstr]);
 
-  // Wrapper to persist provider choice
+  // Wrapper to persist provider choice with new schema
   const connectFreighterWithPersist = useCallback(async () => {
     await freighter.connect();
-    if (freighter.isConnected) saveWalletProvider('freighter');
+    if (freighter.isConnected && freighter.publicKey) {
+      // Persist wallet state: address + connector + network
+      const chainId = freighter.networkPassphrase === 'Test SDF Network ; September 2015'
+        ? 0 // Testnet
+        : 1; // Public
+      saveWalletState(freighter.publicKey, 'freighter', chainId);
+    }
   }, [freighter]);
 
   const connectLobstrWithPersist = useCallback(async () => {
     await lobstr.connect();
-    if (lobstr.isConnected) saveWalletProvider('lobstr');
+    if (lobstr.isConnected && lobstr.publicKey) {
+      // Lobstr doesn't expose network passphrase; default to chainId 1 (public)
+      saveWalletState(lobstr.publicKey, 'lobstr', 1);
+    }
   }, [lobstr]);
 
   // Magic connect wrappers
   const connectMagicEmail = useCallback(async (email: string) => {
     await magic.loginWithEmail(email);
-    if (magic.isConnected) saveWalletProvider('magic');
+    if (magic.isConnected && magic.publicAddress) {
+      // Magic network: assume public (1)
+      saveWalletState(magic.publicAddress, 'magic', 1);
+    }
   }, [magic]);
 
   const connectMagicPasskey = useCallback(async () => {
     await magic.loginWithPasskey();
-    if (magic.isConnected) saveWalletProvider('magic');
+    if (magic.isConnected && magic.publicAddress) {
+      saveWalletState(magic.publicAddress, 'magic', 1);
+    }
   }, [magic]);
 
   const value = useMemo(

@@ -101,6 +101,72 @@ export default function PrivacyPage() {
             </div>
           </section>
 
+          {/* 2b */}
+          <section>
+            <h2 className="text-xl font-bold text-white mb-3">2b. Wallet Persistence and Privacy Controls</h2>
+            <div className="text-white/70 leading-relaxed space-y-3">
+              <p>
+                ElcareHub offers privacy-conscious wallet persistence controls to respect your preferences.
+              </p>
+              
+              <div className="bg-white/5 border border-white/10 rounded-lg p-4 space-y-3">
+                <h3 className="font-semibold text-white">Remember Wallet Setting</h3>
+                <p>
+                  By default, ElcareHub stores your wallet connector type (Freighter, Lobstr, or Magic) 
+                  in browser localStorage, allowing automatic reconnection on your next visit. This setting 
+                  can be disabled in <strong>Settings › Privacy › Remember Wallet</strong>.
+                </p>
+                
+                <p className="text-sm">
+                  <strong>When enabled:</strong> Your wallet connection persists across browser sessions. 
+                  We store only your wallet address (public key), connector type, and connection timestamp—
+                  never your private keys or signing data.
+                </p>
+
+                <p className="text-sm">
+                  <strong>When disabled:</strong> Your wallet connection uses sessionStorage instead, 
+                  clearing automatically when you close your browser. This provides maximum privacy for 
+                  each session.
+                </p>
+              </div>
+
+              <div className="bg-white/5 border border-white/10 rounded-lg p-4 space-y-3">
+                <h3 className="font-semibold text-white">What We Never Store</h3>
+                <ul className="text-sm space-y-2 list-inside">
+                  <li>✓ Private keys or seed phrases (your wallet extension keeps these)</li>
+                  <li>✓ Signatures or signing requests</li>
+                  <li>✓ Raw blockchain provider responses containing transient tokens</li>
+                  <li>✓ Transaction hashes or approval states (stored only on-chain or in indexer)</li>
+                  <li>✓ Session tokens or authentication credentials</li>
+                </ul>
+              </div>
+
+              <div className="bg-white/5 border border-white/10 rounded-lg p-4 space-y-3">
+                <h3 className="font-semibold text-white">Session Expiration</h3>
+                <p className="text-sm">
+                  Persisted wallet sessions expire after 7 days of inactivity. Upon expiration, 
+                  your connection data is automatically cleared, and you will be prompted to reconnect 
+                  on your next visit. You can clear this data manually by disconnecting in the app 
+                  or disabling "Remember Wallet" in settings.
+                </p>
+              </div>
+
+              <div className="bg-white/5 border border-white/10 rounded-lg p-4 space-y-3">
+                <h3 className="font-semibold text-white">Device and Browser Safety</h3>
+                <p className="text-sm">
+                  Browser localStorage and sessionStorage are accessible to JavaScript running on ElcareHub's domain. 
+                  To minimize risk:
+                </p>
+                <ul className="text-sm space-y-2 list-inside">
+                  <li>• Disable "Remember Wallet" if using shared or untrusted devices</li>
+                  <li>• Regularly clear browser data or use private browsing mode</li>
+                  <li>• Keep your browser and wallet extension updated</li>
+                  <li>• Never store large amounts of assets in a browser-connected wallet</li>
+                </ul>
+              </div>
+            </div>
+          </section>
+
           {/* 3 */}
           <section>
             <h2 className="text-xl font-bold text-white mb-3">3. Analytics — your choice</h2>

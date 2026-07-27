@@ -62,6 +62,7 @@ export default function SettingsPage() {
     auctionEndings: true,
 
     // Privacy Settings
+    rememberWallet: true, // Will be loaded from preferences
     showProfilePublicly: true,
     shareActivityData: false,
 
@@ -72,6 +73,13 @@ export default function SettingsPage() {
     currency: 'XLM'
   });
 
+  // Load wallet preferences on mount
+  useEffect(() => {
+    const { getWalletPreferences } = require('@/lib/wallet-preferences');
+    const prefs = getWalletPreferences();
+    setSettings(prev => ({ ...prev, rememberWallet: prefs.rememberWallet }));
+  }, []);
+
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
 
@@ -79,6 +87,11 @@ export default function SettingsPage() {
     setSaving(true);
     // Persist locale and time zone preferences via format utilities (Issue #67)
     setLocalePreferences({ locale: settings.language, timeZone: settings.timeZone });
+    
+    // Persist wallet preferences
+    const { setWalletPreferences } = require('@/lib/wallet-preferences');
+    setWalletPreferences({ rememberWallet: settings.rememberWallet });
+    
     await new Promise(resolve => setTimeout(resolve, 500));
     setSaving(false);
     setSaved(true);
@@ -435,6 +448,27 @@ export default function SettingsPage() {
           <div className="space-y-4">
             <div className="flex items-center justify-between p-3 rounded-lg bg-white/5 border border-white/10">
               <div>
+                <div className="font-medium text-white">Remember Wallet</div>
+                <div className="text-xs text-gray-400">
+                  Keep your wallet connection when you close the browser. Disable this to log out on browser close.
+                </div>
+              </div>
+              <button
+                onClick={() => setSettings(prev => ({ ...prev, rememberWallet: !prev.rememberWallet }))}
+                className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
+                  settings.rememberWallet ? 'bg-brand-500' : 'bg-gray-600'
+                }`}
+              >
+                <span
+                  className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                    settings.rememberWallet ? 'translate-x-6' : 'translate-x-1'
+                  }`}
+                />
+              </button>
+            </div>
+
+            <div className="flex items-center justify-between p-3 rounded-lg bg-white/5 border border-white/10">
+              <div>
                 <div className="font-medium text-white">Public Profile</div>
                 <div className="text-xs text-gray-400">Make your profile visible to other users</div>
               </div>
@@ -469,6 +503,18 @@ export default function SettingsPage() {
                   }`}
                 />
               </button>
+            </div>
+
+            <div className="p-3 rounded-lg bg-brand-500/5 border border-brand-500/20">
+              <div className="flex gap-2">
+                <Info className="h-4 w-4 text-brand-400 flex-shrink-0 mt-0.5" />
+                <div className="text-xs text-gray-400 leading-relaxed">
+                  <strong className="text-white">Wallet Privacy:</strong> Your wallet address is pseudonymous and public on the blockchain. 
+                  When "Remember Wallet" is enabled, your wallet connector type is stored locally. 
+                  When disabled, your session clears when you close your browser. 
+                  Your private keys are never stored by ElcareHub — they stay in your wallet extension.
+                </div>
+              </div>
             </div>
           </div>
         </div>
