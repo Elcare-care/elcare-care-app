@@ -1230,7 +1230,35 @@ impl MarketplaceContract {
         }
         if let Some(exp) = listing.expires_at {
             if env.ledger().timestamp() >= exp {
-                panic_with_error!(&env, MarketplaceError::ListingExpired);
+                listing.status = ListingStatus::Cancelled;
+                save_listing(&env, &listing);
+                remove_from_active_listings(&env, listing_id);
+                for offer_id in load_pending_offer_ids(&env, listing_id).iter() {
+                    if let Some(mut offer) = load_offer(&env, offer_id) {
+                        if offer.status == OfferStatus::Pending {
+                            offer.status = OfferStatus::Rejected;
+                            save_offer(&env, &offer);
+                            TokenClient::new(&env, &offer.token).transfer(
+                                &env.current_contract_address(),
+                                &offer.offerer,
+                                &offer.amount,
+                            );
+                        }
+                    }
+                }
+                clear_pending_offers(&env, listing_id);
+                ListingCancelledEvent {
+                    listing_id,
+                    cancelled_by: listing.artist.clone(),
+                    reason: CancelReason::Expired,
+                    ledger_sequence: env.ledger().sequence(),
+                }.publish(&env);
+                ListingExpiredEvent {
+                    listing_id, expired_at: exp, ledger_sequence: env.ledger().sequence(),
+                }.publish(&env);
+                escrow::release_nft(&env, &listing.collection, listing.token_id,
+                    &listing.artist, env.ledger().sequence(), listing_id);
+                return false;
             }
         }
         if !Self::is_token_whitelisted(&env, &listing.token) {
@@ -1332,6 +1360,12 @@ impl MarketplaceContract {
         listing.status = ListingStatus::Cancelled;
         save_listing(&env, &listing);
         remove_from_active_listings(&env, listing_id);
+        ListingCancelledEvent {
+            listing_id,
+            cancelled_by: listing.artist.clone(),
+            reason: CancelReason::Expired,
+            ledger_sequence: env.ledger().sequence(),
+        }.publish(&env);
         ListingExpiredEvent {
             listing_id, expired_at: exp, ledger_sequence: env.ledger().sequence(),
         }.publish(&env);

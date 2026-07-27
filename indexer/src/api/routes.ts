@@ -238,7 +238,25 @@ router.get('/listings', cacheMiddleware(TTL.LISTINGS_LIST), validateQuery(listin
     const where: any = {};
     if (artist) where.artist = artist;
     if (owner) where.owner = owner;
-    if (status) where.status = status;
+
+    // status=expired is a virtual filter: Cancelled listings whose
+    // LISTING_CANCELLED event carries reason.Expired (tag 2).
+    let expiredIds: bigint[] | null = null;
+    if (status === 'expired') {
+      const rows: any[] = await prisma.$queryRawUnsafe(
+        `SELECT DISTINCT "listingId" FROM "MarketplaceEvent"
+         WHERE "eventType" = 'LISTING_CANCELLED'
+           AND data->'reason'->>'tag' = '2'`
+      );
+      expiredIds = rows.map((r: any) => r.listingId);
+      if (expiredIds.length === 0) {
+        return res.json([]);
+      }
+      where.listingId = { in: expiredIds };
+      where.status = 'Cancelled';
+    } else if (status) {
+      where.status = status;
+    }
 
     if (minPrice !== undefined || maxPrice !== undefined) {
       where.price = {};

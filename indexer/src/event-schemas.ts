@@ -62,7 +62,7 @@ export interface ArtworkSoldData {
 export interface ListingCancelledData {
   listing_id: bigint;
   cancelled_by?: string;
-  reason?: string | object;
+  reason?: string | { tag: number };
   ledger_sequence?: bigint;
 }
 
@@ -315,7 +315,7 @@ export const LISTING_CANCELLED_SCHEMA: ContractEventSchema = {
   data: [
     { name: 'listing_id', type: 'bigint' },
     { name: 'cancelled_by', type: 'string', optional: true },
-    { name: 'reason', type: 'string', optional: true },
+    { name: 'reason', type: 'object', optional: true },
     { name: 'ledger_sequence', type: 'bigint', optional: true },
   ],
 };
