@@ -81,6 +81,13 @@ When introducing schema updates, new event topics, smart contract entry points, 
 2. Verify all path links and environment variable names match the repository.
 3. Ensure no example command or log output requests or prints un-redacted secrets.
 
+## Reliability backlog
+
+Cross-cutting reliability work (contracts, indexer, caches, UX, security, a11y, privacy, support) is
+tracked in [docs/reliability/backlog.md](docs/reliability/backlog.md). Domain owners and the
+[quarterly review process](docs/reliability/quarterly-review-process.md) apply when triaging
+long-lived GitHub issues: close obsolete items with rationale, or link them to a backlog ID.
+
 ## Commit messages
 
 Follow [Conventional Commits](https://www.conventionalcommits.org/), e.g. `feat(frontend): add checkout coverage thresholds`.
