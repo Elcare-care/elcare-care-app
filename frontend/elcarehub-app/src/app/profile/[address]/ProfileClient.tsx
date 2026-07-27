@@ -1,13 +1,13 @@
 "use client";
 
 import { useEffect, useState, useMemo } from "react";
+import Link from "next/link";
 import { useWalletContext } from "@/context/WalletContext";
 import { WalletGuard } from "@/components/WalletGuard";
 import { useArtistListings, useMarketplace, useCancelListings } from "@/hooks/useMarketplace";
 import { useUserActivity } from "@/hooks/useUserActivity";
 import { useCreatorCollections } from "@/hooks/useLaunchpad";
 import { ListingCard } from "@/components/ListingCard";
-import Link from "next/link";
 import {
     History,
     Package,
@@ -205,6 +205,22 @@ function ProfileContent({
 
     return (
         <div className="relative z-10 mx-auto max-w-7xl px-4 sm:px-6 lg:px-8">
+            {/* Breadcrumb */}
+            {!isOwnProfile && displayAddress && (
+                <nav aria-label="Breadcrumb" className="mb-6">
+                    <ol role="list" className="flex items-center gap-1 text-sm text-white/50">
+                        <li>
+                            <Link href="/explore" className="hover:text-brand-400 transition-colors">Discover</Link>
+                        </li>
+                        <li aria-hidden="true" className="text-white/25">/</li>
+                        <li>
+                            <span aria-current="page" className="text-white/90 font-medium truncate max-w-[160px] inline-block">
+                                {displayAddress?.slice(0, 6)}…{displayAddress?.slice(-4)}
+                            </span>
+                        </li>
+                    </ol>
+                </nav>
+            )}
             {/* Profile Header */}
             <div className="relative mb-12 overflow-hidden rounded-[3rem] bg-midnight-900 border border-white/5 shadow-2xl p-8 sm:p-12">
                 <div className="absolute -top-24 -right-24 h-64 w-64 rounded-full bg-brand-500/10 blur-[100px]" />

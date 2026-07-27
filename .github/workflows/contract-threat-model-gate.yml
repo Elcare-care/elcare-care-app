@@ -1,0 +1,129 @@
+name: Contract Threat-Model Gate
+
+# ── Purpose ───────────────────────────────────────────────────
+#
+# Blocks merging of pull requests that modify contract source
+# files without a corresponding threat-model record committed
+# in docs/threat-models/.
+#
+# This is one layer of the defence-in-depth process for high-risk
+# contract changes. It does NOT replace human review; it ensures
+# the review artefact is present so reviewers have context.
+#
+# Exemptions: changes that only touch comments, tests, or
+# Cargo.lock are excluded. See the path filters below.
+#
+# ─────────────────────────────────────────────────────────────
+
+on:
+  pull_request:
+    branches: ["main", "master"]
+    paths:
+      # Trigger on any contract source change
+      - "contracts/**/src/**/*.rs"
+      - "contracts/**/Cargo.toml"
+      # Exclude test files and Cargo.lock from triggering the gate
+      # (test-only changes do not require a threat model)
+    paths-ignore:
+      - "contracts/**/src/test.rs"
+      - "contracts/**/src/test/**"
+      - "Cargo.lock"
+
+jobs:
+  threat-model-check:
+    name: Contract Threat-Model Record Required
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect changed contract files
+        id: changed
+        run: |
+          BASE="${{ github.event.pull_request.base.sha }}"
+          HEAD="${{ github.event.pull_request.head.sha }}"
+
+          # List contract source files changed in this PR
+          CHANGED=$(git diff --name-only "$BASE" "$HEAD" \
+            | grep -E '^contracts/.*/src/[^/]+\.rs$' \
+            | grep -v 'test' \
+            || true)
+
+          if [ -z "$CHANGED" ]; then
+            echo "no_contract_changes=true" >> "$GITHUB_OUTPUT"
+            echo "No non-test contract source files changed — gate not required."
+          else
+            echo "no_contract_changes=false" >> "$GITHUB_OUTPUT"
+            echo "Contract source changes detected:"
+            echo "$CHANGED"
+          fi
+
+      - name: Verify threat-model record is present
+        if: steps.changed.outputs.no_contract_changes == 'false'
+        run: |
+          BASE="${{ github.event.pull_request.base.sha }}"
+          HEAD="${{ github.event.pull_request.head.sha }}"
+
+          # Check whether any file under docs/threat-models/ was added or
+          # modified in this PR.
+          TM_FILES=$(git diff --name-only --diff-filter=ACM "$BASE" "$HEAD" \
+            | grep '^docs/threat-models/' \
+            || true)
+
+          if [ -z "$TM_FILES" ]; then
+            echo ""
+            echo "╔═══════════════════════════════════════════════════════════════╗"
+            echo "║  ❌  THREAT-MODEL RECORD MISSING                              ║"
+            echo "╠═══════════════════════════════════════════════════════════════╣"
+            echo "║  This PR modifies contract source files but does not include  ║"
+            echo "║  a threat-model record under docs/threat-models/.             ║"
+            echo "║                                                               ║"
+            echo "║  Steps to resolve:                                            ║"
+            echo "║  1. Copy docs/threat-model-template.md                        ║"
+            echo "║  2. Save it as:                                               ║"
+            echo "║     docs/threat-models/TM-$(date +%Y-%m-%d)-<short-title>.md  ║"
+            echo "║  3. Complete all sections and commit the file to this branch. ║"
+            echo "║  4. Ensure an independent reviewer signs off in section 8.    ║"
+            echo "║                                                               ║"
+            echo "║  See CONTRIBUTING.md for the full process.                    ║"
+            echo "╚═══════════════════════════════════════════════════════════════╝"
+            exit 1
+          fi
+
+          echo "✅ Threat-model record found:"
+          echo "$TM_FILES"
+
+      - name: Verify threat-model record is not empty / template stub
+        if: steps.changed.outputs.no_contract_changes == 'false'
+        run: |
+          BASE="${{ github.event.pull_request.base.sha }}"
+          HEAD="${{ github.event.pull_request.head.sha }}"
+
+          TM_FILES=$(git diff --name-only --diff-filter=ACM "$BASE" "$HEAD" \
+            | grep '^docs/threat-models/' \
+            || true)
+
+          STUB_FOUND=false
+          for f in $TM_FILES; do
+            # A stub is a file where section 8 reviewer sign-off is still
+            # the template placeholder text.
+            if grep -q 'Independent reviewer | |' "$f" 2>/dev/null; then
+              echo "⚠️  $f appears to be an unfilled template stub (section 8 is empty)."
+              STUB_FOUND=true
+            fi
+          done
+
+          if [ "$STUB_FOUND" = "true" ]; then
+            echo ""
+            echo "Please complete the threat-model record (fill in all sections,"
+            echo "especially the reviewer sign-off in section 8) before merging."
+            exit 1
+          fi
+
+          echo "✅ Threat-model record appears complete."
