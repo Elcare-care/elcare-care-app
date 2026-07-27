@@ -1,4 +1,5 @@
 import { rpc, Contract, TransactionBuilder, BASE_FEE, nativeToScVal, scValToNative } from '@stellar/stellar-sdk';
+import { fetchRawListingFromChain, fetchRawAuctionFromChain } from './chain-state.js';
 // Write-path client: poller / parser writes use the dedicated 3-connection pool
 // so burst writes never starve the API read pool (db.ts, connection_limit=10).
 import prisma from './prisma-write.js';
@@ -644,6 +645,12 @@ async function pollContract(
           });
           recordDbWrite();
           for (const ev of newEvents) emitSSEEvent(ev);
+        } catch (txErr) {
+          logger.error('pollContract: domain write transaction failed', {
+            contractId: contract.contractId,
+            err: txErr instanceof Error ? txErr.message : String(txErr),
+          });
+          throw txErr;
         }
 
         const syncData = buildSyncStateLedgerData(advanceTo, latestHash);
@@ -746,8 +753,10 @@ export async function startPolling() {
 }
 
 
-async function fetchListingFromChain(_listingId: bigint): Promise<any | null> {
-  return null;
+async function fetchListingFromChain(listingId: bigint, contractId?: string): Promise<any | null> {
+  const cid = contractId || process.env.MARKETPLACE_CONTRACT_ID || '';
+  if (!cid) return null;
+  return fetchRawListingFromChain(server, cid, listingId);
 }
 
 /**
@@ -810,8 +819,10 @@ export async function backfillListingMetadata(listingId: bigint, cid: string): P
   });
 }
 
-async function fetchAuctionFromChain(_auctionId: bigint): Promise<any | null> {
-  return null;
+async function fetchAuctionFromChain(auctionId: bigint, contractId?: string): Promise<any | null> {
+  const cid = contractId || process.env.MARKETPLACE_CONTRACT_ID || '';
+  if (!cid) return null;
+  return fetchRawAuctionFromChain(server, cid, auctionId);
 }
 
 /** Resolves the globally unique identity of a decoded event (RPC id preferred). */
@@ -917,7 +928,7 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
 
   switch (eventType) {
     case 'LISTING_CREATED': {
-      let chainListing = await fetchListingFromChain(listingId);
+      let chainListing = await fetchListingFromChain(listingId, event.contractId);
       if (chainListing && !chainListing.artist) chainListing = null;
 
       const artist     = chainListing ? chainListing.artist.toString()      : data.artist;
@@ -1079,7 +1090,7 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
     }
 
     case 'AUCTION_CREATED': {
-      let chainAuction = await fetchAuctionFromChain(listingId);
+      let chainAuction = await fetchAuctionFromChain(listingId, event.contractId);
       if (chainAuction && !chainAuction.creator) chainAuction = null;
 
       const creator      = chainAuction ? chainAuction.creator.toString()         : data.creator;

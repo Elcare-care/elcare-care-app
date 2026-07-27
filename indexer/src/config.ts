@@ -168,6 +168,30 @@ export function loadConfig() {
     pollIntervalMs: parsePositiveInt('POLL_INTERVAL_MS', process.env.POLL_INTERVAL_MS, 5000),
     maxLedgersPerCycle: parsePositiveInt('MAX_LEDGERS_PER_CYCLE', process.env.MAX_LEDGERS_PER_CYCLE, 1000),
     shutdownTimeoutMs: parsePositiveInt('SHUTDOWN_TIMEOUT_MS', process.env.SHUTDOWN_TIMEOUT_MS, 30_000),
+    // ── Reconciler config ──────────────────────────────────────────────────
+    /**
+     * When true, the reconciler writes DB corrections when chain state disagrees.
+     * Defaults to false (detect-only / dry-run safe).
+     * Set RECONCILER_AUTO_REPAIR=true to enable.
+     */
+    reconcilerAutoRepair: process.env.RECONCILER_AUTO_REPAIR === 'true',
+    /**
+     * Maximum total number of records (listings + auctions) the reconciler
+     * will read from chain in a single run.  Prevents runaway RPC spend.
+     */
+    reconcilerBudgetPerRun: parsePositiveInt(
+      'RECONCILER_BUDGET_PER_RUN',
+      process.env.RECONCILER_BUDGET_PER_RUN,
+      200
+    ),
+    /**
+     * Chain-state read mode:
+     *   ledger_entries (default) — getLedgerEntries with DataKey ScVal keys
+     *   simulate                  — simulateTransaction of get_listing/get_auction
+     */
+    chainStateMode: (process.env.CHAIN_STATE_MODE === 'simulate'
+      ? 'simulate'
+      : 'ledger_entries') as 'ledger_entries' | 'simulate',
     /**
      * Issue #286: Number of ledgers that must accumulate on top of a window
      * before its events are considered "confirmed" (finalized enough).

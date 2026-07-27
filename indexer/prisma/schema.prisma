@@ -454,3 +454,44 @@ model ReconciliationRepair {
   @@index([modelType, recordId])
   @@index([createdAt])
 }
+
+// ── Reconciliation run tracking + discrepancies ───────────────────────────────
+//
+// ReconciliationRun captures per-run metadata so operators can audit health.
+// Discrepancy stores every field-level mismatch found; resolvedAt is set when
+// auto-repair corrects the row in the same run.
+
+model ReconciliationRun {
+  id                  Int           @id @default(autoincrement())
+  startedAt           DateTime      @default(now())
+  completedAt         DateTime?
+  sampledListings     Int           @default(0)
+  sampledAuctions     Int           @default(0)
+  discrepanciesFound  Int           @default(0)
+  repairsApplied      Int           @default(0)
+  skippedRecords      Int           @default(0)
+  dryRun              Boolean       @default(false)
+  errorMessage        String?
+  discrepancies       Discrepancy[]
+
+  @@index([startedAt])
+}
+
+model Discrepancy {
+  id           Int               @id @default(autoincrement())
+  runId        Int
+  run          ReconciliationRun @relation(fields: [runId], references: [id])
+  kind         String            // "listing" | "auction"
+  entityId     String            // listingId / auctionId as string
+  field        String            // "status" | "price" | "owner" | "highestBid" | "highestBidder" | "endTime"
+  dbValue      String
+  chainValue   String
+  resolved     Boolean           @default(false)
+  detectedAt   DateTime          @default(now())
+  resolvedAt   DateTime?
+
+  @@index([runId])
+  @@index([kind, entityId])
+  @@index([resolved])
+  @@index([detectedAt])
+}

@@ -1,0 +1,127 @@
+name: Database Backup
+
+# Scheduled backup runs daily at 02:00 UTC.
+# Can also be triggered manually via workflow_dispatch for on-demand backups
+# or DR drill preparation.
+#
+# Required repository secrets (Settings → Secrets → Actions):
+#   BACKUP_DATABASE_URL       — Read-only Postgres connection string to the
+#                               production (or staging) database.
+#                               Example: postgresql://ro_user:pass@host:5432/db
+#   BACKUP_ENCRYPTION_KEY     — Strong random passphrase for AES-256-CBC encryption.
+#                               Generate: openssl rand -base64 48
+#   BACKUP_STORAGE_PATH       — Destination path accessible to the runner, or an
+#                               S3-compatible URI (extend the upload step as needed).
+#
+# Monitoring:
+#   This workflow fails loudly so that a missed backup surfaces as a CI failure.
+#   Wire the workflow status to an alert channel (PagerDuty / Slack) via
+#   GitHub's notification settings or an external webhook step.
+
+on:
+  schedule:
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+    inputs:
+      retention_days:
+        description: "Backup retention days (default: 30)"
+        required: false
+        default: "30"
+
+jobs:
+  backup:
+    name: PostgreSQL Backup
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install PostgreSQL client
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends postgresql-client
+
+      - name: Run backup
+        env:
+          DATABASE_URL: ${{ secrets.BACKUP_DATABASE_URL }}
+          BACKUP_ENCRYPTION_KEY: ${{ secrets.BACKUP_ENCRYPTION_KEY }}
+          BACKUP_DIR: /tmp/elcarehub-backups
+          RETENTION_DAYS: ${{ github.event.inputs.retention_days || '30' }}
+        run: |
+          chmod +x scripts/backup/backup.sh
+          bash scripts/backup/backup.sh
+
+      - name: Upload backup artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: db-backup-${{ github.run_id }}
+          path: /tmp/elcarehub-backups/
+          # Artifact retention is separate from backup file retention.
+          # Keep artifacts for 90 days for audit purposes.
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: Report backup status
+        if: always()
+        run: |
+          if [ "${{ job.status }}" = "success" ]; then
+            echo "✓ Backup succeeded at $(date -u +%FT%TZ)"
+          else
+            echo "✗ Backup FAILED at $(date -u +%FT%TZ)" >&2
+            exit 1
+          fi
+
+  verify-restore:
+    name: Restore Verification (DR Drill)
+    runs-on: ubuntu-latest
+    needs: [backup]
+    timeout-minutes: 30
+    # Run restore verification on every backup to catch restore failures
+    # before a real disaster rather than during one.
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: restore_test
+          POSTGRES_PASSWORD: restore_test
+          POSTGRES_DB: restore_test
+        options: >-
+          --health-cmd "pg_isready -U restore_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+        ports:
+          - 5432:5432
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends postgresql-client
+          cd indexer && npm ci
+
+      - name: Download backup artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: db-backup-${{ github.run_id }}
+          path: /tmp/elcarehub-backups/
+
+      - name: Locate backup file
+        id: locate
+        run: |
+          BACKUP_FILE=$(ls /tmp/elcarehub-backups/pg_backup_*.dump.enc | sort | tail -1)
+          echo "path=${BACKUP_FILE}" >> "$GITHUB_OUTPUT"
+
+      - name: Run restore and read checks
+        env:
+          BACKUP_FILE: ${{ steps.locate.outputs.path }}
+          BACKUP_ENCRYPTION_KEY: ${{ secrets.BACKUP_ENCRYPTION_KEY }}
+          RESTORE_TARGET_URL: postgresql://restore_test:restore_test@localhost:5432/restore_test
+          INDEXER_DIR: ${{ github.workspace }}/indexer
+        run: |
+          chmod +x scripts/backup/restore.sh
+          bash scripts/backup/restore.sh

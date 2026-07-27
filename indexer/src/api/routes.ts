@@ -81,8 +81,9 @@ export function emitSSEEvent(event: any) {
   const dataStr = JSON.stringify(event, (_k, v) => typeof v === 'bigint' ? v.toString() : v);
   const payload: SSEEvent = { id, data: dataStr };
 
-import { hub, emitSSEEvent, closeSSEClients, ensureRealtimeStarted } from '../realtime/index.js';
-export { emitSSEEvent, closeSSEClients };
+  // Maintain a bounded replay buffer for reconnecting clients
+  sseBuffer.push(payload);
+  if (sseBuffer.length > SSE_BUFFER_SIZE) sseBuffer.shift();
 
   const frame = `id: ${id}\ndata: ${dataStr}\n\n`;
   for (const [client] of sseClients) {
@@ -116,28 +117,6 @@ export function apiDurationMiddleware(req: Request, res: Response, next: NextFun
       .observe(s + ns / 1e9);
   });
   next();
-}
-
-// Per-client heartbeat timers so idle proxies don't drop the connection.
-const sseHeartbeats: Map<Response, ReturnType<typeof setInterval>> = new Map();
-
-function setupSSEHeartbeat(res: Response): void {
-  const timer = setInterval(() => {
-    try {
-      res.write(`: heartbeat\n\n`);
-    } catch {
-      cleanupSSEClient(res);
-    }
-  }, SSE_HEARTBEAT_MS);
-  sseHeartbeats.set(res, timer);
-  sseClients.set(res, 0);
-}
-
-function cleanupSSEClient(res: Response): void {
-  const timer = sseHeartbeats.get(res);
-  if (timer) clearInterval(timer);
-  sseHeartbeats.delete(res);
-  sseClients.delete(res);
 }
 
 const router = Router();
@@ -1058,6 +1037,22 @@ router.get('/artists/:address/metrics', cacheMiddleware(60), validateQuery(artis
     });
   } catch (err) {
     next(internalError('Failed to fetch artist metrics'));
+  }
+});
+
+// ── GET /reconciliation/status ────────────────────────────────────────────────
+//
+// Returns the last ReconciliationRun with its counts and the most recent
+// field-level discrepancies.  Returns { lastRun: null } when no run has been
+// recorded yet.
+
+router.get('/reconciliation/status', async (_req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { getReconciliationStatus } = await import('../reconciler.js');
+    const status = await getReconciliationStatus();
+    res.json(status);
+  } catch (err) {
+    next(internalError('Failed to fetch reconciliation status'));
   }
 });
 

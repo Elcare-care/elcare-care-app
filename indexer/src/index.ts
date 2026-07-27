@@ -22,7 +22,6 @@ import { startGapRepairWorker } from './gap-repair.js';
 import { logger } from './logger.js';
 import prisma from './db.js';
 import docsRouter from './api/docs-router.js';
-import { isStalled } from './stall.js';
 import {
   runAllChecks,
   runReadinessChecks,
@@ -191,7 +190,22 @@ const httpServer = app.listen(PORT, () => {
         logger.error('Fatal error in poller', { err });
         process.exit(1);
     });
-  }
+
+    // ── Reconciler loop ───────────────────────────────────────────────────
+    startReconciler().catch((err: unknown) => {
+      logger.error('Reconciler: fatal error', {
+        err: err instanceof Error ? err.message : String(err),
+      });
+    });
+
+    // ── Gap-repair worker ─────────────────────────────────────────────────
+    if (process.env.GAP_REPAIR_ENABLED === 'true') {
+      startGapRepairWorker().catch((err: unknown) => {
+        logger.error('Gap-repair: fatal error', {
+          err: err instanceof Error ? err.message : String(err),
+        });
+      });
+    }
 
   // ── Keeper loop ───────────────────────────────────────────────────────────
   if (process.env.KEEPER_ENABLED === 'true') {

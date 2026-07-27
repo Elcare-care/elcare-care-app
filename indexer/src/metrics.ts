@@ -378,6 +378,20 @@ export const reconcilerDriftGauge = new client.Gauge({
   help: 'Number of records with detected drift in the most recent reconciliation run',
 });
 
+/** Total reconciliation runs completed, labelled by outcome and dry_run mode. */
+export const reconcilerRunsTotal = new client.Counter({
+  name: 'indexer_reconciler_runs_total',
+  help: 'Total reconciliation runs completed, by outcome (ok | error) and dry_run mode',
+  labelNames: ['outcome', 'dry_run'],
+});
+
+/** Total records skipped during a reconciliation run, by skip reason. */
+export const reconcilerSkippedTotal = new client.Counter({
+  name: 'indexer_reconciler_skipped_total',
+  help: 'Total records skipped during reconciliation, by reason (rpc_error | budget_exhausted | decode_error)',
+  labelNames: ['reason'],
+});
+
 // ── Expose metrics handler ────────────────────────────────────────────────────
 
 export async function handleMetrics(req: express.Request, res: express.Response) {
