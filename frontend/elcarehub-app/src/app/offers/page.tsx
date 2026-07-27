@@ -11,7 +11,8 @@ import { useOffererOffers, useWithdrawOffer, useReclaimOffer } from "@/hooks/use
 import { stroopsToXlm, Offer } from "@/lib/contract";
 import { ShoppingBag, Clock, CheckCircle, XCircle, ArrowUpRight, History, Activity, TrendingUp, Loader2, Inbox, CalendarClock, Timer, Coins, AlertTriangle, X } from "lucide-react";
 import { WalletGuard } from "@/components/WalletGuard";
-import { ErrorState, EmptyState } from "@/components/PageStates";
+import { ResourceState } from "@/components/PageStates";
+import { categorizePageError } from "@/lib/pageState";
 import { SUPPORTED_TOKENS } from "@/config/tokens";
 import { clsx } from "clsx";
 
@@ -193,30 +194,47 @@ export default function OffersPage() {
             ))}
           </div>
 
+          {/* Withdraw errors are a write-action failure, not a fetch failure —
+              surfaced inline so a failed withdraw never masks an already-loaded
+              offers list behind a full-page error state. */}
+          {withdrawError && (
+            <div role="alert" className="mb-4 flex items-center gap-2 rounded-2xl border border-terracotta-500/20 bg-terracotta-500/10 px-4 py-3 text-sm text-terracotta-400">
+              <AlertTriangle size={16} aria-hidden="true" />
+              {withdrawError}
+            </div>
+          )}
+
           {/* Content area */}
           <div className="animate-fade-in duration-700">
-            {(error || withdrawError) ? (
-              <ErrorState
-                title="Failed to load offers"
-                message={error || withdrawError || ""}
+            {error ? (
+              <ResourceState
+                isLoading={false}
+                error={categorizePageError(error, { resourceLabel: "offers" })}
                 onRetry={refresh}
+                tone="dark"
               />
             ) : isLoading ? (
-              <div className="grid gap-6 sm:grid-cols-2 lg:grid-cols-3">
+              <div role="status" aria-live="polite" className="grid gap-6 sm:grid-cols-2 lg:grid-cols-3">
+                <span className="sr-only">Loading your offers…</span>
                 {[1, 2, 3].map((i) => (
                   <div key={i} className="h-64 animate-pulse rounded-[2.5rem] bg-white/[0.03] border border-white/5" />
                 ))}
               </div>
             ) : filtered.length === 0 ? (
-              <EmptyState
-                icon={ShoppingBag}
-                title={tab === "all" ? "No offers yet." : `No ${tab.toLowerCase()} offers.`}
-                description="Your offers help secure the most beautiful African art pieces."
-                action={tab === "all" ? { label: "Browse listings", href: "/" } : undefined}
+              <ResourceState
+                isLoading={false}
+                error={null}
+                isEmpty
+                empty={{
+                  icon: ShoppingBag,
+                  title: tab === "all" ? "No offers yet." : `No ${tab.toLowerCase()} offers.`,
+                  description: "Your offers help secure the most beautiful African art pieces.",
+                  action: tab === "all" ? { label: "Browse listings", href: "/" } : undefined,
+                  iconClassName: "bg-midnight-950 text-white/10 shadow-inner",
+                  titleClassName: "text-white",
+                  descriptionClassName: "text-brand-300/40",
+                }}
                 className="rounded-[3.5rem] bg-midnight-900/50 border-2 border-dashed border-white/5 backdrop-blur-sm relative"
-                iconClassName="bg-midnight-950 text-white/10 shadow-inner"
-                titleClassName="text-white"
-                descriptionClassName="text-brand-300/40"
               />
             ) : (
               <div className="grid gap-6 sm:grid-cols-2 lg:grid-cols-3">

@@ -12,7 +12,7 @@ import { ArtworkMetadata, fetchMetadata, getGatewayUrls } from "@/lib/ipfs";
 import { useEffect } from "react";
 import { useWalletContext } from "@/context/WalletContext";
 import { useBuyArtwork } from "@/hooks/useMarketplace";
-import { ShoppingCart, User, Calendar, Tag } from "lucide-react";
+import { ShoppingCart, User, Calendar, Tag, ShieldAlert } from "lucide-react";
 import { GuardButton } from "./WalletGuard";
 import posthog from "posthog-js";
 import { CheckoutModal } from "./CheckoutModal";
@@ -179,6 +179,22 @@ export function ListingCard({ listing, onPurchased }: ListingCardProps) {
 
         {buyError && (
           <p className="mt-2 text-xs text-red-500">{buyError}</p>
+        )}
+
+        {/* Revoked-artist banner — shown when listing is Cancelled and artist
+            was revoked; collectors see why the item is no longer purchasable */}
+        {listing.status === "Cancelled" && (
+          <div
+            className="mt-3 flex items-start gap-2 rounded-xl border border-amber-500/20 bg-amber-500/10 px-3 py-2"
+            role="alert"
+            data-testid="revoked-artist-banner"
+          >
+            <ShieldAlert size={14} className="mt-0.5 shrink-0 text-amber-400" />
+            <p className="text-[11px] leading-snug text-amber-400">
+              This listing was cancelled because the artist&apos;s account has
+              been suspended by the platform.
+            </p>
+          </div>
         )}
       </div>
     </div>

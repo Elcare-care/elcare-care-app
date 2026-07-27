@@ -40,6 +40,8 @@ use soroban_sdk::{
 
 const TTL_THRESHOLD: u32 = 50_000;
 const TTL_BUMP: u32 = 100_000;
+/// Maximum number of vouchers accepted by a single redeem_batch call (#274).
+const MAX_BATCH_SIZE: u32 = 100;
 
 // ─── Errors ──────────────────────────────────────────────────────────────────
 
@@ -59,12 +61,14 @@ pub enum Error {
     EditionAlreadyRegistered = 10,
     InvalidSignature = 11,
     MaxSupplyReached = 12,
-    /// Voucher nonce already redeemed (#39).
     VoucherAlreadyRedeemed = 13,
     NotAllowlisted = 14,
     InvalidMerkleProof = 15,
-    /// Voucher nonce has been explicitly revoked by the creator.
     VoucherRevoked = 16,
+    /// migrate() called for a version already marked done.
+    AlreadyMigrated = 17,
+    /// Unsupported version jump.
+    UnsupportedMigration = 18,
 }
 
 // ─── Data types ───────────────────────────────────────────────────────────────
@@ -99,6 +103,7 @@ pub enum DataKey {
     Initialized,
     Creator,
     CreatorPubkey,
+    CurrentWasmHash,
     Name,
     RoyaltyBps,
     RoyaltyReceiver,
@@ -206,6 +211,16 @@ impl LazyMint1155 {
     ) -> Result<(), Error> {
         if voucher.valid_until != 0 && env.ledger().sequence() > voucher.valid_until as u32 {
             return Err(Error::VoucherExpired);
+        }
+        // Metadata is set once, at redemption, and is never updatable
+        // afterwards (#276: immutable-at-mint by design — see
+        // `is_metadata_frozen`). Still validate boundary/malformed URIs.
+        let uri_len = voucher.uri.len();
+        if uri_len == 0 {
+            return Err(Error::EmptyUri);
+        }
+        if uri_len > MAX_URI_LEN {
+            return Err(Error::UriTooLong);
         }
         if env
             .storage()
@@ -378,6 +393,7 @@ impl LazyMint1155 {
         }
         env.storage().instance().set(&DataKey::Initialized, &true);
         env.storage().instance().set(&DataKey::Creator, &creator);
+        env.storage().instance().set(&DataKey::CurrentWasmHash, &BytesN::from_array(&env, &[0u8; 32]));
         env.storage()
             .instance()
             .set(&DataKey::CreatorPubkey, &creator_pubkey);
@@ -402,6 +418,24 @@ impl LazyMint1155 {
         Ok(())
     }
 
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
+        let old_wasm_hash: BytesN<32> = env
+            .storage()
+            .instance()
+            .get(&DataKey::CurrentWasmHash)
+            .unwrap_or(BytesN::from_array(&env, &[0u8; 32]));
+        env.storage()
+            .instance()
+            .set(&DataKey::CurrentWasmHash, &new_wasm_hash);
+        env.deployer().update_current_contract_wasm(&new_wasm_hash);
+        env.events().publish(
+            (symbol_short!("upgraded"),),
+            (old_wasm_hash, new_wasm_hash),
+        );
+        Ok(())
+    }
+
     // ── Lazy Mint (single) ────────────────────────────────────────────────
 
     /// Redeem a single signed voucher to mint `amount` edition tokens.
@@ -416,6 +450,10 @@ impl LazyMint1155 {
     ) -> Result<(), Error> {
         Self::extend_instance_ttl(&env);
         buyer.require_auth();
+
+        if amount == 0 {
+            return Err(Error::ZeroAmount);
+        }
 
         // 0. Allowlist
         Self::check_allowlist(&env, &buyer, &merkle_proof)?;
@@ -471,6 +509,13 @@ impl LazyMint1155 {
         Self::extend_instance_ttl(&env);
         buyer.require_auth();
 
+        if items.len() == 0 {
+            return Err(Error::EmptyBatch);
+        }
+        if items.len() > MAX_BATCH_SIZE {
+            return Err(Error::BatchTooLarge);
+        }
+
         let pubkey: BytesN<32> = env
             .storage()
             .instance()
@@ -489,7 +534,25 @@ impl LazyMint1155 {
             .unwrap_or(creator.clone());
 
         // Phase 1: validate all items — no state changes yet.
+        //
+        // Duplicate-nonce hardening (#274): RedeemedVoucher(nonce) is only
+        // set during Phase 4 minting, so two items sharing the same voucher
+        // nonce would both pass validation here and get double-minted (and
+        // double-charged) from a single voucher. Reject any in-batch
+        // duplicate before any state mutation.
+        let mut seen_nonces: Vec<u64> = Vec::new(&env);
         for item in items.iter() {
+            if item.amount == 0 {
+                return Err(Error::ZeroAmount);
+            }
+            let nonce = item.voucher.nonce;
+            for i in 0..seen_nonces.len() {
+                if seen_nonces.get(i).unwrap() == nonce {
+                    return Err(Error::DuplicateVoucherInBatch);
+                }
+            }
+            seen_nonces.push_back(nonce);
+
             Self::check_allowlist(&env, &buyer, &item.merkle_proof)?;
             Self::check_voucher(&env, &item.voucher, item.amount, &item.signature, &pubkey, &buyer)?;
         }
@@ -636,6 +699,52 @@ impl LazyMint1155 {
     pub fn merkle_root(env: Env) -> Option<BytesN<32>> {
         env.storage().instance().get(&DataKey::MerkleRoot)
     }
+
+    // ── Versioning & Migration ─────────────────────────────────────────────
+
+    pub fn version(_env: Env) -> &'static str {
+        "1.0.0"
+    }
+
+    pub fn contract_version(env: Env) -> Option<String> {
+        env.storage().instance().get(&DataKey::ContractVersion)
+    }
+
+    /// Creator-guarded idempotent migration entry point.
+    /// v1.0.0: records the completion marker and on-chain version string.
+    pub fn migrate(env: Env) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
+        Self::only_creator(&env)?;
+
+        let target = String::from_str(&env, "1.0.0");
+        let done_key = DataKey::MigrationDone(target.clone());
+
+        if env
+            .storage()
+            .persistent()
+            .get::<DataKey, bool>(&done_key)
+            .unwrap_or(false)
+        {
+            return Err(Error::AlreadyMigrated);
+        }
+
+        // v1.0.0 migration body: nothing to migrate for the initial version.
+        // EditionMaxSupply, Balance, TotalSupply, RedeemedVoucher, and
+        // RevokedVoucher entries are already in persistent storage and remain
+        // readable as-is.
+
+        env.storage().persistent().set(&done_key, &true);
+        env.storage()
+            .persistent()
+            .extend_ttl(&done_key, TTL_THRESHOLD, TTL_BUMP);
+        env.storage()
+            .instance()
+            .set(&DataKey::ContractVersion, &target);
+        env.events()
+            .publish((soroban_sdk::symbol_short!("migrated"), target), ());
+        Ok(())
+    }
+
     // ── Transfers ─────────────────────────────────────────────────────────
 
     pub fn transfer(
@@ -650,6 +759,9 @@ impl LazyMint1155 {
         Self::_transfer(&env, &from, &to, token_id, amount)
     }
 
+    /// Transfer on behalf of `from` — the owner themselves or an authorized
+    /// operator (#275: matches the owner-shortcut already used by
+    /// `batch_transfer`/`burn`, so single and batch paths behave the same).
     pub fn transfer_from(
         env: Env,
         operator: Address,
@@ -660,7 +772,7 @@ impl LazyMint1155 {
     ) -> Result<(), Error> {
         Self::extend_instance_ttl(&env);
         operator.require_auth();
-        if !Self::_is_approved_for_all(&env, &operator, &from) {
+        if operator != from && !Self::_is_approved_for_all(&env, &operator, &from) {
             return Err(Error::NotApproved);
         }
         Self::_transfer_with_operator(&env, &operator, &from, &to, token_id, amount)
@@ -793,6 +905,14 @@ impl LazyMint1155 {
             .persistent()
             .get(&DataKey::TokenUri(token_id))
             .unwrap()
+    }
+
+    /// Always `true` — an edition's URI is set once by whichever voucher
+    /// first registers it and is never updatable afterwards (#276). Exposed
+    /// as a method so every collection type — normal and lazy — exposes the
+    /// same `is_metadata_frozen()` query for frontend/indexer consumers.
+    pub fn is_metadata_frozen(_env: Env) -> bool {
+        true
     }
 
     pub fn total_supply(env: Env, token_id: u64) -> u128 {

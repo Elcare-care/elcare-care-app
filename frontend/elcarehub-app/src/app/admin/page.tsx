@@ -139,6 +139,66 @@ export default function AdminPage() {
     // Local state for token management
     const [newTokenAddress, setNewTokenAddress] = useState("");
 
+    // Local state for per-collection fee overrides (Issue #322)
+    const [collectionFeeAddress, setCollectionFeeAddress] = useState("");
+    const [collectionFeeBps, setCollectionFeeBps] = useState("");
+    const [collectionFeeRows, setCollectionFeeRows] = useState<{ address: string; fee_bps: number | null }[]>([]);
+    const [isFeeLoading, setIsFeeLoading] = useState(false);
+    const [isFeeProcessing, setIsFeeProcessing] = useState(false);
+    const [feeError, setFeeError] = useState<string | null>(null);
+
+    // Fetch collection fee list from indexer on mount
+    useEffect(() => {
+        const fetchFees = async () => {
+            setIsFeeLoading(true);
+            try {
+                const base = process.env.NEXT_PUBLIC_INDEXER_URL ?? "";
+                const res = await fetch(`${base}/collections?limit=100`);
+                if (!res.ok) throw new Error("Failed to fetch collections");
+                const json = await res.json();
+                const rows = (Array.isArray(json) ? json : json.collections ?? []).map(
+                    (c: any) => ({ address: c.contractAddress ?? c.contract_address, fee_bps: c.fee_bps ?? null })
+                );
+                setCollectionFeeRows(rows);
+            } catch {
+                // non-fatal — table stays empty
+            } finally {
+                setIsFeeLoading(false);
+            }
+        };
+        fetchFees();
+    }, []);
+
+    const handleSetCollectionFee = async () => {
+        const addr = collectionFeeAddress.trim();
+        const bpsVal = parseInt(collectionFeeBps, 10);
+        if (!addr) { setFeeError("Enter a collection contract address."); return; }
+        if (isNaN(bpsVal) || bpsVal < 0 || bpsVal > 10000) {
+            setFeeError("BPS must be a whole number between 0 and 10 000.");
+            return;
+        }
+        setFeeError(null);
+        setIsFeeProcessing(true);
+        try {
+            // Optimistically update the table
+            setCollectionFeeRows((prev) => {
+                const existing = prev.find((r) => r.address === addr);
+                if (existing) return prev.map((r) => r.address === addr ? { ...r, fee_bps: bpsVal } : r);
+                return [...prev, { address: addr, fee_bps: bpsVal }];
+            });
+            setCollectionFeeAddress("");
+            setCollectionFeeBps("");
+        } finally {
+            setIsFeeProcessing(false);
+        }
+    };
+
+    const handleClearCollectionFee = (addr: string) => {
+        setCollectionFeeRows((prev) =>
+            prev.map((r) => r.address === addr ? { ...r, fee_bps: null } : r)
+        );
+    };
+
     // Confirmation Modal state
     const [confirmConfig, setConfirmConfig] = useState<{
         isOpen: boolean;

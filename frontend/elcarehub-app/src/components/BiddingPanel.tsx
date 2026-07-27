@@ -4,7 +4,7 @@
 
 "use client";
 
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useId, useMemo } from "react";
 import { Auction, stroopsToXlm } from "@/lib/contract";
 import { useWalletContext } from "@/context/WalletContext";
 import { usePlaceBid } from "@/hooks/usePlaceBid";
@@ -72,6 +72,7 @@ export function BiddingPanel({
 
   const [bidAmount, setBidAmount] = useState("");
   const [bidSuccess, setBidSuccess] = useState(false);
+  const bidErrorId = useId();
 
   const currentBidXlm = parseFloat(stroopsToXlm(auction.highest_bid));
   const reserveXlm = parseFloat(stroopsToXlm(auction.reserve_price));
@@ -221,23 +222,28 @@ export function BiddingPanel({
 
       {/* Bid success */}
       {bidSuccess && (
-        <div className="flex items-center gap-2 rounded-lg bg-green-100 px-3 py-2 text-sm font-medium text-green-700">
-          <CheckCircle size={16} />
+        <div role="status" className="flex items-center gap-2 rounded-lg bg-green-100 px-3 py-2 text-sm font-medium text-green-700">
+          <CheckCircle size={16} aria-hidden="true" />
           Bid placed successfully!
         </div>
       )}
 
       {/* Errors */}
       {bidError && (
-        <div className="flex items-center gap-2 rounded-lg bg-red-50 px-3 py-2 text-sm text-red-500">
-          <AlertCircle size={14} />
+        <div role="alert" className="flex items-center gap-2 rounded-lg bg-red-50 px-3 py-2 text-sm text-red-500">
+          <AlertCircle size={14} aria-hidden="true" />
           {bidError}
         </div>
       )}
       {finalizeError && (
-        <div className="flex items-center gap-2 rounded-lg bg-red-50 px-3 py-2 text-sm text-red-500">
-          <AlertCircle size={14} />
+        <div role="alert" className="flex items-center gap-2 rounded-lg bg-red-50 px-3 py-2 text-sm text-red-500">
+          <AlertCircle size={14} aria-hidden="true" />
           {finalizeError}
+        </div>
+      )}
+      {(isBidding || isFinalizing) && (
+        <div role="status" className="sr-only">
+          {isBidding ? "Placing your bid. Please check your wallet for a signature request." : "Finalizing the auction. Please check your wallet for a signature request."}
         </div>
       )}
 
@@ -245,11 +251,12 @@ export function BiddingPanel({
       {canBid && (
         <div className="space-y-3">
           <div>
-            <label className="mb-1 block text-sm font-medium text-gray-700">
+            <label htmlFor="bid-amount-input" className="mb-1 block text-sm font-medium text-gray-700">
               Your Bid (XLM)
             </label>
             <div className="relative">
               <input
+                id="bid-amount-input"
                 type="number"
                 min={minimumNextBid}
                 step="0.0000001"
@@ -259,14 +266,19 @@ export function BiddingPanel({
                   setBidSuccess(false);
                 }}
                 placeholder={`Min ${minimumNextBid.toFixed(7)} XLM`}
-                className="w-full rounded-lg border border-gray-200 px-3 py-2.5 pr-14 text-sm focus:border-brand-500 focus:outline-none"
+                aria-invalid={!!bidValidation}
+                aria-describedby={bidValidation ? bidErrorId : undefined}
+                className="w-full rounded-lg border border-gray-200 px-3 py-2.5 pr-14 text-sm focus:border-brand-500 focus:outline-none aria-[invalid=true]:border-red-400"
               />
               <span className="absolute right-3 top-1/2 -translate-y-1/2 text-sm font-medium text-gray-400">
                 XLM
               </span>
             </div>
             {bidValidation && (
-              <p className="mt-1 text-xs text-red-500">{bidValidation}</p>
+              <p id={bidErrorId} role="alert" className="mt-1 flex items-center gap-1 text-xs text-red-500">
+                <AlertCircle size={12} aria-hidden="true" />
+                {bidValidation}
+              </p>
             )}
           </div>
 

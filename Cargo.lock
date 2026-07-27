@@ -1361,8 +1361,6 @@ dependencies = [
 [[package]]
 name = "soroban-env-host"
 version = "25.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "43af5d53c57bc2f546e122adc0b1cca6f93942c718977379aa19ddd04f06fcec"
 dependencies = [
  "ark-bls12-381",
  "ark-bn254",
@@ -1437,6 +1435,7 @@ dependencies = [
 name = "soroban-marketplace"
 version = "0.1.0"
 dependencies = [
+ "ed25519-dalek",
  "soroban-sdk",
 ]
 

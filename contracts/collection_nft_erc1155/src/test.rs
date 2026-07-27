@@ -1,7 +1,7 @@
 extern crate std;
 
 use soroban_sdk::{
-    testutils::{Address as _, Ledger as _},
+    testutils::{Address as _, Events as _, Ledger as _},
     Address, Env, String, Vec,
 };
 
@@ -1170,4 +1170,84 @@ fn balance_of_batch_mismatched_lengths_returns_empty() {
     let ids: Vec<u64> = Vec::from_array(&env, [0u64, 1u64]);
     let result = client.balance_of_batch(&accounts, &ids);
     assert_eq!(result.len(), 0);
+}
+
+// ── Migration tests ───────────────────────────────────────────────────────────
+
+mod migration {
+    use super::*;
+
+    #[test]
+    fn fresh_install_migrate_records_version() {
+        let (env, client, _contract_id, _creator) = setup();
+
+        assert!(client.contract_version().is_none());
+        client.migrate();
+        assert_eq!(
+            client.contract_version(),
+            Some(String::from_str(&env, "1.0.0"))
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "AlreadyMigrated")]
+    fn double_migrate_reverts() {
+        let (_env, client, _contract_id, _creator) = setup();
+        client.migrate();
+        client.migrate();
+    }
+
+    #[test]
+    fn migrate_emits_migrated_event() {
+        let (env, client, _contract_id, _creator) = setup();
+        client.migrate();
+
+        let events = env.events().all();
+        let found = events.iter().any(|(_, topics, _)| {
+            topics
+                .get(0)
+                .map(|v| {
+                    soroban_sdk::Symbol::try_from_val(&env, &v)
+                        .map(|s| s == soroban_sdk::symbol_short!("migrated"))
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false)
+        });
+        assert!(found, "expected 'migrated' event");
+    }
+
+    #[test]
+    fn balances_readable_after_migrate() {
+        let (env, client, _contract_id, _creator) = setup();
+
+        let alice = Address::generate(&env);
+        client.mint_new(
+            &alice,
+            &10u128,
+            &String::from_str(&env, "ipfs://token0"),
+        );
+
+        client.migrate();
+
+        assert_eq!(client.balance_of(&alice, &0u64), 10u128);
+        assert_eq!(client.total_supply(&0u64), 10u128);
+    }
+
+    #[test]
+    fn per_token_max_supply_readable_after_migrate() {
+        let (env, client, _contract_id, _creator) = setup();
+
+        client.set_token_max_supply(&0u64, &500u128);
+        client.migrate();
+
+        assert_eq!(client.token_max_supply(&0u64), 500u128);
+    }
+
+    #[test]
+    fn royalty_readable_after_migrate() {
+        let (_env, client, _contract_id, _creator) = setup();
+        client.migrate();
+        let (_, bps) = client.royalty_info();
+        assert_eq!(bps, 500u32);
+    }
 }

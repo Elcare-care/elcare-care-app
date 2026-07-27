@@ -1,14 +1,20 @@
 // ─────────────────────────────────────────────────────────────
 // lib/ipfs.ts — IPFS upload helpers via Pinata REST API
+//
+// Issue #307 / #42 enhancements:
+//   • Returns uploadId and contentHash from routes for workflow tracking
+//   • isDuplicate flag surfaces idempotency information to callers
+//   • Preserves gateway fallback + metadata fetch behaviour
 // ─────────────────────────────────────────────────────────────
 //
 // Artwork metadata schema (stored on IPFS):
 // {
-//   "title": "…",
+//   "title":       "…",
 //   "description": "…",
-//   "artist": "…",
-//   "image": "ipfs://CID",
-//   "year": "2024"
+//   "artist":      "…",
+//   "image":       "ipfs://CID",
+//   "year":        "2024",
+//   "category":    "…"
 // }
 // ─────────────────────────────────────────────────────────────
 
@@ -26,17 +32,27 @@ export interface ArtworkMetadata {
   category: string;
 }
 
-/** Result of any IPFS upload */
+/** Result of any IPFS upload (enriched with idempotency info) */
 export interface IpfsUploadResult {
   cid: string;
   url: string;
+  /** Server-assigned upload ID for workflow/reconciliation tracking */
+  uploadId: string;
+  /** SHA-256 hex digest of the uploaded content */
+  contentHash: string;
+  /**
+   * True when Pinata already had this exact content pinned.
+   * The same CID is returned — no duplicate pin is created.
+   */
+  isDuplicate: boolean;
 }
 
 // ── Upload a File (image) ─────────────────────────────────────
 
 /**
  * Uploads an artwork image to IPFS via Pinata.
- * Returns the raw CID string.
+ * Validates file size and MIME type server-side before pinning.
+ * Returns a stable CID even on retried/duplicate requests.
  */
 export async function uploadImageToIPFS(
   file: File,
@@ -46,14 +62,23 @@ export async function uploadImageToIPFS(
   formData.append("file", file);
   formData.append("name", name ?? file.name);
 
-  const res = await axios.post("/api/ipfs/upload-image", formData, {
+  const res = await axios.post<{
+    cid: string;
+    uploadId: string;
+    contentHash: string;
+    isDuplicate: boolean;
+    mimeType: string;
+  }>("/api/ipfs/upload-image", formData, {
     maxBodyLength: Infinity,
   });
 
-  const cid: string = res.data.cid;
+  const { cid, uploadId, contentHash, isDuplicate } = res.data;
   return {
     cid,
     url: `${config.pinataGateway}/ipfs/${cid}`,
+    uploadId,
+    contentHash,
+    isDuplicate,
   };
 }
 
@@ -61,21 +86,30 @@ export async function uploadImageToIPFS(
 
 /**
  * Uploads artwork metadata JSON to IPFS via Pinata.
- * Returns the CID of the metadata file.
+ * Validates the metadata schema server-side before pinning.
+ * Returns a stable CID even on retried/duplicate requests.
  */
 export async function uploadMetadataToIPFS(
   metadata: ArtworkMetadata,
   name?: string
 ): Promise<IpfsUploadResult> {
-  const res = await axios.post("/api/ipfs/upload-metadata", {
+  const res = await axios.post<{
+    cid: string;
+    uploadId: string;
+    contentHash: string;
+    isDuplicate: boolean;
+  }>("/api/ipfs/upload-metadata", {
     metadata,
     name: name ?? `${metadata.title}-metadata.json`,
   });
 
-  const cid: string = res.data.cid;
+  const { cid, uploadId, contentHash, isDuplicate } = res.data;
   return {
     cid,
     url: `${config.pinataGateway}/ipfs/${cid}`,
+    uploadId,
+    contentHash,
+    isDuplicate,
   };
 }
 
@@ -107,11 +141,13 @@ export function getGatewayUrls(
 
   const primary = primaryGateway ?? config.pinataGateway;
   const seen = new Set<string>();
-  return [primary, ...DEFAULT_FALLBACK_GATEWAYS].filter((gw) => {
-    if (seen.has(gw)) return false;
-    seen.add(gw);
-    return true;
-  }).map((gw) => `${gw.replace(/\/$/, "")}/ipfs/${clean}`);
+  return [primary, ...DEFAULT_FALLBACK_GATEWAYS]
+    .filter((gw) => {
+      if (seen.has(gw)) return false;
+      seen.add(gw);
+      return true;
+    })
+    .map((gw) => `${gw.replace(/\/$/, "")}/ipfs/${clean}`);
 }
 
 // ── Fetch metadata ────────────────────────────────────────────
@@ -119,10 +155,18 @@ export function getGatewayUrls(
 /**
  * Fetches and parses artwork metadata JSON from IPFS.
  * `cid` can be a raw CID string or an "ipfs://CID" URI.
+ * Tries the primary gateway first, then falls back to public gateways.
  */
 export async function fetchMetadata(cid?: string): Promise<ArtworkMetadata> {
   if (!cid) {
-    return { title: "Unknown Artwork", description: "", artist: "Unknown", image: "", year: "", category: "" };
+    return {
+      title: "Unknown Artwork",
+      description: "",
+      artist: "Unknown",
+      image: "",
+      year: "",
+      category: "",
+    };
   }
   const cleanCid = normalizeIpfsUri(cid);
   const urls = getGatewayUrls(cleanCid);

@@ -152,6 +152,8 @@ jobs:
       - name: Run Lint
         run: npm run lint
         working-directory: frontend/elcarehub-app
+      - name: Validate Contract Error Coverage
+        run: node scripts/contract-errors/validate-error-coverage.mjs
       - name: Run Build
         run: npm run build
         working-directory: frontend/elcarehub-app
@@ -304,3 +306,55 @@ jobs:
             exit 1
           fi
         working-directory: indexer
+
+  release-validate:
+    name: Release Version Validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Validate Version Consistency
+        run: |
+          bash scripts/validate-compatibility.sh
+
+  container-scan:
+    name: Container Image Scan (Trivy)
+    runs-on: ubuntu-latest
+    # Only scan when the indexer build passes — no point scanning a broken image.
+    needs: [indexer]
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Build indexer image
+        run: |
+          docker build \
+            --build-arg BUILD_SHA=${{ github.sha }} \
+            --build-arg BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
+            -t elcarehub-indexer:${{ github.sha }} \
+            ./indexer
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: 'elcarehub-indexer:${{ github.sha }}'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          # Fail on HIGH and CRITICAL; ignore findings with no upstream fix yet.
+          severity: 'HIGH,CRITICAL'
+          exit-code: '1'
+          ignore-unfixed: true
+
+      - name: Upload Trivy results to GitHub Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'trivy-results.sarif'
+          category: 'container-scan'
