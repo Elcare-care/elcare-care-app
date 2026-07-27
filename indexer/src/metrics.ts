@@ -51,6 +51,19 @@ export const duplicateEventsCounter = new client.Counter({
   help: 'Total number of duplicate on-chain events skipped during idempotent processing',
 });
 
+// ── Reentrancy guard monitoring (Issue #204) ──────────────────────────────────
+
+/**
+ * Incremented whenever the indexer observes a contract invocation result that
+ * contains the ReentrancyGuard error (code 22).  A sustained rate of this
+ * counter is a signal that something is probing or exploiting the guard and
+ * warrants operator investigation.
+ */
+export const reentrancyGuardTriggeredTotal = new client.Counter({
+  name: 'elcarehub_reentrancy_guard_triggered_total',
+  help: 'Total number of times a ReentrancyGuard rejection (error #22) was observed in contract invocation results',
+});
+
 export const httpRequestDurationMicroseconds = new client.Histogram({
   name: 'http_request_duration_seconds',
   help: 'Duration of HTTP requests in seconds',
@@ -64,6 +77,30 @@ export const httpRequestDurationMicroseconds = new client.Histogram({
 export const stalledGauge = new client.Gauge({
   name: 'indexer_stalled',
   help: '1 when the indexer has not advanced within the stall threshold, 0 otherwise',
+});
+
+/**
+ * Stall event counter, labelled by level: "warning" | "critical" | "fatal".
+ *
+ * Each counter value reflects the total number of times the stall detector has
+ * fired at that severity since the process started.  A dashboard alert on the
+ * rate of "fatal" or a sustained rise in "warning" signals degraded sync health.
+ */
+export const pollerStallTotal = new client.Counter({
+  name: 'elcarehub_poller_stall_total',
+  help: 'Total number of stall events detected, labelled by severity level',
+  labelNames: ['level'],
+});
+
+/**
+ * Automatic poller restart counter.
+ *
+ * Incremented each time the stall detector triggers a stopPoller()/startPoller()
+ * cycle.  When this counter reaches 3 the process exits with a non-zero code.
+ */
+export const pollerRestartTotal = new client.Counter({
+  name: 'elcarehub_poller_restart_total',
+  help: 'Total number of automatic poller restarts attempted by the stall watchdog',
 });
 
 // ── Business KPI Metrics ──────────────────────────────────────────────────────
@@ -287,6 +324,63 @@ export const backfillBatchInserted = new client.Histogram({
 export const backfillLockContentions = new client.Counter({
   name: 'indexer_backfill_lock_contentions_total',
   help: 'Number of times a BackfillJob advisory lock was already held by another worker',
+});
+
+// ── Dead-letter metrics (#287) ────────────────────────────────────────────────
+
+/** Total events that failed to parse and were persisted to dead-letter storage. */
+export const deadLetterCreatedTotal = new client.Counter({
+  name: 'indexer_dead_letter_created_total',
+  help: 'Total events persisted to dead-letter storage, by error code',
+  labelNames: ['error_code'],
+});
+
+/** Current number of Pending (unresolved) dead-letter records. */
+export const deadLetterPendingGauge = new client.Gauge({
+  name: 'indexer_dead_letter_pending',
+  help: 'Current number of dead-letter records in Pending status',
+});
+
+/** Age in seconds of the oldest Pending dead-letter record (0 when none). */
+export const deadLetterOldestAgeSeconds = new client.Gauge({
+  name: 'indexer_dead_letter_oldest_age_seconds',
+  help: 'Age in seconds of the oldest unresolved (Pending) dead-letter event',
+});
+
+// ── Reconciliation metrics (#288) ─────────────────────────────────────────────
+
+/** Total field-level discrepancies found per reconciliation run, by model and field. */
+export const reconcilerDiscrepanciesTotal = new client.Counter({
+  name: 'indexer_reconciler_discrepancies_total',
+  help: 'Total discrepancies detected during reconciliation, by model and field',
+  labelNames: ['model', 'field'],
+});
+
+/** Total deterministic repairs applied (or logged in dry-run), by model. */
+export const reconcilerRepairsTotal = new client.Counter({
+  name: 'indexer_reconciler_repairs_total',
+  help: 'Total repairs applied (or dry-run) by the reconciler, by model',
+  labelNames: ['model', 'dry_run'],
+});
+
+/** Number of records with detected drift in the last reconciliation run. */
+export const reconcilerDriftGauge = new client.Gauge({
+  name: 'indexer_reconciler_drift_records',
+  help: 'Number of records with detected drift in the most recent reconciliation run',
+});
+
+/** Total reconciliation runs completed, labelled by outcome and dry_run mode. */
+export const reconcilerRunsTotal = new client.Counter({
+  name: 'indexer_reconciler_runs_total',
+  help: 'Total reconciliation runs completed, by outcome (ok | error) and dry_run mode',
+  labelNames: ['outcome', 'dry_run'],
+});
+
+/** Total records skipped during a reconciliation run, by skip reason. */
+export const reconcilerSkippedTotal = new client.Counter({
+  name: 'indexer_reconciler_skipped_total',
+  help: 'Total records skipped during reconciliation, by reason (rpc_error | budget_exhausted | decode_error)',
+  labelNames: ['reason'],
 });
 
 // ── Expose metrics handler ────────────────────────────────────────────────────
