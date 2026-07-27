@@ -58,10 +58,30 @@ CI runs migrations and `prisma db seed` before the integration suite. Keep integ
 
 Fix serious/critical violations (labels, roles, focus management, contrast) before merging UI changes. Modals must trap focus while open and restore focus on close (`useModalA11y`).
 
-## Schema changes
+## Architecture & Debugging Guides
 
-See [CONTRIBUTING-SCHEMA-CHANGES.md](./CONTRIBUTING-SCHEMA-CHANGES.md) for Prisma migration requirements.
+Refer to our focused architecture and debugging guides for component boundaries, diagnostic decision trees, log samples, and Safe Redaction guidance:
+
+- 🏗️ **[Local Architecture](docs/guides/local-architecture.md)**: System overview and service boundaries
+- 🦀 **[Contract Testing](docs/guides/contract-testing.md)**: Soroban WASM build and unit testing
+- 🔄 **[Indexer Ingestion](docs/guides/indexer-ingestion.md)**: Polling, stall recovery, and backfill
+- 🏷️ **[Event Parsing](docs/guides/event-parsing.md)**: Soroban XDR event decoding and schemas
+- 💻 **[Frontend Transaction Debugging](docs/guides/frontend-transaction-debugging.md)**: Transaction signing, error codes, and E2E testing
+- 🚀 **[Deployment](docs/guides/deployment.md)**: Contract, indexer container, and frontend releases
+- 🗄️ **[Database Migrations](docs/guides/database-migrations.md)**: Prisma migrations and zero-downtime rules
+- 🛡️ **[Security Triage](docs/guides/security-triage.md)**: Cargo audit, npm audit, Gitleaks, and secret redaction
+
+## Documentation Review Policy
+
+> [!IMPORTANT]
+> A **Documentation Review** is a mandatory prerequisite for all release checklists and PRs involving major architecture changes.
+
+When introducing schema updates, new event topics, smart contract entry points, environment variables, or API endpoints:
+1. Update the corresponding guide in `docs/guides/` to reflect new parameters, failure modes, or diagnostic steps.
+2. Verify all path links and environment variable names match the repository.
+3. Ensure no example command or log output requests or prints un-redacted secrets.
 
 ## Commit messages
 
 Follow [Conventional Commits](https://www.conventionalcommits.org/), e.g. `feat(frontend): add checkout coverage thresholds`.
+

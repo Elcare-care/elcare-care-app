@@ -76,6 +76,19 @@ model Listing {
   updatedAtLedger Int
   createdAt       DateTime      @default(now())
   updatedAt       DateTime      @updatedAt
+
+  // ── Full-text search fields (populated from IPFS metadata after indexing) ──
+  // Populated asynchronously after a LISTING_CREATED event is processed.
+  // Null until IPFS metadata has been fetched and stored.
+  title           String?
+  description     String?
+  artistName      String?
+  // tsvector updated by the listing_search_vector_trigger in PostgreSQL.
+  // Prisma cannot manage this column natively; it is marked Unsupported so
+  // Prisma skips it in generated client writes — all updates go through the
+  // trigger or raw SQL.
+  searchVector    Unsupported("tsvector")?
+
   @@index([artist])
   @@index([status])
   @@index([updatedAtLedger])
@@ -83,6 +96,8 @@ model Listing {
   @@index([artist, updatedAtLedger])
   @@index([collection])
   @@index([collection, status])
+  // GIN index created via raw SQL in the migration (Prisma cannot express it).
+  // CREATE INDEX "Listing_searchVector_idx" ON "Listing" USING gin("searchVector");
 }
 
 model Auction {
@@ -102,6 +117,8 @@ model Auction {
   createdAt       DateTime      @default(now())
   updatedAt       DateTime      @updatedAt
   @@index([updatedAtLedger])
+  @@index([status, updatedAtLedger])
+  @@index([creator, updatedAtLedger])
 }
 
 model Offer {
@@ -111,11 +128,14 @@ model Offer {
   amount          Decimal     @db.Decimal(32, 7)
   token           String
   status          OfferStatus @default(Pending)
+  /// Optional expiry (ledger timestamp) after which the offer can be reclaimed. Null = never expires.
+  expiresAt       BigInt?
   createdAtLedger Int
   updatedAtLedger Int
   createdAt       DateTime    @default(now())
   updatedAt       DateTime    @updatedAt
   @@index([listingId])
+  @@index([listingId, updatedAtLedger])
 }
 
 model Bid {
@@ -139,47 +159,40 @@ model MarketplaceEvent {
   data            Json
   ledgerSequence  Int
   ledgerTimestamp DateTime @default(now())
-  eventHash       String   @unique @default("")  // SHA256(contractId:ledger:txHash:eventIndex)
-  eventId         String   @unique               // RPC-provided globally unique event id (eventHash surrogate for legacy rows)
-  txHash          String   @default("")
-  txIndex         Int      @default(0)           // transaction application order within the ledger
-  eventIndex      Int      @default(0)           // event position within the transaction
+  /// Canonical event identity: SHA256(contractId:ledger:txHash:eventIndex).
+  /// NULL only for legacy rows ingested before this field was introduced.
+  eventHash       String?  @unique               // nullable — no @default("") to prevent degenerate collisions
+  contractId      String   @default("")          // source contract address
+  /// Issue #286: provisional (false) vs confirmed (true) event state.
+  /// Events are promoted to confirmed once they are CONFIRMATION_DEPTH ledgers
+  /// behind the network tip.  On reorg, events past the safe ledger are
+  /// hard-deleted (provisional by definition).
+  confirmed       Boolean  @default(false)
   @@index([actor])
   @@index([eventType])
   @@index([listingId])
   @@index([ledgerSequence])
   @@index([listingId, ledgerSequence])
-  @@index([ledgerSequence, txIndex, eventIndex])
+  @@index([contractId])
+  @@index([actor, ledgerSequence])
+  @@index([contractId, ledgerSequence])
+  @@unique([listingId, eventType, ledgerSequence])
 }
 
-// Full price-change history for listings, one row per lst_pru event.
-// eventId ties each row to its originating MarketplaceEvent for replay idempotency.
-model PriceHistory {
+/// One row per recipient per settled sale, sourced from ROYALTY_PAID events.
+/// Exactly one of listingId / auctionId is set, mirroring the on-chain event.
+model RoyaltyPayment {
   id             Int      @id @default(autoincrement())
-  listingId      BigInt
-  oldPrice       Decimal  @db.Decimal(32, 7)
-  newPrice       Decimal  @db.Decimal(32, 7)
-  updatedBy      String
-  ledgerSequence Int
-  eventId        String   @unique
-  createdAt      DateTime @default(now())
-  @@index([listingId])
-  @@index([listingId, ledgerSequence])
-}
-
-// Protocol fee revenue, one row per fee_cltd event emitted on settlement.
-model ProtocolFee {
-  id             Int      @id @default(autoincrement())
-  listingId      BigInt
+  listingId      BigInt?
+  auctionId      BigInt?
+  recipient      String
   amount         Decimal  @db.Decimal(32, 7)
-  token          String
-  treasury       String
+  salePrice      Decimal  @db.Decimal(32, 7)
   ledgerSequence Int
-  eventId        String   @unique
   createdAt      DateTime @default(now())
-  @@index([listingId])
-  @@index([treasury])
+  @@index([recipient])
   @@index([ledgerSequence])
+  @@index([recipient, ledgerSequence])
 }
 
 model Collection {
@@ -190,8 +203,15 @@ model Collection {
   name            String?
   symbol          String?
   deployedAtLedger Int
+  /// Per-collection protocol fee override in basis points (0–10 000).
+  /// Null means no override is set and the global protocol fee applies.
+  feeBpsOverride  Int?
   createdAt       DateTime @default(now())
+  // GIN-indexed tsvector updated by collection_search_vector_trigger.
+  searchVector    Unsupported("tsvector")?
   @@index([creator])
+  @@index([creator, deployedAtLedger])
+  @@index([kind, deployedAtLedger])
 }
 
 // ── Backfill subsystem ───────────────────────────────────────────────────────
@@ -267,6 +287,45 @@ model LedgerGap {
   @@unique([fromLedger, toLedger, source])  // prevent duplicate gap rows
 }
 
+// ── Ledger Checkpoint subsystem ───────────────────────────────────────────────
+//
+// A LedgerCheckpoint records the state of a single polling window for one
+// tracked contract.  The lifecycle is:
+//   fetched   → Window data retrieved from Stellar RPC; events not yet written.
+//   applying  → DB transaction that writes domain rows is open.
+//   committed → Transaction committed; cursor is now at windowEnd.
+//   failed    → Window application failed after all retries.
+//
+// The cursor on TrackedContract is ONLY advanced inside the same transaction
+// that commits the domain writes (applying → committed).  On restart the
+// poller queries for any checkpoint in "fetched" or "applying" state and
+// replays those windows.  Because all event upserts are idempotent (eventHash
+// unique constraint) a replay is always safe.
+
+enum CheckpointStatus {
+  fetched    // events retrieved from RPC; domain writes not started
+  applying   // DB transaction open; cursor not yet advanced
+  committed  // transaction committed; cursor reflects windowEnd
+  failed     // unrecoverable error; operator action required
+}
+
+model LedgerCheckpoint {
+  id              Int              @id @default(autoincrement())
+  contractId      String           // TrackedContract.contractId
+  windowStart     Int              // first ledger in the batch
+  windowEnd       Int              // last ledger in the batch
+  ledgerHash      String?          // hash of windowEnd ledger (for continuity)
+  eventCount      Int              @default(0)
+  status          CheckpointStatus @default(fetched)
+  error           String?
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+
+  @@index([contractId, status])
+  @@index([status])
+  @@index([contractId, windowEnd])
+}
+
 // ── Keeper subsystem ──────────────────────────────────────────────────────────
 //
 // Records every maintenance action the keeper attempts so that restarts never
@@ -293,6 +352,25 @@ enum KeeperTargetType {
   ReclaimOffer
 }
 
+// ── Price history (Issue #213) ────────────────────────────────────────────────
+//
+// One row per ListingPriceUpdatedEvent.  Populated by the indexer whenever
+// update_listing or update_listing_price emits that event, giving collectors
+// a complete, auditable record of every price change for a listing.
+
+model PriceHistory {
+  id               Int      @id @default(autoincrement())
+  listingId        BigInt
+  oldPrice         Decimal  @db.Decimal(32, 7)
+  newPrice         Decimal  @db.Decimal(32, 7)
+  changedBy        String   @default("")
+  changedAtLedger  Int
+  changedAt        DateTime @default(now())
+
+  @@index([listingId])
+  @@index([listingId, changedAtLedger])
+}
+
 model KeeperAction {
   id          Int                 @id @default(autoincrement())
   targetType  KeeperTargetType
@@ -309,4 +387,70 @@ model KeeperAction {
   @@index([status])
   @@index([targetType, status])
   @@index([updatedAt])
+}
+
+// ── Dead-letter storage (#287) ────────────────────────────────────────────────
+//
+// Stores every event that the parser or domain-application layer fails to
+// process.  Operators can inspect records and replay them after a parser fix
+// using the dead-letter-replay CLI (src/dead-letter-replay.ts).
+//
+// rawTopics / rawValue are bounded at write time (max 512 / 2000 chars each).
+// errorMessage is truncated to 1000 chars and stack-frame paths are redacted.
+
+enum DeadLetterStatus {
+  Pending   // awaiting replay
+  Replayed  // successfully re-processed after a parser fix
+  Failed    // replay exhausted attempts; needs manual review
+}
+
+model DeadLetterEvent {
+  id             Int              @id @default(autoincrement())
+  network        String           @default("")
+  contractId     String
+  ledgerSequence Int
+  txHash         String
+  eventIndex     Int
+  rawTopics      Json
+  rawValue       String           @default("")
+  errorCode      String           // "SCHEMA_DECODE" | "UNKNOWN"
+  errorMessage   String
+  parserVersion  String           @default("")
+  status         DeadLetterStatus @default(Pending)
+  attempts       Int              @default(0)
+  createdAt      DateTime         @default(now())
+  updatedAt      DateTime         @updatedAt
+
+  @@unique([contractId, ledgerSequence, txHash, eventIndex])
+  @@index([status])
+  @@index([contractId, ledgerSequence])
+  @@index([createdAt])
+}
+
+// ── Reconciliation repairs (#288) ─────────────────────────────────────────────
+//
+// Audit trail for every field-level correction the reconciler applies.
+// Preserves oldValue so corrections are reversible and the history is auditable.
+// DryRun rows are written in dry-run mode so operators can preview changes.
+
+enum RepairStatus {
+  Applied  // correction written to the DB
+  DryRun   // would-be correction (dry-run mode; DB not modified)
+  Failed   // repair attempted but failed
+}
+
+model ReconciliationRepair {
+  id           Int          @id @default(autoincrement())
+  modelType    String       // "listing" | "auction" | "offer" | "collection"
+  recordId     String       // stringified BigInt / Int primary key
+  field        String       // e.g. "status", "price", "highestBid"
+  oldValue     String
+  newValue     String
+  reason       String       // e.g. "chain_status_mismatch"
+  sourceLedger Int
+  status       RepairStatus @default(Applied)
+  createdAt    DateTime     @default(now())
+
+  @@index([modelType, recordId])
+  @@index([createdAt])
 }

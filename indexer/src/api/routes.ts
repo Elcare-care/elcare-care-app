@@ -6,7 +6,7 @@ import { cacheMiddleware } from './cache-middleware.js';
 import { etagMiddleware } from './etag-middleware.js';
 import { strictRateLimiter } from './rate-limit-middleware.js';
 import { badRequest, notFound, internalError } from './errors.js';
-import { applyDecodedEvents } from '../poller.js';
+import { applyDecodedEvents, isPollerHalted, getHaltReason, resumePoller, revertLedgers } from '../poller.js';
 import { collectMarketplaceEvents } from '../event-sync.js';
 import {
   validateQuery,
@@ -15,21 +15,30 @@ import {
   offersQuerySchema,
   walletActivityQuerySchema,
   collectionsQuerySchema,
+  creatorCollectionsQuerySchema,
   statsQuerySchema,
   syncGapsQuerySchema,
+  artistMetricsQuerySchema,
+  royaltyBreakdownQuerySchema,
 } from './query-schemas.js';
+import { isValidStellarAddress, STELLAR_ADDRESS_ERROR } from '../stellar-address.js';
 import {
   getOverviewStats,
   getDailyStats,
   getTopCollections,
   getTopArtists,
 } from '../stats.js';
+import {
+  sseConnectionsTotal,
+  sseActiveConnectionsGauge,
+  apiRequestDurationHistogram,
+} from '../metrics.js';
+import { TTL } from '../cache-warmer.js';
 
 // ── SSE registry ───────────────────────────────────────────────────────────────
 
 const SSE_BUFFER_SIZE = 200;
-const MAX_SSE_CONNECTIONS = parseInt(process.env.MAX_SSE_CONNECTIONS || '100', 10);
-const SSE_HEARTBEAT_MS = parseInt(process.env.SSE_HEARTBEAT_MS || '30000', 10);
+const MAX_SSE_CONNECTIONS = parseInt(process.env.MAX_SSE_CONNECTIONS || '500');
 
 interface SSEEvent {
   id: number;
@@ -53,6 +62,18 @@ export function _resetSseState() {
   sseClients.clear();
 }
 
+/** Track SSE client metrics and run cleanup on disconnect. */
+function setupSSEHeartbeat(res: Response): ReturnType<typeof setInterval> {
+  return setInterval(() => {
+    try { res.write(': heartbeat\n\n'); } catch { cleanupSSEClient(res); }
+  }, 30_000);
+}
+
+function cleanupSSEClient(res: Response): void {
+  sseClients.delete(res);
+  sseActiveConnectionsGauge.set(sseClients.size);
+}
+
 // SSE clients registry — keyed by Response, value is last-seen event ID
 
 export function emitSSEEvent(event: any) {
@@ -60,8 +81,8 @@ export function emitSSEEvent(event: any) {
   const dataStr = JSON.stringify(event, (_k, v) => typeof v === 'bigint' ? v.toString() : v);
   const payload: SSEEvent = { id, data: dataStr };
 
-  sseBuffer.push(payload);
-  if (sseBuffer.length > SSE_BUFFER_SIZE) sseBuffer.shift();
+import { hub, emitSSEEvent, closeSSEClients, ensureRealtimeStarted } from '../realtime/index.js';
+export { emitSSEEvent, closeSSEClients };
 
   const frame = `id: ${id}\ndata: ${dataStr}\n\n`;
   for (const [client] of sseClients) {
@@ -69,7 +90,7 @@ export function emitSSEEvent(event: any) {
       client.write(frame);
       sseClients.set(client, id);
     } catch {
-      sseClients.delete(client);
+      cleanupSSEClient(client);
     }
   }
 }
@@ -79,6 +100,22 @@ export function closeSSEClients(): void {
         try { client.end(); } catch { /* ignore */ }
     }
     sseClients.clear();
+    sseActiveConnectionsGauge.set(0);
+}
+
+// ── API request duration middleware ───────────────────────────────────────────
+// Records per-route latency histogram with method / route / status_code labels.
+
+export function apiDurationMiddleware(req: Request, res: Response, next: NextFunction) {
+  const start = process.hrtime();
+  res.on('finish', () => {
+    const [s, ns] = process.hrtime(start);
+    const route = req.route ? (req.baseUrl || '') + req.route.path : req.path;
+    apiRequestDurationHistogram
+      .labels(req.method, route, String(res.statusCode))
+      .observe(s + ns / 1e9);
+  });
+  next();
 }
 
 // Per-client heartbeat timers so idle proxies don't drop the connection.
@@ -106,6 +143,7 @@ function cleanupSSEClient(res: Response): void {
 const router = Router();
 
 router.use(etagMiddleware);
+router.use(apiDurationMiddleware);
 
 const CACHE_TTL_SECONDS = parseInt(process.env.REDIS_CACHE_TTL_SECONDS || '30');
 
@@ -118,7 +156,7 @@ async function getCached<T>(key: string, ttl: number, fetcher: () => Promise<T>)
   }
   const result = await fetcher();
   try {
-    await redis.set(key, JSON.stringify(result), { expiration: { type: 'EX', value: ttl } });
+    await (redis as any).setEx(key, ttl, JSON.stringify(result));
   } catch {
     // ignore cache write failures
   }
@@ -133,35 +171,67 @@ const serialize = (obj: any) =>
 // ── GET /events (SSE) ─────────────────────────────────────────────────────────
 
 router.get('/events', (req: Request, res: Response) => {
+  // Check connection limit
+  if (sseClients.size >= MAX_SSE_CONNECTIONS) {
+    return res.status(503).json({ error: 'Too many SSE connections' });
+  }
+
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
-  res.setHeader('X-Accel-Buffering', 'no'); // prevent nginx from buffering SSE chunks
+  res.setHeader('X-Accel-Buffering', 'no');
   res.flushHeaders();
 
   const lastEventId = req.headers['last-event-id'];
   const resumeFrom = lastEventId ? parseInt(String(lastEventId), 10) : null;
 
   sseClients.set(res, resumeFrom ?? sseEventCounter);
+  sseConnectionsTotal.inc();
+  sseActiveConnectionsGauge.set(sseClients.size);
 
+  // Replay missed events
   if (resumeFrom !== null && !isNaN(resumeFrom)) {
     const missed = sseBuffer.filter(e => e.id > resumeFrom);
     for (const ev of missed) {
-      try {
-        res.write(`id: ${ev.id}\ndata: ${ev.data}\n\n`);
-      } catch {
-        break;
-      }
+      try { res.write(`id: ${ev.id}\ndata: ${ev.data}\n\n`); } catch { break; }
     }
   }
 
-  req.on('close', () => sseClients.delete(res));
+  // Send initial connection message
+  res.write(`data: ${JSON.stringify({ type: 'CONNECTED' })}\n\n`);
+
+  const heartbeat = setupSSEHeartbeat(res);
+
+  const cleanup = () => {
+    clearInterval(heartbeat);
+    cleanupSSEClient(res);
+  };
+  req.on('close', cleanup);
+  res.on('error', cleanup);
 });
 
 // ── GET /listings ─────────────────────────────────────────────────────────────
+//
+// Full-text search strategy:
+//   - search term < 3 chars  → ILIKE fallback on artist + collection fields
+//   - search term >= 3 chars → ts_rank on searchVector (GIN index), results
+//                              ordered by relevance descending then by
+//                              updatedAtLedger for tie-breaking
 
-router.get('/listings', validateQuery(listingsQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
-  const { artist, owner, status, limit, offset, minPrice, maxPrice, search } =
+/** Minimum search term length to trigger tsvector path. */
+const FTS_MIN_LENGTH = 3;
+
+/**
+ * Escape a user string so it is safe to embed in a plainto_tsquery /
+ * to_tsquery call.  Strips characters that have special meaning in tsquery
+ * syntax (&, |, !, :, <, >, (, )) and trims whitespace.
+ */
+function sanitiseTsQuery(raw: string): string {
+  return raw.replace(/[&|!:<>()]/g, ' ').trim();
+}
+
+router.get('/listings', cacheMiddleware(TTL.LISTINGS_LIST), validateQuery(listingsQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
+  const { artist, owner, status, limit, offset, minPrice, maxPrice, search, cursor_ledger, cursor_direction } =
     (req as any).validatedQuery;
   try {
     const where: any = {};
@@ -175,28 +245,107 @@ router.get('/listings', validateQuery(listingsQuerySchema), async (req: Request,
       if (maxPrice !== undefined) where.price.lte = String(maxPrice);
     }
 
+    // ── Cursor pagination ─────────────────────────────────────────────────
+    const direction: 'asc' | 'desc' = cursor_direction ?? 'desc';
+    if (cursor_ledger !== undefined) {
+      where.updatedAtLedger = direction === 'desc'
+        ? { lt: cursor_ledger }
+        : { gt: cursor_ledger };
+    }
+
+    const take = limit ?? 20;
+    const skip = cursor_ledger !== undefined ? 0 : (offset ?? 0);
+
+    // ── Full-text search ──────────────────────────────────────────────────
+    if (search && search.length >= FTS_MIN_LENGTH) {
+      // Build a safe plainto_tsquery expression.  plainto_tsquery handles
+      // phrase tokenisation automatically and never throws on malformed input.
+      const sanitised = sanitiseTsQuery(search);
+
+      // Construct the additional Prisma filters as raw-SQL fragments so we can
+      // combine them with the ts_rank ORDER BY.
+      // We build the WHERE conditions from the `where` object manually for the
+      // raw query so we can inject the tsquery predicate.
+
+      const filterClauses: string[] = [
+        `"searchVector" @@ plainto_tsquery('english', $1)`,
+      ];
+      const params: unknown[] = [sanitised];
+      let pIdx = 2;
+
+      if (artist)   { filterClauses.push(`"artist" = $${pIdx++}`);  params.push(artist); }
+      if (owner)    { filterClauses.push(`"owner" = $${pIdx++}`);   params.push(owner); }
+      if (status)   { filterClauses.push(`"status" = $${pIdx++}::"ListingStatus"`); params.push(status); }
+      if (minPrice !== undefined) { filterClauses.push(`"price" >= $${pIdx++}`); params.push(String(minPrice)); }
+      if (maxPrice !== undefined) { filterClauses.push(`"price" <= $${pIdx++}`); params.push(String(maxPrice)); }
+      if (cursor_ledger !== undefined) {
+        filterClauses.push(
+          direction === 'desc'
+            ? `"updatedAtLedger" < $${pIdx++}`
+            : `"updatedAtLedger" > $${pIdx++}`
+        );
+        params.push(cursor_ledger);
+      }
+
+      const whereSQL = filterClauses.length ? `WHERE ${filterClauses.join(' AND ')}` : '';
+
+      // ts_rank_cd is the coverage-density variant; it rewards documents where
+      // the query terms are near each other.  Normalisation option 1 divides
+      // rank by the document length to avoid bias toward longer descriptions.
+      const results: any[] = await prisma.$queryRawUnsafe(
+        `SELECT *,
+                ts_rank_cd("searchVector", plainto_tsquery('english', $1), 1) AS "_rank"
+         FROM "Listing"
+         ${whereSQL}
+         ORDER BY "_rank" DESC, "updatedAtLedger" ${direction === 'desc' ? 'DESC' : 'ASC'}
+         LIMIT ${take} OFFSET ${skip}`,
+        ...params
+      );
+
+      const [{ count }] = await prisma.$queryRawUnsafe<[{ count: bigint }]>(
+        `SELECT COUNT(*) as count FROM "Listing" ${whereSQL}`,
+        ...params
+      );
+
+      const nextCursor = results.length === take
+        ? String(results[results.length - 1].updatedAtLedger)
+        : '';
+
+      res.setHeader('X-Next-Cursor', nextCursor);
+      res.setHeader('X-Total-Count', String(count));
+      return res.json({ listings: serialize(results), total: Number(count) });
+    }
+
+    // ── Short-term ILIKE fallback (<3 chars) or no search ────────────────
     if (search) {
       where.OR = [
-        { artist: { contains: search, mode: 'insensitive' } },
+        { artist:     { contains: search, mode: 'insensitive' } },
         { collection: { contains: search, mode: 'insensitive' } },
+        { title:      { contains: search, mode: 'insensitive' } },
+        { artistName: { contains: search, mode: 'insensitive' } },
       ];
     }
 
-    const take = limit || undefined;
-    const skip = offset || undefined;
+    const [results, total] = await Promise.all([
+      prisma.listing.findMany({
+        where,
+        orderBy: { updatedAtLedger: direction },
+        take,
+        skip,
+      }),
+      prisma.listing.count({ where: { ...where, updatedAtLedger: undefined } }),
+    ]);
 
-    const results = await prisma.listing.findMany({
-      where,
-      orderBy: { updatedAtLedger: 'desc' },
-      take,
-      skip,
-    });
+    const nextCursor = results.length === take
+      ? String(results[results.length - 1].updatedAtLedger)
+      : '';
 
-    if (take !== undefined || skip !== undefined) {
-      const total = await prisma.listing.count({ where });
+    res.setHeader('X-Next-Cursor', nextCursor);
+    res.setHeader('X-Total-Count', String(total));
+
+    if (limit !== undefined || offset !== undefined || cursor_ledger !== undefined) {
       return res.json({ listings: serialize(results), total });
     }
-
     res.json(serialize(results));
   } catch (err) {
     next(internalError('Failed to fetch listings'));
@@ -205,7 +354,7 @@ router.get('/listings', validateQuery(listingsQuerySchema), async (req: Request,
 
 // ── GET /listings/:id ─────────────────────────────────────────────────────────
 
-router.get('/listings/:id', async (req: Request, res: Response, next: NextFunction) => {
+router.get('/listings/:id', cacheMiddleware(TTL.LISTING_DETAIL), async (req: Request, res: Response, next: NextFunction) => {
   const { id } = req.params;
   try {
     const listing = await prisma.listing.findUnique({
@@ -232,11 +381,29 @@ router.get('/listings/:id/history', async (req: Request, res: Response, next: Ne
     return next(badRequest('Invalid ID format'));
   }
 
-  const limit  = Math.min(parseInt(String(req.query.limit  ?? '100'), 10) || 100, 500);
-  const offset = Math.min(parseInt(String(req.query.offset ?? '0'),   10) || 0,   10000);
+  const limitRaw  = req.query.limit  as string | undefined;
+  const offsetRaw = req.query.offset as string | undefined;
+
+  const limitParsed  = limitRaw  !== undefined ? parseInt(limitRaw,  10) : 100;
+  const offsetParsed = offsetRaw !== undefined ? parseInt(offsetRaw, 10) : 0;
+
+  if (limitRaw !== undefined  && (!Number.isInteger(limitParsed)  || limitParsed  < 1 || limitParsed  > 500)) {
+    return next(badRequest('limit must be an integer between 1 and 500'));
+  }
+  if (offsetRaw !== undefined && (!Number.isInteger(offsetParsed) || offsetParsed < 0 || offsetParsed > 10_000)) {
+    return next(badRequest('offset must be a non-negative integer up to 10000'));
+  }
+
+  const limit  = limitParsed;
+  const offset = offsetParsed;
 
   try {
-    const where = { listingId: BigInt(id) };
+    const where: any = { listingId: BigInt(id) };
+    // Issue #286: optional filter for confirmed-only events
+    const confirmedOnly = (req.query as any).confirmed === 'true';
+    if (confirmedOnly) {
+      where.confirmed = true;
+    }
     const [results, total] = await Promise.all([
       prisma.marketplaceEvent.findMany({
         where,
@@ -252,7 +419,39 @@ router.get('/listings/:id/history', async (req: Request, res: Response, next: Ne
   }
 });
 
-// ── GET /ipfs/:cid ────────────────────────────────────────────────────────────
+// ── GET /listings/:id/price-history (Issue #213) ──────────────────────────────
+//
+// Returns every price-change event for a listing in chronological order.
+// Each row carries oldPrice, newPrice, changedBy (artist address), the ledger
+// sequence, and the wall-clock timestamp so the frontend can render a chart.
+
+router.get('/listings/:id/price-history', cacheMiddleware(60), async (req: Request, res: Response, next: NextFunction) => {
+  const id = req.params.id as string;
+  if (!/^\d+$/.test(id)) {
+    return next(badRequest('Invalid listing ID format'));
+  }
+
+  try {
+    const history = await prisma.priceHistory.findMany({
+      where: { listingId: BigInt(id) },
+      orderBy: { changedAtLedger: 'asc' },
+      select: {
+        id: true,
+        listingId: true,
+        oldPrice: true,
+        newPrice: true,
+        changedBy: true,
+        changedAtLedger: true,
+        changedAt: true,
+      },
+    });
+    res.json(serialize(history));
+  } catch (err) {
+    next(internalError('Failed to fetch price history'));
+  }
+});
+
+
 //
 // Serves cached IPFS metadata for a given CID.  If the metadata is not yet
 // cached, fetches it on-demand (populating the cache), enqueues a background
@@ -315,17 +514,29 @@ router.get('/ipfs/:cid', cacheMiddleware(300), async (req: Request, res: Respons
 
 // ── GET /auctions ─────────────────────────────────────────────────────────────
 
-router.get('/auctions', validateQuery(auctionsQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
-  const { creator, status } = (req as any).validatedQuery;
+router.get('/auctions', cacheMiddleware(TTL.AUCTIONS_LIST), validateQuery(auctionsQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
+  const { creator, status, limit, offset, cursor_ledger, cursor_direction } = (req as any).validatedQuery;
   try {
     const where: any = {};
     if (creator) where.creator = creator;
     if (status) where.status = status;
 
-    const results = await prisma.auction.findMany({
-      where,
-      orderBy: { updatedAtLedger: 'desc' },
-    });
+    const direction: 'asc' | 'desc' = cursor_direction ?? 'desc';
+    if (cursor_ledger !== undefined) {
+      where.updatedAtLedger = direction === 'desc' ? { lt: cursor_ledger } : { gt: cursor_ledger };
+    }
+
+    const take = limit ?? 20;
+    const skip = cursor_ledger !== undefined ? 0 : (offset ?? 0);
+
+    const [results, total] = await Promise.all([
+      prisma.auction.findMany({ where, orderBy: { updatedAtLedger: direction }, take, skip }),
+      prisma.auction.count({ where: { ...(creator ? { creator } : {}), ...(status ? { status } : {}) } }),
+    ]);
+
+    const nextCursor = results.length === take ? String(results[results.length - 1].updatedAtLedger) : '';
+    res.setHeader('X-Next-Cursor', nextCursor);
+    res.setHeader('X-Total-Count', String(total));
     res.json(serialize(results));
   } catch (err) {
     next(internalError('Failed to fetch auctions'));
@@ -334,7 +545,7 @@ router.get('/auctions', validateQuery(auctionsQuerySchema), async (req: Request,
 
 // ── GET /auctions/:id ─────────────────────────────────────────────────────────
 
-router.get('/auctions/:id', async (req: Request, res: Response, next: NextFunction) => {
+router.get('/auctions/:id', cacheMiddleware(TTL.AUCTION_DETAIL), async (req: Request, res: Response, next: NextFunction) => {
   const id = req.params.id as string;
   if (!/^\d+$/.test(id)) {
     return next(badRequest('Invalid ID format'));
@@ -355,20 +566,69 @@ router.get('/auctions/:id', async (req: Request, res: Response, next: NextFuncti
   }
 });
 
+// ── GET /auctions/:id/blocked-bidders ─────────────────────────────────────────
+//
+// Anti-shill-bidding registry (Issue #199).  Replays the auction's
+// AUCTION_BIDDER_BLOCKED / AUCTION_BIDDER_UNBLOCKED events in ledger order to
+// compute the currently-blocked address set, and returns the raw event history
+// alongside it for audit views.
+
+router.get('/auctions/:id/blocked-bidders', async (req: Request, res: Response, next: NextFunction) => {
+  const id = req.params.id as string;
+  if (!/^\d+$/.test(id)) {
+    return next(badRequest('Invalid ID format'));
+  }
+  try {
+    const events = await prisma.marketplaceEvent.findMany({
+      where: {
+        listingId: BigInt(id),
+        eventType: { in: ['AUCTION_BIDDER_BLOCKED', 'AUCTION_BIDDER_UNBLOCKED'] },
+      },
+      orderBy: [{ ledgerSequence: 'asc' }, { id: 'asc' }],
+    });
+
+    const blocked = new Set<string>();
+    for (const ev of events) {
+      const bidder = (ev.data as Record<string, unknown> | null)?.bidder;
+      if (typeof bidder !== 'string') continue;
+      if (ev.eventType === 'AUCTION_BIDDER_BLOCKED') blocked.add(bidder);
+      else blocked.delete(bidder);
+    }
+
+    res.json({
+      auctionId: id,
+      blockedBidders: [...blocked],
+      history: serialize(events),
+    });
+  } catch (err) {
+    next(internalError('Failed to fetch blocked bidders'));
+  }
+});
+
 // ── GET /offers ───────────────────────────────────────────────────────────────
 
 router.get('/offers', validateQuery(offersQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
-  const { listing_id } = (req as any).validatedQuery;
+  const { listing_id, limit, offset, cursor_ledger, cursor_direction } = (req as any).validatedQuery;
   try {
     const where: any = {};
-    if (listing_id) {
-      where.listingId = BigInt(listing_id);
+    if (listing_id) where.listingId = BigInt(listing_id);
+
+    const direction: 'asc' | 'desc' = cursor_direction ?? 'desc';
+    if (cursor_ledger !== undefined) {
+      where.updatedAtLedger = direction === 'desc' ? { lt: cursor_ledger } : { gt: cursor_ledger };
     }
 
-    const results = await prisma.offer.findMany({
-      where,
-      orderBy: { updatedAtLedger: 'desc' },
-    });
+    const take = limit ?? 20;
+    const skip = cursor_ledger !== undefined ? 0 : (offset ?? 0);
+
+    const [results, total] = await Promise.all([
+      prisma.offer.findMany({ where, orderBy: { updatedAtLedger: direction }, take, skip }),
+      prisma.offer.count({ where: listing_id ? { listingId: BigInt(listing_id) } : {} }),
+    ]);
+
+    const nextCursor = results.length === take ? String(results[results.length - 1].updatedAtLedger) : '';
+    res.setHeader('X-Next-Cursor', nextCursor);
+    res.setHeader('X-Total-Count', String(total));
     res.json(serialize(results));
   } catch (err) {
     next(internalError('Failed to fetch offers'));
@@ -377,9 +637,9 @@ router.get('/offers', validateQuery(offersQuerySchema), async (req: Request, res
 
 // ── GET /activity/recent ──────────────────────────────────────────────────────
 
-router.get('/activity/recent', cacheMiddleware(30), async (req: Request, res: Response, next: NextFunction) => {
+router.get('/activity/recent', cacheMiddleware(TTL.ACTIVITY_RECENT), async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const results = await getCached('activity:recent', CACHE_TTL_SECONDS, () =>
+    const results = await getCached('activity:recent', TTL.ACTIVITY_RECENT, () =>
       prisma.marketplaceEvent.findMany({
         take: 20,
         orderBy: { ledgerSequence: 'desc' },
@@ -393,34 +653,95 @@ router.get('/activity/recent', cacheMiddleware(30), async (req: Request, res: Re
 
 // ── GET /collections ──────────────────────────────────────────────────────────
 
-router.get('/collections', cacheMiddleware(60), validateQuery(collectionsQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
-  const { kind, creator } = (req as any).validatedQuery;
+router.get('/collections', cacheMiddleware(TTL.COLLECTIONS), validateQuery(collectionsQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
+  const { kind, creator, limit, offset, cursor_ledger, cursor_direction } = (req as any).validatedQuery;
   try {
     const where: any = {};
     if (kind)    where.kind    = kind;
     if (creator) where.creator = creator;
-    const cacheKey = `collections:${kind ?? ''}:${creator ?? ''}`;
-    const results = await getCached(cacheKey, CACHE_TTL_SECONDS, () =>
-      prisma.collection.findMany({
-        where,
-        orderBy: { deployedAtLedger: 'desc' },
-      })
-    );
-    res.json(serialize(results));
+
+    const direction: 'asc' | 'desc' = cursor_direction ?? 'desc';
+    if (cursor_ledger !== undefined) {
+      where.deployedAtLedger = direction === 'desc' ? { lt: cursor_ledger } : { gt: cursor_ledger };
+    }
+
+    const take = limit ?? 20;
+    const skip = cursor_ledger !== undefined ? 0 : (offset ?? 0);
+
+    const [results, total] = await Promise.all([
+      prisma.collection.findMany({ where, orderBy: { deployedAtLedger: direction }, take, skip }),
+      prisma.collection.count({ where: { ...(kind ? { kind } : {}), ...(creator ? { creator } : {}) } }),
+    ]);
+
+    const nextCursor = results.length === take ? String(results[results.length - 1].deployedAtLedger) : '';
+    res.setHeader('X-Next-Cursor', nextCursor);
+    res.setHeader('X-Total-Count', String(total));
+
+    // Attach a resolved fee_bps field: collection override when set, otherwise null
+    // (clients should fall back to the global fee from GET /stats or contract view).
+    const withFee = results.map((c) => ({
+      ...c,
+      fee_bps: c.feeBpsOverride ?? null,
+    }));
+
+    res.json(serialize(withFee));
   } catch (err) {
     next(internalError('Failed to fetch collections'));
   }
 });
 
+// ── GET /collections/:address/fee ─────────────────────────────────────────────
+// Returns the per-collection fee override for a given collection contract
+// address, or null when the collection is using the global default fee.
+// Response is Redis-cached with a 30-second TTL.
+
+router.get('/collections/:address/fee', async (req: Request, res: Response, next: NextFunction) => {
+  const address = req.params.address as string;
+  if (!address) return next(badRequest('Collection address is required'));
+
+  const cacheKey = `collection_fee:${address}`;
+  try {
+    const result = await getCached(cacheKey, 30, async () => {
+      const collection = await prisma.collection.findUnique({
+        where: { contractAddress: address },
+        select: { feeBpsOverride: true },
+      });
+      if (!collection) return null;
+      return { fee_bps: collection.feeBpsOverride ?? null };
+    });
+
+    if (result === null) return next(notFound('Collection not found'));
+    res.json(result);
+  } catch (err) {
+    next(internalError('Failed to fetch collection fee'));
+  }
+});
+
 // ── GET /creators/:address/collections ───────────────────────────────────────
 
-router.get('/creators/:address/collections', async (req: Request, res: Response, next: NextFunction) => {
-  const { address } = req.params;
+router.get('/creators/:address/collections', validateQuery(creatorCollectionsQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
+  const address = req.params.address as string;
+  if (!isValidStellarAddress(address)) {
+    return next(badRequest('Invalid creator address: must be a valid 56-character Stellar G-address'));
+  }
+  const { limit, offset, cursor_ledger, cursor_direction } = (req as any).validatedQuery;
   try {
-    const results = await prisma.collection.findMany({
-      where: { creator: address as string },
-      orderBy: { deployedAtLedger: 'desc' },
-    });
+    const direction: 'asc' | 'desc' = cursor_direction ?? 'desc';
+    const where: any = { creator: address };
+    if (cursor_ledger !== undefined) {
+      where.deployedAtLedger = direction === 'desc' ? { lt: cursor_ledger } : { gt: cursor_ledger };
+    }
+    const take = limit ?? 20;
+    const skip = cursor_ledger !== undefined ? 0 : (offset ?? 0);
+
+    const [results, total] = await Promise.all([
+      prisma.collection.findMany({ where, orderBy: { deployedAtLedger: direction }, take, skip }),
+      prisma.collection.count({ where: { creator: address } }),
+    ]);
+
+    const nextCursor = results.length === take ? String(results[results.length - 1].deployedAtLedger) : '';
+    res.setHeader('X-Next-Cursor', nextCursor);
+    res.setHeader('X-Total-Count', String(total));
     res.json(serialize(results));
   } catch (err) {
     next(internalError('Failed to fetch creator collections'));
@@ -431,22 +752,36 @@ router.get('/creators/:address/collections', async (req: Request, res: Response,
 
 router.get('/wallets/:address/activity', strictRateLimiter, validateQuery(walletActivityQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
   const address = req.params.address as string;
-  const { limit } = (req as any).validatedQuery;
+  const { limit, offset, cursor_ledger, cursor_direction } = (req as any).validatedQuery;
   const take = Math.min(limit ?? 50, 200);
+
   try {
+    const direction: 'asc' | 'desc' = cursor_direction ?? 'desc';
+    const cursorWhere: any = cursor_ledger !== undefined
+      ? { ledgerSequence: direction === 'desc' ? { lt: cursor_ledger } : { gt: cursor_ledger } }
+      : {};
+
     const jsonKeys = ['buyer', 'artist', 'offerer', 'bidder', 'winner', 'creator'];
     const fromJson = jsonKeys.map((path) => ({
       data: { path: [path], equals: address },
     }));
 
-    const events = await prisma.marketplaceEvent.findMany({
-      where: {
-        OR: [{ actor: address }, ...fromJson],
-      },
-      orderBy: { ledgerSequence: 'desc' },
-      take,
-    });
+    const baseWhere = { OR: [{ actor: address }, ...fromJson] };
+    const where = { ...baseWhere, ...cursorWhere };
 
+    const [events, total] = await Promise.all([
+      prisma.marketplaceEvent.findMany({
+        where,
+        orderBy: { ledgerSequence: direction },
+        take,
+        skip: cursor_ledger !== undefined ? 0 : (offset ?? 0),
+      }),
+      prisma.marketplaceEvent.count({ where: baseWhere }),
+    ]);
+
+    const nextCursor = events.length === take ? String(events[events.length - 1].ledgerSequence) : '';
+    res.setHeader('X-Next-Cursor', nextCursor);
+    res.setHeader('X-Total-Count', String(total));
     res.json(serialize(events));
   } catch (err) {
     next(internalError('Failed to fetch wallet activity'));
@@ -490,6 +825,49 @@ router.get('/wallets/:address/royalty-stats', strictRateLimiter, async (req: Req
     });
   } catch (err) {
     next(internalError('Failed to fetch royalty stats'));
+  }
+});
+
+// ── GET /wallets/:address/royalty-breakdown ───────────────────────────────────
+// Per-sale royalty audit trail (Issue #201): paginated RoyaltyPayment rows for
+// the given recipient address, newest-first, optionally bounded to the
+// inclusive ledger-sequence window [from, to]. Cached for 60 seconds.
+
+router.get('/wallets/:address/royalty-breakdown', cacheMiddleware(60), validateQuery(royaltyBreakdownQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
+  const address = req.params.address as string;
+  if (!isValidStellarAddress(address)) {
+    return next(badRequest(STELLAR_ADDRESS_ERROR));
+  }
+  const { from, to, limit, offset } = (req as any).validatedQuery;
+  try {
+    const where: any = { recipient: address };
+    if (from !== undefined || to !== undefined) {
+      where.ledgerSequence = {};
+      if (from !== undefined) where.ledgerSequence.gte = from;
+      if (to !== undefined)   where.ledgerSequence.lte = to;
+    }
+
+    const take = limit ?? 50;
+    const skip = offset ?? 0;
+    const [payments, total] = await Promise.all([
+      prisma.royaltyPayment.findMany({
+        where,
+        orderBy: { ledgerSequence: 'desc' },
+        take,
+        skip,
+      }),
+      prisma.royaltyPayment.count({ where }),
+    ]);
+
+    res.setHeader('X-Total-Count', String(total));
+    res.json({
+      payments: serialize(payments),
+      total,
+      limit: take,
+      offset: skip,
+    });
+  } catch (err) {
+    next(internalError('Failed to fetch royalty breakdown'));
   }
 });
 
@@ -607,9 +985,9 @@ router.get('/events', (req: Request, res: Response) => {
 // Returns mints-over-time, volume-over-time, and conversion rate aggregates
 // for a given artist, scoped by an optional ?range=day|week|month query param.
 
-router.get('/artists/:address/metrics', cacheMiddleware(60), async (req: Request, res: Response, next: NextFunction) => {
+router.get('/artists/:address/metrics', cacheMiddleware(60), validateQuery(artistMetricsQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
   const address = req.params.address as string;
-  const range = req.query.range as string | undefined;
+  const { range } = (req as any).validatedQuery;
 
   const now = new Date();
   let dateFrom: Date | undefined;
@@ -680,6 +1058,21 @@ router.get('/artists/:address/metrics', cacheMiddleware(60), async (req: Request
     });
   } catch (err) {
     next(internalError('Failed to fetch artist metrics'));
+  }
+});
+
+// ── GET /backfill/status ──────────────────────────────────────────────────────
+//
+// Returns the current state of any running backfill job: progress percentage,
+// throughput (events/s), ETA, and ledger range.  Returns running: false when
+// no backfill is currently active.
+
+router.get('/backfill/status', async (_req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { getBackfillStatus } = await import('../backfill.js');
+    res.json(getBackfillStatus());
+  } catch (err) {
+    next(internalError('Failed to fetch backfill status'));
   }
 });
 
@@ -903,6 +1296,153 @@ router.delete('/admin/contracts/:id', async (req: Request, res: Response, next: 
     res.json(serialize(updated));
   } catch (err) {
     next(internalError('Failed to deactivate tracked contract'));
+  }
+});
+
+// ── GET /search ───────────────────────────────────────────────────────────────
+//
+// Cross-entity full-text search across listings, auctions, and collections.
+//
+// ?q=benin&types=listings,collections&limit=5
+//
+// Each included entity type runs its own ts_rank-ordered query.  Results for
+// types without a searchVector (auctions) fall back to ILIKE on key text
+// fields so that /search works before IPFS metadata is populated.
+//
+// Response shape:
+// {
+//   query: string,
+//   listings:    { items: Listing[],    total: number },
+//   auctions:    { items: Auction[],    total: number },
+//   collections: { items: Collection[], total: number },
+// }
+// Entity buckets not requested in ?types= are omitted from the response.
+
+router.get('/search', validateQuery(searchQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
+  const { q, types, limit } = (req as any).validatedQuery as {
+    q: string;
+    types: Array<'listings' | 'auctions' | 'collections'>;
+    limit: number;
+  };
+
+  try {
+    const sanitised = sanitiseTsQuery(q);
+    const useFts = q.length >= FTS_MIN_LENGTH;
+    const result: Record<string, any> = { query: q };
+
+    // ── Listings ────────────────────────────────────────────────────────────
+    if (types.includes('listings')) {
+      if (useFts) {
+        const rows: any[] = await prisma.$queryRawUnsafe(
+          `SELECT *,
+                  ts_rank_cd("searchVector", plainto_tsquery('english', $1), 1) AS "_rank"
+           FROM "Listing"
+           WHERE "searchVector" @@ plainto_tsquery('english', $1)
+           ORDER BY "_rank" DESC, "updatedAtLedger" DESC
+           LIMIT $2`,
+          sanitised,
+          limit,
+        );
+        const [{ count }] = await prisma.$queryRawUnsafe<[{ count: bigint }]>(
+          `SELECT COUNT(*) as count FROM "Listing"
+           WHERE "searchVector" @@ plainto_tsquery('english', $1)`,
+          sanitised,
+        );
+        result.listings = { items: serialize(rows), total: Number(count) };
+      } else {
+        // Short term — ILIKE fallback
+        const [rows, total] = await Promise.all([
+          prisma.listing.findMany({
+            where: {
+              OR: [
+                { artist:     { contains: q, mode: 'insensitive' } },
+                { collection: { contains: q, mode: 'insensitive' } },
+                { title:      { contains: q, mode: 'insensitive' } },
+                { artistName: { contains: q, mode: 'insensitive' } },
+              ],
+            },
+            orderBy: { updatedAtLedger: 'desc' },
+            take: limit,
+          }),
+          prisma.listing.count({
+            where: {
+              OR: [
+                { artist:     { contains: q, mode: 'insensitive' } },
+                { collection: { contains: q, mode: 'insensitive' } },
+                { title:      { contains: q, mode: 'insensitive' } },
+                { artistName: { contains: q, mode: 'insensitive' } },
+              ],
+            },
+          }),
+        ]);
+        result.listings = { items: serialize(rows), total };
+      }
+    }
+
+    // ── Auctions ────────────────────────────────────────────────────────────
+    // Auctions do not have a searchVector; always use ILIKE on creator +
+    // collection address fields.
+    if (types.includes('auctions')) {
+      const auctionWhere: any = {
+        OR: [
+          { creator:    { contains: q, mode: 'insensitive' } },
+          { collection: { contains: q, mode: 'insensitive' } },
+        ],
+      };
+      const [rows, total] = await Promise.all([
+        prisma.auction.findMany({
+          where: auctionWhere,
+          orderBy: { updatedAtLedger: 'desc' },
+          take: limit,
+        }),
+        prisma.auction.count({ where: auctionWhere }),
+      ]);
+      result.auctions = { items: serialize(rows), total };
+    }
+
+    // ── Collections ─────────────────────────────────────────────────────────
+    if (types.includes('collections')) {
+      if (useFts) {
+        const rows: any[] = await prisma.$queryRawUnsafe(
+          `SELECT *,
+                  ts_rank_cd("searchVector", plainto_tsquery('english', $1), 1) AS "_rank"
+           FROM "Collection"
+           WHERE "searchVector" @@ plainto_tsquery('english', $1)
+           ORDER BY "_rank" DESC, "deployedAtLedger" DESC
+           LIMIT $2`,
+          sanitised,
+          limit,
+        );
+        const [{ count }] = await prisma.$queryRawUnsafe<[{ count: bigint }]>(
+          `SELECT COUNT(*) as count FROM "Collection"
+           WHERE "searchVector" @@ plainto_tsquery('english', $1)`,
+          sanitised,
+        );
+        result.collections = { items: serialize(rows), total: Number(count) };
+      } else {
+        const collectionWhere: any = {
+          OR: [
+            { name:            { contains: q, mode: 'insensitive' } },
+            { symbol:          { contains: q, mode: 'insensitive' } },
+            { contractAddress: { contains: q, mode: 'insensitive' } },
+            { creator:         { contains: q, mode: 'insensitive' } },
+          ],
+        };
+        const [rows, total] = await Promise.all([
+          prisma.collection.findMany({
+            where: collectionWhere,
+            orderBy: { deployedAtLedger: 'desc' },
+            take: limit,
+          }),
+          prisma.collection.count({ where: collectionWhere }),
+        ]);
+        result.collections = { items: serialize(rows), total };
+      }
+    }
+
+    res.json(result);
+  } catch (err) {
+    next(internalError('Failed to execute search'));
   }
 });
 

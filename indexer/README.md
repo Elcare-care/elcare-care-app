@@ -333,3 +333,16 @@ npm run lint
 ```
 
 The test suite uses **Vitest** (configured in `vitest.config.mts` with ESM mode) and **Supertest** for API integration tests. Tests are in `src/__tests__/` and cover the poller, parser, event-sync, API routes, cache middleware, rate limiting, Redis integration, and re-org handling.
+
+---
+
+## Architecture & Debugging Guides
+
+For deeper indexer troubleshooting, schema changes, and ingestion diagnostics, refer to:
+- 🏗️ **[Local Architecture](../docs/guides/local-architecture.md)**
+- 🔄 **[Indexer Ingestion Guide](../docs/guides/indexer-ingestion.md)**
+- 🏷️ **[Event Parsing Guide](../docs/guides/event-parsing.md)**
+- 🗄️ **[Database Migrations Guide](../docs/guides/database-migrations.md)**
+- 🚀 **[Deployment Guide](../docs/guides/deployment.md)**
+- 🛡️ **[Security Triage Guide](../docs/guides/security-triage.md)**
+

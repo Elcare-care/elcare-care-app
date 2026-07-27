@@ -4,24 +4,56 @@
 
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import Link from "next/link";
 import { useWalletContext } from "@/context/WalletContext";
-import { useOffererOffers, useWithdrawOffer } from "@/hooks/useOffers";
+import { useOffererOffers, useWithdrawOffer, useReclaimOffer } from "@/hooks/useOffers";
 import { stroopsToXlm, Offer } from "@/lib/contract";
-import { ShoppingBag, Clock, CheckCircle, XCircle, ArrowUpRight, History, Activity, TrendingUp, Loader2, Inbox, CalendarClock } from "lucide-react";
+import { ShoppingBag, Clock, CheckCircle, XCircle, ArrowUpRight, History, Activity, TrendingUp, Loader2, Inbox, CalendarClock, Timer, Coins, AlertTriangle, X } from "lucide-react";
 import { WalletGuard } from "@/components/WalletGuard";
-import { ErrorState, EmptyState } from "@/components/PageStates";
+import { ResourceState } from "@/components/PageStates";
+import { categorizePageError } from "@/lib/pageState";
 import { SUPPORTED_TOKENS } from "@/config/tokens";
 import { clsx } from "clsx";
 
 type Tab = "all" | "Pending" | "Accepted" | "Rejected" | "Withdrawn";
 
+// Format the time remaining until an offer's expiry as a compact countdown.
+// Returns null once the deadline has passed.
+function formatCountdown(expiresAtSec: number, nowMs: number): string | null {
+  const remainingMs = expiresAtSec * 1000 - nowMs;
+  if (remainingMs <= 0) return null;
+  const totalSec = Math.floor(remainingMs / 1000);
+  const days = Math.floor(totalSec / 86400);
+  const hours = Math.floor((totalSec % 86400) / 3600);
+  const minutes = Math.floor((totalSec % 3600) / 60);
+  const seconds = totalSec % 60;
+  if (days > 0) return `${days}d ${hours}h ${minutes}m`;
+  if (hours > 0) return `${hours}h ${minutes}m ${seconds}s`;
+  return `${minutes}m ${seconds}s`;
+}
+
 export default function OffersPage() {
   const { publicKey } = useWalletContext();
   const { offers, isLoading, error, refresh } = useOffererOffers(publicKey);
   const { withdraw, isWithdrawing, error: withdrawError } = useWithdrawOffer(publicKey);
+  const { reclaim, isReclaiming } = useReclaimOffer(publicKey);
   const [tab, setTab] = useState<Tab>("all");
+  const [confirmOffer, setConfirmOffer] = useState<Offer | null>(null);
+
+  // Ticks once a second so pending-offer countdowns update live.
+  const [now, setNow] = useState<number>(() => Date.now());
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, []);
+
+  const handleReclaim = async () => {
+    if (!confirmOffer) return;
+    const ok = await reclaim(confirmOffer.offer_id);
+    setConfirmOffer(null);
+    if (ok) refresh();
+  };
 
   const pendingCnt = offers.filter((o: Offer) => o.status === "Pending").length;
   const acceptedCnt = offers.filter((o: Offer) => o.status === "Accepted").length;
@@ -162,30 +194,47 @@ export default function OffersPage() {
             ))}
           </div>
 
+          {/* Withdraw errors are a write-action failure, not a fetch failure —
+              surfaced inline so a failed withdraw never masks an already-loaded
+              offers list behind a full-page error state. */}
+          {withdrawError && (
+            <div role="alert" className="mb-4 flex items-center gap-2 rounded-2xl border border-terracotta-500/20 bg-terracotta-500/10 px-4 py-3 text-sm text-terracotta-400">
+              <AlertTriangle size={16} aria-hidden="true" />
+              {withdrawError}
+            </div>
+          )}
+
           {/* Content area */}
           <div className="animate-fade-in duration-700">
-            {(error || withdrawError) ? (
-              <ErrorState
-                title="Failed to load offers"
-                message={error || withdrawError || ""}
+            {error ? (
+              <ResourceState
+                isLoading={false}
+                error={categorizePageError(error, { resourceLabel: "offers" })}
                 onRetry={refresh}
+                tone="dark"
               />
             ) : isLoading ? (
-              <div className="grid gap-6 sm:grid-cols-2 lg:grid-cols-3">
+              <div role="status" aria-live="polite" className="grid gap-6 sm:grid-cols-2 lg:grid-cols-3">
+                <span className="sr-only">Loading your offers…</span>
                 {[1, 2, 3].map((i) => (
                   <div key={i} className="h-64 animate-pulse rounded-[2.5rem] bg-white/[0.03] border border-white/5" />
                 ))}
               </div>
             ) : filtered.length === 0 ? (
-              <EmptyState
-                icon={ShoppingBag}
-                title={tab === "all" ? "No offers yet." : `No ${tab.toLowerCase()} offers.`}
-                description="Your offers help secure the most beautiful African art pieces."
-                action={tab === "all" ? { label: "Browse listings", href: "/" } : undefined}
+              <ResourceState
+                isLoading={false}
+                error={null}
+                isEmpty
+                empty={{
+                  icon: ShoppingBag,
+                  title: tab === "all" ? "No offers yet." : `No ${tab.toLowerCase()} offers.`,
+                  description: "Your offers help secure the most beautiful African art pieces.",
+                  action: tab === "all" ? { label: "Browse listings", href: "/" } : undefined,
+                  iconClassName: "bg-midnight-950 text-white/10 shadow-inner",
+                  titleClassName: "text-white",
+                  descriptionClassName: "text-brand-300/40",
+                }}
                 className="rounded-[3.5rem] bg-midnight-900/50 border-2 border-dashed border-white/5 backdrop-blur-sm relative"
-                iconClassName="bg-midnight-950 text-white/10 shadow-inner"
-                titleClassName="text-white"
-                descriptionClassName="text-brand-300/40"
               />
             ) : (
               <div className="grid gap-6 sm:grid-cols-2 lg:grid-cols-3">
@@ -248,25 +297,59 @@ export default function OffersPage() {
                         </span>
                       </div>
 
-                      {o.status === "Pending" && (
-                        <button
-                          data-testid={`withdraw-btn-${o.offer_id}`}
-                          onClick={async () => {
-                            const ok = await withdraw(o.offer_id);
-                            if (ok) refresh();
-                          }}
-                          disabled={isWithdrawing}
-                          className="w-full flex items-center justify-center gap-2 rounded-2xl bg-white/5 hover:bg-terracotta-500/20 py-4 text-xs font-bold text-terracotta-400 border border-white/10 hover:border-terracotta-500/30 transition-all shadow-xl group/btn"
+                      {/* Offer Expiry Countdown — the offer's own deadline */}
+                      {o.status === "Pending" && o.expires_at != null && (
+                        <div
+                          data-testid={`offer-countdown-${o.offer_id}`}
+                          className="flex items-center justify-between rounded-2xl bg-white/[0.03] border border-white/10 px-4 py-3"
                         >
-                          {isWithdrawing ? (
-                            <Loader2 size={16} className="animate-spin" />
-                          ) : (
-                            <>
-                              <XCircle size={16} className="group-hover/btn:scale-110 transition-transform" />
-                              Withdraw Offer
-                            </>
-                          )}
-                        </button>
+                          <div className="flex items-center gap-2">
+                            <Timer size={13} className={clsx(o.expires_at * 1000 <= now ? "text-terracotta-400" : "text-mint-400")} />
+                            <span className="text-[10px] uppercase font-bold text-white/30 tracking-widest">Offer Expiry</span>
+                          </div>
+                          <span className={clsx("text-xs font-mono font-bold", o.expires_at * 1000 <= now ? "text-terracotta-400" : "text-mint-400")}>
+                            {formatCountdown(o.expires_at, now) ?? "Expired"}
+                          </span>
+                        </div>
+                      )}
+
+                      {o.status === "Pending" && (
+                        o.expires_at != null && o.expires_at * 1000 <= now ? (
+                          <button
+                            data-testid={`reclaim-btn-${o.offer_id}`}
+                            onClick={() => setConfirmOffer(o)}
+                            disabled={isReclaiming}
+                            className="w-full flex items-center justify-center gap-2 rounded-2xl bg-brand-500/15 hover:bg-brand-500/25 py-4 text-xs font-bold text-brand-300 border border-brand-500/30 hover:border-brand-500/50 transition-all shadow-xl group/btn"
+                          >
+                            {isReclaiming ? (
+                              <Loader2 size={16} className="animate-spin" />
+                            ) : (
+                              <>
+                                <Coins size={16} className="group-hover/btn:scale-110 transition-transform" />
+                                Reclaim Funds
+                              </>
+                            )}
+                          </button>
+                        ) : (
+                          <button
+                            data-testid={`withdraw-btn-${o.offer_id}`}
+                            onClick={async () => {
+                              const ok = await withdraw(o.offer_id);
+                              if (ok) refresh();
+                            }}
+                            disabled={isWithdrawing}
+                            className="w-full flex items-center justify-center gap-2 rounded-2xl bg-white/5 hover:bg-terracotta-500/20 py-4 text-xs font-bold text-terracotta-400 border border-white/10 hover:border-terracotta-500/30 transition-all shadow-xl group/btn"
+                          >
+                            {isWithdrawing ? (
+                              <Loader2 size={16} className="animate-spin" />
+                            ) : (
+                              <>
+                                <XCircle size={16} className="group-hover/btn:scale-110 transition-transform" />
+                                Withdraw Offer
+                              </>
+                            )}
+                          </button>
+                        )
                       )}
                     </div>
                   </div>
@@ -275,6 +358,76 @@ export default function OffersPage() {
             )}
           </div>
         </div>
+
+        {/* Reclaim confirmation modal */}
+        {confirmOffer && (
+          <div
+            className="fixed inset-0 z-50 flex items-center justify-center p-4"
+            data-testid="reclaim-modal"
+            role="dialog"
+            aria-modal="true"
+          >
+            <div
+              className="absolute inset-0 bg-midnight-950/80 backdrop-blur-sm"
+              onClick={() => !isReclaiming && setConfirmOffer(null)}
+            />
+            <div className="relative w-full max-w-md rounded-[2.5rem] bg-midnight-900 border border-white/10 shadow-2xl p-8 animate-fade-in">
+              <button
+                onClick={() => setConfirmOffer(null)}
+                disabled={isReclaiming}
+                aria-label="Close"
+                className="absolute top-5 right-5 rounded-full p-2 text-white/30 hover:text-white hover:bg-white/5 transition-colors disabled:opacity-40"
+              >
+                <X size={18} />
+              </button>
+
+              <div className="flex flex-col items-center text-center gap-5">
+                <div className="flex h-16 w-16 items-center justify-center rounded-[1.4rem] bg-brand-500/10 border border-brand-500/20">
+                  <Coins size={30} className="text-brand-400" />
+                </div>
+                <div className="space-y-1">
+                  <h2 className="font-display text-2xl font-bold text-white">Reclaim Funds</h2>
+                  <p className="text-sm text-white/40">
+                    Offer #{confirmOffer.offer_id} has expired. Reclaiming refunds your escrowed amount and closes the offer.
+                  </p>
+                </div>
+
+                <div className="w-full rounded-2xl bg-white/5 border border-white/10 px-6 py-5">
+                  <p className="text-[10px] uppercase tracking-widest font-bold text-white/40 mb-1">Amount to Reclaim</p>
+                  <div className="flex items-baseline justify-center gap-2">
+                    <span className="font-display text-4xl font-bold text-white">{stroopsToXlm(confirmOffer.amount)}</span>
+                    <span className="text-xs font-bold text-brand-400 uppercase tracking-widest">{getTokenSymbol(confirmOffer.token)}</span>
+                  </div>
+                </div>
+
+                <div className="flex items-start gap-2 text-left w-full rounded-2xl bg-terracotta-500/5 border border-terracotta-500/15 px-4 py-3">
+                  <AlertTriangle size={16} className="text-terracotta-400 shrink-0 mt-0.5" />
+                  <p className="text-[11px] text-terracotta-300/80">
+                    This submits an on-chain transaction. You will be asked to sign it in your wallet.
+                  </p>
+                </div>
+
+                <div className="flex w-full gap-3 pt-1">
+                  <button
+                    onClick={() => setConfirmOffer(null)}
+                    disabled={isReclaiming}
+                    className="flex-1 rounded-2xl bg-white/5 hover:bg-white/10 py-4 text-xs font-bold text-white/60 border border-white/10 transition-all disabled:opacity-40"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    data-testid="reclaim-confirm-btn"
+                    onClick={handleReclaim}
+                    disabled={isReclaiming}
+                    className="flex-1 flex items-center justify-center gap-2 rounded-2xl bg-brand-500 hover:bg-brand-400 py-4 text-xs font-bold text-white shadow-xl shadow-brand-500/20 transition-all disabled:opacity-60"
+                  >
+                    {isReclaiming ? <Loader2 size={16} className="animate-spin" /> : <><Coins size={16} /> Confirm Reclaim</>}
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
       </WalletGuard>
     </div>
   );

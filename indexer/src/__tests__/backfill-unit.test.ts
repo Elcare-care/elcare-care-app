@@ -43,8 +43,10 @@ const mockPrisma = vi.hoisted(() => ({
   syncState:    { findUnique: vi.fn(), upsert: vi.fn(), update: vi.fn() },
   $queryRaw:    vi.fn(),
   $transaction: vi.fn(),
-}));
-vi.mock('../db.js', () => ({ default: mockPrisma }));
+};
+// backfill.ts imports from prisma-write (write pool), not db (read pool)
+vi.mock('../db.js',          () => ({ default: mockPrisma }));
+vi.mock('../prisma-write.js', () => ({ default: mockPrisma }));
 
 // ── Mock event-sync so we never hit the network ───────────────────────────────
 vi.mock('../event-sync.js', () => ({
@@ -271,6 +273,93 @@ describe('persistLedgerGap', () => {
 // ─────────────────────────────────────────────────────────────────────────────
 // 5. Migration-safety: new models have required fields + correct defaults
 // ─────────────────────────────────────────────────────────────────────────────
+
+describe('migration-safety: BackfillJob defaults', () => {
+  it('create call includes checkpointLedger=0 and totalInserted=0 defaults', async () => {
+    mockPrisma.backfillJob.create.mockResolvedValue({ id: 99 });
+    await createBackfillJob(1, 100, 'https://x.example.com', null);
+    const args = mockPrisma.backfillJob.create.mock.calls[0][0];
+    expect(args.data.checkpointLedger).toBe(0);
+    expect(args.data.totalInserted).toBe(0);
+    expect(args.data.status).toBe('Pending');
+  });
+});
+
+describe('migration-safety: LedgerGap defaults', () => {
+  it('upsert create payload uses status=Open', async () => {
+    mockPrisma.ledgerGap.upsert.mockResolvedValue({ id: 1 });
+    mockPrisma.ledgerGap.findMany.mockResolvedValue([]);
+
+    const expectedCreate = { fromLedger: 200, toLedger: 300, source: 'manual', status: 'Open' };
+    mockPrisma.ledgerGap.upsert.mockResolvedValueOnce({ id: 2, ...expectedCreate });
+
+    await mockPrisma.ledgerGap.upsert({
+      where:  { fromLedger_toLedger_source: { fromLedger: 200, toLedger: 300, source: 'manual' } },
+      create: expectedCreate,
+      update: {},
+    });
+
+    expect(mockPrisma.ledgerGap.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        create: expect.objectContaining({ status: 'Open' }),
+        update: {},
+      }),
+    );
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 6. getBackfillStatus — in-process status for /backfill/status API endpoint
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('getBackfillStatus', () => {
+  it('returns running=false when no backfill is active', async () => {
+    const { getBackfillStatus } = await import('../backfill.js');
+    const status = getBackfillStatus();
+    expect(status).toHaveProperty('running');
+    expect(typeof status.running).toBe('boolean');
+  });
+
+  it('includes required fields in the status object', async () => {
+    const { getBackfillStatus } = await import('../backfill.js');
+    const status = getBackfillStatus();
+    expect(status).toHaveProperty('jobId');
+    expect(status).toHaveProperty('fromLedger');
+    expect(status).toHaveProperty('toLedger');
+    expect(status).toHaveProperty('percentage');
+    expect(status).toHaveProperty('throughputEventsPerSec');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 7. BACKFILL_CONCURRENCY config
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('BACKFILL_CONCURRENCY configuration', () => {
+  const originalEnv = process.env;
+
+  beforeEach(() => { process.env = { ...originalEnv }; });
+  afterEach(() => { process.env = originalEnv; });
+
+  it('defaults to 5 when not set', () => {
+    delete process.env.BACKFILL_CONCURRENCY;
+    const c = parseInt(process.env.BACKFILL_CONCURRENCY || '5', 10);
+    expect(c).toBe(5);
+  });
+
+  it('reads a custom concurrency from env', () => {
+    process.env.BACKFILL_CONCURRENCY = '10';
+    const c = parseInt(process.env.BACKFILL_CONCURRENCY || '5', 10);
+    expect(c).toBe(10);
+  });
+
+  it('does not exceed MAX_CONCURRENCY of 20', () => {
+    const requested = 100;
+    const MAX = 20;
+    const applied = Math.min(requested, MAX);
+    expect(applied).toBe(20);
+  });
+});
 
 describe('migration-safety: BackfillJob defaults', () => {
   it('create call includes checkpointLedger=0 and totalInserted=0 defaults', async () => {

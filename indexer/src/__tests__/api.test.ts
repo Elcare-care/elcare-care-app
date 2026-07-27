@@ -37,6 +37,8 @@ const mockRedis = vi.hoisted(() => ({
 }));
 
 vi.mock('../db', () => ({ default: mockPrisma }));
+// routes.ts → poller.ts → prisma-write; provide same mock to avoid real DB init
+vi.mock('../prisma-write', () => ({ default: mockPrisma }));
 vi.mock('../redis.js', () => ({ default: mockRedis }));
 
 import router from '../api/routes';
@@ -658,5 +660,70 @@ describe('GET /wallets/:address/royalty-stats — extended', () => {
     // If headers contain ratelimit info, strict limiter is applied
     expect(response.headers['ratelimit-limit']).toBeDefined();
     expect(parseInt(response.headers['ratelimit-limit'])).toBeLessThanOrEqual(100);
+  });
+});
+// ── GET /auctions/:id/blocked-bidders (Issue #199) ────────────────────────────
+
+describe('GET /auctions/:id/blocked-bidders', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  const registryEvent = (id: number, type: string, bidder: string, ledger: number) => ({
+    id,
+    listingId: BigInt(7),
+    eventType: type,
+    actor: bidder,
+    data: { auction_id: '7', bidder },
+    ledgerSequence: ledger,
+    ledgerTimestamp: new Date('2026-01-01T00:00:00Z'),
+    eventHash: `hash-${id}`,
+    contractId: 'CMARKET',
+  });
+
+  it('returns 400 for a non-numeric auction id', async () => {
+    const res = await request(app).get('/auctions/abc/blocked-bidders');
+    expect(res.status).toBe(400);
+  });
+
+  it('returns an empty registry when no block events exist', async () => {
+    mockPrisma.marketplaceEvent.findMany.mockResolvedValue([]);
+    const res = await request(app).get('/auctions/7/blocked-bidders');
+    expect(res.status).toBe(200);
+    expect(res.body.auctionId).toBe('7');
+    expect(res.body.blockedBidders).toEqual([]);
+    expect(res.body.history).toEqual([]);
+  });
+
+  it('replays block/unblock history into the current blocked set', async () => {
+    mockPrisma.marketplaceEvent.findMany.mockResolvedValue([
+      registryEvent(1, 'AUCTION_BIDDER_BLOCKED',   'GSHILL_A', 100),
+      registryEvent(2, 'AUCTION_BIDDER_BLOCKED',   'GSHILL_B', 101),
+      registryEvent(3, 'AUCTION_BIDDER_UNBLOCKED', 'GSHILL_A', 102),
+    ]);
+    const res = await request(app).get('/auctions/7/blocked-bidders');
+    expect(res.status).toBe(200);
+    expect(res.body.blockedBidders).toEqual(['GSHILL_B']);
+    expect(res.body.history).toHaveLength(3);
+  });
+
+  it('keeps an address blocked when it is re-blocked after an unblock', async () => {
+    mockPrisma.marketplaceEvent.findMany.mockResolvedValue([
+      registryEvent(1, 'AUCTION_BIDDER_BLOCKED',   'GSHILL_A', 100),
+      registryEvent(2, 'AUCTION_BIDDER_UNBLOCKED', 'GSHILL_A', 101),
+      registryEvent(3, 'AUCTION_BIDDER_BLOCKED',   'GSHILL_A', 102),
+    ]);
+    const res = await request(app).get('/auctions/7/blocked-bidders');
+    expect(res.body.blockedBidders).toEqual(['GSHILL_A']);
+  });
+
+  it('queries only registry event types in ledger order', async () => {
+    mockPrisma.marketplaceEvent.findMany.mockResolvedValue([]);
+    await request(app).get('/auctions/7/blocked-bidders');
+    expect(mockPrisma.marketplaceEvent.findMany).toHaveBeenCalledWith({
+      where: {
+        listingId: BigInt(7),
+        eventType: { in: ['AUCTION_BIDDER_BLOCKED', 'AUCTION_BIDDER_UNBLOCKED'] },
+      },
+      orderBy: [{ ledgerSequence: 'asc' }, { id: 'asc' }],
+    });
   });
 });

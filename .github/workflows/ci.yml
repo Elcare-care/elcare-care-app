@@ -152,6 +152,8 @@ jobs:
       - name: Run Lint
         run: npm run lint
         working-directory: frontend/elcarehub-app
+      - name: Validate Contract Error Coverage
+        run: node scripts/contract-errors/validate-error-coverage.mjs
       - name: Run Build
         run: npm run build
         working-directory: frontend/elcarehub-app
@@ -214,29 +216,7 @@ jobs:
   indexer-integration:
     name: Indexer Integration Tests
     runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:15-alpine
-        env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: marketplace_indexer_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U postgres"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-      redis:
-        image: redis:7-alpine
-        ports:
-          - 6379:6379
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
+    timeout-minutes: 5
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -257,9 +237,6 @@ jobs:
       - name: Run Integration Tests
         run: npm run test:integration
         working-directory: indexer
-        env:
-          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/marketplace_indexer_test?schema=public
-          REDIS_URL: redis://localhost:6379
 
   indexer:
     name: Build and Test Indexer (${{ matrix.node-version }})
@@ -329,3 +306,17 @@ jobs:
             exit 1
           fi
         working-directory: indexer
+
+  release-validate:
+    name: Release Version Validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Validate Version Consistency
+        run: |
+          bash scripts/validate-compatibility.sh

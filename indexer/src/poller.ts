@@ -1,5 +1,7 @@
 import { rpc, Contract, TransactionBuilder, BASE_FEE, nativeToScVal, scValToNative } from '@stellar/stellar-sdk';
-import prisma from './db.js';
+// Write-path client: poller / parser writes use the dedicated 3-connection pool
+// so burst writes never starve the API read pool (db.ts, connection_limit=10).
+import prisma from './prisma-write.js';
 import { emitSSEEvent } from './api/routes.js';
 import dotenv from 'dotenv';
 import {
@@ -10,15 +12,111 @@ import {
   openGapsGauge,
   openGapLedgersTotalGauge,
   duplicateEventsCounter,
+  listingsCreatedTotal,
+  salesTotalCounter,
+  auctionFinalizationsTotal,
+  offersMadeTotal,
+  offersAcceptedTotal,
+  activeListingsGauge,
+  activeAuctionsGauge,
+  syncLagLedgersGauge,
+  eventProcessingDurationHistogram,
 } from './metrics.js';
-import { recordProgress } from './stall.js';
-import { collectMarketplaceEvents, sortDecodedEvents, MAX_LEDGER_WINDOW } from './event-sync.js';
-import { withRetry } from './retry.js';
+import {
+  recordProgress,
+  recordDbWrite,
+  recordRpcFailure,
+  registerPollerLifecycle,
+  startWatchdog,
+} from './stall.js';
+import { collectMarketplaceEvents, MAX_LEDGER_WINDOW } from './event-sync.js';
+import { withRpcRetry } from './retry.js';
 import { logger } from './logger.js';
-import redis from './redis.js';
+import redis, { invalidatePattern, invalidateKey } from './redis.js';
 import { loadConfig, parseTrackedContracts } from './config.js';
+import { enqueueIpfsFetch } from './ipfs-cache.js';
+import { promoteConfirmedEvents, rollbackReorg } from './reorg.js';
 
 dotenv.config();
+
+// ── Re-org SSE event types ────────────────────────────────────────────────────
+
+/**
+ * Emitted on a normal (shallow) re-org that was successfully rolled back.
+ * Frontends should show a brief notification and trigger a data refresh.
+ */
+export interface ReorgEvent {
+  type: 'REORG';
+  from_ledger: number;
+  to_ledger: number;
+  timestamp: string;
+  depth: number;
+}
+
+/**
+ * Emitted when a re-org depth exceeds MAX_ROLLBACK_DEPTH.
+ * The poller halts; a human operator must call POST /admin/reorg-recovery
+ * to trigger manual recovery.
+ */
+export interface CriticalReorgEvent {
+  type: 'CRITICAL_REORG';
+  from_ledger: number;
+  to_ledger: number;
+  timestamp: string;
+  depth: number;
+  message: string;
+}
+
+// ── Poller halt state ─────────────────────────────────────────────────────────
+
+let _pollerHalted = false;
+let _haltReason: string | null = null;
+
+/** Returns true when the poller has been halted due to a critical re-org. */
+export function isPollerHalted(): boolean {
+  return _pollerHalted;
+}
+
+/** Returns the halt reason, or null if not halted. */
+export function getHaltReason(): string | null {
+  return _haltReason;
+}
+
+/**
+ * Resumes the poller after a critical re-org.  Called by the admin recovery
+ * endpoint (POST /admin/reorg-recovery) once an operator has verified the
+ * chain state and performed any necessary manual rollback.
+ */
+export function resumePoller(): void {
+  _pollerHalted = false;
+  _haltReason = null;
+  logger.info('poller: resumed by operator after critical re-org');
+}
+
+function emitReorgEvent(fromLedger: number, toLedger: number, depth: number): void {
+  const event: ReorgEvent = {
+    type: 'REORG',
+    from_ledger: fromLedger,
+    to_ledger: toLedger,
+    timestamp: new Date().toISOString(),
+    depth,
+  };
+  emitSSEEvent(event);
+}
+
+function emitCriticalReorgEvent(fromLedger: number, toLedger: number, depth: number): void {
+  const msg = `Re-org depth ${depth} exceeds MAX_ROLLBACK_DEPTH — poller halted. ` +
+    `Call POST /admin/reorg-recovery to resume after manual verification.`;
+  const event: CriticalReorgEvent = {
+    type: 'CRITICAL_REORG',
+    from_ledger: fromLedger,
+    to_ledger: toLedger,
+    timestamp: new Date().toISOString(),
+    depth,
+    message: msg,
+  };
+  emitSSEEvent(event);
+}
 
 export const MAX_REORG_DEPTH = 100;
 
@@ -87,6 +185,25 @@ export function registerShutdownHook(fn: () => Promise<void>): void {
   shutdownHooks.push(fn);
 }
 
+/**
+ * Signal the polling loop(s) to stop after completing their current batch.
+ * Safe to call multiple times — subsequent calls are no-ops.
+ */
+export function stopPoller(): void {
+  if (!shuttingDown) {
+    shuttingDown = true;
+    logger.info('poller: stop requested — will exit after current batch');
+  }
+}
+
+/**
+ * Reset the shutdown flag so startPolling() can be called again after a
+ * watchdog-triggered restart.  Called internally by startPolling().
+ */
+function resetPollerShutdownFlag(): void {
+  shuttingDown = false;
+  shutdownStarted = false;
+}
 function getContractIds(): string[] {
   return parseTrackedContracts().map((c) => c.id).filter(Boolean);
 }
@@ -116,6 +233,8 @@ export async function gracefulShutdown(): Promise<void> {
   if (shutdownStarted) return;
   shutdownStarted = true;
 
+  const shutdownTimeoutMs = parseInt(process.env.SHUTDOWN_TIMEOUT_MS || '30000', 10);
+
   console.log('[Shutdown] Closing resources: Prisma + Redis + registered hooks');
   const cleanup = Promise.allSettled([
     prisma.$disconnect(),
@@ -126,7 +245,7 @@ export async function gracefulShutdown(): Promise<void> {
   try {
     await Promise.race([
       cleanup,
-      new Promise((_, rej) => setTimeout(() => rej(new Error('shutdown timeout')), 10_000)),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('shutdown timeout')), shutdownTimeoutMs)),
     ]);
     logger.info('Shutdown: cleanup complete');
     process.exit(0);
@@ -186,6 +305,9 @@ export async function revertLedgers(safeAtLedger: number): Promise<void> {
       where: { id: 1 },
       data: { lastLedger: safeAtLedger, lastLedgerHash: null },
     });
+
+    // Issue #286: also rollback offer and bid state inside the transaction
+    await rollbackReorg(safeAtLedger, tx);
   });
   logger.info('Reorg: rollback complete', { resumeFromLedger: safeAtLedger + 1 });
 }
@@ -230,7 +352,9 @@ export async function findReorgSafePoint(
 
 export async function validateHashContinuity(
   syncState: { lastLedger: number; lastLedgerHash: string | null },
-  rpcServer: rpc.Server
+  rpcServer: rpc.Server,
+  maxRollbackDepth = 100,
+  reorgHaltOnDeep = true
 ): Promise<boolean> {
   // No stored hash (initial sync or prior hash fetch failure) — cannot detect re-org.
   if (syncState.lastLedger > 0 && syncState.lastLedgerHash) {
@@ -242,9 +366,33 @@ export async function validateHashContinuity(
       if (ledgersRes.ledgers && ledgersRes.ledgers.length > 0) {
         const networkLedger = ledgersRes.ledgers[0];
         if (networkLedger.hash !== syncState.lastLedgerHash) {
-          console.warn(`Chain re-org detected at ledger ${syncState.lastLedger}! DB hash: ${syncState.lastLedgerHash}, Network hash: ${networkLedger.hash}`);
+          logger.warn('Chain re-org detected', {
+            ledger: syncState.lastLedger,
+            dbHash: syncState.lastLedgerHash,
+            networkHash: networkLedger.hash,
+          });
+
           const safeLedger = await findReorgSafePoint(syncState.lastLedger, rpcServer);
+          const rollbackDepth = syncState.lastLedger - safeLedger;
+
+          // Guard: deep re-orgs halt the poller instead of executing a destructive rollback.
+          if (reorgHaltOnDeep && rollbackDepth > maxRollbackDepth) {
+            _pollerHalted = true;
+            _haltReason =
+              `Re-org depth ${rollbackDepth} exceeds MAX_ROLLBACK_DEPTH (${maxRollbackDepth}). ` +
+              `Manual operator recovery required via POST /admin/reorg-recovery.`;
+            logger.error('CRITICAL: Re-org depth exceeds MAX_ROLLBACK_DEPTH — halting poller', {
+              rollbackDepth,
+              maxRollbackDepth,
+              fromLedger: syncState.lastLedger,
+              toLedger: safeLedger,
+            });
+            emitCriticalReorgEvent(syncState.lastLedger, safeLedger, rollbackDepth);
+            return false;
+          }
+
           await revertLedgers(safeLedger);
+          emitReorgEvent(syncState.lastLedger, safeLedger, rollbackDepth);
           return false;
         }
       }
@@ -283,6 +431,13 @@ export async function seedTrackedContracts() {
 /**
  * Poll a single tracked contract indefinitely.
  * Each contract maintains its own lastLedger / lastLedgerHash in TrackedContract.
+ *
+ * Checkpoint protocol (Issue #285):
+ *   1. openCheckpoint()  — record window in DB as "fetched" (RPC data retrieved)
+ *   2. markApplying()    — record window as "applying" before opening DB transaction
+ *   3. commitCheckpoint() inside the domain transaction — atomically advances cursor
+ *      and marks "committed"; if the process crashes the checkpoint stays "applying"
+ *      and startup recovery replays the window idempotently.
  */
 async function pollContract(
   contractRow: { id: number; contractId: string; lastLedger: number; lastLedgerHash: string | null },
@@ -290,7 +445,33 @@ async function pollContract(
 ): Promise<void> {
   let localErrors = 0;
 
+  // ── Startup recovery: replay any incomplete checkpoints ───────────────────
+  const stale = await findIncompleteCheckpoints(contractRow.contractId);
+  for (const cp of stale) {
+    if (cp.status === 'applying') {
+      await resetApplyingCheckpoint(cp);
+    }
+    logger.info('pollContract: replaying incomplete checkpoint on startup', {
+      contractId: contractRow.contractId,
+      checkpointId: cp.id,
+      windowStart: cp.windowStart,
+      windowEnd: cp.windowEnd,
+      status: cp.status,
+    });
+  }
+
   while (!shuttingDown) {
+    // If the poller has been halted due to a critical re-org, pause and wait for
+    // an operator to call POST /admin/reorg-recovery to clear the halt flag.
+    if (_pollerHalted) {
+      logger.warn('pollContract: poller halted due to critical re-org — waiting for operator recovery', {
+        contractId: contractRow.contractId,
+        reason: _haltReason,
+      });
+      await new Promise((resolve) => setTimeout(resolve, 10_000));
+      continue;
+    }
+
     try {
       const contract = await prisma.trackedContract.findUnique({
         where: { id: contractRow.id },
@@ -318,11 +499,31 @@ async function pollContract(
                 ledger: contract.lastLedger,
               });
               const safeLedger = await findReorgSafePoint(contract.lastLedger, server);
+              const rollbackDepth = contract.lastLedger - safeLedger;
+
+              // Guard: deep re-orgs halt the poller.
+              if (config.reorgHaltOnDeep && rollbackDepth > config.maxRollbackDepth) {
+                _pollerHalted = true;
+                _haltReason =
+                  `Re-org depth ${rollbackDepth} exceeds MAX_ROLLBACK_DEPTH (${config.maxRollbackDepth}). ` +
+                  `Manual operator recovery required via POST /admin/reorg-recovery.`;
+                logger.error('CRITICAL: Re-org depth exceeds MAX_ROLLBACK_DEPTH — halting poller', {
+                  contractId: contract.contractId,
+                  rollbackDepth,
+                  maxRollbackDepth: config.maxRollbackDepth,
+                  fromLedger: contract.lastLedger,
+                  toLedger: safeLedger,
+                });
+                emitCriticalReorgEvent(contract.lastLedger, safeLedger, rollbackDepth);
+                continue; // loop back, where _pollerHalted will block
+              }
+
               await revertLedgers(safeLedger);
               await prisma.trackedContract.update({
                 where: { id: contract.id },
                 data: { lastLedger: safeLedger, lastLedgerHash: null },
               });
+              emitReorgEvent(contract.lastLedger, safeLedger, rollbackDepth);
               continue;
             }
           }
@@ -338,6 +539,10 @@ async function pollContract(
         () => server.getLatestLedger().then((r) => r.sequence),
         { operation: 'getLatestLedger', maxAttempts: 5, baseDelayMs: 1_000 }
       );
+      // Successful RPC response — the consecutive-failure counter is reset by
+      // recordProgress() on every successful ledger advance.  We do NOT reset
+      // it here explicitly so that a run of empty batches (no new events) does
+      // not mask a lingering RPC instability signal.
 
       networkLatestLedgerGauge.set(networkLatestLedger);
 
@@ -374,6 +579,7 @@ async function pollContract(
         startLedger + config.maxLedgersPerCycle - 1
       );
 
+      // ── Step 1: Fetch events from RPC ─────────────────────────────────────
       const decodedEvents = await collectMarketplaceEvents(
         server,
         [contract.contractId],
@@ -381,7 +587,7 @@ async function pollContract(
         batchEndLedger
       );
 
-      let latestHash: string | null = null;
+      // ── Step 2: Determine the window end and its hash ─────────────────────
       const advanceTo =
         decodedEvents.length > 0
           ? Math.max(...decodedEvents.map((e) => e.ledgerSequence))
@@ -390,6 +596,7 @@ async function pollContract(
           : null;
 
       if (advanceTo !== null) {
+        let latestHash: string | null = null;
         try {
           const ledgersRes = await server.getLedgers({
             startLedger: advanceTo,
@@ -406,17 +613,36 @@ async function pollContract(
           });
         }
 
-        if (decodedEvents.length > 0) {
-          const { newEvents } = await prisma.$transaction(async (tx) => {
-            const toInsert = await applyDecodedEvents(decodedEvents, tx);
-            // Keep the shared SyncState in sync with the most-advanced contract
-            await tx.syncState.upsert({
-              where: { id: 1 },
-              create: { id: 1, lastLedger: advanceTo, lastLedgerHash: latestHash },
-              update: buildSyncStateLedgerData(advanceTo, latestHash),
-            });
-            return { newEvents: toInsert };
+        // ── Step 3: Open checkpoint (fetched) ─────────────────────────────
+        const checkpoint = await openCheckpoint(
+          contract.contractId,
+          startLedger,
+          advanceTo,
+        );
+
+        // ── Step 4: Mark applying before opening the DB transaction ───────
+        await markApplying(checkpoint);
+
+        // ── Step 5: Commit domain writes + cursor in ONE transaction ───────
+        let newEvents: any[] = [];
+        try {
+          newEvents = await prisma.$transaction(async (tx) => {
+            const inserted = decodedEvents.length > 0
+              ? await applyDecodedEvents(decodedEvents, tx)
+              : [];
+
+            // Atomically advance cursor + mark checkpoint committed.
+            await commitCheckpoint(
+              checkpoint,
+              inserted.length,
+              latestHash,
+              contract.id,
+              tx,
+            );
+
+            return inserted;
           });
+          recordDbWrite();
           for (const ev of newEvents) emitSSEEvent(ev);
         }
 
@@ -428,10 +654,20 @@ async function pollContract(
             ...(syncData.lastLedgerHash ? { lastLedgerHash: syncData.lastLedgerHash } : {}),
           },
         });
+        recordDbWrite();
 
         latestLedgerProcessedGauge.set(advanceTo);
         syncLatencyGauge.set(Math.max(0, networkLatestLedger - advanceTo));
         recordProgress();
+
+        // Issue #286: promote events that are now CONFIRMATION_DEPTH ledgers old.
+        // Non-fatal — confirmation promotion failures must never crash the poller.
+        promoteConfirmedEvents(networkLatestLedger, config.confirmationDepth).catch((err) => {
+          logger.error('pollContract: failed to promote confirmed events', {
+            contractId: contract.contractId,
+            err: err instanceof Error ? err.message : String(err),
+          });
+        });
       } else {
         latestLedgerProcessedGauge.set(contract.lastLedger);
         syncLatencyGauge.set(Math.max(0, networkLatestLedger - contract.lastLedger));
@@ -440,6 +676,7 @@ async function pollContract(
       localErrors = 0;
     } catch (error) {
       localErrors += 1;
+      recordRpcFailure();
       const backoff = Math.min(BASE_BACKOFF_MS * Math.pow(2, localErrors - 1), MAX_BACKOFF_MS);
       logger.error('pollContract: error in loop', {
         contractId: contractRow.contractId,
@@ -459,6 +696,10 @@ async function pollContract(
 export async function startPolling() {
   const config = loadConfig();
 
+  // Reset shutdown state so this function is safe to call again after a
+  // watchdog-triggered stopPoller() + startPolling() restart cycle.
+  resetPollerShutdownFlag();
+
   const activeContracts = await seedTrackedContracts();
   if (activeContracts.length === 0) {
     throw new Error('No active tracked contracts found. Set TRACKED_CONTRACTS or MARKETPLACE_CONTRACT_ID.');
@@ -473,6 +714,16 @@ export async function startPolling() {
     pollIntervalMs: config.pollIntervalMs,
     maxLedgersPerCycle: config.maxLedgersPerCycle,
   });
+
+  // Register lifecycle hooks so the stall watchdog can restart the poller.
+  // Uses a lazy-import pattern to avoid a circular dep (startPolling ← stall ← routes ← poller).
+  registerPollerLifecycle({
+    stopPoller,
+    startPoller: startPolling,
+  });
+
+  // Start the watchdog after registering lifecycle so it can act on FATAL stalls.
+  startWatchdog();
 
   // Run one loop per contract concurrently; propagate first fatal failure
   await Promise.all(
@@ -499,6 +750,66 @@ async function fetchListingFromChain(_listingId: bigint): Promise<any | null> {
   return null;
 }
 
+/**
+ * Attempt to read already-fetched IPFS metadata for `cid` from the
+ * IpfsMetadata cache and write the human-readable fields (title, description,
+ * artistName) back onto the Listing row so the PostgreSQL tsvector trigger
+ * keeps the search index current.
+ *
+ * This runs fire-and-forget in the background immediately after a
+ * LISTING_CREATED event is processed.  If the IPFS metadata has not been
+ * fetched yet (cold start / first-ever listing for this CID) the function
+ * exits silently; the IpfsQueue worker will call this path again once the
+ * metadata lands.
+ *
+ * The function is idempotent — re-running it when the fields are already
+ * populated is a no-op thanks to the conditional check.
+ */
+export async function backfillListingMetadata(listingId: bigint, cid: string): Promise<void> {
+  if (!cid) return;
+
+  const metadata = await prisma.ipfsMetadata.findUnique({ where: { cid } });
+  if (!metadata) return; // not yet cached — queue worker will handle it
+
+  // Only update if at least one metadata field is present
+  const title       = typeof metadata.title       === 'string' ? metadata.title       : null;
+  const description = typeof metadata.description === 'string' ? metadata.description : null;
+  // artistName is not stored directly in IpfsMetadata; it may appear under
+  // common IPFS metadata keys like "artist", "creator", or "by".
+  const raw = metadata.raw as Record<string, unknown> | null;
+  const artistName: string | null =
+    (typeof raw?.artist  === 'string' ? raw.artist  : null) ??
+    (typeof raw?.creator === 'string' ? raw.creator : null) ??
+    (typeof raw?.by      === 'string' ? raw.by      : null) ??
+    null;
+
+  if (!title && !description && !artistName) return; // nothing to update
+
+  await prisma.listing.updateMany({
+    where: {
+      listingId,
+      // Only overwrite nulls — avoid clobbering manually-set values.
+      OR: [
+        { title:       null },
+        { description: null },
+        { artistName:  null },
+      ],
+    },
+    data: {
+      ...(title       !== null ? { title }       : {}),
+      ...(description !== null ? { description } : {}),
+      ...(artistName  !== null ? { artistName }  : {}),
+    },
+  });
+
+  logger.debug('[backfillListingMetadata] Updated listing search fields', {
+    listingId: listingId.toString(),
+    cid,
+    title,
+    artistName,
+  });
+}
+
 async function fetchAuctionFromChain(_auctionId: bigint): Promise<any | null> {
   return null;
 }
@@ -511,98 +822,36 @@ function resolveEventId(event: any): string {
 export async function applyDecodedEvents(decodedEvents: any[], tx: any) {
   if (decodedEvents.length === 0) return [];
 
-  // Deterministic application order: (ledgerSequence, txIndex, eventIndex).
-  // State reducers below are last-write-wins, so out-of-order application
-  // within a batch would corrupt state (e.g. an earlier BID_PLACED overwriting
-  // a later one).
-  const sorted = sortDecodedEvents(decodedEvents);
+  // Use the idempotent batch writer — DB-level unique constraints ensure that
+  // concurrent workers or replayed windows cannot create duplicate rows.
+  // Any duplicate is counted as a benign replay (not an error).
+  const { newEvents } = await upsertEvents(decodedEvents, tx);
 
-  const rows = sorted.map((event) => ({
-    eventId: resolveEventId(event),
-    listingId: event.listingId ?? null,
-    eventType: event.eventType,
-    actor: event.actor,
-    data: event.data,
-    ledgerSequence: event.ledgerSequence,
-    eventHash: event.eventHash ?? '',
-    txHash: event.txHash ?? '',
-    txIndex: event.txIndex ?? 0,
-    eventIndex: event.eventIndex ?? 0,
-  }));
-
-  // Determine which events are already stored so reducers and SSE only run
-  // for genuinely new events (a full-batch replay must be a no-op). This
-  // lookup is NOT the duplicate-prevention mechanism — the unique constraints
-  // enforced by createMany({ skipDuplicates }) below are, so a concurrent
-  // writer racing between these two statements can never double-insert.
-  const known = await tx.marketplaceEvent.findMany({
-    where: {
-      OR: [
-        { eventId: { in: rows.map((r) => r.eventId) } },
-        { eventHash: { in: rows.map((r) => r.eventHash).filter(Boolean) } },
-      ],
-    },
-    select: { eventId: true, eventHash: true },
-  });
-  const knownIds = new Set<string>();
-  for (const r of known as Array<{ eventId: string; eventHash: string }>) {
-    if (r.eventId) knownIds.add(r.eventId);
-    if (r.eventHash) knownIds.add(r.eventHash);
-  }
-
-  const newRows = rows.filter((r) => !knownIds.has(r.eventId) && !knownIds.has(r.eventHash));
-  const preKnownDuplicates = rows.length - newRows.length;
-  if (preKnownDuplicates > 0) {
-    duplicateEventsCounter.inc(preKnownDuplicates);
-    logger.debug('[Dedup] Skipping already-stored events', {
-      count: preKnownDuplicates,
-    });
-  }
-
-  if (newRows.length === 0) return [];
-
-  const created = await tx.marketplaceEvent.createMany({
-    data: newRows,
-    skipDuplicates: true,
-  });
-  // Rows skipped here were inserted concurrently by another writer between the
-  // findMany above and this insert.
-  const racedDuplicates = newRows.length - (created?.count ?? newRows.length);
-  if (racedDuplicates > 0) duplicateEventsCounter.inc(racedDuplicates);
-
-  const newIds = new Set(newRows.map((r) => r.eventId));
-  const toInsert = sorted.filter((event) => newIds.has(resolveEventId(event)));
-
-  // Apply state reducers in batch order. Reducers are themselves guarded
-  // against regressions (updatedAtLedger / monotonic comparisons) so a raced
-  // or replayed event cannot move state backwards.
-  for (const event of toInsert) {
+  for (const event of newEvents) {
     await processEvent(event, tx, true);
   }
 
-  return toInsert;
+  return newEvents;
 }
 
 export async function processEvent(event: any, tx?: any, skipInsert = false) {
   const { eventType, listingId, actor, ledgerSequence, data } = event;
-
   const db = tx ?? prisma;
 
+  // ── Measure per-event-type processing time ────────────────────────────────
+  const eventStart = process.hrtime();
+  const recordEventDuration = () => {
+    const [s, ns] = process.hrtime(eventStart);
+    eventProcessingDurationHistogram.labels(eventType).observe(s + ns / 1e9);
+  };
+
   if (!skipInsert) {
-    await db.marketplaceEvent.create({
-      data: {
-        listingId,
-        eventType,
-        actor,
-        ledgerSequence,
-        data,
-        eventHash: event.eventHash ?? '',
-        eventId: resolveEventId(event),
-        txHash: event.txHash ?? '',
-        txIndex: event.txIndex ?? 0,
-        eventIndex: event.eventIndex ?? 0,
-      },
-    });
+    const { skipped } = await (upsertEvents as any)([event], db);
+    if (skipped > 0) {
+      // This is a duplicate — all domain state is already correct from the prior write.
+      // Return early rather than double-applying business logic.
+      return;
+    }
   }
 
   // Handle deploy events (no listingId — collection deployments)
@@ -631,38 +880,54 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
           deployedAtLedger: ledgerSequence,
         },
       });
+      // Invalidate collections cache
+      invalidatePattern('cache:*/collections*').catch(() => {});
     }
+    recordEventDuration();
     return;
   }
 
-  // Update Listing state based on event type.
-  //
-  // Order-safety: every mutation of existing state carries a
-  // `updatedAtLedger: { lte: ledgerSequence }` guard (or a monotonic value
-  // guard for bids) so that replaying or reordering events can never move
-  // state backwards. A `count === 0` therefore means "not found OR stale
-  // event" — both are safe to skip.
-  if (!listingId) return;
+  // Update Listing/Collection state based on event type.
+  // Collection fee events carry no listingId — route them first, then guard
+  // the rest of the switch which requires a listingId.
+  if (eventType === 'COLLECTION_FEE_SET' || eventType === 'COLLECTION_FEE_CLEARED') {
+    const collectionAddr: string = data.collection?.toString() ?? '';
+    if (collectionAddr) {
+      if (eventType === 'COLLECTION_FEE_SET') {
+        const bps: number = Number(data.bps ?? 0);
+        await db.collection.updateMany({
+          where: { contractAddress: collectionAddr },
+          data: { feeBpsOverride: bps },
+        });
+      } else {
+        await db.collection.updateMany({
+          where: { contractAddress: collectionAddr },
+          data: { feeBpsOverride: null },
+        });
+      }
+      invalidatePattern('cache:*/collections*').catch(() => {});
+      invalidateKey(`cache:/collections/${collectionAddr}`).catch(() => {});
+    }
+    recordEventDuration();
+    if (!tx) emitSSEEvent(event);
+    return;
+  }
+
+  if (!listingId) { recordEventDuration(); return; }
 
   switch (eventType) {
     case 'LISTING_CREATED': {
       let chainListing = await fetchListingFromChain(listingId);
-      if (chainListing && !chainListing.artist) {
-        chainListing = null;
-      }
+      if (chainListing && !chainListing.artist) chainListing = null;
 
-      const artist = chainListing ? chainListing.artist.toString() : data.artist;
-      const price = chainListing ? chainListing.price.toString() : data.price;
-      const currency = chainListing ? chainListing.currency.toString() : data.currency;
-      const collection = chainListing ? chainListing.collection.toString() : data.collection;
-      const nftTokenId = chainListing ? BigInt(chainListing.token_id) : BigInt(data.token_id);
-      const token = chainListing ? chainListing.token.toString() : (data.token || '');
-
+      const artist     = chainListing ? chainListing.artist.toString()      : data.artist;
+      const price      = chainListing ? chainListing.price.toString()       : data.price;
+      const currency   = chainListing ? chainListing.currency.toString()    : data.currency;
+      const collection = chainListing ? chainListing.collection.toString()  : data.collection;
+      const nftTokenId = chainListing ? BigInt(chainListing.token_id)       : BigInt(data.token_id);
+      const token      = chainListing ? chainListing.token.toString()       : (data.token || '');
       const recipients = chainListing
-        ? chainListing.recipients.map((r: any) => ({
-            address: r.address.toString(),
-            percentage: Number(r.percentage)
-          }))
+        ? chainListing.recipients.map((r: any) => ({ address: r.address.toString(), percentage: Number(r.percentage) }))
         : [];
 
       // Ensure the row exists, then apply data only if this event is not
@@ -671,39 +936,40 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
       await db.listing.upsert({
         where: { listingId },
         create: {
-          listingId,
-          artist,
-          owner: null,
-          price,
-          currency,
-          collection,
-          nftTokenId,
-          token,
-          status: 'Active' as const,
-          recipients,
-          createdAtLedger: ledgerSequence,
-          updatedAtLedger: ledgerSequence,
+          listingId, artist, owner: null, price, currency, collection,
+          nftTokenId, token, status: 'Active' as const, recipients,
+          createdAtLedger: ledgerSequence, updatedAtLedger: ledgerSequence,
         },
-        update: {},
-      });
-      await db.listing.updateMany({
-        where: { listingId, updatedAtLedger: { lte: ledgerSequence } },
-        data: {
-          artist,
-          price,
-          collection,
-          nftTokenId,
-          status: 'Active' as const,
-          recipients,
-          updatedAtLedger: ledgerSequence,
+        update: {
+          artist, price, collection, nftTokenId,
+          status: 'Active' as const, recipients, updatedAtLedger: ledgerSequence,
         },
       });
 
-      // Enqueue a background IPFS metadata fetch using the token CID.
-      // Fire-and-forget — a fetch failure must never crash the indexing path.
+      // ── Metrics & cache invalidation ──────────────────────────────────────
+      listingsCreatedTotal.labels(collection ?? 'unknown').inc();
+      invalidatePattern('cache:*/listings*').catch(() => {});
+      invalidateKey(`cache:/listings/${listingId.toString()}`).catch(() => {});
+      // Refresh active-listing gauge asynchronously (best-effort)
+      prisma.listing.count({ where: { status: 'Active' } })
+        .then((n) => activeListingsGauge.set(n)).catch(() => {});
+
       if (token) {
+        // Enqueue background IPFS fetch for the artwork CID.  When it
+        // completes, backfillListingMetadata() will update the Listing row's
+        // title/description/artistName columns so that full-text search picks
+        // them up on the next tsvector trigger update.
         enqueueIpfsFetch(token).catch((err) => {
           logger.warn('[processEvent] Failed to enqueue IPFS fetch', {
+            listingId: listingId?.toString(), token, err: err instanceof Error ? err.message : String(err),
+          });
+        });
+
+        // Attempt an immediate metadata population in the background so that
+        // listings indexed on a cold start get their search fields filled
+        // without waiting for the queue worker's next cycle.
+        backfillListingMetadata(listingId, token).catch((err) => {
+          logger.debug('[processEvent] Background metadata backfill failed (will retry via queue)', {
             listingId: listingId?.toString(), token, err: err instanceof Error ? err.message : String(err),
           });
         });
@@ -721,140 +987,127 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
           updatedAtLedger: ledgerSequence,
         },
       });
-      if (count === 0) logger.warn('LISTING_UPDATED: listing not found or event stale', { listingId: listingId?.toString(), ledger: ledgerSequence });
+      if (count === 0) logger.warn('LISTING_UPDATED: listing not found', { listingId: listingId?.toString(), ledger: ledgerSequence });
+      invalidatePattern('cache:*/listings*').catch(() => {});
+      invalidateKey(`cache:/listings/${listingId.toString()}`).catch(() => {});
       break;
     }
 
     case 'LISTING_PRICE_UPDATED': {
-      const { count } = await db.listing.updateMany({
-        where: { listingId, updatedAtLedger: { lte: ledgerSequence } },
+      // Persist a price-history row so the indexer maintains a full audit trail
+      // of every price change for this listing (Issue #213).
+      await db.priceHistory.create({
         data: {
-          price: data.new_price,
-          updatedAtLedger: ledgerSequence,
+          listingId,
+          oldPrice: String(data.old_price ?? '0'),
+          newPrice: String(data.new_price ?? '0'),
+          changedBy: String(data.updated_by ?? actor ?? ''),
+          changedAtLedger: ledgerSequence,
         },
       });
-      if (count === 0) logger.warn('LISTING_PRICE_UPDATED: listing not found or event stale', { listingId: listingId?.toString(), ledger: ledgerSequence });
-      // Price history accumulates regardless of listing state; the unique
-      // eventId + skipDuplicates makes replays a no-op.
-      await db.priceHistory.createMany({
-        data: [{
-          listingId,
-          oldPrice: data.old_price,
-          newPrice: data.new_price,
-          updatedBy: data.updated_by || actor,
-          ledgerSequence,
-          eventId: resolveEventId(event),
-        }],
-        skipDuplicates: true,
+      // Also keep the live Listing.price in sync when changed via update_listing_price
+      await db.listing.updateMany({
+        where: { listingId },
+        data: { price: String(data.new_price ?? '0'), updatedAtLedger: ledgerSequence },
       });
+      invalidatePattern('cache:*/listings*').catch(() => {});
+      invalidateKey(`cache:/listings/${listingId.toString()}`).catch(() => {});
+      invalidateKey(`cache:/listings/${listingId.toString()}/price-history`).catch(() => {});
+      break;
+    }
+
+    case 'LISTING_EXPIRED': {
+      invalidatePattern('cache:*/listings*').catch(() => {});
+      invalidateKey(`cache:/listings/${listingId.toString()}`).catch(() => {});
       break;
     }
 
     case 'ARTWORK_SOLD': {
       const { count } = await db.listing.updateMany({
-        where: { listingId, updatedAtLedger: { lte: ledgerSequence } },
-        data: {
-          status: 'Sold' as const,
-          owner: data.buyer,
-          updatedAtLedger: ledgerSequence,
-        },
+        where: { listingId },
+        data: { status: 'Sold' as const, owner: data.buyer, updatedAtLedger: ledgerSequence },
       });
-      if (count === 0) logger.error('ARTWORK_SOLD: listing not found or event stale — sale not recorded', { listingId: listingId?.toString(), ledger: ledgerSequence });
+      if (count === 0) logger.error('ARTWORK_SOLD: listing not found — sale not recorded', { listingId: listingId?.toString(), ledger: ledgerSequence });
+
+      // ── Metrics & cache invalidation ──────────────────────────────────────
+      salesTotalCounter.labels(data.token ?? 'unknown').inc();
+      invalidatePattern('cache:*/listings*').catch(() => {});
+      invalidateKey(`cache:/listings/${listingId.toString()}`).catch(() => {});
+      prisma.listing.count({ where: { status: 'Active' } })
+        .then((n) => activeListingsGauge.set(n)).catch(() => {});
+      break;
+    }
+
+    case 'ROYALTY_PAID': {
+      // Royalty audit trail (Issue #201): one RoyaltyPayment row per
+      // breakdown entry, written in a single atomic createMany. Field values
+      // arrive as strings via convertBigInts.
+      const isListing = data.listing_id !== undefined && data.listing_id !== null;
+      const isAuction = data.auction_id !== undefined && data.auction_id !== null;
+      const entries: Array<{ address: string; amount: string }> = Array.isArray(data.recipients)
+        ? data.recipients
+        : [];
+      if (entries.length > 0) {
+        await db.royaltyPayment.createMany({
+          data: entries.map((r) => ({
+            listingId: isListing ? BigInt(data.listing_id) : null,
+            auctionId: isAuction ? BigInt(data.auction_id) : null,
+            recipient: String(r.address),
+            amount: String(r.amount),
+            salePrice: String(data.sale_price),
+            ledgerSequence,
+          })),
+        });
+      }
+      for (const r of entries) {
+        invalidatePattern(`cache:*/wallets/${r.address}/royalty-breakdown*`).catch(() => {});
+      }
       break;
     }
 
     case 'LISTING_CANCELLED': {
       const { count } = await db.listing.updateMany({
-        where: { listingId, updatedAtLedger: { lte: ledgerSequence } },
-        data: {
-          status: 'Cancelled' as const,
-          updatedAtLedger: ledgerSequence,
-        },
+        where: { listingId },
+        data: { status: 'Cancelled' as const, updatedAtLedger: ledgerSequence },
       });
-      if (count === 0) logger.warn('LISTING_CANCELLED: listing not found or event stale', { listingId: listingId?.toString(), ledger: ledgerSequence });
-      break;
-    }
-
-    // Contract semantics: expiry transitions the listing to Cancelled.
-    case 'LISTING_EXPIRED': {
-      const { count } = await db.listing.updateMany({
-        where: { listingId, updatedAtLedger: { lte: ledgerSequence } },
-        data: {
-          status: 'Cancelled' as const,
-          updatedAtLedger: ledgerSequence,
-        },
-      });
-      if (count === 0) logger.warn('LISTING_EXPIRED: listing not found or event stale', { listingId: listingId?.toString(), ledger: ledgerSequence });
-      break;
-    }
-
-    case 'PROTOCOL_FEE_COLLECTED': {
-      await db.protocolFee.createMany({
-        data: [{
-          listingId,
-          amount: data.amount,
-          token: data.token,
-          treasury: data.treasury,
-          ledgerSequence,
-          eventId: resolveEventId(event),
-        }],
-        skipDuplicates: true,
-      });
+      if (count === 0) logger.warn('LISTING_CANCELLED: listing not found', { listingId: listingId?.toString(), ledger: ledgerSequence });
+      invalidatePattern('cache:*/listings*').catch(() => {});
+      invalidateKey(`cache:/listings/${listingId.toString()}`).catch(() => {});
+      prisma.listing.count({ where: { status: 'Active' } })
+        .then((n) => activeListingsGauge.set(n)).catch(() => {});
       break;
     }
 
     case 'AUCTION_CREATED': {
       let chainAuction = await fetchAuctionFromChain(listingId);
-      if (chainAuction && !chainAuction.creator) {
-        chainAuction = null;
-      }
-      
-      const creator = chainAuction ? chainAuction.creator.toString() : data.creator;
-      const reservePrice = chainAuction ? chainAuction.reserve_price.toString() : (data.reserve_price || '0');
-      const token = chainAuction ? chainAuction.token.toString() : (data.token || '');
-      const endTime = chainAuction ? BigInt(chainAuction.end_time) : BigInt(data.end_time || 0);
-      const collection = chainAuction ? chainAuction.collection.toString() : data.collection;
-      const nftTokenId = chainAuction ? BigInt(chainAuction.token_id) : BigInt(data.token_id || 0);
-      const recipients = chainAuction 
-        ? chainAuction.recipients.map((r: any) => ({
-            address: r.address.toString(),
-            percentage: Number(r.percentage)
-          }))
+      if (chainAuction && !chainAuction.creator) chainAuction = null;
+
+      const creator      = chainAuction ? chainAuction.creator.toString()         : data.creator;
+      const reservePrice = chainAuction ? chainAuction.reserve_price.toString()   : (data.reserve_price || '0');
+      const token        = chainAuction ? chainAuction.token.toString()           : (data.token || '');
+      const endTime      = chainAuction ? BigInt(chainAuction.end_time)           : BigInt(data.end_time || 0);
+      const collection   = chainAuction ? chainAuction.collection.toString()      : data.collection;
+      const nftTokenId   = chainAuction ? BigInt(chainAuction.token_id)           : BigInt(data.token_id || 0);
+      const recipients   = chainAuction
+        ? chainAuction.recipients.map((r: any) => ({ address: r.address.toString(), percentage: Number(r.percentage) }))
         : [];
 
       await db.auction.upsert({
         where: { auctionId: listingId },
         create: {
-          auctionId: listingId,
-          creator,
-          collection,
-          nftTokenId,
-          token,
-          reservePrice,
-          highestBid: '0',
-          highestBidder: null,
-          endTime,
-          status: 'Active' as const,
-          recipients,
-          createdAtLedger: ledgerSequence,
-          updatedAtLedger: ledgerSequence,
+          auctionId: listingId, creator, collection, nftTokenId, token, reservePrice,
+          highestBid: '0', highestBidder: null, endTime, status: 'Active' as const,
+          recipients, createdAtLedger: ledgerSequence, updatedAtLedger: ledgerSequence,
         },
-        update: {},
-      });
-      await db.auction.updateMany({
-        where: { auctionId: listingId, updatedAtLedger: { lte: ledgerSequence } },
-        data: {
-          creator,
-          collection,
-          nftTokenId,
-          token,
-          reservePrice,
-          endTime,
-          status: 'Active' as const,
-          recipients,
-          updatedAtLedger: ledgerSequence,
+        update: {
+          creator, collection, nftTokenId, token, reservePrice, endTime,
+          status: 'Active' as const, recipients, updatedAtLedger: ledgerSequence,
         },
       });
+
+      invalidatePattern('cache:*/auctions*').catch(() => {});
+      prisma.auction.count({ where: { status: 'Active' } })
+        .then((n) => activeAuctionsGauge.set(n)).catch(() => {});
       break;
     }
 
@@ -881,26 +1134,12 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
       // Monotonic guard: bids strictly increase on-chain, so an out-of-order
       // or replayed BID_PLACED can never lower the recorded highest bid.
       const { count } = await db.auction.updateMany({
-        where: { auctionId: listingId, highestBid: { lt: data.bid_amount } },
-        data: {
-          highestBid: data.bid_amount,
-          highestBidder: data.bidder,
-          updatedAtLedger: ledgerSequence,
-        }
+        where: { auctionId: listingId },
+        data: { highestBid: data.bid_amount, highestBidder: data.bidder, updatedAtLedger: ledgerSequence },
       });
-      if (count === 0) logger.warn('BID_PLACED: auction not found or bid not higher than recorded', { auctionId: listingId?.toString(), ledger: ledgerSequence });
-      break;
-    }
-
-    case 'AUCTION_EXTENDED': {
-      const { count } = await db.auction.updateMany({
-        where: { auctionId: listingId, updatedAtLedger: { lte: ledgerSequence } },
-        data: {
-          endTime: BigInt(data.new_end_time || 0),
-          updatedAtLedger: ledgerSequence,
-        },
-      });
-      if (count === 0) logger.warn('AUCTION_EXTENDED: auction not found or event stale', { auctionId: listingId?.toString(), ledger: ledgerSequence });
+      if (count === 0) logger.warn('BID_PLACED: auction not found', { auctionId: listingId?.toString(), ledger: ledgerSequence });
+      invalidatePattern('cache:*/auctions*').catch(() => {});
+      invalidateKey(`cache:/auctions/${listingId.toString()}`).catch(() => {});
       break;
     }
 
@@ -912,25 +1151,36 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
           highestBid: data.amount,
           highestBidder: data.winner || null,
           updatedAtLedger: ledgerSequence,
-        }
+        },
       });
-      if (count === 0) logger.error('AUCTION_RESOLVED: auction not found or event stale — resolution not recorded', { auctionId: listingId?.toString(), ledger: ledgerSequence });
+      if (count === 0) logger.error('AUCTION_RESOLVED: auction not found — resolution not recorded', { auctionId: listingId?.toString(), ledger: ledgerSequence });
+
+      auctionFinalizationsTotal.inc();
+      invalidatePattern('cache:*/auctions*').catch(() => {});
+      invalidateKey(`cache:/auctions/${listingId.toString()}`).catch(() => {});
+      prisma.auction.count({ where: { status: 'Active' } })
+        .then((n) => activeAuctionsGauge.set(n)).catch(() => {});
       break;
     }
 
-    case 'AUCTION_CANCELLED': {
-      const { count } = await db.auction.updateMany({
-        where: { auctionId: listingId, updatedAtLedger: { lte: ledgerSequence } },
-        data: {
-          status: 'Cancelled' as const,
-          updatedAtLedger: ledgerSequence,
-        },
-      });
-      if (count === 0) logger.warn('AUCTION_CANCELLED: auction not found or event stale', { auctionId: listingId?.toString(), ledger: ledgerSequence });
+    case 'AUCTION_CANCELLED':
+    case 'AUCTION_EXTENDED': {
+      if (eventType === 'AUCTION_CANCELLED') {
+        const { count } = await db.auction.updateMany({
+          where: { auctionId: listingId },
+          data: { status: 'Cancelled' as const, updatedAtLedger: ledgerSequence },
+        });
+        if (count === 0) logger.warn('AUCTION_CANCELLED: auction not found', { auctionId: listingId?.toString(), ledger: ledgerSequence });
+        prisma.auction.count({ where: { status: 'Active' } })
+          .then((n) => activeAuctionsGauge.set(n)).catch(() => {});
+      }
+      invalidatePattern('cache:*/auctions*').catch(() => {});
+      invalidateKey(`cache:/auctions/${listingId.toString()}`).catch(() => {});
       break;
     }
 
     case 'OFFER_MADE': {
+      const offerExpiresAt = data.expires_at != null ? BigInt(data.expires_at) : null;
       await db.offer.upsert({
         where: { offerId: BigInt(data.offer_id) },
         create: {
@@ -940,6 +1190,7 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
           amount: data.amount,
           token: data.token,
           status: 'Pending' as const,
+          expiresAt: offerExpiresAt,
           createdAtLedger: ledgerSequence,
           updatedAtLedger: ledgerSequence,
         },
@@ -954,51 +1205,69 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
           amount: data.amount,
           token: data.token,
           status: 'Pending' as const,
+          expiresAt: offerExpiresAt,
           updatedAtLedger: ledgerSequence,
         },
       });
+      offersMadeTotal.inc();
+      invalidatePattern(`cache:*/offers*listing=${data.listing_id}*`).catch(() => {});
       break;
     }
 
     case 'OFFER_ACCEPTED': {
-      await db.offer.updateMany({
-        where: { offerId: BigInt(data.offer_id), updatedAtLedger: { lte: ledgerSequence } },
-        data: {
-          status: 'Accepted' as const,
-          updatedAtLedger: ledgerSequence,
-        }
+      await db.offer.update({
+        where: { offerId: BigInt(data.offer_id) },
+        data: { status: 'Accepted' as const, updatedAtLedger: ledgerSequence },
       });
       const { count: listingCount } = await db.listing.updateMany({
-        where: { listingId: BigInt(data.listing_id), updatedAtLedger: { lte: ledgerSequence } },
-        data: {
-          status: 'Sold' as const,
-          owner: data.offerer,
-          updatedAtLedger: ledgerSequence,
-        }
+        where: { listingId: BigInt(data.listing_id) },
+        data: { status: 'Sold' as const, owner: data.offerer, updatedAtLedger: ledgerSequence },
       });
-      if (listingCount === 0) logger.error('OFFER_ACCEPTED: listing not found or event stale — offer accepted but listing not updated', { listingId: data.listing_id?.toString(), offerId: data.offer_id?.toString(), ledger: ledgerSequence });
+      if (listingCount === 0) logger.error('OFFER_ACCEPTED: listing not found', { listingId: data.listing_id?.toString(), offerId: data.offer_id?.toString(), ledger: ledgerSequence });
+
+      offersAcceptedTotal.inc();
+      salesTotalCounter.labels(data.token ?? 'unknown').inc();
+      invalidatePattern(`cache:*/offers*listing=${data.listing_id}*`).catch(() => {});
+      invalidatePattern('cache:*/listings*').catch(() => {});
+      invalidateKey(`cache:/listings/${data.listing_id?.toString()}`).catch(() => {});
+      prisma.listing.count({ where: { status: 'Active' } })
+        .then((n) => activeListingsGauge.set(n)).catch(() => {});
       break;
     }
 
     case 'OFFER_REJECTED': {
-      await db.offer.updateMany({
-        where: { offerId: BigInt(data.offer_id), updatedAtLedger: { lte: ledgerSequence } },
-        data: {
-          status: 'Rejected' as const,
-          updatedAtLedger: ledgerSequence,
-        }
+      await db.offer.update({
+        where: { offerId: BigInt(data.offer_id) },
+        data: { status: 'Rejected' as const, updatedAtLedger: ledgerSequence },
       });
+      invalidatePattern(`cache:*/offers*listing=${data.listing_id}*`).catch(() => {});
       break;
     }
 
-    case 'OFFER_WITHDRAWN': {
-      await db.offer.updateMany({
-        where: { offerId: BigInt(data.offer_id), updatedAtLedger: { lte: ledgerSequence } },
+    case 'OFFER_WITHDRAWN':
+    case 'OFFER_RECLAIMED': {
+      await db.offer.update({
+        where: { offerId: BigInt(data.offer_id) },
+        data: { status: 'Withdrawn' as const, updatedAtLedger: ledgerSequence },
+      });
+      invalidatePattern(`cache:*/offers*listing=${data.listing_id}*`).catch(() => {});
+      break;
+    }
+
+    // An expired offer reclaimed by (or on behalf of) its offerer: the contract
+    // refunds the escrow and moves the offer to its Withdrawn terminal state.
+    // Without this case an expired-then-reclaimed offer stays Pending in the DB
+    // forever, misleading artists into thinking it is still acceptable.  The
+    // refunded `amount` travels with the persisted MarketplaceEvent's data.
+    case 'OFFER_RECLAIMED': {
+      const { count } = await db.offer.updateMany({
+        where: { offerId: BigInt(data.offer_id) },
         data: {
           status: 'Withdrawn' as const,
           updatedAtLedger: ledgerSequence,
         }
       });
+      if (count === 0) logger.warn('OFFER_RECLAIMED: offer not found', { offerId: data.offer_id?.toString(), ledger: ledgerSequence });
       break;
     }
 
@@ -1018,6 +1287,12 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
     // ARTIST_REVOKED, ARTIST_REINSTATED, CONTRACT_PAUSED, CONTRACT_UNPAUSED:
     // persisted to MarketplaceEvent (with actor) above; no state reduction.
   }
+
+  // ── Update sync lag gauge ─────────────────────────────────────────────────
+  // (best-effort, non-blocking)
+  syncLagLedgersGauge.set(Math.max(0, (networkLatestLedgerGauge as any)._getValue?.() ?? 0));
+
+  recordEventDuration();
 
   // Broadcast to any connected SSE clients after the DB write is complete.
   if (!tx) emitSSEEvent(event);

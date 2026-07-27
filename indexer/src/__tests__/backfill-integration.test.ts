@@ -81,8 +81,10 @@ const mockDb = vi.hoisted(() => ({
   },
   $queryRaw:    vi.fn(),
   $transaction: vi.fn(),
-}));
-vi.mock('../db.js', () => ({ default: mockDb }));
+};
+// backfill.ts and gap-repair.ts import from prisma-write (write pool)
+vi.mock('../db.js',         () => ({ default: mockDb }));
+vi.mock('../prisma-write.js', () => ({ default: mockDb }));
 
 // ── Mock collectMarketplaceEvents ─────────────────────────────────────────────
 const mockCollect = vi.hoisted(() => vi.fn().mockResolvedValue([]));

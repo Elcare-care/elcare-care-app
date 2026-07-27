@@ -1,5 +1,6 @@
 import { xdr, Address, scValToNative } from '@stellar/stellar-sdk';
 import { createHash } from 'crypto';
+import { SCHEMA_REGISTRY, decodeWithSchema, type DecodeResult } from './event-schemas.js';
 
 export interface DecodedEvent {
   eventType: string;
@@ -38,31 +39,38 @@ export function computeEventHash(
 // Covers all 24 symbols in contracts/soroban-marketplace/src/events.rs plus
 // the 4 launchpad deploy symbols.
 const TOPIC_MAP: Record<string, string> = {
-  'lst_crtd': 'LISTING_CREATED',
-  'art_sold': 'ARTWORK_SOLD',
-  'lst_cncl': 'LISTING_CANCELLED',
-  'lst_updt': 'LISTING_UPDATED',
-  'lst_pru': 'LISTING_PRICE_UPDATED',
-  'lst_expd': 'LISTING_EXPIRED',
-  'bid_plcd': 'BID_PLACED',
-  'auc_rslv': 'AUCTION_RESOLVED',
-  'auc_cncl': 'AUCTION_CANCELLED',
-  'auc_ext': 'AUCTION_EXTENDED',
-  'ofr_made': 'OFFER_MADE',
-  'ofr_accp': 'OFFER_ACCEPTED',
-  'ofr_rjct': 'OFFER_REJECTED',
-  'ofr_wdrn': 'OFFER_WITHDRAWN',
-  'ofr_rclm': 'OFFER_RECLAIMED',
-  'roy_paid': 'ROYALTY_PAID',
-  'fee_cltd': 'PROTOCOL_FEE_COLLECTED',
-  'adm_prop': 'ADMIN_TRANSFER_PROPOSED',
-  'adm_xfrd': 'ADMIN_TRANSFERRED',
-  'art_rvkd': 'ARTIST_REVOKED',
-  'art_rnst': 'ARTIST_REINSTATED',
-  'ctr_psd': 'CONTRACT_PAUSED',
-  'ctr_unpsd': 'CONTRACT_UNPAUSED',
-  'auc_crtd': 'AUCTION_CREATED',
-  'dep_n721': 'DEPLOY_NORMAL_721',
+  'listing_created':  'LISTING_CREATED',
+  'artwork_sold':  'ARTWORK_SOLD',
+  'listing_cancelled':  'LISTING_CANCELLED',
+  'listing_updated':  'LISTING_UPDATED',
+  'listing_price_updated':   'LISTING_PRICE_UPDATED',
+  'listing_expired':  'LISTING_EXPIRED',
+  'bid_placed':  'BID_PLACED',
+  'auction_resolved':  'AUCTION_RESOLVED',
+  'auction_cancelled':  'AUCTION_CANCELLED',
+  'auction_created':  'AUCTION_CREATED',
+  'auction_extended':   'AUCTION_EXTENDED',
+  'offer_made':  'OFFER_MADE',
+  'offer_accepted':  'OFFER_ACCEPTED',
+  'offer_rejected':  'OFFER_REJECTED',
+  'offer_withdrawn':  'OFFER_WITHDRAWN',
+  'offer_reclaimed':  'OFFER_RECLAIMED',
+  'royalty_paid':  'ROYALTY_PAID',
+  'protocol_fee_collected':  'PROTOCOL_FEE_COLLECTED',
+  'artist_revoked':  'ARTIST_REVOKED',
+  'artist_reinstated':  'ARTIST_REINSTATED',
+  'admin_transfer_proposed':  'ADMIN_TRANSFER_PROPOSED',
+  'admin_transferred':  'ADMIN_TRANSFERRED',
+  'admin_proposal_cancelled':  'ADMIN_PROPOSAL_CANCELLED',
+  'contract_paused':   'CONTRACT_PAUSED',
+  'contract_unpaused': 'CONTRACT_UNPAUSED',
+  // Granular pause events (Issue #205)
+  'collection_paused':   'COLLECTION_PAUSED',
+  'collection_unpaused': 'COLLECTION_UNPAUSED',
+  'function_paused':     'FUNCTION_PAUSED',
+  'function_unpaused':   'FUNCTION_UNPAUSED',
+  // Launchpad deploy events (topics[0] = "deploy", topics[1] = kind tag)
+  'dep_n721':  'DEPLOY_NORMAL_721',
   'dep_n1155': 'DEPLOY_NORMAL_1155',
   'dep_l721':  'DEPLOY_LAZY_721',
   'dep_l1155': 'DEPLOY_LAZY_1155',
@@ -139,9 +147,55 @@ export function parseMarketplaceEvent(
   const rawVal = xdr.ScVal.fromXDR(valueXdr, 'base64');
   const nativeData = scValToNative(rawVal);
 
-  const listingId = extractListingId(nativeData);
-  const actor = extractActor(type, nativeData);
-  const eventHash = computeEventHash(contractId, ledger, txHash, eventIndex);
+  // ── Schema-driven validation ──────────────────────────────────────────────
+  const schema = SCHEMA_REGISTRY.get(type);
+  if (schema) {
+    const result = decodeWithSchema(type, schema, nativeData);
+    if (!result.ok) {
+      // Surface as a SchemaDecodeError so event-sync.ts can classify it with
+      // the per-event-type Prometheus label before skipping this event.
+      throw new SchemaDecodeError(type, result.reason, result.raw);
+    }
+  }
+
+  // ── Shared field extraction ───────────────────────────────────────────────
+  const obj = nativeData as Record<string, unknown>;
+
+  let listingId: bigint | null = null;
+  if (obj.listing_id !== undefined && obj.listing_id !== null) {
+    listingId = BigInt(obj.listing_id as bigint | number | string);
+  } else if (obj.auction_id !== undefined && obj.auction_id !== null) {
+    listingId = BigInt(obj.auction_id as bigint | number | string);
+  }
+
+  let actor = '';
+  if (obj.artist)   actor = String(obj.artist);
+  else if (obj.creator)  actor = String(obj.creator);
+  else if (obj.offerer)  actor = String(obj.offerer);
+  else if (obj.bidder)   actor = String(obj.bidder);
+  else if (obj.buyer)    actor = String(obj.buyer);
+  // Collection fee events carry no personal actor — use the collection address
+  // as a stable identifier so the MarketplaceEvent.actor column is never empty.
+  else if (obj.collection) actor = String(obj.collection);
+
+  // For deploy events the value is a 2-tuple [creator, contract_address]
+  if (
+    type === 'DEPLOY_NORMAL_721' ||
+    type === 'DEPLOY_NORMAL_1155' ||
+    type === 'DEPLOY_LAZY_721' ||
+    type === 'DEPLOY_LAZY_1155'
+  ) {
+    if (Array.isArray(nativeData) && nativeData.length >= 2) {
+      actor = String(nativeData[0]);
+    }
+    return {
+      eventType: type,
+      listingId: null,
+      actor,
+      ledgerSequence: ledger,
+      data: convertBigInts(nativeData),
+    };
+  }
 
   return {
     eventType: type,

@@ -77,6 +77,44 @@ pub enum MarketplaceError {
     PriceOutOfBounds = 39,
     /// A checked arithmetic operation overflowed while computing fee splits.
     ArithmeticOverflow = 40,
+    /// `accept_admin` was called after the pending admin proposal's `expires_at`
+    /// ledger timestamp has passed.  The proposal must be re-issued.
+    ///
+    /// NOTE: Issue #202 suggested discriminant 35, but 35/36 are already taken
+    /// (`OfferLimitReached`/`BatchTooLarge`); the next free codes 41/42 are used
+    /// instead so existing on-chain error codes are not renumbered.
+    AdminProposalExpired = 41,
+    /// `accept_admin` or `cancel_admin_proposal` was called when no admin
+    /// proposal is currently pending.
+    NoAdminProposalPending = 42,
+    /// A royalty `Recipient` has a `percentage` of zero basis points.
+    /// Every recipient in the list must contribute a non-zero share so that
+    /// the list cannot contain dead-weight entries that waste gas on every
+    /// settlement.
+    ZeroRecipientBps = 43,
+    /// The recipient list contains a duplicate address.  Each address may
+    /// appear at most once so payouts are unambiguous and the total bps
+    /// calculation cannot be confused by double-counting.
+    DuplicateRecipient = 44,
+    /// `admin_cancel_auction` was called on an auction that is not Active, or
+    /// `refund_losing_bid` was called on an auction that is not in a state
+    /// that permits refunds.
+    InvalidAuctionState = 45,
+    /// A bidder attempted to call `refund_losing_bid` for an auction where
+    /// they are the current highest bidder (their funds are still locked as
+    /// the winning escrow) or they have no bid to refund.
+    NoBidToRefund = 46,
+    /// The anti-sniping extension window is zero or would overflow the auction
+    /// end time.
+    InvalidExtensionWindow = 47,
+    /// The auction has reached its `max_extensions` cap and can no longer be
+    /// extended by the anti-sniping logic.
+    MaxExtensionsReached = 48,
+    /// `escrow_nft` was called by an account that does not own the token.
+    NotTokenOwner = 49,
+    /// The token is already held in marketplace escrow for another listing
+    /// or auction (double-listing guard).
+    TokenAlreadyEscrowed = 50,
 }
 
 #[contracttype]
@@ -104,6 +142,27 @@ pub struct Recipient {
     pub address: Address,
     /// Share expressed in basis points (0 – 10 000).
     pub percentage: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct BatchCreateListingInput {
+    pub price: i128,
+    pub currency: Symbol,
+    pub token: Address,
+    pub collection: Address,
+    pub token_id: u64,
+    pub recipients: soroban_sdk::Vec<Recipient>,
+    pub expires_at: Option<u64>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct BatchUpdateListingInput {
+    pub listing_id: u64,
+    pub new_price: i128,
+    pub new_token: Address,
+    pub new_recipients: soroban_sdk::Vec<Recipient>,
 }
 
 #[contracttype]
@@ -150,6 +209,21 @@ pub struct Auction {
     pub extension_window: u64,
     pub extension_trigger: u64,
     pub protocol_fee_bps: u32,
+    /// Bid-history ring-buffer capacity snapshotted at auction creation time.
+    ///
+    /// Snapshotting here means a later admin change to the global
+    /// `BidHistoryCap` never retroactively shrinks or grows the history of
+    /// an already-running auction — each auction's ring-buffer behaviour is
+    /// fixed when it is created.
+    ///
+    /// Valid range: 1 – 200 (enforced by `set_bid_history_cap`).
+    pub bid_history_cap: u32,
+    /// Maximum number of times this auction's end time may be extended by
+    /// the anti-sniping logic.  0 = unlimited (legacy behaviour).
+    /// Snapshotted from the global `max_extensions` setting at creation time.
+    pub max_extensions: u32,
+    /// Running count of extensions applied so far.
+    pub extension_count: u32,
 }
 
 #[contracttype]

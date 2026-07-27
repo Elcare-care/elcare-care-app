@@ -4,7 +4,7 @@
 
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import {
   getOffer,
   getOffererOffers,
@@ -12,6 +12,7 @@ import {
   getArtistListings,
   getListing,
   withdrawOffer,
+  reclaimOffer,
   acceptOffer,
   rejectOffer,
   makeOffer,
@@ -20,6 +21,11 @@ import {
 } from "@/lib/contract";
 import { getReadableErrorMessage } from "@/lib/errors";
 import { useTransientErrorToast } from "./useTransientErrorToast";
+import {
+  useReconciliation,
+  generatePendingId,
+  type ConfirmedSnapshot,
+} from "./useReconciliation";
 import { useTxToast } from "./useTxToast";
 
 // ── useOffererOffers ─────────────────────────────────────────
@@ -186,6 +192,26 @@ export function useWithdrawOffer(publicKey: string | null) {
   return { withdraw, isWithdrawing, error: null };
 }
 
+// ── useReclaimOffer ──────────────────────────────────────────
+
+export function useReclaimOffer(publicKey: string | null) {
+  const { run, isRunning: isReclaiming } = useTxToast();
+
+  const reclaim = useCallback(
+    async (offerId: number): Promise<boolean> => {
+      if (!publicKey) return false;
+      const result = await run(
+        () => reclaimOffer(publicKey, offerId),
+        { action: "Reclaim offer funds" }
+      );
+      return result !== null;
+    },
+    [publicKey, run]
+  );
+
+  return { reclaim, isReclaiming, error: null };
+}
+
 // ── useAcceptOffer ───────────────────────────────────────────
 
 export function useAcceptOffer(publicKey: string | null) {
@@ -246,3 +272,65 @@ export function useMakeOffer(publicKey: string | null) {
   return { make, isOffering, error: null };
 }
 
+
+// ── useOffersWithReconciliation (Issue #302) ──────────────────────────────────
+//
+// Wraps useOffererOffers with provisional state so the UI can display a
+// "pending" badge on an offer while its transaction is in-flight, and
+// roll back to the confirmed snapshot if the tx fails.
+
+export function useOffersWithReconciliation(publicKey: string | null) {
+  const offersHook = useOffererOffers(publicKey);
+  const recon = useReconciliation<OffererOffer>({ mutationTtlMs: 60_000 });
+
+  const prevRef = useRef<OffererOffer[]>([]);
+  useEffect(() => {
+    if (offersHook.offers === prevRef.current) return;
+    prevRef.current = offersHook.offers;
+
+    const snapshots: ConfirmedSnapshot<OffererOffer>[] = offersHook.offers.map((o) => ({
+      resourceId: String(o.offer_id),
+      data: o,
+      ledger: (o as any).updatedAtLedger ?? 0,
+    }));
+    recon.applyConfirmedData(snapshots);
+  }, [offersHook.offers]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  /**
+   * Tag an offer mutation as pending immediately after tx submission.
+   * Returns a pendingId that can be used to resolve or reject later.
+   */
+  const addOfferMutation = useCallback(
+    (
+      action: "make" | "withdraw" | "accept" | "reject" | "reclaim",
+      offer: OffererOffer,
+      txHash: string | null = null
+    ): string => {
+      const pendingId = generatePendingId(`offer-${action}`);
+      recon.addMutation({
+        pendingId,
+        txHash,
+        kind: "offer",
+        resourceId: String(offer.offer_id),
+        optimisticValue: offer,
+      });
+      return pendingId;
+    },
+    [recon]
+  );
+
+  const getOfferState = useCallback(
+    (offerId: string | number) =>
+      recon.getResourceState(String(offerId), "offer"),
+    [recon]
+  );
+
+  return {
+    ...offersHook,
+    pendingMutations: recon.pendingMutations,
+    addOfferMutation,
+    getOfferState,
+    resolveMutation: recon.resolveMutation,
+    rejectMutation: recon.rejectMutation,
+  };
+}

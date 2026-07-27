@@ -324,3 +324,14 @@ dependencies cannot be statically extracted
 This comes from `@stellar/stellar-sdk` pulling in `sodium-native` (a Node.js native module) even in the browser bundle. It is handled via webpack `resolve.fallback` stubs in `next.config.js` and does **not** affect runtime behavior. The browser SDK uses its WASM/JS crypto fallback automatically.
 
 See: [stellar/js-stellar-sdk#922](https://github.com/stellar/js-stellar-sdk/issues/922)
+
+---
+
+## Architecture & Debugging Guides
+
+For transaction debugging, wallet flow troubleshooting, and local testing references:
+- 🏗️ **[Local Architecture](../../docs/guides/local-architecture.md)**
+- 💻 **[Frontend Transaction Debugging Guide](../../docs/guides/frontend-transaction-debugging.md)**
+- 🚀 **[Deployment Guide](../../docs/guides/deployment.md)**
+- 🛡️ **[Security Triage Guide](../../docs/guides/security-triage.md)**
+

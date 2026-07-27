@@ -1,5 +1,11 @@
-process.env.DATABASE_URL =
-  process.env.DATABASE_URL ||
-  'postgresql://postgres:postgres@localhost:5432/marketplace_indexer_test?schema=public';
+if (!process.env.DATABASE_URL) {
+  throw new Error(
+    'DATABASE_URL must be set by the integration global setup (Testcontainers) before tests run.'
+  );
+}
 
-process.env.REDIS_URL = process.env.REDIS_URL || 'redis://localhost:6379';
+if (!process.env.REDIS_URL) {
+  throw new Error(
+    'REDIS_URL must be set by the integration global setup (Testcontainers) before tests run.'
+  );
+}
