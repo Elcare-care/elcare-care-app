@@ -1,0 +1,141 @@
+# mutants.toml — cargo-mutants configuration
+#
+# Governs mutation testing for the elcare-care-app Rust workspace.
+#
+# Tool: cargo-mutants (https://mutants.rs)
+# Install: cargo install cargo-mutants
+#
+# Run full analysis:
+#   cargo mutants --workspace
+#
+# Run bounded PR mode (changed files only):
+#   cargo mutants --file contracts/soroban-marketplace/src/math.rs
+#
+# ── Selected modules (rationale) ─────────────────────────────────────────────
+#
+# The modules below contain the highest-impact business logic where a surviving
+# mutant represents a dangerous latent defect rather than dead code or a
+# cosmetic difference:
+#
+#   math.rs          — Fee arithmetic and dust routing. A surviving mutant here
+#                      means an arithmetic operator could be wrong and no test
+#                      would catch it. Every basis-point calculation is critical.
+#
+#   contract.rs      — Settlement (buy_artwork, finalize_auction, accept_offer),
+#                      access-control guards (require_admin, require_not_paused,
+#                      require_not_revoked), and the two-step admin rotation.
+#                      Inverted authorization checks are the highest-severity class.
+#
+#   storage.rs       — Index correctness (add_to_active_listings,
+#                      remove_from_active_listings) and reentrancy lock
+#                      acquire/release. Off-by-one mutations in O(1) swap-remove
+#                      could silently corrupt the active-listing index.
+#
+#   escrow.rs        — NFT custody transitions. A surviving mutant in escrow
+#                      could allow double-listing or asset theft.
+#
+#   launchpad/src/contract.rs
+#                    — Deploy-fee collection and WASM clone address derivation.
+#                      Fee mutations directly impact protocol revenue.
+#
+# ── Exclusions (rationale) ───────────────────────────────────────────────────
+#
+# Excluded files / patterns with justification:
+#
+#   */test.rs, */tests.rs   — Test code itself; mutating tests produces noise.
+#
+#   */lib.rs                — Re-export files with no business logic; mutations
+#                             produce compile errors rather than meaningful survivors.
+#
+#   */events.rs             — Event struct definitions and topic-string constants.
+#                             Mutating string literals produces detected-but-irrelevant
+#                             failures; the meaningful side is tested via integration
+#                             tests in the indexer, not contract unit tests.
+#
+#   */types.rs              — Data-type definitions (enums, structs). Mutating
+#                             discriminant values in #[repr(u32)] enums would break
+#                             XDR serialisation and is caught by all callers —
+#                             these produce trivially caught mutants that inflate
+#                             run time without finding new coverage gaps.
+#
+#   patches/**              — Vendored soroban-env-host; not our code.
+#
+#   collection_nft_erc721/**, collection_nft_erc1155/**,
+#   lazy_mint_erc721/**,     lazy_mint_erc1155/**
+#                           — Thin collection contracts with minimal logic beyond
+#                             delegation to the SDK. Their mutation testing is
+#                             deferred until they contain custom business logic.
+#                             Document: see MUTATION_TESTING.md §Exclusions.
+#
+# ── Acceptable mutation score thresholds ─────────────────────────────────────
+#
+# Acceptable score is defined as: killed / (killed + survived) >= threshold.
+#
+#   math.rs      ≥ 95%   — Pure arithmetic; any survivor is a test gap.
+#   contract.rs  ≥ 80%   — Large module; some trivial mutations in view-only
+#                          getters are acceptable survivors (documented in
+#                          MUTATION_TESTING.md §Known Survivors).
+#   storage.rs   ≥ 85%
+#   escrow.rs    ≥ 90%
+#   launchpad    ≥ 75%   — Lower threshold because the launchpad has fewer
+#                          unit tests today; survivors drive new test work.
+
+[cargo_mutants]
+# Maximum wall-clock time for a single mutant test run.
+# Soroban unit tests compile + run in ~8 s on a modern machine; 60 s gives
+# ample headroom for slow CI runners.
+timeout_multiplier = 3.0
+timeout_minimum    = 60
+
+# Parallelism: run N mutants simultaneously. Set to number of CPU cores.
+# Override via --jobs N on the CLI or MUTANTS_JOBS env var.
+# Default here is 4 (safe for a 4-core CI runner without OOM risk).
+jobs = 4
+
+# Emit structured JSON output so the reporter can parse scores.
+output = "cargo-mutants-out"
+
+# Show only undetected mutants in stdout (detected clutter is suppressed).
+# Full log is always in cargo-mutants-out/
+caught_in_progress = false
+
+# ── Explicit file inclusions (high-priority modules) ─────────────────────────
+
+[[filters]]
+# Only mutate files listed here; everything else is skipped unless the
+# --workspace flag overrides this for scheduled full runs.
+include_globs = [
+    "contracts/soroban-marketplace/src/math.rs",
+    "contracts/soroban-marketplace/src/contract.rs",
+    "contracts/soroban-marketplace/src/storage.rs",
+    "contracts/soroban-marketplace/src/escrow.rs",
+    "contracts/launchpad/src/contract.rs",
+]
+
+# ── Exclusions ────────────────────────────────────────────────────────────────
+
+[[filters]]
+exclude_globs = [
+    "*/test.rs",
+    "*/tests.rs",
+    "*/lib.rs",
+    "*/events.rs",
+    "*/types.rs",
+    "patches/**",
+    "contracts/collection_nft_erc721/**",
+    "contracts/collection_nft_erc1155/**",
+    "contracts/lazy_mint_erc721/**",
+    "contracts/lazy_mint_erc1155/**",
+]
+
+# ── Skip trivial mutations that generate noise without finding coverage gaps ──
+
+[[skip_mutations]]
+# Skipping mutations to log! / log macros (emit-only, never tested by callers)
+function_name_re = "^log$|^log_info$|^log_warn$|^log_error$|^log_debug$"
+
+[[skip_mutations]]
+# Skipping string-literal mutations inside emit_* event functions.
+# These are tested by the indexer integration tests, not contract unit tests.
+# Allowing them would produce false survivors at the contract layer.
+source_file_re   = "events\\.rs$"
