@@ -87,6 +87,10 @@ const TOPIC_MAP: Record<string, string> = {
   // Token whitelist events (Issue #208)
   'token_whitelisted':      'TOKEN_WHITELISTED',
   'token_removed':          'TOKEN_REMOVED',
+  // Voucher lifecycle events (nonce-based replay protection)
+  'redeemed':               'VOUCHER_REDEEMED',
+  'revoke':                 'VOUCHER_REVOKED',
+  'expired':                'VOUCHER_EXPIRED',
   // Launchpad deploy events (topics[0] = "deploy", topics[1] = kind tag)
   'dep_n721':  'DEPLOY_NORMAL_721',
   'dep_n1155': 'DEPLOY_NORMAL_1155',

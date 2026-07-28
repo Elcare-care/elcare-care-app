@@ -1383,6 +1383,71 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
       break;
     }
 
+    // Voucher lifecycle events (nonce-based replay protection)
+    case 'VOUCHER_REDEEMED': {
+      const nonce = BigInt(data.nonce ?? 0);
+      const tokenId = BigInt(data.token_id ?? 0);
+      const collection = event.contractId;
+      await db.voucher.upsert({
+        where: { collection_nonce: { collection, nonce } },
+        create: {
+          nonce,
+          collection,
+          tokenId,
+          status: 'Redeemed',
+          createdAtLedger: ledgerSequence,
+          updatedAtLedger: ledgerSequence,
+        },
+        update: {
+          status: 'Redeemed',
+          updatedAtLedger: ledgerSequence,
+        },
+      });
+      break;
+    }
+
+    case 'VOUCHER_REVOKED': {
+      const nonce = BigInt(data.nonce ?? 0);
+      const collection = event.contractId;
+      await db.voucher.upsert({
+        where: { collection_nonce: { collection, nonce } },
+        create: {
+          nonce,
+          collection,
+          tokenId: 0n, // unknown from revoke event
+          status: 'Revoked',
+          createdAtLedger: ledgerSequence,
+          updatedAtLedger: ledgerSequence,
+        },
+        update: {
+          status: 'Revoked',
+          updatedAtLedger: ledgerSequence,
+        },
+      });
+      break;
+    }
+
+    case 'VOUCHER_EXPIRED': {
+      const nonce = BigInt(data.nonce ?? 0);
+      const collection = event.contractId;
+      await db.voucher.upsert({
+        where: { collection_nonce: { collection, nonce } },
+        create: {
+          nonce,
+          collection,
+          tokenId: 0n, // unknown from expired event
+          status: 'Expired',
+          createdAtLedger: ledgerSequence,
+          updatedAtLedger: ledgerSequence,
+        },
+        update: {
+          status: 'Expired',
+          updatedAtLedger: ledgerSequence,
+        },
+      });
+      break;
+    }
+
     // ROYALTY_PAID, ADMIN_TRANSFER_PROPOSED, ADMIN_TRANSFERRED,
     // ARTIST_REVOKED, ARTIST_REINSTATED, CONTRACT_PAUSED, CONTRACT_UNPAUSED:
     // persisted to MarketplaceEvent (with actor) above; no state reduction.

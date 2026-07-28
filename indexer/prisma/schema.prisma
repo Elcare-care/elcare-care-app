@@ -518,3 +518,36 @@ model Discrepancy {
   @@index([resolved])
   @@index([detectedAt])
 }
+
+// ── Voucher tracking (nonce-based replay protection) ────────────────────────
+//
+// Tracks voucher lifecycle for lazy-mint contracts. Each voucher has a unique
+// nonce that can only be redeemed once. Status transitions:
+//   issued → redeemed | revoked | expired
+//
+// Populated from contract events: redeemed, revoke, expired
+
+enum VoucherStatus {
+  Issued
+  Redeemed
+  Revoked
+  Expired
+}
+
+model Voucher {
+  id              Int          @id @default(autoincrement())
+  nonce           BigInt
+  collection      String       // contract address
+  tokenId         BigInt
+  status          VoucherStatus @default(Issued)
+  createdAtLedger Int
+  updatedAtLedger Int
+  createdAt       DateTime     @default(now())
+  updatedAt       DateTime     @updatedAt
+
+  @@unique([collection, nonce])
+  @@index([collection])
+  @@index([status])
+  @@index([collection, status])
+  @@index([createdAtLedger])
+}

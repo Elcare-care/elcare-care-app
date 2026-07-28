@@ -746,6 +746,37 @@ router.get('/collections/:address/fee', async (req: Request, res: Response, next
   }
 });
 
+// ── GET /collections/:address/vouchers ─────────────────────────────────────────
+// Returns vouchers for a collection with status filtering (nonce-based replay protection)
+
+router.get('/collections/:address/vouchers', async (req: Request, res: Response, next: NextFunction) => {
+  const address = req.params.address as string;
+  const { status, limit, offset } = req.query as any;
+  try {
+    const where: any = { collection: address };
+    if (status && ['Issued', 'Redeemed', 'Revoked', 'Expired'].includes(status as string)) {
+      where.status = status;
+    }
+    const take = Math.min(limit ? parseInt(limit) : 50, 200);
+    const skip = offset ? parseInt(offset) : 0;
+
+    const [vouchers, total] = await Promise.all([
+      prisma.voucher.findMany({
+        where,
+        orderBy: { createdAtLedger: 'desc' },
+        take,
+        skip,
+      }),
+      prisma.voucher.count({ where }),
+    ]);
+
+    res.setHeader('X-Total-Count', String(total));
+    res.json(serialize(vouchers));
+  } catch (err) {
+    next(internalError('Failed to fetch vouchers'));
+  }
+});
+
 // ── GET /creators/:address/collections ───────────────────────────────────────
 
 router.get('/creators/:address/collections', validateQuery(creatorCollectionsQuerySchema), async (req: Request, res: Response, next: NextFunction) => {

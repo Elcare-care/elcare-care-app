@@ -5,13 +5,47 @@ import Link from "next/link";
 import { Navbar } from "@/components/Navbar";
 import { useCollectionDetail } from "@/hooks/useLaunchpad";
 import { useWalletContext } from "@/context/WalletContext";
-import { Loader2, ShieldCheck, User, Percent, Database, Package, ArrowLeft, Plus, Lock, Unlock } from "lucide-react";
+import { Loader2, ShieldCheck, User, Percent, Database, Package, ArrowLeft, Plus, Lock, Unlock, Ticket, CheckCircle, XCircle, Clock } from "lucide-react";
+import { useState, useEffect } from "react";
+
+interface Voucher {
+  id: number;
+  nonce: string;
+  collection: string;
+  tokenId: string;
+  status: 'Issued' | 'Redeemed' | 'Revoked' | 'Expired';
+  createdAtLedger: number;
+  updatedAtLedger: number;
+}
 
 export default function CollectionDetailClient({ address }: { address: string }) {
   const { metadata, isLoading, error } = useCollectionDetail(address);
   const { publicKey } = useWalletContext();
+  const [vouchers, setVouchers] = useState<Voucher[]>([]);
+  const [vouchersLoading, setVouchersLoading] = useState(false);
+  const [voucherFilter, setVoucherFilter] = useState<'All' | 'Issued' | 'Redeemed' | 'Revoked' | 'Expired'>('All');
 
   const isCreator = publicKey === metadata?.creator;
+
+  useEffect(() => {
+    const fetchVouchers = async () => {
+      if (!address) return;
+      setVouchersLoading(true);
+      try {
+        const statusParam = voucherFilter === 'All' ? '' : `?status=${voucherFilter}`;
+        const response = await fetch(`/api/collections/${address}/vouchers${statusParam}`);
+        if (response.ok) {
+          const data = await response.json();
+          setVouchers(data);
+        }
+      } catch (err) {
+        console.error('Failed to fetch vouchers:', err);
+      } finally {
+        setVouchersLoading(false);
+      }
+    };
+    fetchVouchers();
+  }, [address, voucherFilter]);
 
   return (
     <main className="min-h-screen bg-brand-50/20">
@@ -113,6 +147,92 @@ export default function CollectionDetailClient({ address }: { address: string })
                     <p className="text-gray-500 font-inter">No items found in this collection yet.</p>
                   </div>
                 </div>
+
+                {isCreator && (
+                  <div className="bg-white rounded-3xl border border-gray-100 p-8 shadow-sm">
+                    <div className="flex items-center justify-between mb-6">
+                      <h3 className="text-2xl font-display font-bold text-gray-900">Voucher Management</h3>
+                      <div className="flex items-center gap-2">
+                        <Ticket size={20} className="text-gray-400" />
+                        <span className="text-sm font-medium text-gray-500">
+                          {vouchers.length} total
+                        </span>
+                      </div>
+                    </div>
+
+                    <div className="flex gap-2 mb-6">
+                      {(['All', 'Issued', 'Redeemed', 'Revoked', 'Expired'] as const).map((filter) => (
+                        <button
+                          key={filter}
+                          onClick={() => setVoucherFilter(filter)}
+                          className={`px-4 py-2 rounded-xl text-sm font-bold transition-all ${
+                            voucherFilter === filter
+                              ? 'bg-brand-500 text-white'
+                              : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
+                          }`}
+                        >
+                          {filter}
+                        </button>
+                      ))}
+                    </div>
+
+                    {vouchersLoading ? (
+                      <div className="flex items-center justify-center py-8">
+                        <Loader2 size={24} className="animate-spin text-brand-500" />
+                      </div>
+                    ) : vouchers.length === 0 ? (
+                      <div className="flex flex-col items-center justify-center py-8 text-center bg-gray-50/50 rounded-2xl border border-dashed border-gray-200">
+                        <Ticket size={32} className="text-gray-300 mb-2" />
+                        <p className="text-gray-500 font-inter text-sm">No vouchers found</p>
+                      </div>
+                    ) : (
+                      <div className="space-y-3 max-h-96 overflow-y-auto">
+                        {vouchers.map((voucher) => (
+                          <div
+                            key={voucher.id}
+                            className="flex items-center justify-between p-4 rounded-xl bg-gray-50 border border-gray-100"
+                          >
+                            <div className="flex items-center gap-3">
+                              {voucher.status === 'Redeemed' && (
+                                <CheckCircle size={20} className="text-green-500" />
+                              )}
+                              {voucher.status === 'Revoked' && (
+                                <XCircle size={20} className="text-red-500" />
+                              )}
+                              {voucher.status === 'Expired' && (
+                                <Clock size={20} className="text-amber-500" />
+                              )}
+                              {voucher.status === 'Issued' && (
+                                <Ticket size={20} className="text-blue-500" />
+                              )}
+                              <div>
+                                <p className="font-mono text-sm font-medium text-gray-900">
+                                  Nonce: {voucher.nonce}
+                                </p>
+                                <p className="text-xs text-gray-500">
+                                  Token ID: {voucher.tokenId}
+                                </p>
+                              </div>
+                            </div>
+                            <span
+                              className={`px-3 py-1 rounded-full text-xs font-bold uppercase ${
+                                voucher.status === 'Redeemed'
+                                  ? 'bg-green-100 text-green-700'
+                                  : voucher.status === 'Revoked'
+                                  ? 'bg-red-100 text-red-700'
+                                  : voucher.status === 'Expired'
+                                  ? 'bg-amber-100 text-amber-700'
+                                  : 'bg-blue-100 text-blue-700'
+                              }`}
+                            >
+                              {voucher.status}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
 
               <div className="space-y-6">
