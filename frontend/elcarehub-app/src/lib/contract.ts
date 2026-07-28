@@ -576,7 +576,20 @@ export async function getAllListings(): Promise<Listing[]> {
 
 // ── Offer types mirrored from the Rust contract ──────────────
 
+/**
+ * On-chain offer statuses as returned by the contract.
+ * "Expired" and "Stale" are client-side derived states — they are never
+ * stored on-chain but are computed from expires_at vs the current ledger
+ * time, or from indexer freshness metadata.
+ */
 export type OfferStatus = "Pending" | "Accepted" | "Rejected" | "Withdrawn";
+
+/**
+ * Extended UI status that includes client-derived states.
+ * - "Expired"  : status is "Pending" AND expires_at is in the past (reclaim available)
+ * - "Stale"    : data was fetched too long ago to be trusted (soft warning only)
+ */
+export type OfferUIStatus = OfferStatus | "Expired" | "Stale";
 
 export interface Offer {
   offer_id: number;
@@ -588,6 +601,53 @@ export interface Offer {
   created_at: number;
   /** Unix seconds after which the offer expires and can be reclaimed. Absent when the offer never expires. */
   expires_at?: number;
+  /**
+   * Soroban transaction hash from the escrow deposit (set when the offer was
+   * created). Populated by the indexer; absent when not yet indexed.
+   */
+  escrow_tx_hash?: string;
+  /**
+   * Soroban transaction hash from the refund/payout event (set when
+   * Accepted, Rejected, Withdrawn, or Expired+Reclaimed).
+   * Populated by the indexer; absent when the terminal tx is not yet indexed.
+   */
+  refund_tx_hash?: string;
+}
+
+/**
+ * Derive the display status for an offer, incorporating client-side
+ * "Expired" and "Stale" states that are not stored on-chain.
+ *
+ * Rules:
+ *  - If `isStale` is true, returns "Stale" (soft warning; does not block actions).
+ *  - If status is "Pending" and expires_at is defined and in the past → "Expired".
+ *  - Otherwise returns the on-chain status unchanged.
+ *
+ * @param offer        The raw on-chain Offer object.
+ * @param nowMs        Current wall-clock time in milliseconds (defaults to Date.now()).
+ * @param isStale      Whether the data is considered stale (from indexer freshness).
+ */
+export function deriveOfferUIStatus(
+  offer: Pick<Offer, "status" | "expires_at">,
+  nowMs: number = Date.now(),
+  isStale = false
+): OfferUIStatus {
+  if (offer.status === "Pending") {
+    if (offer.expires_at != null && offer.expires_at * 1000 <= nowMs) {
+      return "Expired";
+    }
+    if (isStale) return "Stale";
+  }
+  return offer.status;
+}
+
+/**
+ * Returns true when the given UI status allows an action to be taken.
+ * Only "Pending" offers permit accept / reject / withdraw.
+ * "Expired" offers only permit reclaim (handled separately).
+ */
+export function isOfferActionable(uiStatus: OfferUIStatus): boolean {
+  return uiStatus === "Pending" || uiStatus === "Stale";
 }
 
 // ── Offer ScVal parsing ──────────────────────────────────────
@@ -599,6 +659,14 @@ function parseOfferFromScVal(raw: unknown): Offer {
   const expires_at =
     expiresAtRaw != null ? Number(expiresAtRaw) : undefined;
 
+  // escrow_tx_hash and refund_tx_hash are optional indexer-enriched fields;
+  // they are not present in the on-chain ScVal but may be injected by the
+  // indexer REST layer before the object reaches this parser.
+  const escrow_tx_hash =
+    typeof obj["escrow_tx_hash"] === "string" ? obj["escrow_tx_hash"] : undefined;
+  const refund_tx_hash =
+    typeof obj["refund_tx_hash"] === "string" ? obj["refund_tx_hash"] : undefined;
+
   return {
     offer_id: Number(obj["offer_id"]),
     listing_id: Number(obj["listing_id"]),
@@ -608,6 +676,8 @@ function parseOfferFromScVal(raw: unknown): Offer {
     status: String(obj["status"]) as OfferStatus,
     created_at: Number(obj["created_at"]),
     ...(expires_at !== undefined && { expires_at }),
+    ...(escrow_tx_hash !== undefined && { escrow_tx_hash }),
+    ...(refund_tx_hash !== undefined && { refund_tx_hash }),
   };
 }
 

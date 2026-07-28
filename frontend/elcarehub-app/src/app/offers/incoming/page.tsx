@@ -4,10 +4,11 @@
 
 "use client";
 
+import React from "react";
 import { useWalletContext } from "@/context/WalletContext";
 import { useIncomingOffers, useAcceptOffer, useRejectOffer } from "@/hooks/useOffers";
-import { stroopsToXlm, Offer, Listing } from "@/lib/contract";
-import { Inbox, Clock, CheckCircle, XCircle, MoreVertical, ArrowUpRight, History, Activity, TrendingUp, Loader2, User, Tag, CalendarClock } from "lucide-react";
+import { stroopsToXlm, Offer, Listing, deriveOfferUIStatus } from "@/lib/contract";
+import { Inbox, Clock, CheckCircle, XCircle, MoreVertical, ArrowUpRight, History, Activity, TrendingUp, Loader2, User, Tag, CalendarClock, ExternalLink, AlertOctagon } from "lucide-react";
 import { WalletGuard } from "@/components/WalletGuard";
 import { SUPPORTED_TOKENS } from "@/config/tokens";
 import { clsx } from "clsx";
@@ -19,11 +20,21 @@ export default function IncomingOffersPage() {
   const { accept, isAccepting, error: acceptError } = useAcceptOffer(publicKey);
   const { reject, isRejecting, error: rejectError } = useRejectOffer(publicKey);
 
+  // Tick every second for live expiry countdowns
+  const [now, setNow] = React.useState(() => Date.now());
+  React.useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, []);
+
   // Flatten all offers for stats
   const allOffers = offersByListing.flatMap(
     (group: { listing: Listing; offers: Offer[] }) => group.offers
   );
-  const pendingCnt = allOffers.filter((o: Offer) => o.status === "Pending").length;
+  const pendingCnt = allOffers.filter((o: Offer) => {
+    const s = deriveOfferUIStatus(o, now);
+    return s === "Pending" || s === "Stale";
+  }).length;
   const acceptedCnt = allOffers.filter((o: Offer) => o.status === "Accepted").length;
 
   const getTokenSymbol = (address: string) => {
@@ -195,7 +206,11 @@ export default function IncomingOffersPage() {
 
                     {/* Offers Grid for this Listing */}
                     <div className="grid gap-6 sm:grid-cols-2 lg:grid-cols-3" data-testid={`offers-grid-${group.listing.listing_id}`}>
-                      {group.offers.map((o) => (
+                      {group.offers.map((o) => {
+                        const uiStatus = deriveOfferUIStatus(o, now);
+                        const isActionable = uiStatus === "Pending" || uiStatus === "Stale";
+                        const isExpired = uiStatus === "Expired";
+                        return (
                         <div key={o.offer_id} data-testid={`offer-card-${o.offer_id}`} className="group relative flex flex-col rounded-[2.5rem] bg-white/[0.03] hover:bg-white/[0.07] hover:border-white/10 transition-all duration-500 border border-white/5 p-6 shadow-2xl overflow-hidden min-h-[320px]">
                           {/* BG Tribal Accent */}
                           <div className="absolute -top-10 -right-10 tribal-pattern opacity-[0.02] scale-50 group-hover:scale-75 transition-transform duration-1000" />
@@ -210,13 +225,18 @@ export default function IncomingOffersPage() {
                                 <span className="text-xs font-mono text-white/60">{o.offerer.slice(0, 6)}...{o.offerer.slice(-4)}</span>
                               </div>
                             </div>
-                            <div className={clsx(
-                              "px-3 py-1 rounded-full text-[9px] font-bold uppercase tracking-widest border",
-                              o.status === "Pending" ? "bg-brand-500/10 text-brand-400 border-brand-500/20" :
-                                o.status === "Accepted" ? "bg-mint-500/10 text-mint-400 border-mint-500/20" :
+                            <div
+                              className={clsx(
+                                "px-3 py-1 rounded-full text-[9px] font-bold uppercase tracking-widest border",
+                                uiStatus === "Pending" ? "bg-brand-500/10 text-brand-400 border-brand-500/20" :
+                                  uiStatus === "Accepted" ? "bg-mint-500/10 text-mint-400 border-mint-500/20" :
+                                  uiStatus === "Expired" ? "bg-amber-500/10 text-amber-400 border-amber-500/20" :
+                                  uiStatus === "Stale" ? "bg-yellow-500/10 text-yellow-400 border-yellow-500/20" :
                                   "bg-white/5 text-white/30 border-white/10"
-                            )}>
-                              {o.status}
+                              )}
+                              data-testid={`offer-status-badge-${o.offer_id}`}
+                            >
+                              {uiStatus}
                             </div>
                           </div>
 
@@ -234,7 +254,63 @@ export default function IncomingOffersPage() {
                               <span className="text-white/40">{new Date(o.created_at * 1000).toLocaleDateString()}</span>
                             </div>
 
-                            {o.status === "Pending" && (
+                            {/* Expired notice */}
+                            {isExpired && (
+                              <div
+                                className="flex items-center gap-2 rounded-xl bg-amber-500/10 border border-amber-500/20 px-3 py-2 text-[10px] text-amber-400"
+                                data-testid={`offer-expired-notice-${o.offer_id}`}
+                              >
+                                <AlertOctagon size={12} />
+                                Offer expired — awaiting reclaim by offerer
+                              </div>
+                            )}
+
+                            {/* Escrow / refund transaction links */}
+                            {(o.escrow_tx_hash || o.refund_tx_hash) && (
+                              <div className="flex flex-col gap-1">
+                                {o.escrow_tx_hash && (
+                                  <div
+                                    className="flex items-center gap-2 text-[10px] text-white/30"
+                                    data-testid={`escrow-tx-${o.offer_id}`}
+                                  >
+                                    <span className="uppercase font-bold tracking-widest text-white/20">Escrow:</span>
+                                    <span className="font-mono">{o.escrow_tx_hash.slice(0, 8)}…</span>
+                                    <a
+                                      href={`https://stellar.expert/explorer/testnet/tx/${o.escrow_tx_hash}`}
+                                      target="_blank"
+                                      rel="noopener noreferrer"
+                                      aria-label="View escrow transaction"
+                                      className="hover:text-brand-400 transition-colors"
+                                    >
+                                      <ExternalLink size={10} />
+                                    </a>
+                                  </div>
+                                )}
+                                {o.refund_tx_hash && (
+                                  <div
+                                    className="flex items-center gap-2 text-[10px] text-white/30"
+                                    data-testid={`refund-tx-${o.offer_id}`}
+                                  >
+                                    <span className="uppercase font-bold tracking-widest text-white/20">
+                                      {o.status === "Accepted" ? "Payment:" : "Refund:"}
+                                    </span>
+                                    <span className="font-mono">{o.refund_tx_hash.slice(0, 8)}…</span>
+                                    <a
+                                      href={`https://stellar.expert/explorer/testnet/tx/${o.refund_tx_hash}`}
+                                      target="_blank"
+                                      rel="noopener noreferrer"
+                                      aria-label="View refund transaction"
+                                      className="hover:text-mint-400 transition-colors"
+                                    >
+                                      <ExternalLink size={10} />
+                                    </a>
+                                  </div>
+                                )}
+                              </div>
+                            )}
+
+                            {/* Accept / Reject — only for actionable offers */}
+                            {isActionable && (
                               <div className="grid grid-cols-2 gap-3">
                                 <button
                                   data-testid={`accept-btn-${o.offer_id}`}
@@ -272,7 +348,8 @@ export default function IncomingOffersPage() {
                             )}
                           </div>
                         </div>
-                      ))}
+                        );
+                      })}
                     </div>
                   </div>
                 ))}
