@@ -1,7 +1,5 @@
 import { rpc, Contract, TransactionBuilder, BASE_FEE, nativeToScVal, scValToNative } from '@stellar/stellar-sdk';
 import { fetchRawListingFromChain, fetchRawAuctionFromChain } from './chain-state.js';
-// Write-path client: poller / parser writes use the dedicated 3-connection pool
-// so burst writes never starve the API read pool (db.ts, connection_limit=10).
 import prisma from './prisma-write.js';
 import { emitSSEEvent } from './api/routes.js';
 import dotenv from 'dotenv';
@@ -33,10 +31,13 @@ import {
 import { collectMarketplaceEvents, MAX_LEDGER_WINDOW } from './event-sync.js';
 import { withRpcRetry } from './retry.js';
 import { logger } from './logger.js';
-import redis, { invalidatePattern, invalidateKey } from './redis.js';
+import redis from './redis.js';
+import { applyInvalidation, invalidateListing, invalidateAuction, invalidateOffer, invalidateCollection, invalidateWalletActivity, invalidateStats } from './cache-invalidation.js';
 import { loadConfig, parseTrackedContracts } from './config.js';
 import { enqueueIpfsFetch } from './ipfs-cache.js';
 import { promoteConfirmedEvents, rollbackReorg } from './reorg.js';
+import { acquireLease, releaseLease, renewLease, type LeaseRole } from './coordination/lease.js';
+import { applyInvalidation, invalidateListing, invalidateAuction, invalidateOffer, invalidateCollection, invalidateWalletActivity, invalidateStats } from './cache-invalidation.js';
 
 dotenv.config();
 
@@ -703,8 +704,6 @@ async function pollContract(
 export async function startPolling() {
   const config = loadConfig();
 
-  // Reset shutdown state so this function is safe to call again after a
-  // watchdog-triggered stopPoller() + startPolling() restart cycle.
   resetPollerShutdownFlag();
 
   const activeContracts = await seedTrackedContracts();
@@ -722,30 +721,37 @@ export async function startPolling() {
     maxLedgersPerCycle: config.maxLedgersPerCycle,
   });
 
-  // Register lifecycle hooks so the stall watchdog can restart the poller.
-  // Uses a lazy-import pattern to avoid a circular dep (startPolling ← stall ← routes ← poller).
   registerPollerLifecycle({
     stopPoller,
     startPoller: startPolling,
   });
 
-  // Start the watchdog after registering lifecycle so it can act on FATAL stalls.
   startWatchdog();
 
-  // Run one loop per contract concurrently; propagate first fatal failure
-  await Promise.all(
-    activeContracts.map((contract) =>
-      pollContract(
-        {
-          id: contract.id,
-          contractId: contract.contractId,
-          lastLedger: contract.lastLedger,
-          lastLedgerHash: contract.lastLedgerHash,
-        },
-        config
+  // Issue #294: acquire a distributed lease before advancing the cursor.
+  const lease = await acquireLease('poller');
+  if (!lease) {
+    logger.warn('startPolling: another worker holds the lease — exiting');
+    return;
+  }
+
+  try {
+    await Promise.all(
+      activeContracts.map((contract) =>
+        pollContract(
+          {
+            id: contract.id,
+            contractId: contract.contractId,
+            lastLedger: contract.lastLedger,
+            lastLedgerHash: contract.lastLedgerHash,
+          },
+          config
+        )
       )
-    )
-  );
+    );
+  } finally {
+    releaseLease('poller');
+  }
 
   if (shuttingDown) {
     await gracefulShutdown();
@@ -892,7 +898,7 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
         },
       });
       // Invalidate collections cache
-      invalidatePattern('cache:*/collections*').catch(() => {});
+      invalidateCollection(contractAddr).catch(() => {});
     }
     recordEventDuration();
     return;
@@ -916,8 +922,7 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
           data: { feeBpsOverride: null },
         });
       }
-      invalidatePattern('cache:*/collections*').catch(() => {});
-      invalidateKey(`cache:/collections/${collectionAddr}`).catch(() => {});
+      invalidateCollection(contractAddr).catch(() => {});
     }
     recordEventDuration();
     if (!tx) emitSSEEvent(event);
@@ -959,8 +964,8 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
 
       // ── Metrics & cache invalidation ──────────────────────────────────────
       listingsCreatedTotal.labels(collection ?? 'unknown').inc();
-      invalidatePattern('cache:*/listings*').catch(() => {});
-      invalidateKey(`cache:/listings/${listingId.toString()}`).catch(() => {});
+      invalidateListing(listingId.toString()).catch(() => {});
+
       // Refresh active-listing gauge asynchronously (best-effort)
       prisma.listing.count({ where: { status: 'Active' } })
         .then((n) => activeListingsGauge.set(n)).catch(() => {});
@@ -999,8 +1004,8 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
         },
       });
       if (count === 0) logger.warn('LISTING_UPDATED: listing not found', { listingId: listingId?.toString(), ledger: ledgerSequence });
-      invalidatePattern('cache:*/listings*').catch(() => {});
-      invalidateKey(`cache:/listings/${listingId.toString()}`).catch(() => {});
+      invalidateListing(listingId.toString()).catch(() => {});
+
       break;
     }
 
@@ -1021,15 +1026,15 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
         where: { listingId },
         data: { price: String(data.new_price ?? '0'), updatedAtLedger: ledgerSequence },
       });
-      invalidatePattern('cache:*/listings*').catch(() => {});
-      invalidateKey(`cache:/listings/${listingId.toString()}`).catch(() => {});
-      invalidateKey(`cache:/listings/${listingId.toString()}/price-history`).catch(() => {});
+      invalidateListing(listingId.toString()).catch(() => {});
+
+
       break;
     }
 
     case 'LISTING_EXPIRED': {
-      invalidatePattern('cache:*/listings*').catch(() => {});
-      invalidateKey(`cache:/listings/${listingId.toString()}`).catch(() => {});
+      invalidateListing(listingId.toString()).catch(() => {});
+
       break;
     }
 
@@ -1042,8 +1047,8 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
 
       // ── Metrics & cache invalidation ──────────────────────────────────────
       salesTotalCounter.labels(data.token ?? 'unknown').inc();
-      invalidatePattern('cache:*/listings*').catch(() => {});
-      invalidateKey(`cache:/listings/${listingId.toString()}`).catch(() => {});
+      invalidateListing(listingId.toString()).catch(() => {});
+
       prisma.listing.count({ where: { status: 'Active' } })
         .then((n) => activeListingsGauge.set(n)).catch(() => {});
       break;
@@ -1071,7 +1076,7 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
         });
       }
       for (const r of entries) {
-        invalidatePattern(`cache:*/wallets/${r.address}/royalty-breakdown*`).catch(() => {});
+        invalidateWalletActivity(r.address).catch(() => {});
       }
       break;
     }
@@ -1082,8 +1087,8 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
         data: { status: 'Cancelled' as const, updatedAtLedger: ledgerSequence },
       });
       if (count === 0) logger.warn('LISTING_CANCELLED: listing not found', { listingId: listingId?.toString(), ledger: ledgerSequence });
-      invalidatePattern('cache:*/listings*').catch(() => {});
-      invalidateKey(`cache:/listings/${listingId.toString()}`).catch(() => {});
+      invalidateListing(listingId.toString()).catch(() => {});
+
       prisma.listing.count({ where: { status: 'Active' } })
         .then((n) => activeListingsGauge.set(n)).catch(() => {});
       break;
@@ -1109,8 +1114,8 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
           auctionsCancelled: auctionResult.count,
           ledger: ledgerSequence,
         });
-        invalidatePattern('cache:*/listings*').catch(() => {});
-        invalidatePattern('cache:*/auctions*').catch(() => {});
+        invalidateListing(listingId.toString()).catch(() => {});
+        invalidateAuction(listingId.toString()).catch(() => {});
         prisma.listing.count({ where: { status: 'Active' } })
           .then((n) => activeListingsGauge.set(n)).catch(() => {});
         prisma.auction.count({ where: { status: 'Active' } })
@@ -1146,7 +1151,7 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
         },
       });
 
-      invalidatePattern('cache:*/auctions*').catch(() => {});
+      invalidateAuction(listingId.toString()).catch(() => {});
       prisma.auction.count({ where: { status: 'Active' } })
         .then((n) => activeAuctionsGauge.set(n)).catch(() => {});
       break;
@@ -1179,8 +1184,8 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
         data: { highestBid: data.bid_amount, highestBidder: data.bidder, updatedAtLedger: ledgerSequence },
       });
       if (count === 0) logger.warn('BID_PLACED: auction not found', { auctionId: listingId?.toString(), ledger: ledgerSequence });
-      invalidatePattern('cache:*/auctions*').catch(() => {});
-      invalidateKey(`cache:/auctions/${listingId.toString()}`).catch(() => {});
+      invalidateAuction(listingId.toString()).catch(() => {});
+
       break;
     }
 
@@ -1197,8 +1202,8 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
       if (count === 0) logger.error('AUCTION_RESOLVED: auction not found — resolution not recorded', { auctionId: listingId?.toString(), ledger: ledgerSequence });
 
       auctionFinalizationsTotal.inc();
-      invalidatePattern('cache:*/auctions*').catch(() => {});
-      invalidateKey(`cache:/auctions/${listingId.toString()}`).catch(() => {});
+      invalidateAuction(listingId.toString()).catch(() => {});
+
       prisma.auction.count({ where: { status: 'Active' } })
         .then((n) => activeAuctionsGauge.set(n)).catch(() => {});
       break;
@@ -1215,8 +1220,8 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
         prisma.auction.count({ where: { status: 'Active' } })
           .then((n) => activeAuctionsGauge.set(n)).catch(() => {});
       }
-      invalidatePattern('cache:*/auctions*').catch(() => {});
-      invalidateKey(`cache:/auctions/${listingId.toString()}`).catch(() => {});
+      invalidateAuction(listingId.toString()).catch(() => {});
+
       break;
     }
 
@@ -1251,7 +1256,7 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
         },
       });
       offersMadeTotal.inc();
-      invalidatePattern(`cache:*/offers*listing=${data.listing_id}*`).catch(() => {});
+      invalidateOffer(data.listing_id?.toString()).catch(() => {});
       break;
     }
 
@@ -1268,9 +1273,9 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
 
       offersAcceptedTotal.inc();
       salesTotalCounter.labels(data.token ?? 'unknown').inc();
-      invalidatePattern(`cache:*/offers*listing=${data.listing_id}*`).catch(() => {});
-      invalidatePattern('cache:*/listings*').catch(() => {});
-      invalidateKey(`cache:/listings/${data.listing_id?.toString()}`).catch(() => {});
+      invalidateOffer(data.listing_id?.toString()).catch(() => {});
+      invalidateListing(listingId.toString()).catch(() => {});
+
       prisma.listing.count({ where: { status: 'Active' } })
         .then((n) => activeListingsGauge.set(n)).catch(() => {});
       break;
@@ -1281,7 +1286,7 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
         where: { offerId: BigInt(data.offer_id) },
         data: { status: 'Rejected' as const, updatedAtLedger: ledgerSequence },
       });
-      invalidatePattern(`cache:*/offers*listing=${data.listing_id}*`).catch(() => {});
+      invalidateOffer(data.listing_id?.toString()).catch(() => {});
       break;
     }
 
@@ -1291,7 +1296,7 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
         where: { offerId: BigInt(data.offer_id) },
         data: { status: 'Withdrawn' as const, updatedAtLedger: ledgerSequence },
       });
-      invalidatePattern(`cache:*/offers*listing=${data.listing_id}*`).catch(() => {});
+      invalidateOffer(data.listing_id?.toString()).catch(() => {});
       break;
     }
 

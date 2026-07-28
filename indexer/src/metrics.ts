@@ -221,6 +221,75 @@ export function metricsMiddleware(req: express.Request, res: express.Response, n
   next();
 }
 
+// ── Cache metrics ─────────────────────────────────────────────────────────────
+
+export const cacheHitsTotal = new client.Counter({
+  name: 'elcarehub_cache_hits_total',
+  help: 'Total cache hits by resource kind',
+  labelNames: ['resource'],
+});
+
+export const cacheMissesTotal = new client.Counter({
+  name: 'elcarehub_cache_misses_total',
+  help: 'Total cache misses by resource kind',
+  labelNames: ['resource'],
+});
+
+export const cacheStaleBypassTotal = new client.Counter({
+  name: 'elcarehub_cache_stale_bypass_total',
+  help: 'Total stale cache bypasses by resource kind',
+  labelNames: ['resource'],
+});
+
+export const cacheBypassTotal = new client.Counter({
+  name: 'elcarehub_cache_bypass_total',
+  help: 'Total cache bypasses (Redis unavailable) by resource kind',
+  labelNames: ['resource'],
+});
+
+export const cacheInvalidationsTotal = new client.Counter({
+  name: 'elcarehub_cache_invalidations_total',
+  help: 'Total cache invalidations by resource kind',
+  labelNames: ['resource'],
+});
+
+export const cacheInvalidationFailuresTotal = new client.Counter({
+  name: 'elcarehub_cache_invalidation_failures_total',
+  help: 'Total cache invalidation failures by resource kind',
+  labelNames: ['resource'],
+});
+
+// ── Worker lease metrics ───────────────────────────────────────────────────────
+
+export const indexerLeaseAcquisitionsTotal = new client.Counter({
+  name: 'elcarehub_lease_acquisitions_total',
+  help: 'Total successful lease acquisitions',
+  labelNames: ['role'],
+});
+
+export const indexerLeaseRenewalsTotal = new client.Counter({
+  name: 'elcarehub_lease_renewals_total',
+  help: 'Total successful lease renewals',
+  labelNames: ['role'],
+});
+
+export const indexerLeaseLostTotal = new client.Counter({
+  name: 'elcarehub_lease_lost_total',
+  help: 'Total times a worker lost its lease',
+  labelNames: ['role'],
+});
+
+export const indexerLeaseContentionTotal = new client.Counter({
+  name: 'elcarehub_lease_contention_total',
+  help: 'Total lease acquisition contentions',
+  labelNames: ['role'],
+});
+
+export const indexerWorkerLeaseGauge = new client.Gauge({
+  name: 'elcarehub_worker_lease_held',
+  help: '1 when this instance holds the active worker lease, 0 otherwise',
+});
+
 // ── Keeper metrics ────────────────────────────────────────────────────────────
 //
 // entry_point label values: "expire_listing" | "finalize_auction" | "reclaim_offer"
