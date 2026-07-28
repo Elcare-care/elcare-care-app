@@ -1,10 +1,36 @@
 use soroban_sdk::{symbol_short, Address, BytesN, Env};
 
+// ── Event Schema Versioning (Issue #278) ────────────────────────────────────
+//
+// This mirrors the policy documented at the top of
+// `contracts/soroban-marketplace/src/events.rs`: event shapes only ever
+// change additively, numeric encodings are fixed once chosen, and topics are
+// never reused for a different payload shape.
+//
+// Only `publish_deploy` is versioned today because it is the only launchpad
+// event the indexer currently decodes (`indexer/src/parser.ts` `TOPIC_MAP`
+// maps `dep_n721` / `dep_n1155` / `dep_l721` / `dep_l1155` to
+// `DEPLOY_NORMAL_721` etc.). The other events below (fee collection, admin
+// rotation, pause, wasm-hash updates) are emitted for on-chain audit history
+// but are not yet read by the indexer; if/when indexer support is added for
+// them, follow this same convention — append `EVENT_SCHEMA_VERSION` as a new
+// trailing tuple element, never insert or reorder existing elements.
+pub const EVENT_SCHEMA_VERSION: u32 = 1;
+
+/// Emitted when a new collection is deployed via the launchpad.
+///
+/// Topics: ("deploy", kind_tag)
+/// Data:   (creator: Address, deployed_address: Address, schema_version: u32)
+///
+/// `schema_version` was appended additively (Issue #278) as the 3rd tuple
+/// element; historical events emitted before this change only have 2
+/// elements, which the indexer's `DEPLOY_SCHEMA` still accepts (it validates
+/// `length >= 2` and only type-checks indices 0 and 1).
 #[allow(deprecated)]
 pub fn publish_deploy(env: &Env, tag: soroban_sdk::Symbol, creator: &Address, address: &Address) {
     env.events().publish(
         (symbol_short!("deploy"), tag),
-        (creator.clone(), address.clone()),
+        (creator.clone(), address.clone(), EVENT_SCHEMA_VERSION),
     );
 }
 
@@ -84,6 +110,17 @@ pub fn publish_admin_transfer_cancelled(env: &Env, admin: &Address, cancelled_pe
 pub fn publish_paused(env: &Env, admin: &Address, paused: bool) {
     env.events()
         .publish((symbol_short!("paused"),), (admin.clone(), paused));
+}
+
+/// Emitted when the admin assigns the `EmergencyPause` role to a new address
+/// (Issue #267).
+///
+/// Topics: ("pauser", "set")
+/// Data:   (pauser: Address)
+#[allow(deprecated)]
+pub fn publish_emergency_pauser_updated(env: &Env, pauser: &Address) {
+    env.events()
+        .publish((symbol_short!("pauser"), symbol_short!("set")), pauser.clone());
 }
 
 /// Emitted when the admin records a new set of collection WASM hashes.

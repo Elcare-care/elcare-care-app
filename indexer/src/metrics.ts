@@ -1,6 +1,13 @@
 import client from 'prom-client';
 import express from 'express';
 import { logger } from './logger.js';
+import { requestIdMiddleware } from './api/request-id-middleware.js';
+
+// Re-exported under its old name for backwards compatibility with existing
+// call sites/imports. The plain-text console.log implementation that used to
+// live here has been replaced by the structured JSON + correlation-ID
+// middleware in ./api/request-id-middleware.ts — see that file for behavior.
+export { requestIdMiddleware as requestLogger };
 
 // Enable default metrics (CPU, memory, etc.)
 client.collectDefaultMetrics();
@@ -37,6 +44,19 @@ export const eventDecodeErrorsCounter = new client.Counter({
   name: 'indexer_decode_errors_by_type_total',
   help: 'Total XDR event decode errors by event type',
   labelNames: ['event_type'],
+});
+
+/**
+ * Counts events whose `schema_version` is higher than what this indexer
+ * build understands (Issue #278). Distinct from `eventDecodeErrorsCounter`:
+ * the event decoded structurally fine, it's just a version the indexer
+ * hasn't been updated to recognize as safe — a signal that the indexer is
+ * behind the deployed contract and needs investigation/upgrade.
+ */
+export const unsupportedSchemaVersionCounter = new client.Counter({
+  name: 'indexer_unsupported_schema_version_total',
+  help: 'Total events skipped because their schema_version is not recognized by this indexer build, by event type and version',
+  labelNames: ['event_type', 'schema_version'],
 });
 
 export const duplicateEventsCounter = new client.Counter({
@@ -178,24 +198,8 @@ export const eventProcessingDurationHistogram = new client.Histogram({
   buckets: [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1],
 });
 
-// Request logging middleware
-export function requestLogger(req: express.Request, res: express.Response, next: express.NextFunction) {
-  const startTime = Date.now();
-
-  res.on('finish', () => {
-    const latency = Date.now() - startTime;
-    const statusClass = res.statusCode < 400 ? '2xx/3xx' : res.statusCode < 500 ? '4xx' : '5xx';
-    
-    // Skip logging for health checks and metrics
-    if (req.path !== '/health' && req.path !== '/metrics' && req.path !== '/readyz') {
-      console.log(
-        `${req.method} ${req.path} ${res.statusCode} ${latency}ms`
-      );
-    }
-  });
-
-  next();
-}
+// Structured request logging (JSON, with correlation IDs) lives in
+// ./api/request-id-middleware.ts — this file only owns Prometheus metrics.
 
 // Middleware to track HTTP response times
 export function metricsMiddleware(req: express.Request, res: express.Response, next: express.NextFunction) {

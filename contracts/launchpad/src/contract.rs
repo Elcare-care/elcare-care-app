@@ -873,20 +873,35 @@ impl Launchpad {
 
     // ── Pause ─────────────────────────────────────────────────────────────
 
-    /// Halts all four `deploy_*` functions.
+    /// Halts all four `deploy_*` functions. Callable by the configured
+    /// `EmergencyPauser` (see `set_emergency_pauser`), or by the admin when no
+    /// separate pauser has been assigned — so this remains usable even if the
+    /// routine admin authority is unavailable, once a distinct pauser is set.
     pub fn pause(env: Env) -> Result<(), Error> {
         storage::extend_instance_ttl(&env);
-        let admin = storage::require_admin(&env)?;
+        let authority = storage::require_pause_authority(&env)?;
         storage::set_paused(&env, true);
-        events::publish_paused(&env, &admin, true);
+        events::publish_paused(&env, &authority, true);
         Ok(())
     }
 
     pub fn unpause(env: Env) -> Result<(), Error> {
         storage::extend_instance_ttl(&env);
-        let admin = storage::require_admin(&env)?;
+        let authority = storage::require_pause_authority(&env)?;
         storage::set_paused(&env, false);
-        events::publish_paused(&env, &admin, false);
+        events::publish_paused(&env, &authority, false);
+        Ok(())
+    }
+
+    /// Assigns the `EmergencyPause` role to `pauser`, separating it from the
+    /// routine `Admin` authority (Issue #267). Admin-only. Passing the
+    /// current admin's own address restores the pre-role-separation
+    /// behaviour (admin remains the sole pauser).
+    pub fn set_emergency_pauser(env: Env, pauser: Address) -> Result<(), Error> {
+        storage::extend_instance_ttl(&env);
+        storage::require_admin(&env)?;
+        storage::set_emergency_pauser(&env, &pauser);
+        events::publish_emergency_pauser_updated(&env, &pauser);
         Ok(())
     }
 
@@ -984,6 +999,12 @@ impl Launchpad {
 
     pub fn paused(env: Env) -> bool {
         storage::is_paused(&env)
+    }
+
+    /// The explicit `EmergencyPause` role holder, or `None` if unassigned
+    /// (in which case `pause`/`unpause` fall back to the admin).
+    pub fn emergency_pauser(env: Env) -> Option<Address> {
+        storage::get_emergency_pauser(&env)
     }
 
     /// (fee_receiver, deploy_fee) — the treasury and flat deployment fee.

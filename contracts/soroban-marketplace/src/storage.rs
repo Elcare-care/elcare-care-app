@@ -1,7 +1,76 @@
 // storage.rs
-use crate::types::{Auction, BidRecord, Listing, Offer};
-use soroban_sdk::{contracttype, Address, Env, Vec};
+use crate::types::{Auction, BidRecord, Listing, MarketplaceError, Offer};
+use soroban_sdk::{contracttype, panic_with_error, Address, Env, Vec};
 
+// ── Storage retention classification (Issue #280) ────────────────────────
+//
+// Every `DataKey` variant below falls into exactly one of three retention
+// classes. This classification is the contract's answer to "what happens to
+// this key over time" and drives both the bounded maintenance entry points
+// in `contract.rs` (`extend_active_ttls`, `cleanup_expired_locks`) and what
+// the indexer/operators should expect to still be readable on-chain months
+// or years later. See also `docs/guides/storage-retention.md`.
+//
+// ACTIVE — must never be cleaned up while the referenced record is live.
+//   `Listing(id)` while status == Active, `Auction(id)` while status ==
+//   Active, `Offer(id)` while status == Pending, `ListingPendingOffers(id)`
+//   for such a listing, `ActiveListingPos(id)`, the `ActiveListings` index
+//   pages/length, and the two lock keys while genuinely held mid-transaction
+//   (`ListingLock`/`AuctionLock` — see the Recoverable note below on why
+//   these are not actually a growth risk).  `extend_active_ttls` walks
+//   exactly this set and re-extends its TTL; it never deletes anything.
+//
+// RECOVERABLE — safe to clear once terminal / stale; already bounded today.
+//   - `ListingLock(id)` / `AuctionLock(id)`: written to *temporary* (not
+//     persistent) storage with a short TTL (`REENTRANCY_LOCK_TTL` ledgers,
+//     see `acquire_listing_lock`/`acquire_auction_lock`) and explicitly
+//     released on every normal exit path of every function that acquires
+//     one. A panic mid-call rolls back the whole transaction (including the
+//     lock write), so it can never "leak" a lock either. Net effect: these
+//     keys are not an unbounded persistent-storage growth vector at all —
+//     Soroban's own temporary-entry expiry reclaims them even in the
+//     hypothetical case this contract failed to release one. The
+//     `cleanup_expired_locks` entry point exists as an operator-triggered
+//     safety valve for a stuck lock spotted off-chain, not a routine sweep.
+//   - Legacy pre-1.1.0 monolithic index keys (`ArtistListings(Address)`,
+//     `ArtistAuctions(Address)`, `ListingOffers(u64)`, `OffererOffers
+//     (Address)`, `ActiveListings`): already drained and deleted by the
+//     existing bounded `migrate`/`migrate_step` entry point via
+//     `take_legacy_index_vec`; nothing further to add here.
+//   - `ActiveListingPos(id)`, `ListingPendingOffers(id)`, `IndexPage`/
+//     `IndexLen` pages, `EscrowedToken`: already self-cleaning — each helper
+//     in this file deletes its own key the moment the last element/flag is
+//     removed (see `index_store_page`, `remove_from_active_listings`,
+//     `remove_pending_offer`, `clear_escrow_record`). No batch job needed.
+//   - `ArtistCancelCursor(Address)` / `MigrationCursor`: cleared on
+//     completion (migration) or on reinstatement (cancel cursor); the tiny
+//     residual left for a permanently-revoked artist is a single `u32` and
+//     not considered worth a dedicated sweep.
+//
+// ARCHIVAL — retained indefinitely on-chain for provenance / dispute
+// resolution; never actively deleted by contract code.
+//   `Listing(id)`, `Auction(id)`, `Offer(id)` records themselves, in *any*
+//   status, including terminal ones (Sold/Cancelled/Finalized/Accepted/
+//   Rejected/Withdrawn). The contract does not hard-delete historical
+//   marketplace records: doing so would destroy the provenance trail an
+//   indexer, a dispute, or a future audit needs. Instead, `extend_active_ttls`
+//   deliberately *skips* re-extending a terminal record's TTL, so once it
+//   naturally lapses, Soroban's own archival mechanism takes over (the data
+//   is still restorable on-chain, just no longer "hot"; see
+//   `docs/guides/storage-retention.md` for the operator-facing explanation
+//   of what this means for the indexer). `RevokedArtist`, `MigrationDone`
+//   markers and config keys (`Admin`, `Treasury`, `ProtocolFeeBps`, price
+//   bounds, etc.) are likewise small, permanent, and intentionally never
+//   swept.
+//
+// Bounded maintenance (Issue #280 acceptance criteria #2/#3):
+//   Both `extend_active_ttls` and `cleanup_expired_locks` (contract.rs)
+//   process at most `MAX_MAINTENANCE_ITEMS` entries per call regardless of
+//   the caller-supplied `max_items`, persist a resumable cursor
+//   (`TtlSweepProgress`) or accept an explicit bounded id list, and check
+//   status before touching anything so an Active listing, an Active
+//   auction, or a Pending offer can never be removed by a maintenance call.
+//
 /// Identifies one of the growing id-collections kept by the marketplace.
 ///
 /// Every index is stored as a sequence of fixed-capacity pages
@@ -42,6 +111,22 @@ pub struct PendingAdminProposal {
     pub expires_at: u64,
 }
 
+/// A pending two-step role-authority rotation (Issue #267).
+///
+/// Stored under `DataKey::PendingRole(role)` between `propose_role_transfer`
+/// and `accept_role_transfer`, mirroring [`PendingAdminProposal`]'s semantics:
+/// `expires_at` bounds how long a proposal can sit unaccepted, and the current
+/// holder can clear it early via `cancel_role_proposal`.
+#[contracttype]
+#[derive(Clone)]
+pub struct PendingRoleProposal {
+    /// Address invited to become the new holder of the role.
+    pub candidate: Address,
+    /// Absolute ledger timestamp after which the proposal can no longer be
+    /// accepted.
+    pub expires_at: u64,
+}
+
 /// Resumable progress marker for a versioned storage migration.
 #[contracttype]
 #[derive(Clone)]
@@ -49,6 +134,23 @@ pub struct MigrationProgress {
     /// Which migration phase is in progress (see `contract::migrate_step`).
     pub phase: u32,
     /// Position within the phase (last fully-processed item id/index).
+    pub cursor: u64,
+}
+
+/// Resumable progress marker for the periodic `contract::extend_active_ttls`
+/// maintenance sweep (Issue #280).
+///
+/// Phase 0 walks the `ActiveListings` index (`cursor` = logical position);
+/// phase 1 walks the sequential auction id space `1..=AuctionCount`
+/// (`cursor` = last-processed auction id). Once phase 1 completes the sweep
+/// wraps back to phase 0 rather than stopping — unlike `MigrationProgress`
+/// this is not expected to ever "finish": TTL upkeep for the live record set
+/// is an ongoing operational task, so as long as at least one listing or
+/// auction is Active, later calls will always find something to refresh.
+#[contracttype]
+#[derive(Clone)]
+pub struct TtlSweepProgress {
+    pub phase: u32,
     pub cursor: u64,
 }
 
@@ -361,6 +463,111 @@ pub fn increment_offer_count(env: &Env) -> u64 {
     let count = get_offer_count(env) + 1;
     env.storage().persistent().set(&DataKey::OfferCount, &count);
     bump_entry_ttl(env, &DataKey::OfferCount);
+    count
+}
+
+// ── Accounting counters (Issue #279) ─────────────────────────
+//
+// On-chain, per-payment-token totals so operators/creators/indexers can
+// reconcile expected fees and royalties against actual transfers without
+// relying solely on off-chain event aggregation.
+//
+// Design (deliberately simple — see docs/guides/accounting-reconciliation.md
+// for the full rationale):
+//   • Lifetime, monotonic, non-resettable totals. Never reset, never
+//     decremented — the simplest policy, hardest to game, and it matches
+//     "cannot be manipulated by failed transactions" (Soroban transactions
+//     are atomic, so a panic anywhere rolls back the whole invocation
+//     including any counter bump that happened earlier in the same call —
+//     these functions are only ever invoked *after* the corresponding token
+//     transfer(s) have already succeeded, right alongside the existing
+//     `ProtocolFeeCollectedEvent` / `RoyaltySettlementEvent` emissions).
+//   • Keyed by payment token address only (not by recipient) — an unbounded
+//     per-recipient breakdown would grow storage without bound as new
+//     recipients appear; the existing `RoyaltySettlementEvent` snapshot
+//     already carries the full per-recipient split for anyone who needs
+//     finer granularity, so the on-chain counter intentionally stays a
+//     per-token lifetime aggregate.
+//   • `RoyaltyTotal` accumulates the same `total_amount` value that is
+//     emitted on every `RoyaltySettlementEvent` (the gross settlement value:
+//     listing price / winning bid / accepted offer amount), so an indexer
+//     can reconcile by summing `RoyaltySettlementEvent.total_amount` grouped
+//     by token and comparing against `get_royalty_total(token)`.
+//   • `ProtocolFeeTotal` accumulates the same `amount` emitted on every
+//     `ProtocolFeeCollectedEvent`.
+//   • `SettlementCount` increments once per successful settlement (one per
+//     `RoyaltySettlementEvent` emission), regardless of whether a protocol
+//     fee was actually collected on that settlement.
+
+pub fn get_protocol_fee_total(env: &Env, token: &Address) -> i128 {
+    let key = DataKey::ProtocolFeeTotal(token.clone());
+    let value = env.storage().persistent().get::<DataKey, i128>(&key).unwrap_or(0);
+    if value != 0 {
+        bump_entry_ttl(env, &key);
+    }
+    value
+}
+
+/// Add `amount` to the lifetime protocol-fee total for `token`. No-op when
+/// `amount <= 0` (fee collection never subtracts). Panics with
+/// `ArithmeticOverflow` on i128 overflow (practically unreachable given real
+/// token supplies, kept for defense-in-depth consistency with the rest of
+/// the contract's checked-arithmetic style).
+pub fn add_protocol_fee_total(env: &Env, token: &Address, amount: i128) {
+    if amount <= 0 {
+        return;
+    }
+    let key = DataKey::ProtocolFeeTotal(token.clone());
+    let current = get_protocol_fee_total(env, token);
+    let updated = current
+        .checked_add(amount)
+        .unwrap_or_else(|| panic_with_error!(env, MarketplaceError::ArithmeticOverflow));
+    env.storage().persistent().set(&key, &updated);
+    bump_entry_ttl(env, &key);
+}
+
+pub fn get_royalty_total(env: &Env, token: &Address) -> i128 {
+    let key = DataKey::RoyaltyTotal(token.clone());
+    let value = env.storage().persistent().get::<DataKey, i128>(&key).unwrap_or(0);
+    if value != 0 {
+        bump_entry_ttl(env, &key);
+    }
+    value
+}
+
+/// Add `amount` to the lifetime royalty-settlement total for `token`. No-op
+/// when `amount <= 0`.
+pub fn add_royalty_total(env: &Env, token: &Address, amount: i128) {
+    if amount <= 0 {
+        return;
+    }
+    let key = DataKey::RoyaltyTotal(token.clone());
+    let current = get_royalty_total(env, token);
+    let updated = current
+        .checked_add(amount)
+        .unwrap_or_else(|| panic_with_error!(env, MarketplaceError::ArithmeticOverflow));
+    env.storage().persistent().set(&key, &updated);
+    bump_entry_ttl(env, &key);
+}
+
+pub fn get_settlement_count(env: &Env, token: &Address) -> u64 {
+    let key = DataKey::SettlementCount(token.clone());
+    let value = env.storage().persistent().get::<DataKey, u64>(&key).unwrap_or(0);
+    if value != 0 {
+        bump_entry_ttl(env, &key);
+    }
+    value
+}
+
+/// Increment the lifetime settlement count for `token` by one and return the
+/// new value.
+pub fn increment_settlement_count(env: &Env, token: &Address) -> u64 {
+    let key = DataKey::SettlementCount(token.clone());
+    let count = get_settlement_count(env, token)
+        .checked_add(1)
+        .unwrap_or_else(|| panic_with_error!(env, MarketplaceError::ArithmeticOverflow));
+    env.storage().persistent().set(&key, &count);
+    bump_entry_ttl(env, &key);
     count
 }
 
@@ -797,6 +1004,51 @@ pub fn clear_pending_admin_storage(env: &Env) {
     env.storage().persistent().remove(&DataKey::PendingAdmin);
 }
 
+// ── Role-based authorization (Issue #267) ────────────────────
+
+pub fn get_role_storage(env: &Env, role: &crate::types::RoleType) -> Option<Address> {
+    let key = DataKey::Role(role.clone());
+    let value = env.storage().persistent().get::<DataKey, Address>(&key);
+    if value.is_some() {
+        bump_entry_ttl(env, &key);
+    }
+    value
+}
+
+pub fn set_role_storage(env: &Env, role: &crate::types::RoleType, authority: &Address) {
+    let key = DataKey::Role(role.clone());
+    env.storage().persistent().set(&key, authority);
+    bump_entry_ttl(env, &key);
+}
+
+pub fn set_pending_role_storage(
+    env: &Env,
+    role: &crate::types::RoleType,
+    pending: &PendingRoleProposal,
+) {
+    let key = DataKey::PendingRole(role.clone());
+    env.storage().persistent().set(&key, pending);
+    bump_entry_ttl(env, &key);
+}
+
+pub fn get_pending_role_storage(
+    env: &Env,
+    role: &crate::types::RoleType,
+) -> Option<PendingRoleProposal> {
+    let key = DataKey::PendingRole(role.clone());
+    let value = env.storage().persistent().get::<DataKey, PendingRoleProposal>(&key);
+    if value.is_some() {
+        bump_entry_ttl(env, &key);
+    }
+    value
+}
+
+pub fn clear_pending_role_storage(env: &Env, role: &crate::types::RoleType) {
+    env.storage()
+        .persistent()
+        .remove(&DataKey::PendingRole(role.clone()));
+}
+
 // ── Bid history ──────────────────────────────────────────────
 
 pub fn append_bid_record(env: &Env, auction_id: u64, record: &BidRecord, cap: u32) {
@@ -1032,6 +1284,23 @@ pub fn clear_migration_progress(env: &Env, version: &soroban_sdk::String) {
     env.storage()
         .persistent()
         .remove(&DataKey::MigrationCursor(version.clone()));
+}
+
+// ── TTL-sweep cursor (Issue #280) ─────────────────────────────
+
+/// Load the resumable progress of the `extend_active_ttls` maintenance
+/// sweep (phase 0 cursor 0 the first time it is ever called).
+pub fn get_ttl_sweep_progress(env: &Env) -> TtlSweepProgress {
+    env.storage()
+        .persistent()
+        .get::<DataKey, TtlSweepProgress>(&DataKey::TtlSweepState)
+        .unwrap_or(TtlSweepProgress { phase: 0, cursor: 0 })
+}
+
+pub fn set_ttl_sweep_progress(env: &Env, progress: &TtlSweepProgress) {
+    let key = DataKey::TtlSweepState;
+    env.storage().persistent().set(&key, progress);
+    bump_entry_ttl(env, &key);
 }
 
 /// Read-and-delete a legacy (pre-1.1.0) monolithic `Vec<u64>` index entry.

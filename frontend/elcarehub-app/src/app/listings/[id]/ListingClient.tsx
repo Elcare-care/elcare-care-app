@@ -28,6 +28,7 @@ import { PriceHistoryChart } from "@/components/PriceHistoryChart";
 import { SocialShare } from "@/components/SocialShare";
 import { GuardButton } from "@/components/WalletGuard";
 import { ResourceState } from "@/components/PageStates";
+import { Breadcrumb } from "@/components/Breadcrumb";
 import { categorizePageError, PageStateError } from "@/lib/pageState";
 import {
     ArrowLeft,
@@ -37,6 +38,7 @@ import {
     Calendar,
     Hash,
     Clock,
+    Hourglass,
     Gavel,
     History,
     ShieldCheck,
@@ -247,6 +249,7 @@ export default function ListingDetailPage({ id }: ListingClientProps) {
     const isOwn = publicKey === artist;
     const status = listing?.status || auction?.status;
     const isActive = status === "Active";
+    const isExpired = status === "Cancelled" && !!listing?.expires_at && listing.expires_at < Date.now() / 1000;
 
     const priceDisplay = listing
         ? stroopsToXlm(listing.price)
@@ -264,6 +267,14 @@ export default function ListingDetailPage({ id }: ListingClientProps) {
 
     return (
         <div className="min-h-screen bg-midnight-950 text-white pb-20 pt-24 px-4 sm:px-6 lg:px-8">
+            {/* Breadcrumb */}
+            <Breadcrumb
+                items={[
+                    { label: "Discover", href: "/explore" },
+                    { label: metadata?.title ?? `Artwork #${id}` },
+                ]}
+                className="mb-8"
+            />
 
             <div className="grid gap-12 lg:grid-cols-2 lg:items-start">
                 {/* LEFT COLUMN: Media, Tabs & Description */}
@@ -273,7 +284,11 @@ export default function ListingDetailPage({ id }: ListingClientProps) {
                         {imageUrl ? (
                             <Image
                                 src={imageUrl}
-                                alt={metadata?.title ?? "Artwork"}
+                                alt={
+                                    metadata?.isDecorativeImage
+                                        ? ""
+                                        : (metadata?.altText ?? metadata?.title ?? "Artwork")
+                                }
                                 fill
                                 className="object-cover transition-transform duration-700 group-hover:scale-105"
                                 priority
@@ -290,9 +305,10 @@ export default function ListingDetailPage({ id }: ListingClientProps) {
                         <div className={`absolute top-6 right-6 px-4 py-1.5 rounded-full text-xs font-bold tracking-widest uppercase backdrop-blur-md shadow-xl border ${
                             status === "Active" ? "bg-mint-500/20 text-mint-400 border-mint-500/30" :
                             status === "Sold" || status === "Finalized" ? "bg-brand-500/20 text-brand-400 border-brand-500/30" :
+                            isExpired ? "bg-orange-500/20 text-orange-400 border-orange-500/30" :
                             "bg-terracotta-500/20 text-terracotta-400 border-terracotta-500/30"
                         }`}>
-                            {status}
+                            {isExpired ? "Expired" : status}
                         </div>
 
                         {/* Type Badge */}
@@ -557,6 +573,15 @@ export default function ListingDetailPage({ id }: ListingClientProps) {
                                     </div>
                                 )}
 
+                                {isExpired && (
+                                    <div className="p-6 rounded-2xl bg-orange-500/10 border border-orange-500/20 text-center flex items-center justify-center gap-3" data-testid="expired-banner">
+                                        <Hourglass size={18} className="text-orange-400" />
+                                        <p className="text-orange-400 font-bold italic">
+                                            This listing has expired and is no longer available.
+                                        </p>
+                                    </div>
+                                )}
+
                                 {(buyError || bidError) && (
                                     <div className="p-4 rounded-xl bg-terracotta-500/10 border border-terracotta-500/20 text-terracotta-400 text-xs flex items-center gap-3">
                                         <AlertCircle size={16} />
@@ -564,8 +589,8 @@ export default function ListingDetailPage({ id }: ListingClientProps) {
                                     </div>
                                 )}
 
-                                {/* Secondary Actions: Share + Provenance */}
-                                <div className="flex gap-3 pt-6">
+                                {/* Secondary Actions: Share + Provenance + Report */}
+                                <div className="flex gap-3 pt-6 flex-wrap">
                                     {/* Social share buttons */}
                                     <SocialShare
                                         title={metadata?.title ?? `Listing #${id}`}
@@ -582,6 +607,16 @@ export default function ListingDetailPage({ id }: ListingClientProps) {
                                         <History size={14} />
                                         <span className="hidden sm:inline">Provenance</span>
                                     </button>
+                                    {/* Work item B: link to support center with pre-filled context */}
+                                    <a
+                                        href={`/support?listing_id=${id}${listing?.metadata_cid ? `&cid=${listing.metadata_cid}` : ''}`}
+                                        title="Report an issue with this listing"
+                                        data-testid="report-issue-link"
+                                        className="h-11 px-4 rounded-xl bg-white/5 hover:bg-white/10 transition-all border border-white/10 flex items-center gap-2 text-xs font-bold text-white/60"
+                                    >
+                                        <AlertCircle size={14} />
+                                        <span className="hidden sm:inline">Report Issue</span>
+                                    </a>
                                 </div>
                             </div>
                         </div>

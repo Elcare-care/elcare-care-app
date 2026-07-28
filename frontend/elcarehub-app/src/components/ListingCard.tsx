@@ -4,15 +4,14 @@
 
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import Image from "next/image";
 import Link from "next/link";
 import { Listing, stroopsToXlm } from "@/lib/contract";
 import { ArtworkMetadata, fetchMetadata, getGatewayUrls } from "@/lib/ipfs";
-import { useEffect } from "react";
 import { useWalletContext } from "@/context/WalletContext";
 import { useBuyArtwork } from "@/hooks/useMarketplace";
-import { ShoppingCart, User, Calendar, Tag, ShieldAlert } from "lucide-react";
+import { ShoppingCart, User, Calendar, Tag, ShieldAlert, Clock, Hourglass } from "lucide-react";
 import { GuardButton } from "./WalletGuard";
 import posthog from "posthog-js";
 import { CheckoutModal } from "./CheckoutModal";
@@ -60,6 +59,35 @@ export function ListingCard({ listing, onPurchased }: ListingCardProps) {
   const allGatewaysExhausted = imageUrls !== null && gatewayIndex >= imageUrls.length;
 
   const isOwn = publicKey === listing.artist;
+  const isExpired = listing.status === "Cancelled" && !!listing.expires_at && listing.expires_at < Date.now() / 1000;
+
+  // Countdown for active listings with an expiry deadline
+  const [countdown, setCountdown] = useState<string | null>(null);
+  useEffect(() => {
+    if (listing.status !== "Active" || !listing.expires_at) {
+      setCountdown(null);
+      return;
+    }
+    const update = () => {
+      const now = Date.now() / 1000;
+      if (now >= listing.expires_at!) {
+        setCountdown("Expired");
+        return;
+      }
+      const remaining = Math.floor(listing.expires_at! - now);
+      const h = Math.floor(remaining / 3600);
+      const m = Math.floor((remaining % 3600) / 60);
+      const s = remaining % 60;
+      setCountdown(
+        h > 0
+          ? `${h}h ${String(m).padStart(2, "0")}m ${String(s).padStart(2, "0")}s`
+          : `${m}m ${String(s).padStart(2, "0")}s`
+      );
+    };
+    update();
+    const id = setInterval(update, 1000);
+    return () => clearInterval(id);
+  }, [listing.status, listing.expires_at]);
 
   const handleBuy = async () => {
     return await buy(listing.listing_id);
@@ -102,7 +130,11 @@ export function ListingCard({ listing, onPurchased }: ListingCardProps) {
             <Image
               key={currentImageUrl}
               src={currentImageUrl}
-              alt={metadata?.title ?? `Listing #${listing.listing_id}`}
+              alt={
+                metadata?.isDecorativeImage
+                  ? ""
+                  : (metadata?.altText ?? metadata?.title ?? `Listing #${listing.listing_id}`)
+              }
               fill
               className="object-cover transition-transform duration-300 group-hover:scale-105"
               onError={() => setGatewayIndex((i) => i + 1)}
@@ -117,10 +149,18 @@ export function ListingCard({ listing, onPurchased }: ListingCardProps) {
 
           {/* Status badge */}
           <span
-            className={`absolute right-3 top-3 rounded-full px-2.5 py-0.5 text-xs font-semibold ${STATUS_BADGE[listing.status] ?? "bg-gray-100 text-gray-500"}`}
+            className={`absolute right-3 top-3 rounded-full px-2.5 py-0.5 text-xs font-semibold ${isExpired ? "bg-orange-100 text-orange-600" : STATUS_BADGE[listing.status] ?? "bg-gray-100 text-gray-500"}`}
           >
-            {listing.status}
+            {isExpired ? "Expired" : listing.status}
           </span>
+
+          {/* Countdown badge for active listings with an expiry */}
+          {countdown && listing.status === "Active" && (
+            <span className="absolute left-3 top-3 flex items-center gap-1 rounded-full bg-midnight-900/80 backdrop-blur-sm px-2.5 py-0.5 text-[10px] font-bold text-white/80 uppercase tracking-wider">
+              <Clock size={10} />
+              {countdown}
+            </span>
+          )}
         </div>
       </Link>
 
@@ -145,10 +185,23 @@ export function ListingCard({ listing, onPurchased }: ListingCardProps) {
               {listing.artist.slice(0, 8)}…{listing.artist.slice(-4)}
             </span>
           </div>
+          {metadata?.creator && (
+            <div className="flex items-center gap-1.5">
+              <User size={12} />
+              <span className="truncate">{metadata.creator}</span>
+            </div>
+          )}
           {metadata?.year && (
             <div className="flex items-center gap-1.5">
               <Calendar size={12} />
               <span>{metadata.year}</span>
+            </div>
+          )}
+          {metadata?.license && (
+            <div className="flex items-center gap-1.5">
+              <span className="text-[10px] uppercase tracking-wider opacity-70">
+                {metadata.license}
+              </span>
             </div>
           )}
         </div>
@@ -183,7 +236,7 @@ export function ListingCard({ listing, onPurchased }: ListingCardProps) {
 
         {/* Revoked-artist banner — shown when listing is Cancelled and artist
             was revoked; collectors see why the item is no longer purchasable */}
-        {listing.status === "Cancelled" && (
+        {listing.status === "Cancelled" && !isExpired && (
           <div
             className="mt-3 flex items-start gap-2 rounded-xl border border-amber-500/20 bg-amber-500/10 px-3 py-2"
             role="alert"
@@ -193,6 +246,18 @@ export function ListingCard({ listing, onPurchased }: ListingCardProps) {
             <p className="text-[11px] leading-snug text-amber-400">
               This listing was cancelled because the artist&apos;s account has
               been suspended by the platform.
+            </p>
+          </div>
+        )}
+        {isExpired && (
+          <div
+            className="mt-3 flex items-start gap-2 rounded-xl border border-orange-500/20 bg-orange-500/10 px-3 py-2"
+            role="alert"
+            data-testid="expired-listing-banner"
+          >
+            <Hourglass size={14} className="mt-0.5 shrink-0 text-orange-400" />
+            <p className="text-[11px] leading-snug text-orange-400">
+              This listing has expired and is no longer available for purchase.
             </p>
           </div>
         )}

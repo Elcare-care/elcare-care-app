@@ -13,6 +13,8 @@ export default defineConfig({
         screenshot: 'only-on-failure',
         headless: true,
     },
+    // Work item A: snapshot directory (committed to repo, reviewed in PR diffs)
+    snapshotDir: './tests/e2e/snapshots',
     projects: [
         {
             name: 'chromium',

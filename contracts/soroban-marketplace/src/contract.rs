@@ -125,6 +125,14 @@ const MIN_AUCTION_DURATION: u64 = 3_600; // 1 hour
 /// Maximum number of listing ids accepted by one `cancel_listings` batch.
 const MAX_BATCH_CANCEL: u32 = 10;
 
+/// Hard ceiling on the number of records/ids any single bounded maintenance
+/// call (`extend_active_ttls`, `cleanup_expired_locks`) will touch, applied
+/// on top of (never relaxed by) whatever the caller passes as `max_items` /
+/// however many ids they supply. Keeps a single maintenance transaction's
+/// compute/read footprint bounded no matter what an admin requests.
+/// (Issue #280)
+const MAX_MAINTENANCE_ITEMS: u32 = 100;
+
 const MAX_OFFERS_PER_LISTING: u32 = 50;
 
 /// Maximum number of addresses one auction's blocked-bidder registry can hold
@@ -227,6 +235,123 @@ impl MarketplaceContract {
         get_pending_admin_storage(&env)
     }
 
+    // ── Role-based authorization (Issue #267) ─────────────────
+    //
+    // Every privileged entry point below is owned by exactly one `RoleType`:
+    // `ProtocolConfig` (price bounds, treasury, fees, bid/auction params),
+    // `EmergencyPause` (global/collection/function circuit breakers),
+    // `CollectionAdmin` (artist revocation/reinstatement, listing cleanup)
+    // and `Upgrade` (storage/version migration). A role with no explicit
+    // holder falls back to whoever holds `Admin`, so existing single-admin
+    // deployments keep working unchanged until an operator opts in via
+    // `migrate_roles` or a direct `propose_role_transfer` /
+    // `accept_role_transfer`. Keeping `EmergencyPause` independently
+    // assignable means an incident responder can still halt the marketplace
+    // even if the (potentially slower, multisig-gated) `ProtocolConfig`
+    // authority is unavailable or compromised.
+
+    /// Resolve the current holder of `role`: its explicit holder if one has
+    /// been assigned, otherwise the contract `Admin`.
+    pub fn get_role(env: Env, role: RoleType) -> Address {
+        get_role_storage(&env, &role)
+            .unwrap_or_else(|| Self::get_admin(env.clone()).expect("admin not set"))
+    }
+
+    /// View: the currently-pending role-transfer proposal for `role`, or
+    /// `None` when no rotation is in progress.
+    pub fn get_pending_role(env: Env, role: RoleType) -> Option<PendingRoleProposal> {
+        get_pending_role_storage(&env, &role)
+    }
+
+    /// Step 1 of the two-step role rotation: the current holder of `role`
+    /// proposes a candidate. Mirrors `transfer_admin`'s TTL/overwrite
+    /// semantics — a second call overwrites any still-pending proposal.
+    pub fn propose_role_transfer(
+        env: Env,
+        current_authority: Address,
+        role: RoleType,
+        candidate: Address,
+    ) {
+        current_authority.require_auth();
+        let stored = Self::get_role(env.clone(), role.clone());
+        if current_authority != stored {
+            panic_with_error!(&env, MarketplaceError::Unauthorized);
+        }
+        let expires_at = env.ledger().timestamp() + ADMIN_PROPOSAL_TTL;
+        set_pending_role_storage(
+            &env,
+            &role,
+            &PendingRoleProposal {
+                candidate: candidate.clone(),
+                expires_at,
+            },
+        );
+        emit_role_proposed(&env, role, current_authority, candidate, expires_at);
+    }
+
+    /// Step 2: the proposed candidate accepts and becomes the explicit
+    /// holder of `role`. Reverts with `NoRoleProposalPending` if no proposal
+    /// is active, `Unauthorized` if the caller is not the proposed candidate,
+    /// and `RoleProposalExpired` if the proposal's deadline has passed —
+    /// analogous to `accept_admin`.
+    pub fn accept_role_transfer(env: Env, role: RoleType, candidate: Address) {
+        candidate.require_auth();
+        let pending = get_pending_role_storage(&env, &role)
+            .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::NoRoleProposalPending));
+        if candidate != pending.candidate {
+            panic_with_error!(&env, MarketplaceError::Unauthorized);
+        }
+        if env.ledger().timestamp() > pending.expires_at {
+            panic_with_error!(&env, MarketplaceError::RoleProposalExpired);
+        }
+        let old_authority = Self::get_role(env.clone(), role.clone());
+        set_role_storage(&env, &role, &candidate);
+        clear_pending_role_storage(&env, &role);
+        emit_role_accepted(&env, role, old_authority, candidate);
+    }
+
+    /// Cancel a still-pending role-transfer proposal. Callable only by the
+    /// current holder of the role. Reverts with `NoRoleProposalPending` when
+    /// no proposal is active.
+    pub fn cancel_role_proposal(env: Env, current_authority: Address, role: RoleType) {
+        current_authority.require_auth();
+        let stored = Self::get_role(env.clone(), role.clone());
+        if current_authority != stored {
+            panic_with_error!(&env, MarketplaceError::Unauthorized);
+        }
+        let pending = get_pending_role_storage(&env, &role)
+            .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::NoRoleProposalPending));
+        clear_pending_role_storage(&env, &role);
+        emit_role_proposal_cancelled(&env, role, current_authority, pending.candidate);
+    }
+
+    /// Migration path for existing single-admin deployments (Issue #267):
+    /// explicitly assigns `admin` as the holder of every role that does not
+    /// yet have one, emitting `role_migrated` for each. Callable only by the
+    /// current `Admin`.
+    ///
+    /// Idempotent: a role that already has an explicit holder (including one
+    /// assigned by an earlier `migrate_roles` call, or one since transferred
+    /// to a distinct authority) is left untouched, so re-running it is always
+    /// safe.
+    pub fn migrate_roles(env: Env, admin: Address) {
+        admin.require_auth();
+        if admin != Self::get_admin(env.clone()).expect("admin not set") {
+            panic_with_error!(&env, MarketplaceError::Unauthorized);
+        }
+        for role in [
+            RoleType::ProtocolConfig,
+            RoleType::EmergencyPause,
+            RoleType::CollectionAdmin,
+            RoleType::Upgrade,
+        ] {
+            if get_role_storage(&env, &role).is_none() {
+                set_role_storage(&env, &role, &admin);
+                emit_role_migrated(&env, role, admin.clone());
+            }
+        }
+    }
+
     // ── Versioning & Migration ───────────────────────────────
 
     pub fn version(env: Env) -> soroban_sdk::String {
@@ -282,11 +407,7 @@ impl MarketplaceContract {
 
     /// Common guard for `migrate`/`migrate_step`: admin auth + not-yet-migrated.
     fn require_pending_migration(env: &Env, admin: &Address) -> soroban_sdk::String {
-        admin.require_auth();
-        let stored_admin = Self::get_admin(env.clone()).expect("admin not set");
-        if *admin != stored_admin {
-            panic_with_error!(env, MarketplaceError::Unauthorized);
-        }
+        Self::require_role(env, admin, RoleType::Upgrade);
         let version = soroban_sdk::String::from_str(env, CONTRACT_VERSION);
         if is_migration_done(env, &version) {
             panic_with_error!(env, MarketplaceError::AlreadyMigrated);
@@ -430,10 +551,7 @@ impl MarketplaceContract {
     // ── Price bounds ─────────────────────────────────────────
 
     pub fn set_price_bounds(env: Env, admin: Address, min: i128, max: i128) {
-        admin.require_auth();
-        if admin != Self::get_admin(env.clone()).expect("admin not set") {
-            panic_with_error!(&env, MarketplaceError::Unauthorized);
-        }
+        Self::require_role(&env, &admin, RoleType::ProtocolConfig);
         if min < 0 || max < 0 || min > max { panic_with_error!(&env, MarketplaceError::InvalidPrice); }
         set_min_price_storage(&env, min);
         set_max_price_storage(&env, max);
@@ -446,10 +564,7 @@ impl MarketplaceContract {
     // ── Treasury & Fees ──────────────────────────────────────
 
     pub fn set_treasury(env: Env, admin: Address, treasury: Address) {
-        admin.require_auth();
-        if admin != Self::get_admin(env.clone()).expect("admin not set") {
-            panic_with_error!(&env, MarketplaceError::Unauthorized);
-        }
+        Self::require_role(&env, &admin, RoleType::ProtocolConfig);
         crate::storage::set_treasury_storage(&env, &treasury);
     }
 
@@ -458,10 +573,7 @@ impl MarketplaceContract {
     }
 
     pub fn set_protocol_fee(env: Env, admin: Address, bps: u32) {
-        admin.require_auth();
-        if admin != Self::get_admin(env.clone()).expect("admin not set") {
-            panic_with_error!(&env, MarketplaceError::Unauthorized);
-        }
+        Self::require_role(&env, &admin, RoleType::ProtocolConfig);
         if bps > 1000 { panic_with_error!(&env, MarketplaceError::InvalidPrice); }
         crate::storage::set_protocol_fee_bps_storage(&env, bps);
     }
@@ -510,10 +622,7 @@ impl MarketplaceContract {
     }
 
     pub fn set_min_bid_increment(env: Env, admin: Address, increment: i128) {
-        admin.require_auth();
-        if admin != Self::get_admin(env.clone()).expect("admin not set") {
-            panic_with_error!(&env, MarketplaceError::Unauthorized);
-        }
+        Self::require_role(&env, &admin, RoleType::ProtocolConfig);
         if increment < 0 { panic_with_error!(&env, MarketplaceError::InvalidPrice); }
         crate::storage::set_min_bid_increment_storage(&env, increment);
     }
@@ -543,10 +652,7 @@ impl MarketplaceContract {
     /// If a future version needs O(1) eviction, the ring buffer can be replaced
     /// with an indexed page (write-head pointer in instance storage).
     pub fn set_bid_history_cap(env: Env, admin: Address, cap: u32) {
-        admin.require_auth();
-        if admin != Self::get_admin(env.clone()).expect("admin not set") {
-            panic_with_error!(&env, MarketplaceError::Unauthorized);
-        }
+        Self::require_role(&env, &admin, RoleType::ProtocolConfig);
         if cap == 0 || cap > MAX_BID_HISTORY_CAP {
             panic_with_error!(&env, MarketplaceError::InvalidPrice);
         }
@@ -558,10 +664,7 @@ impl MarketplaceContract {
     }
 
     pub fn set_auction_extension_window(env: Env, admin: Address, window: u64) {
-        admin.require_auth();
-        if admin != Self::get_admin(env.clone()).expect("admin not set") {
-            panic_with_error!(&env, MarketplaceError::Unauthorized);
-        }
+        Self::require_role(&env, &admin, RoleType::ProtocolConfig);
         set_auction_extension_window_storage(&env, window);
     }
 
@@ -570,10 +673,7 @@ impl MarketplaceContract {
     }
 
     pub fn set_auction_extension_trigger(env: Env, admin: Address, trigger: u64) {
-        admin.require_auth();
-        if admin != Self::get_admin(env.clone()).expect("admin not set") {
-            panic_with_error!(&env, MarketplaceError::Unauthorized);
-        }
+        Self::require_role(&env, &admin, RoleType::ProtocolConfig);
         set_auction_extension_trigger_storage(&env, trigger);
     }
 
@@ -585,10 +685,7 @@ impl MarketplaceContract {
     /// the anti-sniping logic.  0 = unlimited (default).
     /// Snapshotted into each new auction at creation time.
     pub fn set_auction_max_extensions(env: Env, admin: Address, max: u32) {
-        admin.require_auth();
-        if admin != Self::get_admin(env.clone()).expect("admin not set") {
-            panic_with_error!(&env, MarketplaceError::Unauthorized);
-        }
+        Self::require_role(&env, &admin, RoleType::ProtocolConfig);
         set_auction_max_extensions_storage(&env, max);
     }
 
@@ -599,20 +696,14 @@ impl MarketplaceContract {
     // ── Pause ────────────────────────────────────────────────
 
     pub fn admin_pause(env: Env, admin: Address) {
-        admin.require_auth();
-        if admin != Self::get_admin(env.clone()).expect("admin not set") {
-            panic_with_error!(&env, MarketplaceError::Unauthorized);
-        }
+        Self::require_role(&env, &admin, RoleType::EmergencyPause);
         crate::storage::set_paused(&env, true);
         #[allow(deprecated)]
         env.events().publish((crate::events::CONTRACT_PAUSED,), ());
     }
 
     pub fn admin_unpause(env: Env, admin: Address) {
-        admin.require_auth();
-        if admin != Self::get_admin(env.clone()).expect("admin not set") {
-            panic_with_error!(&env, MarketplaceError::Unauthorized);
-        }
+        Self::require_role(&env, &admin, RoleType::EmergencyPause);
         crate::storage::set_paused(&env, false);
         #[allow(deprecated)]
         env.events().publish((crate::events::CONTRACT_UNPAUSED,), ());
@@ -632,23 +723,59 @@ impl MarketplaceContract {
     // Any active axis blocks the affected operations.  Global pause
     // still blocks everything; collection and function pauses are
     // additive narrow restrictions layered on top.
+    //
+    // ── State-transition matrix (narrowly-scoped emergency pause) ──
+    //
+    // A pause is meant to stop *new* risk exposure, not trap funds or NFTs
+    // that are already committed to the contract.  Every public entry point
+    // falls into exactly one of the two buckets below.
+    //
+    // Blocked when paused (subject to global / collection / function axes,
+    // via `require_not_paused` or `require_not_paused_ctx`) — these create
+    // new exposure (new escrow, new payment flow, new price commitment):
+    //   - create_listing        (collection + function axis)
+    //   - update_listing        (global axis)
+    //   - update_listing_price  (global axis)
+    //   - buy_artwork           (collection + function axis)
+    //   - create_auction        (collection + function axis)
+    //   - place_bid             (collection + function axis)
+    //   - make_offer            (collection + function axis)
+    //   - accept_offer          (global axis — a purchase-like state
+    //                            transition, not fund recovery, so it stays
+    //                            gated like buy_artwork)
+    //
+    // Always available regardless of pause state (fund recovery / cleanup —
+    // these return escrowed tokens or NFTs to their rightful owner, or tidy
+    // up state that is already terminal/expired, so blocking them would trap
+    // user funds during exactly the incident a pause is meant to contain):
+    //   - cancel_listing            (artist reclaims NFT from escrow)
+    //   - cancel_listings           (batch form of the above)
+    //   - cancel_artist_listings    (admin-driven revocation cleanup sweep)
+    //   - expire_listing            (permissionless; already unguarded)
+    //   - cancel_auction            (creator reclaims NFT, no-bid only)
+    //   - finalize_auction          (settles an already-ended auction —
+    //                                explicitly called out by the issue)
+    //   - admin_cancel_auction      (admin emergency unwind + bidder refund)
+    //   - withdraw_offer            (offerer reclaims escrowed funds)
+    //   - reject_offer              (artist rejects offer, funds return to
+    //                                the offerer)
+    //   - reclaim_offer             (offerer reclaims funds from an offer
+    //                                that expired without action)
+    //
+    // These cleanup paths deliberately skip *all three* pause axes (global,
+    // collection, function) — they exist precisely so a paused incident
+    // doesn't also freeze user funds/state in limbo.
 
     /// Pause all operations for a specific collection.
     pub fn pause_collection(env: Env, admin: Address, collection: Address) {
-        admin.require_auth();
-        if admin != Self::get_admin(env.clone()).expect("admin not set") {
-            panic_with_error!(&env, MarketplaceError::Unauthorized);
-        }
+        Self::require_role(&env, &admin, RoleType::EmergencyPause);
         crate::storage::set_collection_paused(&env, &collection, true);
         crate::events::emit_collection_paused(&env, collection);
     }
 
     /// Resume all operations for a previously paused collection.
     pub fn unpause_collection(env: Env, admin: Address, collection: Address) {
-        admin.require_auth();
-        if admin != Self::get_admin(env.clone()).expect("admin not set") {
-            panic_with_error!(&env, MarketplaceError::Unauthorized);
-        }
+        Self::require_role(&env, &admin, RoleType::EmergencyPause);
         crate::storage::set_collection_paused(&env, &collection, false);
         crate::events::emit_collection_unpaused(&env, collection);
     }
@@ -662,20 +789,14 @@ impl MarketplaceContract {
     /// Valid names: "buy_artwork", "create_listing", "place_bid",
     ///              "create_auction", "make_offer", "accept_offer".
     pub fn pause_function(env: Env, admin: Address, function_name: Symbol) {
-        admin.require_auth();
-        if admin != Self::get_admin(env.clone()).expect("admin not set") {
-            panic_with_error!(&env, MarketplaceError::Unauthorized);
-        }
+        Self::require_role(&env, &admin, RoleType::EmergencyPause);
         crate::storage::set_function_paused(&env, &function_name, true);
         crate::events::emit_function_paused(&env, function_name);
     }
 
     /// Resume a previously paused entry-point.
     pub fn unpause_function(env: Env, admin: Address, function_name: Symbol) {
-        admin.require_auth();
-        if admin != Self::get_admin(env.clone()).expect("admin not set") {
-            panic_with_error!(&env, MarketplaceError::Unauthorized);
-        }
+        Self::require_role(&env, &admin, RoleType::EmergencyPause);
         crate::storage::set_function_paused(&env, &function_name, false);
         crate::events::emit_function_unpaused(&env, function_name);
     }
@@ -702,7 +823,7 @@ impl MarketplaceContract {
     /// The function is idempotent: calling it on an already-revoked artist with
     /// no remaining items is a no-op.
     pub fn revoke_artist(env: Env, artist: Address) {
-        Self::require_admin(&env);
+        Self::require_role_auth(&env, RoleType::CollectionAdmin);
         set_artist_revocation_storage(&env, &artist);
 
         // Emit the revocation event using the typed struct (not the raw address).
@@ -821,7 +942,7 @@ impl MarketplaceContract {
     }
 
     pub fn reinstate_artist(env: Env, artist: Address) {
-        Self::require_admin(&env);
+        Self::require_role_auth(&env, RoleType::CollectionAdmin);
         remove_artist_revocation_storage(&env, &artist);
         // Clear any in-progress revocation cursors on reinstatement
         crate::storage::clear_artist_cancel_cursor(&env, &artist);
@@ -848,10 +969,7 @@ impl MarketplaceContract {
     /// repeatedly until it returns `0`.  Calling it for a non-revoked artist
     /// does nothing and returns `0`.
     pub fn cancel_artist_listings(env: Env, admin: Address, artist: Address, max_items: u32) -> u64 {
-        admin.require_auth();
-        if admin != Self::get_admin(env.clone()).expect("admin not set") {
-            panic_with_error!(&env, MarketplaceError::Unauthorized);
-        }
+        Self::require_role(&env, &admin, RoleType::CollectionAdmin);
 
         // Only cancel listings if the artist is actually revoked.  A stale
         // cursor from an interrupted sweep is dropped so a later re-revocation
@@ -919,7 +1037,7 @@ impl MarketplaceContract {
     /// call reverts.  Per listing the refund-then-cancel semantics match
     /// `cancel_listing`.  Returns the number of listings cancelled.
     pub fn cancel_listings(env: Env, owner: Address, listing_ids: Vec<u64>) -> u32 {
-        Self::require_not_paused(&env);
+        // Fund-recovery / cleanup op — always available, ignores all pause axes.
         owner.require_auth();
 
         if listing_ids.len() > MAX_BATCH_CANCEL {
@@ -933,18 +1051,223 @@ impl MarketplaceContract {
         listing_ids.len()
     }
 
+    // ── Bounded storage maintenance (Issue #280) ─────────────
+    //
+    // Two admin-only, bounded-per-call entry points. Neither ever deletes a
+    // Listing, Auction or Offer record — see the retention classification
+    // at the top of `storage.rs` and `docs/guides/storage-retention.md` for
+    // the full policy. Both emit `CleanupSummaryEvent` so an indexer/keeper
+    // can observe how much maintenance work actually happened each call.
+
+    /// Bounded, resumable TTL-refresh sweep over the live (non-terminal)
+    /// record set: Active listings (+ their Pending offers) and Active
+    /// auctions (+ their bid history).
+    ///
+    /// Every read/write this contract performs already re-extends the TTL
+    /// of the record it touches (`storage::bump_entry_ttl` call sites), so a
+    /// frequently-used listing or auction never silently expires. This
+    /// sweep defends against the opposite case: an Active listing or
+    /// auction nobody has read or interacted with recently, whose TTL can
+    /// lapse invisibly and make it unexpectedly unavailable to the indexer
+    /// or frontend even though it is still logically live.
+    ///
+    /// Processes at most `max_items` records this call, hard-capped at
+    /// `MAX_MAINTENANCE_ITEMS` regardless of the argument, and persists a
+    /// `TtlSweepProgress` cursor so repeated calls make forward progress.
+    /// The sweep is a perpetual cycle (phase 0 = `ActiveListings` index,
+    /// phase 1 = sequential auction ids, then wraps back to phase 0) — as
+    /// long as at least one listing or auction is Active, later calls will
+    /// always find something to refresh. Unlike `migrate_step` this is not
+    /// a one-shot drain; it is meant to be invoked periodically forever by
+    /// an operator/keeper process.
+    ///
+    /// Never touches a terminal (Sold/Cancelled/Finalized) record — those
+    /// are deliberately left to fall out of TTL so Soroban's own archival
+    /// mechanism takes over, since the contract never deletes historical
+    /// listing/auction/offer data. If the sweep finds an id still present
+    /// in the `ActiveListings` index or auction id space whose stored
+    /// status is no longer Active (or the record is missing), it emits a
+    /// `TtlAnomalyEvent` instead of silently doing nothing, surfacing the
+    /// index/state drift rather than hiding it.
+    ///
+    /// Returns the number of records actually refreshed this call.
+    pub fn extend_active_ttls(env: Env, admin: Address, max_items: u32) -> u32 {
+        admin.require_auth();
+        if admin != Self::get_admin(env.clone()).expect("admin not set") {
+            panic_with_error!(&env, MarketplaceError::Unauthorized);
+        }
+
+        let budget_cap = max_items.min(MAX_MAINTENANCE_ITEMS);
+        let total_listings = active_listings_len(&env);
+        let total_auctions = get_auction_count(&env);
+        if budget_cap == 0 || (total_listings == 0 && total_auctions == 0) {
+            return 0;
+        }
+
+        let mut progress = get_ttl_sweep_progress(&env);
+        let mut processed: u32 = 0;
+        // Bounds the number of phase-0/phase-1 toggles when one side of the
+        // sweep is empty, so the loop can never spin forever without making
+        // progress (each toggle is O(1); two full toggles are always enough
+        // to reach whichever side has work).
+        let mut toggles: u32 = 0;
+
+        while processed < budget_cap && toggles < 4 {
+            if progress.phase == 0 {
+                if total_listings == 0 || progress.cursor >= total_listings as u64 {
+                    progress.phase = 1;
+                    progress.cursor = 0;
+                    toggles += 1;
+                    continue;
+                }
+                let pos = progress.cursor as u32;
+                if let Some(listing_id) = index_get(&env, &IndexId::ActiveListings, pos) {
+                    match load_listing(&env, listing_id) {
+                        Some(listing) if listing.status == ListingStatus::Active => {
+                            // `load_listing` already bumped the listing's own
+                            // TTL; also refresh every Pending offer hanging
+                            // off it (bounded, ≤ MAX_OFFERS_PER_LISTING).
+                            for offer_id in load_pending_offer_ids(&env, listing_id).iter() {
+                                load_offer(&env, offer_id);
+                            }
+                        }
+                        _ => {
+                            TtlAnomalyEvent {
+                                subject: Symbol::new(&env, "listing"),
+                                id: listing_id,
+                                ledger_sequence: env.ledger().sequence(),
+                            }
+                            .publish(&env);
+                        }
+                    }
+                }
+                progress.cursor += 1;
+                processed += 1;
+            } else {
+                if total_auctions == 0 || progress.cursor >= total_auctions {
+                    progress.phase = 0;
+                    progress.cursor = 0;
+                    toggles += 1;
+                    continue;
+                }
+                let auction_id = progress.cursor + 1; // ids are 1-based
+                match load_auction(&env, auction_id) {
+                    Some(auction) if auction.status == AuctionStatus::Active => {
+                        // `load_auction` already bumped the auction's own
+                        // TTL; also refresh its bid history if any.
+                        load_auction_bids(&env, auction_id);
+                    }
+                    Some(_) => {} // terminal — intentionally left alone
+                    None => {
+                        TtlAnomalyEvent {
+                            subject: Symbol::new(&env, "auction"),
+                            id: auction_id,
+                            ledger_sequence: env.ledger().sequence(),
+                        }
+                        .publish(&env);
+                    }
+                }
+                progress.cursor += 1;
+                processed += 1;
+            }
+        }
+
+        set_ttl_sweep_progress(&env, &progress);
+        CleanupSummaryEvent {
+            kind: Symbol::new(&env, "ttl_extend"),
+            items_processed: processed,
+            ledger_sequence: env.ledger().sequence(),
+        }
+        .publish(&env);
+        processed
+    }
+
+    /// Bounded admin safety-valve that force-clears reentrancy locks for the
+    /// given listing/auction ids.
+    ///
+    /// `ListingLock`/`AuctionLock` live in *temporary* storage with a short
+    /// TTL (`REENTRANCY_LOCK_TTL` ledgers) and are already released on every
+    /// normal exit path of every function that acquires one; a panic
+    /// mid-call rolls back the whole transaction (including the lock
+    /// write), so it can never leak a lock either. Under normal operation
+    /// Soroban's own temporary-storage expiry reclaims any lock this
+    /// contract somehow failed to release. This entry point exists purely
+    /// as an operator-triggered safety valve for a stuck lock spotted
+    /// off-chain — it is a no-op (and safe to retry) for any id whose lock
+    /// is already absent, so calling it again with nothing left to clear
+    /// just returns 0.
+    ///
+    /// `listing_ids` and `auction_ids` are processed in that order up to a
+    /// combined `MAX_MAINTENANCE_ITEMS`; ids past the cap are silently
+    /// ignored rather than causing the whole call to revert. Returns the
+    /// number of locks actually found and cleared.
+    pub fn cleanup_expired_locks(
+        env: Env,
+        admin: Address,
+        listing_ids: Vec<u64>,
+        auction_ids: Vec<u64>,
+    ) -> u32 {
+        admin.require_auth();
+        if admin != Self::get_admin(env.clone()).expect("admin not set") {
+            panic_with_error!(&env, MarketplaceError::Unauthorized);
+        }
+
+        let mut cleared: u32 = 0;
+        let mut budget = MAX_MAINTENANCE_ITEMS;
+
+        for listing_id in listing_ids.iter() {
+            if budget == 0 {
+                break;
+            }
+            budget -= 1;
+            let key = DataKey::ListingLock(listing_id);
+            if env.storage().temporary().has(&key) {
+                release_listing_lock(&env, listing_id);
+                cleared += 1;
+            }
+        }
+        for auction_id in auction_ids.iter() {
+            if budget == 0 {
+                break;
+            }
+            budget -= 1;
+            let key = DataKey::AuctionLock(auction_id);
+            if env.storage().temporary().has(&key) {
+                release_auction_lock(&env, auction_id);
+                cleared += 1;
+            }
+        }
+
+        CleanupSummaryEvent {
+            kind: Symbol::new(&env, "lock_cleanup"),
+            items_processed: cleared,
+            ledger_sequence: env.ledger().sequence(),
+        }
+        .publish(&env);
+        cleared
+    }
+
     // ── Token Whitelist ──────────────────────────────────────
 
     pub fn add_token_to_whitelist(env: Env, token: Address) {
         Self::require_admin(&env);
+        // Boundary validation (Issue #282): reject the marketplace's own
+        // address before it can ever land in the whitelist. Decimals/asset
+        // identity for the token are the off-chain registry's job (see
+        // `validate_token_asset` doc comment); this is deliberately a cheap,
+        // on-chain-only sanity check.
+        Self::validate_token_asset(&env, &token, None);
         let key = crate::storage::DataKey::TokenWhitelist;
         let mut wl = env.storage().persistent()
             .get::<_, Vec<Address>>(&key).unwrap_or(Vec::new(&env));
+        // Idempotent by design: re-whitelisting an already-present token is a
+        // no-op rather than an error, so an admin re-running a setup script
+        // can never accidentally create duplicate entries.
         if !wl.contains(&token) { wl.push_back(token); env.storage().persistent().set(&key, &wl); }
     }
 
     pub fn remove_token_from_whitelist(env: Env, token: Address) {
-        Self::require_admin(&env);
+        Self::require_role_auth(&env, RoleType::ProtocolConfig);
         let key = crate::storage::DataKey::TokenWhitelist;
         let wl = env.storage().persistent()
             .get::<_, Vec<Address>>(&key).unwrap_or(Vec::new(&env));
@@ -1111,7 +1434,35 @@ impl MarketplaceContract {
         }
         if let Some(exp) = listing.expires_at {
             if env.ledger().timestamp() >= exp {
-                panic_with_error!(&env, MarketplaceError::ListingExpired);
+                listing.status = ListingStatus::Cancelled;
+                save_listing(&env, &listing);
+                remove_from_active_listings(&env, listing_id);
+                for offer_id in load_pending_offer_ids(&env, listing_id).iter() {
+                    if let Some(mut offer) = load_offer(&env, offer_id) {
+                        if offer.status == OfferStatus::Pending {
+                            offer.status = OfferStatus::Rejected;
+                            save_offer(&env, &offer);
+                            TokenClient::new(&env, &offer.token).transfer(
+                                &env.current_contract_address(),
+                                &offer.offerer,
+                                &offer.amount,
+                            );
+                        }
+                    }
+                }
+                clear_pending_offers(&env, listing_id);
+                ListingCancelledEvent {
+                    listing_id,
+                    cancelled_by: listing.artist.clone(),
+                    reason: CancelReason::Expired,
+                    ledger_sequence: env.ledger().sequence(),
+                }.publish(&env);
+                ListingExpiredEvent {
+                    listing_id, expired_at: exp, ledger_sequence: env.ledger().sequence(),
+                }.publish(&env);
+                escrow::release_nft(&env, &listing.collection, listing.token_id,
+                    &listing.artist, env.ledger().sequence(), listing_id);
+                return false;
             }
         }
         if !Self::is_token_whitelisted(&env, &listing.token) {
@@ -1147,6 +1498,7 @@ impl MarketplaceContract {
             listing_id, artist: listing.artist.clone(), buyer: buyer.clone(),
             price: listing.price, currency: listing.currency.clone(),
             ledger_sequence: env.ledger().sequence(),
+            schema_version: EVENT_SCHEMA_VERSION,
         }.publish(&env);
         // Interactions
         let (fee, payouts) = Self::distribute_payout(
@@ -1155,11 +1507,18 @@ impl MarketplaceContract {
         );
         if fee > 0 {
             if let Some(treasury) = crate::storage::get_treasury_storage(&env) {
+                crate::storage::add_protocol_fee_total(&env, &listing.token, fee);
                 ProtocolFeeCollectedEvent {
                     listing_id, amount: fee, token: listing.token.clone(), treasury,
+                    schema_version: EVENT_SCHEMA_VERSION,
                 }.publish(&env);
             }
         }
+        // On-chain accounting counters (Issue #279) — bumped only after the
+        // transfer plan above has fully succeeded, alongside the royalty
+        // settlement snapshot so they always agree with the emitted event.
+        crate::storage::add_royalty_total(&env, &listing.token, listing.price);
+        crate::storage::increment_settlement_count(&env, &listing.token);
         // Emit royalty settlement snapshot for auditability (Issue #270)
         RoyaltySettlementEvent {
             id: listing_id,
@@ -1167,6 +1526,7 @@ impl MarketplaceContract {
             total_amount: listing.price,
             token: listing.token.clone(),
             ledger_sequence: env.ledger().sequence(),
+            schema_version: EVENT_SCHEMA_VERSION,
         }.publish(&env);
         // Per-recipient payout breakdown for the royalty audit trail (Issue #201)
         emit_royalty_paid(
@@ -1190,7 +1550,7 @@ impl MarketplaceContract {
     // ── cancel_listing ───────────────────────────────────────
     // Effects first, then release_nft (Interaction)
     pub fn cancel_listing(env: Env, artist: Address, listing_id: u64) -> bool {
-        Self::require_not_paused(&env);
+        // Fund-recovery / cleanup op — always available, ignores all pause axes.
         artist.require_auth();
         Self::cancel_listing_inner(&env, &artist, listing_id)
     }
@@ -1213,6 +1573,12 @@ impl MarketplaceContract {
         listing.status = ListingStatus::Cancelled;
         save_listing(&env, &listing);
         remove_from_active_listings(&env, listing_id);
+        ListingCancelledEvent {
+            listing_id,
+            cancelled_by: listing.artist.clone(),
+            reason: CancelReason::Expired,
+            ledger_sequence: env.ledger().sequence(),
+        }.publish(&env);
         ListingExpiredEvent {
             listing_id, expired_at: exp, ledger_sequence: env.ledger().sequence(),
         }.publish(&env);
@@ -1239,6 +1605,7 @@ impl MarketplaceContract {
         if duration < MIN_AUCTION_DURATION {
             panic_with_error!(&env, MarketplaceError::InvalidAuctionDuration);
         }
+        Self::validate_token_asset(&env, &token, Some(&collection));
         if !Self::is_token_whitelisted(&env, &token) {
             panic_with_error!(&env, MarketplaceError::TokenNotWhitelisted);
         }
@@ -1287,6 +1654,7 @@ impl MarketplaceContract {
         AuctionCreatedEvent {
             auction_id, creator: creator.clone(), reserve_price,
             token, collection: collection.clone(), token_id, end_time,
+            schema_version: EVENT_SCHEMA_VERSION,
         }.publish(&env);
         // Interaction — pull NFT into custody
         escrow::escrow_nft(&env, &creator, &collection, token_id, false, auction_id);
@@ -1374,6 +1742,7 @@ impl MarketplaceContract {
                 token: auction.token.clone(),
                 reason: Symbol::new(&env, "outbid"),
                 ledger_sequence: env.ledger().sequence(),
+                schema_version: EVENT_SCHEMA_VERSION,
             }.publish(&env);
         }
         tc.transfer(&bidder, &env.current_contract_address(), &amount);
@@ -1383,7 +1752,7 @@ impl MarketplaceContract {
     // CEI: lock → checks → effects → emit → interactions (payout + release_nft) → unlock
     // With escrow: NFT source is always the contract — no seller-side surprise.
     pub fn finalize_auction(env: Env, caller: Address, auction_id: u64) {
-        Self::require_not_paused(&env);
+        // Fund-recovery / cleanup op — always available, ignores all pause axes.
         caller.require_auth();
         // RAII guard — cleared by Drop whether the function returns normally or panics.
         let _guard = AuctionReentrancyScope::new(&env, auction_id);
@@ -1400,7 +1769,10 @@ impl MarketplaceContract {
         let snapshotted_fee = auction.protocol_fee_bps;
         auction.status = if winner.is_some() { AuctionStatus::Finalized } else { AuctionStatus::Cancelled };
         save_auction(&env, &auction);
-        AuctionFinalizedEvent { auction_id, winner: winner.clone(), amount: winning_bid }.publish(&env);
+        AuctionFinalizedEvent {
+            auction_id, winner: winner.clone(), amount: winning_bid,
+            schema_version: EVENT_SCHEMA_VERSION,
+        }.publish(&env);
         if let Some(ref w) = winner {
             let (fee, payouts) = Self::distribute_payout(
                 &env, &auction.token, &auction.collection, winning_bid,
@@ -1408,12 +1780,17 @@ impl MarketplaceContract {
             );
             if fee > 0 {
                 if let Some(treasury) = crate::storage::get_treasury_storage(&env) {
+                    crate::storage::add_protocol_fee_total(&env, &auction.token, fee);
                     ProtocolFeeCollectedEvent {
                         listing_id: auction_id, amount: fee,
                         token: auction.token.clone(), treasury,
+                        schema_version: EVENT_SCHEMA_VERSION,
                     }.publish(&env);
                 }
             }
+            // On-chain accounting counters (Issue #279) — see buy_artwork.
+            crate::storage::add_royalty_total(&env, &auction.token, winning_bid);
+            crate::storage::increment_settlement_count(&env, &auction.token);
             // Emit royalty settlement snapshot for auditability (Issue #270)
             RoyaltySettlementEvent {
                 id: auction_id,
@@ -1421,6 +1798,7 @@ impl MarketplaceContract {
                 total_amount: winning_bid,
                 token: auction.token.clone(),
                 ledger_sequence: env.ledger().sequence(),
+                schema_version: EVENT_SCHEMA_VERSION,
             }.publish(&env);
             // Per-recipient payout breakdown for the royalty audit trail (Issue #201)
             emit_royalty_paid(
@@ -1446,7 +1824,7 @@ impl MarketplaceContract {
     // ── cancel_auction ───────────────────────────────────────
     // Only no-bid auctions can be cancelled; releases NFT back to creator
     pub fn cancel_auction(env: Env, creator: Address, auction_id: u64) {
-        Self::require_not_paused(&env);
+        // Fund-recovery / cleanup op — always available, ignores all pause axes.
         creator.require_auth();
         let mut auction = load_auction(&env, auction_id)
             .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::AuctionNotFound));
@@ -1473,10 +1851,7 @@ impl MarketplaceContract {
     // Admin emergency cancellation — works even if bids exist.
     // Refunds the highest bidder before cancelling. (Issue #271)
     pub fn admin_cancel_auction(env: Env, admin: Address, auction_id: u64) {
-        admin.require_auth();
-        if admin != Self::get_admin(env.clone()).expect("admin not set") {
-            panic_with_error!(&env, MarketplaceError::Unauthorized);
-        }
+        Self::require_role(&env, &admin, RoleType::EmergencyPause);
         if !acquire_auction_lock(&env, auction_id) {
             panic_with_error!(&env, MarketplaceError::ReentrancyGuard);
         }
@@ -1503,6 +1878,7 @@ impl MarketplaceContract {
                 token: auction.token.clone(),
                 reason: Symbol::new(&env, "admin_cancel"),
                 ledger_sequence: env.ledger().sequence(),
+                schema_version: EVENT_SCHEMA_VERSION,
             }.publish(&env);
         }
         auction.status = AuctionStatus::Cancelled;
@@ -1518,6 +1894,7 @@ impl MarketplaceContract {
             refunded_amount,
             token: auction.token.clone(),
             ledger_sequence: env.ledger().sequence(),
+            schema_version: EVENT_SCHEMA_VERSION,
         }.publish(&env);
         // Return NFT to creator
         escrow::release_nft(&env, &auction.collection, auction.token_id,
@@ -1542,6 +1919,7 @@ impl MarketplaceContract {
         }
         if listing.artist == offerer { panic_with_error!(&env, MarketplaceError::CannotOfferOwnListing); }
         if amount <= 0 { panic_with_error!(&env, MarketplaceError::InsufficientOfferAmount); }
+        Self::validate_token_asset(&env, &token, Some(&listing.collection));
         if !Self::is_token_whitelisted(&env, &token) {
             panic_with_error!(&env, MarketplaceError::TokenNotWhitelisted);
         }
@@ -1579,6 +1957,7 @@ impl MarketplaceContract {
             amount,
             token,
             expires_at,
+            schema_version: EVENT_SCHEMA_VERSION,
         }
         .publish(&env);
 
@@ -1586,7 +1965,7 @@ impl MarketplaceContract {
     }
 
     pub fn withdraw_offer(env: Env, offerer: Address, offer_id: u64) {
-        Self::require_not_paused(&env);
+        // Fund-recovery / cleanup op — always available, ignores all pause axes.
         offerer.require_auth();
         let mut offer = load_offer(&env, offer_id)
             .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::OfferNotFound));
@@ -1610,7 +1989,8 @@ impl MarketplaceContract {
     }
 
     pub fn reject_offer(env: Env, artist: Address, offer_id: u64) {
-        Self::require_not_paused(&env);
+        // Fund-recovery / cleanup op (returns escrowed funds to the offerer) —
+        // always available, ignores all pause axes.
         artist.require_auth();
         let mut offer = load_offer(&env, offer_id)
             .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::OfferNotFound));
@@ -1701,6 +2081,7 @@ impl MarketplaceContract {
 
         OfferAcceptedEvent {
             offer_id, listing_id, offerer: accepted_offerer.clone(), amount: accepted_amount,
+            schema_version: EVENT_SCHEMA_VERSION,
         }.publish(&env);
         // Interactions
         let (fee, payouts) = Self::distribute_payout(
@@ -1709,11 +2090,16 @@ impl MarketplaceContract {
         );
         if fee > 0 {
             if let Some(treasury) = crate::storage::get_treasury_storage(&env) {
+                crate::storage::add_protocol_fee_total(&env, &offer.token, fee);
                 ProtocolFeeCollectedEvent {
                     listing_id, amount: fee, token: offer.token.clone(), treasury,
+                    schema_version: EVENT_SCHEMA_VERSION,
                 }.publish(&env);
             }
         }
+        // On-chain accounting counters (Issue #279) — see buy_artwork.
+        crate::storage::add_royalty_total(&env, &offer.token, offer.amount);
+        crate::storage::increment_settlement_count(&env, &offer.token);
         // Emit royalty settlement snapshot for auditability (Issue #270)
         RoyaltySettlementEvent {
             id: listing_id,
@@ -1721,6 +2107,7 @@ impl MarketplaceContract {
             total_amount: offer.amount,
             token: offer.token.clone(),
             ledger_sequence: env.ledger().sequence(),
+            schema_version: EVENT_SCHEMA_VERSION,
         }.publish(&env);
         // Per-recipient payout breakdown for the royalty audit trail (Issue #201)
         emit_royalty_paid(
@@ -1741,7 +2128,7 @@ impl MarketplaceContract {
     }
 
     pub fn reclaim_offer(env: Env, offer_id: u64) {
-        Self::require_not_paused(&env);
+        // Fund-recovery / cleanup op — always available, ignores all pause axes.
         let mut offer = load_offer(&env, offer_id)
             .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::OfferNotFound));
         if offer.status != OfferStatus::Pending {

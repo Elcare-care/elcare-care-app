@@ -30,13 +30,15 @@ import {
 } from "lucide-react";
 import { Listing, getProtocolFee } from "@/lib/contract";
 import { useSupportedTokens } from "@/hooks/useSupportedTokens";
-import { TokenConfig, getTokenConfigByAddress } from "@/config/tokens";
+import { TokenConfig, getTokenConfigByAddress, baseUnitsToDisplay } from "@/config/tokens";
 import { resolveSupportedTokens, getDefaultSupportedToken } from "@/lib/token-support";
 import { calculateSettlementPreview, isPreviewStillValid, SettlementPreview } from "@/lib/settlement";
 import { useFreshListing, preflightConflictMessage } from "@/hooks/useFreshListing";
 import posthog from "posthog-js";
 import { useModalA11y } from "@/hooks/useModalA11y";
 import { StatusAnnouncer } from "@/components/a11y/StatusAnnouncer";
+import { ActionDisclosure } from "@/components/ActionDisclosure";
+import { useDisclosure } from "@/hooks/useDisclosure";
 
 interface CheckoutModalProps {
   isOpen: boolean;
@@ -58,6 +60,9 @@ export function CheckoutModal({
   isBuyingCrypto,
 }: CheckoutModalProps) {
   const { dialogRef, titleId } = useModalA11y(isOpen, onClose);
+
+  // Work item C: disclosure acknowledgement
+  const { disclosure, acknowledged: disclosureAcknowledged, acknowledge: acknowledgeDisclosure, blocksAction } = useDisclosure('purchase');
 
   // Payment token
   const { tokens: allTokens, isLoading: loadingTokens, error: tokensError } = useSupportedTokens();
@@ -216,7 +221,7 @@ export function CheckoutModal({
     return `Review & Pay ${preview?.itemPriceDisplay ?? ""} ${selectedToken.symbol}`;
   };
 
-  const isButtonDisabled = step === "processing" || isBuyingCrypto || isPreflighting || !!previewError;
+  const isButtonDisabled = step === "processing" || isBuyingCrypto || isPreflighting || !!previewError || blocksAction;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
@@ -439,6 +444,14 @@ export function CheckoutModal({
                 </span>
               </div>
             </div>
+
+          {/* Work item C: action disclosure — must be acknowledged before signing */}
+            <ActionDisclosure
+              disclosure={disclosure}
+              acknowledged={disclosureAcknowledged}
+              onAcknowledge={acknowledgeDisclosure}
+              className="mt-2"
+            />
 
             {/* Preflight spinner */}
             {isPreflighting && (
