@@ -76,3 +76,17 @@ SECURITY_SCANNING_TRIAGE.md
 # Playwright test results / reports
 playwright-report/
 test-results/
+
+# Vitest / Jest snapshots
+*.snap
+*.snap.new
+**/snapshots/
+
+# Coverage
+coverage/
+*.lcov
+
+# Temporary files
+*.tmp
+*.bak
+*.orig

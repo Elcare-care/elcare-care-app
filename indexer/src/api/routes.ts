@@ -6,6 +6,7 @@ import { cacheMiddleware } from './cache-middleware.js';
 import { etagMiddleware } from './etag-middleware.js';
 import { strictRateLimiter } from './rate-limit-middleware.js';
 import { badRequest, notFound, internalError } from './errors.js';
+import { versioningMiddleware, ok, validateResponse, ListingResponseV1, AuctionResponseV1, OfferResponseV1, CollectionResponseV1 } from './versioning.js';
 import { applyDecodedEvents, isPollerHalted, getHaltReason, resumePoller, revertLedgers } from '../poller.js';
 import { collectMarketplaceEvents } from '../event-sync.js';
 import {
@@ -122,6 +123,7 @@ export function apiDurationMiddleware(req: Request, res: Response, next: NextFun
 
 const router = Router();
 
+router.use(versioningMiddleware);
 router.use(etagMiddleware);
 router.use(apiDurationMiddleware);
 
@@ -172,7 +174,6 @@ const serializeOffers = (rows: any[]) => serialize(rows).map((row: any) => withD
 // ── GET /events (SSE) ─────────────────────────────────────────────────────────
 
 router.get('/events', (req: Request, res: Response) => {
-  // Check connection limit
   if (sseClients.size >= MAX_SSE_CONNECTIONS) {
     return res.status(503).json({ error: 'Too many SSE connections' });
   }
@@ -184,21 +185,22 @@ router.get('/events', (req: Request, res: Response) => {
   res.flushHeaders();
 
   const lastEventId = req.headers['last-event-id'];
-  const resumeFrom = lastEventId ? parseInt(String(lastEventId), 10) : null;
+  const resumeFrom = lastEventId ? String(lastEventId) : null;
 
-  sseClients.set(res, resumeFrom ?? sseEventCounter);
+  sseClients.set(res, resumeFrom ? parseInt(resumeFrom, 10) : sseEventCounter);
   sseConnectionsTotal.inc();
   sseActiveConnectionsGauge.set(sseClients.size);
 
-  // Replay missed events
-  if (resumeFrom !== null && !isNaN(resumeFrom)) {
-    const missed = sseBuffer.filter(e => e.id > resumeFrom);
+  if (resumeFrom !== null) {
+    const missed = sseBuffer.filter(e => e.id > parseInt(resumeFrom, 10));
     for (const ev of missed) {
       try { res.write(`id: ${ev.id}\ndata: ${ev.data}\n\n`); } catch { break; }
     }
+    if (missed.length === 0 && sseBuffer.length > 0 && sseBuffer[0].id > parseInt(resumeFrom, 10)) {
+      res.write(`event: reset\ndata: ${JSON.stringify({ reason: 'cursor_too_old', since: resumeFrom })}\n\n`);
+    }
   }
 
-  // Send initial connection message
   res.write(`data: ${JSON.stringify({ type: 'CONNECTED' })}\n\n`);
 
   const heartbeat = setupSSEHeartbeat(res);
@@ -363,6 +365,14 @@ router.get('/listings', cacheMiddleware(TTL.LISTINGS_LIST), validateQuery(listin
     res.setHeader('X-Total-Count', String(total));
 
     if (limit !== undefined || offset !== undefined || cursor_ledger !== undefined) {
+      const validated = validateResponse(z.object({ listings: ListingResponseV1.array(), total: z.number() }), {
+        listings: serialize(results),
+        total: Number(total),
+      });
+      return ok(res, validated);
+    }
+    const validated = validateResponse(ListingResponseV1.array(), serialize(results));
+    return ok(res, validated);
       return res.json({ listings: serializeListings(results), total });
     }
     res.json(serializeListings(results));
