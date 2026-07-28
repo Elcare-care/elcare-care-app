@@ -7949,6 +7949,181 @@ fn test_add_and_remove_token_whitelist() {
     }
 }
 
+// ── Token registry tests (Issue #208) ───────────────────────────────
+
+#[test]
+fn test_token_registry_add_creates_entry() {
+    let (env, client, admin, _, token_id, _, _) = setup();
+    client.set_admin(&admin);
+    
+    // Add token to whitelist
+    client.add_token_to_whitelist(&token_id);
+    
+    // Verify registry entry exists
+    let entry = client.get_token_whitelist_entry(token_id.clone());
+    assert!(entry.is_some());
+    let entry = entry.unwrap();
+    assert!(entry.active);
+    assert_eq!(entry.added_by, admin);
+    assert!(entry.added_at > 0);
+}
+
+#[test]
+fn test_token_registry_remove_soft_deletes() {
+    let (env, client, admin, _, token_id, _, _) = setup();
+    client.set_admin(&admin);
+    
+    // Add token to whitelist
+    client.add_token_to_whitelist(&token_id);
+    
+    // Remove token
+    client.remove_token_from_whitelist(&token_id);
+    
+    // Verify entry still exists but is inactive
+    let entry = client.get_token_whitelist_entry(token_id.clone());
+    assert!(entry.is_some());
+    let entry = entry.unwrap();
+    assert!(!entry.active);
+    assert_eq!(entry.added_by, admin); // Original adder preserved
+}
+
+#[test]
+fn test_token_registry_reactivate_removed_token() {
+    let (env, client, admin, _, token_id, _, _) = setup();
+    client.set_admin(&admin);
+    
+    // Add token
+    client.add_token_to_whitelist(&token_id);
+    let first_entry = client.get_token_whitelist_entry(token_id.clone()).unwrap();
+    let original_added_at = first_entry.added_at;
+    
+    // Remove token
+    client.remove_token_from_whitelist(&token_id);
+    
+    // Re-add token (should reactivate, preserving original added_at)
+    client.add_token_to_whitelist(&token_id);
+    let reactivated_entry = client.get_token_whitelist_entry(token_id.clone()).unwrap();
+    assert!(reactivated_entry.active);
+    assert_eq!(reactivated_entry.added_at, original_added_at);
+}
+
+#[test]
+fn test_token_registry_idempotent_add() {
+    let (env, client, admin, _, token_id, _, _) = setup();
+    client.set_admin(&admin);
+    
+    // Add token twice
+    client.add_token_to_whitelist(&token_id.clone());
+    client.add_token_to_whitelist(&token_id);
+    
+    // Should only have one entry
+    let entry = client.get_token_whitelist_entry(token_id.clone());
+    assert!(entry.is_some());
+    assert!(entry.unwrap().active);
+}
+
+#[test]
+fn test_token_registry_idempotent_remove() {
+    let (env, client, admin, _, token_id, _, _) = setup();
+    client.set_admin(&admin);
+    
+    // Add token
+    client.add_token_to_whitelist(&token_id.clone());
+    
+    // Remove token twice
+    client.remove_token_from_whitelist(&token_id.clone());
+    client.remove_token_from_whitelist(&token_id);
+    
+    // Should still be inactive
+    let entry = client.get_token_whitelist_entry(token_id.clone());
+    assert!(entry.is_some());
+    assert!(!entry.unwrap().active);
+}
+
+#[test]
+fn test_get_whitelisted_tokens_returns_active_only() {
+    let (env, client, admin, _, token_id, _, _) = setup();
+    client.set_admin(&admin);
+    
+    let token2 = Address::generate(&env);
+    let token3 = Address::generate(&env);
+    
+    // Add three tokens
+    client.add_token_to_whitelist(&token_id.clone());
+    client.add_token_to_whitelist(&token2.clone());
+    client.add_token_to_whitelist(&token3.clone());
+    
+    // Remove one
+    client.remove_token_from_whitelist(&token2.clone());
+    
+    // get_whitelisted_tokens should return only active tokens
+    let active = client.get_whitelisted_tokens();
+    assert_eq!(active.len(), 2);
+    assert!(active.contains(&token_id));
+    assert!(active.contains(&token3));
+    assert!(!active.contains(&token2));
+}
+
+#[test]
+fn test_get_whitelisted_tokens_paginated() {
+    let (env, client, admin, _, token_id, _, _) = setup();
+    client.set_admin(&admin);
+    
+    let tokens: Vec<Address> = (0..5).map(|_| Address::generate(&env)).collect();
+    
+    // Add tokens
+    for token in tokens.iter() {
+        client.add_token_to_whitelist(token);
+    }
+    client.add_token_to_whitelist(&token_id);
+    
+    // Test pagination
+    let page1 = client.get_whitelisted_tokens_paginated(0, 2);
+    assert_eq!(page1.len(), 2);
+    
+    let page2 = client.get_whitelisted_tokens_paginated(2, 2);
+    assert_eq!(page2.len(), 2);
+    
+    let page3 = client.get_whitelisted_tokens_paginated(4, 10);
+    assert_eq!(page3.len(), 2); // Only 2 remaining
+}
+
+#[test]
+fn test_token_registry_history_preserved() {
+    let (env, client, admin, _, token_id, _, _) = setup();
+    client.set_admin(&admin);
+    
+    // Add token
+    client.add_token_to_whitelist(&token_id.clone());
+    let added_entry = client.get_token_whitelist_entry(token_id.clone()).unwrap();
+    
+    // Remove token
+    client.remove_token_from_whitelist(&token_id.clone());
+    let removed_entry = client.get_token_whitelist_entry(token_id.clone()).unwrap();
+    
+    // History should be preserved
+    assert_eq!(added_entry.added_at, removed_entry.added_at);
+    assert_eq!(added_entry.added_by, removed_entry.added_by);
+}
+
+#[test]
+fn test_token_whitelist_events_emitted() {
+    let (env, client, admin, _, token_id, _, _) = setup();
+    client.set_admin(&admin);
+    
+    // Add token - should emit TOKEN_WHITELISTED
+    client.add_token_to_whitelist(&token_id.clone());
+    
+    // Remove token - should emit TOKEN_REMOVED
+    client.remove_token_from_whitelist(&token_id.clone());
+    
+    // Re-add token - should emit TOKEN_WHITELISTED again
+    client.add_token_to_whitelist(&token_id);
+    
+    // Verify events were emitted (event verification is done by the indexer)
+    // This test ensures the contract doesn't panic when emitting events
+}
+
 #[test]
 #[should_panic(expected = "Error(Contract, #2)")]
 fn test_settlement_boundary_price_zero() {

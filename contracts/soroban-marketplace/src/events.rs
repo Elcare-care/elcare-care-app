@@ -92,6 +92,9 @@ pub const AUCTION_BID_REFUNDED: &str = "auction_bid_refunded";
 pub const AUCTION_ADMIN_CANCELLED: &str = "auction_admin_cancelled";
 // Revocation cascade incomplete signal (Issue #214)
 pub const REVOCATION_INCOMPLETE: &str = "revocation_incomplete";
+// Token whitelist events (Issue #208)
+pub const TOKEN_WHITELISTED: &str = "token_whitelisted";
+pub const TOKEN_REMOVED: &str = "token_removed";
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -910,6 +913,34 @@ impl RoleMigratedEvent {
     }
 }
 
+/// Emitted when a token is added to the whitelist (Issue #208).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TokenWhitelistedEvent {
+    pub token: Address,
+    pub added_by: Address,
+}
+impl TokenWhitelistedEvent {
+    pub fn publish(self, env: &Env) {
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, TOKEN_WHITELISTED),), self);
+    }
+}
+
+/// Emitted when a token is removed from the whitelist (Issue #208).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TokenRemovedEvent {
+    pub token: Address,
+    pub removed_by: Address,
+}
+impl TokenRemovedEvent {
+    pub fn publish(self, env: &Env) {
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, TOKEN_REMOVED),), self);
+    }
+}
+
 /// Emit `role_transfer_proposed` for a newly-created role rotation proposal.
 pub fn emit_role_proposed(
     env: &Env,
@@ -954,6 +985,24 @@ pub fn emit_role_proposal_cancelled(
         role,
         current_authority,
         cancelled_candidate,
+    }
+    .publish(env);
+}
+
+/// Emit `token_whitelisted` when a token is added to the whitelist (Issue #208).
+pub fn emit_token_whitelisted(env: &Env, token: &Address, added_by: &Address) {
+    TokenWhitelistedEvent {
+        token: token.clone(),
+        added_by: added_by.clone(),
+    }
+    .publish(env);
+}
+
+/// Emit `token_removed` when a token is removed from the whitelist (Issue #208).
+pub fn emit_token_removed(env: &Env, token: &Address, removed_by: &Address) {
+    TokenRemovedEvent {
+        token: token.clone(),
+        removed_by: removed_by.clone(),
     }
     .publish(env);
 }

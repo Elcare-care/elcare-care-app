@@ -7,7 +7,7 @@
 import { useState, useCallback, useEffect } from "react";
 import { StrKey } from "@stellar/stellar-sdk";
 import { useWallet } from "@/hooks/useWallet";
-import { useAdminStats, useModeration, useTokenManagement, useAdminCheck, useAdminTransfer, usePauseControls, PAUSABLE_FUNCTIONS, type PausableFunction } from "@/hooks/useAdmin";
+import { useAdminStats, useModeration, useTokenManagement, useAdminCheck, useAdminTransfer, usePauseControls, PAUSABLE_FUNCTIONS, type PausableFunction, type WhitelistedToken, type TokenHistory } from "@/hooks/useAdmin";
 import { useAdminSession } from "@/hooks/useAdminSession";
 import { AdminConfirmationModal } from "@/components/AdminConfirmationModal";
 import {
@@ -73,8 +73,12 @@ export default function AdminPage() {
         isLoading: isLoadingTokens,
         isProcessing: isManagingTokens,
         error: tokenError,
-        refresh: refreshTokens
+        refresh: refreshTokens,
+        getTokenHistory
     } = useTokenManagement(publicKey);
+
+    const [historyDrawerOpen, setHistoryDrawerOpen] = useState(false);
+    const [selectedTokenHistory, setSelectedTokenHistory] = useState<TokenHistory | null>(null);
 
     const { isAuthenticated, authenticate, logout, sessionExpiresIn } = useAdminSession(publicKey);
 
@@ -274,6 +278,14 @@ export default function AdminPage() {
                 }
             }
         });
+    };
+
+    const handleViewHistory = async (address: string) => {
+        const history = await getTokenHistory(address);
+        if (history) {
+            setSelectedTokenHistory(history);
+            setHistoryDrawerOpen(true);
+        }
     };
 
     const handleRemoveToken = async (addr: string) => {
@@ -637,24 +649,40 @@ export default function AdminPage() {
                             </div>
 
                             {whitelistedTokens.map((token) => (
-                                <div key={token} className="group relative rounded-2xl border border-gray-100 bg-white p-6 shadow-sm hover:border-brand-200 transition-all">
+                                <div key={token.address} className="group relative rounded-2xl border border-gray-100 bg-white p-6 shadow-sm hover:border-brand-200 transition-all">
                                     <div className="mb-4 flex h-10 w-10 items-center justify-center rounded-full bg-mint-50 text-mint-600 font-bold">
                                         T
                                     </div>
-                                    <h4 className="font-bold text-midnight-950 truncate" title={token}>
-                                        {token.slice(0, 8)}...{token.slice(-8)}
+                                    <h4 className="font-bold text-midnight-950 truncate" title={token.address}>
+                                        {token.address.slice(0, 8)}...{token.address.slice(-8)}
                                     </h4>
-                                    <p className="mt-1 text-xs text-gray-500 font-mono">{token.slice(0, 16)}...</p>
+                                    <p className="mt-1 text-xs text-gray-500 font-mono">{token.address.slice(0, 16)}...</p>
+                                    <div className="mt-2 text-[10px] text-gray-400">
+                                        <span>Added: {token.addedAtLedger}</span>
+                                        <span className="mx-1">•</span>
+                                        <span className="truncate" title={token.addedBy}>{token.addedBy.slice(0, 8)}...</span>
+                                    </div>
                                     
-                                    <button
-                                        type="button"
-                                        aria-label="Remove token"
-                                        title="Remove token"
-                                        onClick={() => handleRemoveToken(token)}
-                                        className="absolute right-4 top-4 rounded-lg p-2 text-gray-300 hover:bg-red-50 hover:text-red-500 transition-all opacity-0 group-hover:opacity-100"
-                                    >
-                                        <Trash2 size={18} />
-                                    </button>
+                                    <div className="absolute right-4 top-4 flex gap-1 opacity-0 group-hover:opacity-100 transition-all">
+                                        <button
+                                            type="button"
+                                            aria-label="View token history"
+                                            title="View history"
+                                            onClick={() => handleViewHistory(token.address)}
+                                            className="rounded-lg p-2 text-gray-300 hover:bg-blue-50 hover:text-blue-500 transition-all"
+                                        >
+                                            <History size={18} />
+                                        </button>
+                                        <button
+                                            type="button"
+                                            aria-label="Remove token"
+                                            title="Remove token"
+                                            onClick={() => handleRemoveToken(token.address)}
+                                            className="rounded-lg p-2 text-gray-300 hover:bg-red-50 hover:text-red-500 transition-all"
+                                        >
+                                            <Trash2 size={18} />
+                                        </button>
+                                    </div>
                                 </div>
                             ))}
 
@@ -942,6 +970,80 @@ export default function AdminPage() {
                     return ok;
                 }}
             />
+
+            {/* Token History Drawer */}
+            {historyDrawerOpen && selectedTokenHistory && (
+                <div className="fixed inset-0 z-50 flex">
+                    <div 
+                        className="fixed inset-0 bg-black/50"
+                        onClick={() => setHistoryDrawerOpen(false)}
+                    />
+                    <div className="relative ml-auto h-full w-full max-w-md bg-white shadow-xl">
+                        <div className="flex h-full flex-col">
+                            <div className="flex items-center justify-between border-b p-6">
+                                <div>
+                                    <h2 className="text-xl font-bold text-midnight-950">Token History</h2>
+                                    <p className="mt-1 text-sm text-gray-500 font-mono">
+                                        {selectedTokenHistory.address.slice(0, 12)}...{selectedTokenHistory.address.slice(-8)}
+                                    </p>
+                                </div>
+                                <button
+                                    type="button"
+                                    onClick={() => setHistoryDrawerOpen(false)}
+                                    className="rounded-lg p-2 text-gray-400 hover:bg-gray-100 hover:text-gray-600"
+                                >
+                                    <X size={20} />
+                                </button>
+                            </div>
+                            <div className="flex-1 overflow-y-auto p-6">
+                                {selectedTokenHistory.events.length === 0 ? (
+                                    <div className="flex flex-col items-center justify-center h-full text-gray-400">
+                                        <History className="h-12 w-12 mb-2 opacity-20" />
+                                        <p className="text-sm">No history available</p>
+                                    </div>
+                                ) : (
+                                    <div className="space-y-4">
+                                        {selectedTokenHistory.events.map((event, idx) => (
+                                            <div key={idx} className="rounded-xl border border-gray-100 bg-gray-50 p-4">
+                                                <div className="flex items-center gap-2 mb-2">
+                                                    <div className={`rounded-full p-1.5 ${
+                                                        event.type === 'whitelisted' 
+                                                            ? 'bg-green-100 text-green-600' 
+                                                            : 'bg-red-100 text-red-600'
+                                                    }`}>
+                                                        {event.type === 'whitelisted' ? (
+                                                            <CheckCircle2 className="h-4 w-4" />
+                                                        ) : (
+                                                            <X className="h-4 w-4" />
+                                                        )}
+                                                    </div>
+                                                    <span className="font-semibold text-sm capitalize">
+                                                        {event.type === 'whitelisted' ? 'Token Whitelisted' : 'Token Removed'}
+                                                    </span>
+                                                </div>
+                                                <div className="space-y-1 text-xs text-gray-500">
+                                                    <div className="flex justify-between">
+                                                        <span>Ledger:</span>
+                                                        <span className="font-mono">{event.ledger}</span>
+                                                    </div>
+                                                    <div className="flex justify-between">
+                                                        <span>By:</span>
+                                                        <span className="font-mono">{event.actor.slice(0, 8)}...</span>
+                                                    </div>
+                                                    <div className="flex justify-between">
+                                                        <span>Timestamp:</span>
+                                                        <span>{new Date(event.timestamp).toLocaleString()}</span>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        ))}
+                                    </div>
+                                )}
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            )}
         </div >
     );
 }

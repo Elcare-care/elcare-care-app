@@ -142,6 +142,25 @@ model Offer {
   @@index([listingId, updatedAtLedger])
 }
 
+// ── Token whitelist registry (Issue #208) ─────────────────────────────────
+//
+// Tracks all tokens ever added to the whitelist with full audit trail.
+// Soft delete pattern: removed tokens have active=false but remain in the table.
+
+model WhitelistedToken {
+  address         String   @id
+  active          Boolean  @default(true)
+  addedAtLedger   Int
+  removedAtLedger  Int?
+  addedBy         String
+  removedBy       String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([active])
+  @@index([addedAtLedger])
+}
+
 model Bid {
   id              Int      @id @default(autoincrement())
   auctionId       BigInt

@@ -1265,29 +1265,72 @@ impl MarketplaceContract {
         // `validate_token_asset` doc comment); this is deliberately a cheap,
         // on-chain-only sanity check.
         Self::validate_token_asset(&env, &token, None);
-        let key = crate::storage::DataKey::TokenWhitelist;
-        let mut wl = env.storage().persistent()
-            .get::<_, Vec<Address>>(&key).unwrap_or(Vec::new(&env));
-        // Idempotent by design: re-whitelisting an already-present token is a
-        // no-op rather than an error, so an admin re-running a setup script
-        // can never accidentally create duplicate entries.
-        if !wl.contains(&token) { wl.push_back(token); env.storage().persistent().set(&key, &wl); }
+
+        // Check if token is already whitelisted (active or removed)
+        let existing = crate::storage::get_token_whitelist_entry(&env, &token);
+        if let Some(entry) = existing {
+            if entry.active {
+                // Already active - no-op (idempotent)
+                return;
+            } else {
+                // Previously removed - reactivate it
+                let updated = crate::storage::TokenWhitelistEntry {
+                    added_at: entry.added_at,
+                    added_by: entry.added_by,
+                    active: true,
+                };
+                crate::storage::set_token_whitelist_entry(&env, &token, &updated);
+                crate::events::emit_token_whitelisted(&env, &token, &env.invoker());
+                return;
+            }
+        }
+
+        // New token - create registry entry
+        let now = env.ledger().timestamp();
+        let entry = crate::storage::TokenWhitelistEntry {
+            added_at: now,
+            added_by: env.invoker(),
+            active: true,
+        };
+        crate::storage::set_token_whitelist_entry(&env, &token, &entry);
+        crate::storage::add_token_to_whitelist_index(&env, &token);
+        crate::events::emit_token_whitelisted(&env, &token, &env.invoker());
     }
 
     pub fn remove_token_from_whitelist(env: Env, token: Address) {
         Self::require_role_auth(&env, RoleType::ProtocolConfig);
-        let key = crate::storage::DataKey::TokenWhitelist;
-        let wl = env.storage().persistent()
-            .get::<_, Vec<Address>>(&key).unwrap_or(Vec::new(&env));
-        let mut nw = Vec::new(&env);
-        for t in wl.iter() { if t != token { nw.push_back(t.clone()); } }
-        env.storage().persistent().set(&key, &nw);
+
+        // Check if token exists in registry
+        let existing = crate::storage::get_token_whitelist_entry(&env, &token);
+        if let Some(mut entry) = existing {
+            if !entry.active {
+                // Already removed - no-op (idempotent)
+                return;
+            }
+            // Soft delete: set active to false, preserve history
+            entry.active = false;
+            crate::storage::set_token_whitelist_entry(&env, &token, &entry);
+            crate::events::emit_token_removed(&env, &token, &env.invoker());
+        }
+        // If token was never whitelisted, do nothing (no-op)
     }
 
-    pub fn get_token_whitelist(env: Env) -> Vec<Address> {
-        let key = crate::storage::DataKey::TokenWhitelist;
-        env.storage().persistent()
-            .get::<_, Vec<Address>>(&key).unwrap_or(Vec::new(&env))
+    /// Get all currently whitelisted tokens (active only).
+    /// View function for querying the whitelist.
+    pub fn get_whitelisted_tokens(env: Env) -> Vec<Address> {
+        crate::storage::get_all_token_registry(&env)
+    }
+
+    /// Get paginated whitelisted tokens (active only).
+    /// View function for querying the whitelist with pagination.
+    pub fn get_whitelisted_tokens_paginated(env: Env, start: u32, limit: u32) -> Vec<Address> {
+        crate::storage::get_token_registry_range(&env, start, limit)
+    }
+
+    /// Get the whitelist entry for a specific token (for history/audit).
+    /// Returns None if the token was never whitelisted.
+    pub fn get_token_whitelist_entry(env: Env, token: Address) -> Option<crate::storage::TokenWhitelistEntry> {
+        crate::storage::get_token_whitelist_entry(&env, &token)
     }
 
     // ── create_listing ───────────────────────────────────────
@@ -2494,17 +2537,7 @@ impl MarketplaceContract {
     }
 
     fn is_token_whitelisted(env: &Env, token: &Address) -> bool {
-        let key = crate::storage::DataKey::TokenWhitelist;
-        let whitelist = env
-            .storage()
-            .persistent()
-            .get::<_, Vec<Address>>(&key)
-            .unwrap_or(Vec::new(env));
-        if whitelist.is_empty() {
-            true
-        } else {
-            whitelist.contains(token)
-        }
+        crate::storage::is_token_whitelisted(env, token)
     }
 
     // ── IPFS CID validation (Issue #206) ─────────────────────────────────────

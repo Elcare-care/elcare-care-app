@@ -1246,6 +1246,39 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
       break;
     }
 
+    case 'TOKEN_WHITELISTED': {
+      await db.whitelistedToken.upsert({
+        where: { address: data.token },
+        create: {
+          address: data.token,
+          active: true,
+          addedAtLedger: ledgerSequence,
+          addedBy: data.added_by,
+        },
+        update: {
+          active: true,
+          addedAtLedger: ledgerSequence,
+          addedBy: data.added_by,
+          removedAtLedger: null,
+          removedBy: null,
+        },
+      });
+      break;
+    }
+
+    case 'TOKEN_REMOVED': {
+      const { count } = await db.whitelistedToken.updateMany({
+        where: { address: data.token },
+        data: {
+          active: false,
+          removedAtLedger: ledgerSequence,
+          removedBy: data.removed_by,
+        },
+      });
+      if (count === 0) logger.warn('TOKEN_REMOVED: token not found in whitelist', { eventType, token: data.token, ledger: ledgerSequence });
+      break;
+    }
+
     case 'OFFER_MADE': {
       const offerExpiresAt = data.expires_at != null ? BigInt(data.expires_at) : null;
       await db.offer.upsert({

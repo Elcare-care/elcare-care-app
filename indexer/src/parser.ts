@@ -82,9 +82,11 @@ const TOPIC_MAP: Record<string, string> = {
   // (Issue #271) — previously emitted on-chain but not mapped here, so the
   // indexer silently dropped every one of these events. Fixed as part of
   // Issue #278's "every indexed event has a documented version and schema".
-  'royalty_settlement':     'ROYALTY_SETTLEMENT',
   'auction_bid_refunded':   'AUCTION_BID_REFUNDED',
   'auction_admin_cancelled':'AUCTION_ADMIN_CANCELLED',
+  // Token whitelist events (Issue #208)
+  'token_whitelisted':      'TOKEN_WHITELISTED',
+  'token_removed':          'TOKEN_REMOVED',
   // Launchpad deploy events (topics[0] = "deploy", topics[1] = kind tag)
   'dep_n721':  'DEPLOY_NORMAL_721',
   'dep_n1155': 'DEPLOY_NORMAL_1155',

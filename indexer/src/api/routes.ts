@@ -1491,4 +1491,54 @@ router.get('/search', validateQuery(searchQuerySchema), async (req: Request, res
   }
 });
 
+// ── GET /tokens (Issue #208) ─────────────────────────────────────────────────────
+
+router.get('/tokens', cacheMiddleware(60), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const tokens = await prisma.whitelistedToken.findMany({
+      where: { active: true },
+      orderBy: { addedAtLedger: 'desc' },
+    });
+    res.json({
+      tokens: tokens.map((t: any) => ({
+        address: t.address,
+        addedAtLedger: t.addedAtLedger,
+        addedBy: t.addedBy,
+      })),
+      total: tokens.length,
+    });
+  } catch (err) {
+    next(internalError('Failed to fetch whitelisted tokens'));
+  }
+});
+
+// ── GET /tokens/:address/history (Issue #208) ───────────────────────────────────
+
+router.get('/tokens/:address/history', async (req: Request, res: Response, next: NextFunction) => {
+  const address = req.params.address as string;
+  if (!isValidStellarAddress(address)) {
+    return next(badRequest(STELLAR_ADDRESS_ERROR));
+  }
+  try {
+    const token = await prisma.whitelistedToken.findUnique({
+      where: { address },
+    });
+    if (!token) {
+      return next(notFound('Token not found in whitelist registry'));
+    }
+    res.json({
+      address: token.address,
+      active: token.active,
+      addedAtLedger: token.addedAtLedger,
+      addedBy: token.addedBy,
+      removedAtLedger: token.removedAtLedger,
+      removedBy: token.removedBy,
+      createdAt: token.createdAt,
+      updatedAt: token.updatedAt,
+    });
+  } catch (err) {
+    next(internalError('Failed to fetch token history'));
+  }
+});
+
 export default router;
