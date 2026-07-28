@@ -122,6 +122,14 @@ const ADMIN_PROPOSAL_TTL: u64 = 604_800; // 7 days
 /// auctions that expire almost immediately.
 const MIN_AUCTION_DURATION: u64 = 3_600; // 1 hour
 
+/// Maximum total auction duration in seconds (30 days).
+///
+/// An auction's end_time cannot exceed original_end_time + MAX_TOTAL_AUCTION_DURATION
+/// even with anti-sniping extensions. This prevents adversarial bidders from
+/// indefinitely extending an auction by placing small qualifying bids just before
+/// each deadline.
+const MAX_TOTAL_AUCTION_DURATION: u64 = 2_592_000; // 30 days
+
 /// Maximum number of listing ids accepted by one `cancel_listings` batch.
 const MAX_BATCH_CANCEL: u32 = 10;
 
@@ -1648,6 +1656,7 @@ impl MarketplaceContract {
             status: AuctionStatus::Active, recipients,
             min_increment, extension_window, extension_trigger, protocol_fee_bps,
             bid_history_cap, max_extensions, extension_count: 0,
+            original_end_time: end_time,
         };
         save_auction(&env, &auction);
         add_artist_auction_id(&env, &creator, auction_id);
@@ -1706,22 +1715,36 @@ impl MarketplaceContract {
             if auction.extension_window == 0 {
                 panic_with_error!(&env, MarketplaceError::InvalidExtensionWindow);
             }
-            let prev_end_time = auction.end_time;
-            auction.end_time = now.checked_add(auction.extension_window).unwrap_or(auction.end_time);
-            auction.extension_count = auction.extension_count.saturating_add(1);
-            extended = true;
-            save_auction(&env, &auction);
-            append_bid_record(&env, auction_id,
-                &BidRecord { bidder: bidder.clone(), amount, ledger: env.ledger().sequence() },
-                auction.bid_history_cap,
-            );
-            BidPlacedEvent { auction_id, bidder: bidder.clone(), bid_amount: amount }.publish(&env);
-            AuctionExtendedEvent {
-                auction_id,
-                prev_end_time,
-                new_end_time: auction.end_time,
-                extension_count: auction.extension_count,
-            }.publish(&env);
+            // Enforce total duration cap - extension cannot push end_time beyond
+            // original_end_time + MAX_TOTAL_AUCTION_DURATION.
+            let proposed_end_time = now.checked_add(auction.extension_window).unwrap_or(auction.end_time);
+            let max_allowed_end_time = auction.original_end_time.saturating_add(MAX_TOTAL_AUCTION_DURATION);
+            if proposed_end_time > max_allowed_end_time {
+                // Bid is still accepted, but extension is not applied
+                save_auction(&env, &auction);
+                append_bid_record(&env, auction_id,
+                    &BidRecord { bidder: bidder.clone(), amount, ledger: env.ledger().sequence() },
+                    auction.bid_history_cap,
+                );
+                BidPlacedEvent { auction_id, bidder: bidder.clone(), bid_amount: amount }.publish(&env);
+            } else {
+                let prev_end_time = auction.end_time;
+                auction.end_time = proposed_end_time;
+                auction.extension_count = auction.extension_count.saturating_add(1);
+                extended = true;
+                save_auction(&env, &auction);
+                append_bid_record(&env, auction_id,
+                    &BidRecord { bidder: bidder.clone(), amount, ledger: env.ledger().sequence() },
+                    auction.bid_history_cap,
+                );
+                BidPlacedEvent { auction_id, bidder: bidder.clone(), bid_amount: amount }.publish(&env);
+                AuctionExtendedEvent {
+                    auction_id,
+                    prev_end_time,
+                    new_end_time: auction.end_time,
+                    extension_count: auction.extension_count,
+                }.publish(&env);
+            }
         } else {
             save_auction(&env, &auction);
             append_bid_record(&env, auction_id,

@@ -1150,6 +1150,7 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
           auctionId: listingId, creator, collection, nftTokenId, token, reservePrice,
           highestBid: '0', highestBidder: null, endTime, status: 'Active' as const,
           recipients, createdAtLedger: ledgerSequence, updatedAtLedger: ledgerSequence,
+          extensionCount: 0, originalEndTime: endTime,
         },
         update: {
           creator, collection, nftTokenId, token, reservePrice, endTime,
@@ -1228,6 +1229,17 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
         if (count === 0) logger.warn('AUCTION_CANCELLED: auction not found', { eventType, auctionId: listingId?.toString(), ledger: ledgerSequence });
         prisma.auction.count({ where: { status: 'Active' } })
           .then((n) => activeAuctionsGauge.set(n)).catch(() => {});
+      } else if (eventType === 'AUCTION_EXTENDED') {
+        // Update auction's endTime and extensionCount from the extension event
+        const { count } = await db.auction.updateMany({
+          where: { auctionId: listingId },
+          data: {
+            endTime: BigInt(data.new_end_time),
+            extensionCount: Number(data.extension_count),
+            updatedAtLedger: ledgerSequence,
+          },
+        });
+        if (count === 0) logger.warn('AUCTION_EXTENDED: auction not found', { eventType, auctionId: listingId?.toString(), ledger: ledgerSequence });
       }
       invalidateAuction(listingId.toString()).catch(() => {});
 

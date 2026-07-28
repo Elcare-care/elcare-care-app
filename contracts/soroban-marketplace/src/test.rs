@@ -5164,6 +5164,124 @@ fn test_multiple_late_bids_each_reset_end_time() {
     assert!(end2 > end1, "each late bid must produce a later deadline");
 }
 
+#[test]
+fn test_total_duration_cap_prevents_extension() {
+    // When an extension would push end_time beyond original_end_time + MAX_TOTAL_AUCTION_DURATION,
+    // the bid is still accepted but the extension is not applied.
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    // Create auction with very short duration to test the cap
+    let duration = 3600u64; // 1 hour
+    let trigger = 300u64;
+    let window = 600u64;
+
+    let auction_id = create_auction_with_extension(
+        &env,
+        &client,
+        &artist,
+        &artist,
+        &token_id,
+        &collection_id,
+        duration,
+        window,
+        trigger,
+    );
+
+    let auction = client.get_auction(&auction_id);
+    let original_end_time = auction.end_time;
+    let original_end_time_field = auction.original_end_time;
+
+    // Verify original_end_time is set correctly
+    assert_eq!(
+        original_end_time, original_end_time_field,
+        "original_end_time must equal initial end_time"
+    );
+
+    // Advance time to just before the cap would be exceeded
+    // MAX_TOTAL_AUCTION_DURATION = 2,592,000 seconds (30 days)
+    // We'll simulate being very close to that limit
+    let start = env.ledger().timestamp();
+    // Set time to original_end_time - trigger - 1 (just inside trigger window)
+    // but also ensure that adding window would exceed the cap
+    let time_near_cap = original_end_time_field + crate::contract::MAX_TOTAL_AUCTION_DURATION - window - 1;
+    env.ledger().set_timestamp(time_near_cap);
+
+    let before = client.get_auction(&auction_id);
+    let before_end = before.end_time;
+    let before_count = before.extension_count;
+
+    // Place bid - should be accepted but extension should not be applied
+    client.place_bid(&buyer, &auction_id, &1_500_000_i128);
+
+    let after = client.get_auction(&auction_id);
+    
+    // Bid should be accepted (highest_bid updated)
+    assert_eq!(after.highest_bid, 1_500_000_i128);
+    assert_eq!(after.highest_bidder, Some(buyer));
+    
+    // Extension should NOT be applied (end_time unchanged)
+    assert_eq!(
+        after.end_time, before_end,
+        "end_time must not change when extension would exceed total duration cap"
+    );
+    
+    // Extension count should NOT be incremented
+    assert_eq!(
+        after.extension_count, before_count,
+        "extension_count must not increment when extension is not applied"
+    );
+}
+
+#[test]
+fn test_normal_extension_within_duration_cap() {
+    // Verify that normal extensions still work when within the total duration cap
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let duration = 3600u64;
+    let trigger = 300u64;
+    let window = 600u64;
+
+    let auction_id = create_auction_with_extension(
+        &env,
+        &client,
+        &artist,
+        &artist,
+        &token_id,
+        &collection_id,
+        duration,
+        window,
+        trigger,
+    );
+
+    let start = env.ledger().timestamp();
+    
+    // Advance to inside trigger window (well within duration cap)
+    env.ledger().set_timestamp(start + 3400);
+
+    let before = client.get_auction(&auction_id);
+    let before_count = before.extension_count;
+
+    client.place_bid(&buyer, &auction_id, &1_500_000_i128);
+
+    let after = client.get_auction(&auction_id);
+    
+    // Extension should be applied normally
+    assert_eq!(
+        after.end_time, start + 3400 + window,
+        "end_time must be extended when within total duration cap"
+    );
+    
+    // Extension count should be incremented
+    assert_eq!(
+        after.extension_count, before_count + 1,
+        "extension_count must increment when extension is applied"
+    );
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Cancel Auction (Feature B)
 // ═══════════════════════════════════════════════════════════════════════════

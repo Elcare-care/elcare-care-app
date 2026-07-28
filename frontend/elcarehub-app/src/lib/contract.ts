@@ -91,6 +91,12 @@ export interface Auction {
   status: AuctionStatus;
   recipients: Recipient[];
   created_at: number;
+  /** Maximum number of extensions allowed (0 = unlimited) */
+  max_extensions?: number;
+  /** Running count of extensions applied so far */
+  extension_count?: number;
+  /** Original end time set at auction creation, used to enforce total duration cap */
+  original_end_time?: number;
 }
 
 // ── Soroban RPC server ────────────────────────────────────────

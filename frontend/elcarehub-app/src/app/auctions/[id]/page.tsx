@@ -807,6 +807,21 @@ export default function AuctionDetailPage() {
                   Time Remaining
                 </p>
                 <Countdown endTime={liveEndTime} />
+                
+                {/* Extension count display */}
+                {auction.extension_count !== undefined && auction.extension_count > 0 && (
+                  <div className="mt-3 flex items-center gap-2">
+                    <span className="text-xs text-gray-500">
+                      Extended {auction.extension_count} time{auction.extension_count !== 1 ? 's' : ''}
+                    </span>
+                    {auction.max_extensions && auction.extension_count >= auction.max_extensions && (
+                      <span className="inline-flex items-center gap-1 rounded-full bg-amber-50 px-2 py-0.5 text-xs font-medium text-amber-600">
+                        <AlertCircle size={10} />
+                        Max extensions reached
+                      </span>
+                    )}
+                  </div>
+                )}
               </div>
             )}
 

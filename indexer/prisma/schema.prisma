@@ -116,6 +116,10 @@ model Auction {
   updatedAtLedger Int
   createdAt       DateTime      @default(now())
   updatedAt       DateTime      @updatedAt
+  /// Running count of extensions applied so far (from AuctionExtended events)
+  extensionCount  Int           @default(0)
+  /// Original end time set at auction creation, used to enforce total duration cap
+  originalEndTime BigInt
   @@index([updatedAtLedger])
   @@index([status, updatedAtLedger])
   @@index([creator, updatedAtLedger])

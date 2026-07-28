@@ -304,17 +304,27 @@ describe('decodeWithSchema — AUCTION_CANCELLED', () => {
 // ── AUCTION_EXTENDED ──────────────────────────────────────────────────────────
 
 describe('decodeWithSchema — AUCTION_EXTENDED', () => {
-  const valid = { auction_id: 11n, new_end_time: 1900000000n };
+  const valid = { auction_id: 11n, prev_end_time: 1800000000n, new_end_time: 1900000000n, extension_count: 1n };
 
   it('valid decode', () => assertOk(decodeWithSchema('AUCTION_EXTENDED', AUCTION_EXTENDED_SCHEMA, valid)));
 
   it('error: missing new_end_time', () => {
-    const r = assertErr(decodeWithSchema('AUCTION_EXTENDED', AUCTION_EXTENDED_SCHEMA, { auction_id: 11n }));
+    const r = assertErr(decodeWithSchema('AUCTION_EXTENDED', AUCTION_EXTENDED_SCHEMA, { auction_id: 11n, prev_end_time: 1800000000n, extension_count: 1n }));
     expect(r.reason).toContain('new_end_time');
   });
 
+  it('error: missing prev_end_time', () => {
+    const r = assertErr(decodeWithSchema('AUCTION_EXTENDED', AUCTION_EXTENDED_SCHEMA, { auction_id: 11n, new_end_time: 1900000000n, extension_count: 1n }));
+    expect(r.reason).toContain('prev_end_time');
+  });
+
+  it('error: missing extension_count', () => {
+    const r = assertErr(decodeWithSchema('AUCTION_EXTENDED', AUCTION_EXTENDED_SCHEMA, { auction_id: 11n, prev_end_time: 1800000000n, new_end_time: 1900000000n }));
+    expect(r.reason).toContain('extension_count');
+  });
+
   it('error: wrong type for new_end_time', () => {
-    const r = assertErr(decodeWithSchema('AUCTION_EXTENDED', AUCTION_EXTENDED_SCHEMA, { auction_id: 11n, new_end_time: 1900000000 }));
+    const r = assertErr(decodeWithSchema('AUCTION_EXTENDED', AUCTION_EXTENDED_SCHEMA, { auction_id: 11n, prev_end_time: 1800000000n, new_end_time: 1900000000, extension_count: 1n }));
     expect(r.reason).toContain('new_end_time');
   });
 });

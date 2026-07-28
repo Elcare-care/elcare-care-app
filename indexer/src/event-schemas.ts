@@ -193,7 +193,11 @@ export interface AuctionCancelledData {
 
 export interface AuctionExtendedData {
   auction_id: bigint;
+  /** End time before the extension was applied */
+  prev_end_time: bigint;
   new_end_time: bigint;
+  /** Which extension this is (1-based); allows consumers to detect cap proximity */
+  extension_count: bigint;
 }
 
 export interface OfferMadeData {
@@ -539,7 +543,9 @@ export const AUCTION_EXTENDED_SCHEMA: ContractEventSchema = {
   type: 'AUCTION_EXTENDED',
   data: [
     { name: 'auction_id', type: 'bigint' },
+    { name: 'prev_end_time', type: 'bigint' },
     { name: 'new_end_time', type: 'bigint' },
+    { name: 'extension_count', type: 'bigint' },
   ],
 };
 
