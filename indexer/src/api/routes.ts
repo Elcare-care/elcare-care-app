@@ -708,9 +708,11 @@ router.get('/collections', cacheMiddleware(TTL.COLLECTIONS), validateQuery(colle
 
     // Attach a resolved fee_bps field: collection override when set, otherwise null
     // (clients should fall back to the global fee from GET /stats or contract view).
+    // Also include metadataFrozen field for frontend freeze controls.
     const withFee = results.map((c) => ({
       ...c,
       fee_bps: c.feeBpsOverride ?? null,
+      metadataFrozen: c.metadataFrozen ?? false,
     }));
 
     res.json(serialize(withFee));

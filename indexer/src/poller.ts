@@ -1448,6 +1448,32 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
       break;
     }
 
+    // Metadata freeze events (per-token and per-collection)
+    case 'COLLECTION_METADATA_FROZEN': {
+      const collection = event.contractId;
+      await db.collection.updateMany({
+        where: { contractAddress: collection },
+        data: { metadataFrozen: true },
+      });
+      invalidateCollection(collection).catch(() => {});
+      break;
+    }
+
+    case 'TOKEN_METADATA_FROZEN': {
+      // Token-level freeze - track in MarketplaceEvent for listing visibility
+      // The token_id is in the event data
+      const tokenId = BigInt(data.token_id ?? 0);
+      logger.info('Token metadata frozen', { collection: event.contractId, tokenId, ledger: ledgerSequence });
+      break;
+    }
+
+    case 'TOKEN_METADATA_UPDATED': {
+      // Token metadata updated - track for audit trail
+      const tokenId = BigInt(data.token_id ?? 0);
+      logger.info('Token metadata updated', { collection: event.contractId, tokenId, ledger: ledgerSequence });
+      break;
+    }
+
     // ROYALTY_PAID, ADMIN_TRANSFER_PROPOSED, ADMIN_TRANSFERRED,
     // ARTIST_REVOKED, ARTIST_REINSTATED, CONTRACT_PAUSED, CONTRACT_UNPAUSED:
     // persisted to MarketplaceEvent (with actor) above; no state reduction.

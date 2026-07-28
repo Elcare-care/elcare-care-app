@@ -91,6 +91,10 @@ const TOPIC_MAP: Record<string, string> = {
   'redeemed':               'VOUCHER_REDEEMED',
   'revoke':                 'VOUCHER_REVOKED',
   'expired':                'VOUCHER_EXPIRED',
+  // Metadata freeze events (per-token and per-collection)
+  'token_frz':              'TOKEN_METADATA_FROZEN',
+  'token_meta_upd':         'TOKEN_METADATA_UPDATED',
+  'meta_frz':               'COLLECTION_METADATA_FROZEN',
   // Launchpad deploy events (topics[0] = "deploy", topics[1] = kind tag)
   'dep_n721':  'DEPLOY_NORMAL_721',
   'dep_n1155': 'DEPLOY_NORMAL_1155',

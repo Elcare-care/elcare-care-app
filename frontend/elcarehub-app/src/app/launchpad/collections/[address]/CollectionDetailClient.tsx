@@ -5,7 +5,7 @@ import Link from "next/link";
 import { Navbar } from "@/components/Navbar";
 import { useCollectionDetail } from "@/hooks/useLaunchpad";
 import { useWalletContext } from "@/context/WalletContext";
-import { Loader2, ShieldCheck, User, Percent, Database, Package, ArrowLeft, Plus, Lock, Unlock, Ticket, CheckCircle, XCircle, Clock } from "lucide-react";
+import { Loader2, ShieldCheck, User, Percent, Database, Package, ArrowLeft, Plus, Lock, Unlock, Ticket, CheckCircle, XCircle, Clock, AlertTriangle } from "lucide-react";
 import { useState, useEffect } from "react";
 
 interface Voucher {
@@ -24,8 +24,26 @@ export default function CollectionDetailClient({ address }: { address: string })
   const [vouchers, setVouchers] = useState<Voucher[]>([]);
   const [vouchersLoading, setVouchersLoading] = useState(false);
   const [voucherFilter, setVoucherFilter] = useState<'All' | 'Issued' | 'Redeemed' | 'Revoked' | 'Expired'>('All');
+  const [showFreezeModal, setShowFreezeModal] = useState(false);
+  const [freezing, setFreezing] = useState(false);
 
   const isCreator = publicKey === metadata?.creator;
+
+  const handleFreezeCollection = async () => {
+    if (!address || !publicKey) return;
+    setFreezing(true);
+    try {
+      // Call contract freeze_metadata function
+      // This would need to be implemented via the wallet SDK
+      alert('Freeze functionality requires contract integration - implement via wallet SDK');
+      setShowFreezeModal(false);
+    } catch (err) {
+      console.error('Failed to freeze collection:', err);
+      alert('Failed to freeze collection');
+    } finally {
+      setFreezing(false);
+    }
+  };
 
   useEffect(() => {
     const fetchVouchers = async () => {
@@ -149,16 +167,54 @@ export default function CollectionDetailClient({ address }: { address: string })
                 </div>
 
                 {isCreator && (
-                  <div className="bg-white rounded-3xl border border-gray-100 p-8 shadow-sm">
-                    <div className="flex items-center justify-between mb-6">
-                      <h3 className="text-2xl font-display font-bold text-gray-900">Voucher Management</h3>
-                      <div className="flex items-center gap-2">
-                        <Ticket size={20} className="text-gray-400" />
-                        <span className="text-sm font-medium text-gray-500">
-                          {vouchers.length} total
-                        </span>
+                  <>
+                    <div className="bg-white rounded-3xl border border-gray-100 p-8 shadow-sm">
+                      <div className="flex items-center justify-between mb-6">
+                        <h3 className="text-2xl font-display font-bold text-gray-900">Metadata Freeze</h3>
+                        <div className="flex items-center gap-2">
+                          <Lock size={20} className="text-gray-400" />
+                          <span className="text-sm font-medium text-gray-500">
+                            {metadata?.isMetadataFrozen ? 'Frozen' : 'Mutable'}
+                          </span>
+                        </div>
+                      </div>
+
+                      <div className="flex items-center justify-between p-4 rounded-xl bg-gray-50 border border-gray-100">
+                        <div>
+                          <p className="font-bold text-gray-900 mb-1">Freeze Collection Metadata</p>
+                          <p className="text-sm text-gray-500">
+                            Permanently lock all metadata for this collection. This action is irreversible.
+                          </p>
+                        </div>
+                        {metadata?.isMetadataFrozen ? (
+                          <button
+                            disabled
+                            className="px-4 py-2 rounded-xl bg-gray-200 text-gray-500 font-bold cursor-not-allowed"
+                          >
+                            Already Frozen
+                          </button>
+                        ) : (
+                          <button
+                            onClick={() => setShowFreezeModal(true)}
+                            className="px-4 py-2 rounded-xl bg-red-500 text-white font-bold hover:bg-red-600 transition-colors flex items-center gap-2"
+                          >
+                            <Lock size={16} />
+                            Freeze All
+                          </button>
+                        )}
                       </div>
                     </div>
+
+                    <div className="bg-white rounded-3xl border border-gray-100 p-8 shadow-sm">
+                      <div className="flex items-center justify-between mb-6">
+                        <h3 className="text-2xl font-display font-bold text-gray-900">Voucher Management</h3>
+                        <div className="flex items-center gap-2">
+                          <Ticket size={20} className="text-gray-400" />
+                          <span className="text-sm font-medium text-gray-500">
+                            {vouchers.length} total
+                          </span>
+                        </div>
+                      </div>
 
                     <div className="flex gap-2 mb-6">
                       {(['All', 'Issued', 'Redeemed', 'Revoked', 'Expired'] as const).map((filter) => (
@@ -232,6 +288,7 @@ export default function CollectionDetailClient({ address }: { address: string })
                       </div>
                     )}
                   </div>
+                  </>
                 )}
               </div>
 
@@ -280,6 +337,61 @@ export default function CollectionDetailClient({ address }: { address: string })
           ) : null}
         </div>
       </div>
+
+      {/* Freeze Confirmation Modal */}
+      {showFreezeModal && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+          <div className="bg-white rounded-3xl p-8 max-w-md w-full shadow-2xl">
+            <div className="flex items-center gap-3 mb-6">
+              <div className="p-3 rounded-full bg-red-100">
+                <AlertTriangle size={24} className="text-red-600" />
+              </div>
+              <h3 className="text-2xl font-display font-bold text-gray-900">Freeze Collection Metadata</h3>
+            </div>
+
+            <div className="space-y-4 mb-8">
+              <p className="text-gray-600">
+                You are about to permanently freeze all metadata for this collection. This action is <strong>irreversible</strong>.
+              </p>
+              <div className="p-4 rounded-xl bg-amber-50 border border-amber-200">
+                <p className="text-sm text-amber-800 font-medium">
+                  ⚠️ Once frozen, neither you nor anyone else will be able to update token URIs or collection metadata.
+                </p>
+              </div>
+              <p className="text-sm text-gray-500">
+                This provides collectors with a guarantee that the artwork they purchased will never be altered.
+              </p>
+            </div>
+
+            <div className="flex gap-3">
+              <button
+                onClick={() => setShowFreezeModal(false)}
+                disabled={freezing}
+                className="flex-1 px-4 py-3 rounded-xl bg-gray-100 text-gray-700 font-bold hover:bg-gray-200 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleFreezeCollection}
+                disabled={freezing}
+                className="flex-1 px-4 py-3 rounded-xl bg-red-500 text-white font-bold hover:bg-red-600 transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
+              >
+                {freezing ? (
+                  <>
+                    <Loader2 size={16} className="animate-spin" />
+                    Freezing...
+                  </>
+                ) : (
+                  <>
+                    <Lock size={16} />
+                    Confirm Freeze
+                  </>
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </main>
   );
 }

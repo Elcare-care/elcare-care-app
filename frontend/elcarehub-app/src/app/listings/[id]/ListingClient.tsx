@@ -45,6 +45,7 @@ import {
     CheckCircle2,
     AlertCircle,
     TrendingUp,
+    Lock,
 } from "lucide-react";
 
 interface ListingClientProps {
@@ -310,6 +311,14 @@ export default function ListingDetailPage({ id }: ListingClientProps) {
                         }`}>
                             {isExpired ? "Expired" : status}
                         </div>
+
+                        {/* Metadata Immutable Badge */}
+                        {metadata?.isMetadataFrozen && (
+                            <div className="absolute top-16 right-6 px-3 py-1 rounded-full text-xs font-bold tracking-widest uppercase backdrop-blur-md shadow-xl border bg-gray-900/80 text-gray-200 border-gray-700 flex items-center gap-1.5">
+                                <Lock size={10} />
+                                Metadata Immutable
+                            </div>
+                        )}
 
                         {/* Type Badge */}
                         <div className="absolute top-6 left-6 px-4 py-1.5 rounded-full text-xs font-bold bg-white/10 backdrop-blur-md text-white border border-white/20">
