@@ -57,6 +57,7 @@ export interface Listing {
   owner: string | null;
   created_at: number;
   expires_at?: number;
+  quantity?: number;
 }
 
 export interface BatchCreateListingInput {
@@ -64,6 +65,7 @@ export interface BatchCreateListingInput {
   tokenAddress?: string;
   collectionAddress: string;
   nftTokenId: number;
+  quantity?: number;
   recipients?: Array<{ address: string; percentage: number }>;
   expiresAt?: number | null;
 }

@@ -908,10 +908,17 @@ impl MarketplaceContract {
                         reason: CancelReason::AdminRevoked,
                         ledger_sequence: env.ledger().sequence(),
                     }.publish(&env);
-                    escrow::release_nft(
-                        &env, &listing.collection, listing.token_id,
-                        &listing.artist, env.ledger().sequence(), listing_id,
-                    );
+                    if listing.quantity > 1 {
+                        escrow::release_nft_with_quantity(
+                            &env, &listing.collection, listing.token_id,
+                            listing.quantity, &listing.artist, env.ledger().sequence(), listing_id,
+                        );
+                    } else {
+                        escrow::release_nft(
+                            &env, &listing.collection, listing.token_id,
+                            &listing.artist, env.ledger().sequence(), listing_id,
+                        );
+                    }
                 }
             }
         }
@@ -1053,10 +1060,17 @@ impl MarketplaceContract {
                         ledger_sequence: env.ledger().sequence(),
                     }.publish(&env);
                     // Interaction: return NFT from escrow to artist
-                    escrow::release_nft(
-                        &env, &listing.collection, listing.token_id,
-                        &listing.artist, env.ledger().sequence(), listing_id,
-                    );
+                    if listing.quantity > 1 {
+                        escrow::release_nft_with_quantity(
+                            &env, &listing.collection, listing.token_id,
+                            listing.quantity, &listing.artist, env.ledger().sequence(), listing_id,
+                        );
+                    } else {
+                        escrow::release_nft(
+                            &env, &listing.collection, listing.token_id,
+                            &listing.artist, env.ledger().sequence(), listing_id,
+                        );
+                    }
                 }
             }
         }
@@ -1387,7 +1401,7 @@ impl MarketplaceContract {
     #[allow(clippy::too_many_arguments)]
     pub fn create_listing(
         env: Env, artist: Address, price: i128, currency: Symbol,
-        token: Address, collection: Address, token_id: u64,
+        token: Address, collection: Address, token_id: u64, quantity: u64,
         recipients: Vec<Recipient>, expires_at: Option<u64>,
     ) -> u64 {
         bump_instance_ttl(&env);
@@ -1406,6 +1420,7 @@ impl MarketplaceContract {
             token,
             collection,
             token_id,
+            quantity,
             recipients,
             expires_at,
         )
@@ -1433,6 +1448,7 @@ impl MarketplaceContract {
                 request.token.clone(),
                 request.collection.clone(),
                 request.token_id,
+                request.quantity,
                 request.recipients.clone(),
                 request.expires_at,
             );
@@ -1562,8 +1578,13 @@ impl MarketplaceContract {
                 ListingExpiredEvent {
                     listing_id, expired_at: exp, ledger_sequence: env.ledger().sequence(),
                 }.publish(&env);
-                escrow::release_nft(&env, &listing.collection, listing.token_id,
-                    &listing.artist, env.ledger().sequence(), listing_id);
+                if listing.quantity > 1 {
+                    escrow::release_nft_with_quantity(&env, &listing.collection, listing.token_id,
+                        listing.quantity, &listing.artist, env.ledger().sequence(), listing_id);
+                } else {
+                    escrow::release_nft(&env, &listing.collection, listing.token_id,
+                        &listing.artist, env.ledger().sequence(), listing_id);
+                }
                 return false;
             }
         }
@@ -1636,8 +1657,14 @@ impl MarketplaceContract {
             listing.token.clone(), payouts,
         );
         // NFT: from escrow → buyer (CEI: state already Sold)
-        escrow::release_nft(&env, &listing.collection, listing.token_id,
-            &buyer, env.ledger().sequence(), listing_id);
+        // Use batch transfer for ERC-1155 listings (quantity > 1)
+        if listing.quantity > 1 {
+            escrow::release_nft_with_quantity(&env, &listing.collection, listing.token_id,
+                listing.quantity, &buyer, env.ledger().sequence(), listing_id);
+        } else {
+            escrow::release_nft(&env, &listing.collection, listing.token_id,
+                &buyer, env.ledger().sequence(), listing_id);
+        }
         for i in 0..p_offerers.len() {
             TokenClient::new(&env, &p_tokens.get(i).unwrap()).transfer(
                 &env.current_contract_address(),
@@ -1687,8 +1714,13 @@ impl MarketplaceContract {
             listing_id, expired_at: exp, ledger_sequence: env.ledger().sequence(),
         }.publish(&env);
         // Return NFT to seller
-        escrow::release_nft(&env, &listing.collection, listing.token_id,
-            &listing.artist, env.ledger().sequence(), listing_id);
+        if listing.quantity > 1 {
+            escrow::release_nft_with_quantity(&env, &listing.collection, listing.token_id,
+                listing.quantity, &listing.artist, env.ledger().sequence(), listing_id);
+        } else {
+            escrow::release_nft(&env, &listing.collection, listing.token_id,
+                &listing.artist, env.ledger().sequence(), listing_id);
+        }
     }
 
     // ── create_auction ───────────────────────────────────────
@@ -2228,8 +2260,13 @@ impl MarketplaceContract {
             offer.token.clone(), payouts,
         );
         // NFT: escrow → accepted offerer (CEI: status Sold already)
-        escrow::release_nft(&env, &listing.collection, listing.token_id,
-            &accepted_offerer, env.ledger().sequence(), listing_id);
+        if listing.quantity > 1 {
+            escrow::release_nft_with_quantity(&env, &listing.collection, listing.token_id,
+                listing.quantity, &accepted_offerer, env.ledger().sequence(), listing_id);
+        } else {
+            escrow::release_nft(&env, &listing.collection, listing.token_id,
+                &accepted_offerer, env.ledger().sequence(), listing_id);
+        }
         for i in 0..r_offerers.len() {
             TokenClient::new(&env, &r_tokens.get(i).unwrap()).transfer(
                 &env.current_contract_address(),
@@ -2382,7 +2419,7 @@ impl MarketplaceContract {
 
     fn create_listing_inner(
         env: &Env, artist: &Address, price: i128, currency: Symbol,
-        token: Address, collection: Address, token_id: u64,
+        token: Address, collection: Address, token_id: u64, quantity: u64,
         recipients: Vec<Recipient>, expires_at: Option<u64>,
     ) -> u64 {
         if price <= 0 { panic_with_error!(env, MarketplaceError::InvalidPrice); }
@@ -2416,6 +2453,7 @@ impl MarketplaceContract {
             token,
             collection: collection.clone(),
             token_id,
+            quantity,
             recipients,
             status: ListingStatus::Active,
             owner: None,
@@ -2520,8 +2558,13 @@ impl MarketplaceContract {
             reason: CancelReason::Owner,
             ledger_sequence: env.ledger().sequence(),
         }.publish(env);
-        escrow::release_nft(env, &listing.collection, listing.token_id,
-            artist, env.ledger().sequence(), listing_id);
+        if listing.quantity > 1 {
+            escrow::release_nft_with_quantity(env, &listing.collection, listing.token_id,
+                listing.quantity, artist, env.ledger().sequence(), listing_id);
+        } else {
+            escrow::release_nft(env, &listing.collection, listing.token_id,
+                artist, env.ledger().sequence(), listing_id);
+        }
         true
     }
 

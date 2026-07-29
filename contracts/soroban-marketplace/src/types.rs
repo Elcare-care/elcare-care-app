@@ -152,6 +152,7 @@ pub struct BatchCreateListingInput {
     pub token: Address,
     pub collection: Address,
     pub token_id: u64,
+    pub quantity: u64,
     pub recipients: soroban_sdk::Vec<Recipient>,
     pub expires_at: Option<u64>,
 }
@@ -192,6 +193,9 @@ pub struct Listing {
     pub token: Address,
     pub collection: Address,
     pub token_id: u64,
+    /// Quantity for ERC-1155 listings (fungible editions). For ERC-721,
+    /// this is always 1 (single NFT).
+    pub quantity: u64,
     pub recipients: soroban_sdk::Vec<Recipient>,
     pub status: ListingStatus,
     pub owner: Option<Address>,

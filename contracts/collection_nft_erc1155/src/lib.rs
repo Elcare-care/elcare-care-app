@@ -31,6 +31,8 @@ const TTL_BUMP: u32 = 100_000;
 const MAX_BPS: u32 = 10_000; // 100 % in basis points
 /// Maximum number of items accepted by any single batch call (#274).
 const MAX_BATCH_SIZE: u32 = 200;
+/// Maximum URI length in bytes (#276).
+const MAX_URI_LEN: u32 = 2048;
 
 // ─── Errors ──────────────────────────────────────────────────────────────────
 
@@ -54,6 +56,16 @@ pub enum Error {
     AlreadyMigrated = 13,
     /// Unsupported version jump.
     UnsupportedMigration = 14,
+    /// Empty URI provided.
+    EmptyUri = 15,
+    /// URI exceeds maximum length.
+    UriTooLong = 16,
+    /// Zero amount provided.
+    ZeroAmount = 17,
+    /// Empty batch provided.
+    EmptyBatch = 18,
+    /// Batch exceeds maximum size.
+    BatchTooLarge = 19,
 }
 
 // ─── Storage Keys ─────────────────────────────────────────────────────────────
@@ -695,6 +707,21 @@ impl NormalNFT1155 {
             Self::_transfer(&env, &from, &to, id, amount)?;
         }
         Ok(())
+    }
+
+    /// ERC-1155 standard `safeBatchTransferFrom` — alias for `batch_transfer`.
+    /// Transfers multiple token types from `from` to `to` atomically.
+    /// Requires operator approval if caller is not the owner.
+    pub fn batch_transfer_from(
+        env: Env,
+        operator: Address,
+        from: Address,
+        to: Address,
+        ids: Vec<u64>,
+        amounts: Vec<u128>,
+        _data: Bytes,
+    ) -> Result<(), Error> {
+        Self::batch_transfer(env, operator, from, to, ids, amounts)
     }
 
     // ── Approvals ─────────────────────────────────────────────────────────

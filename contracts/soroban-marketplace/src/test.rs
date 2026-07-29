@@ -89,7 +89,7 @@ fn create_test_listing(
     MockNftClient::new(env, &collection_id).set_owner(&1u64, artist);
     client.create_listing(
         artist, &10_000_000_i128, &symbol_short!("XLM"),
-        token_id, &collection_id, &1u64,
+        token_id, &collection_id, &1u64, &1u64,
         &valid_recipients(env, artist), &None::<u64>,
     )
 }
@@ -127,6 +127,7 @@ fn test_set_treasury_and_protocol_fee() {
         &token_id,
         &collection_id,
         &1u64,
+        &1u64,
         &recipients,
         &None::<u64>,
     );
@@ -149,7 +150,7 @@ fn test_buy_artwork_no_treasury_fee_set() {
     let price = 1_000_000_i128;
     let id = client.create_listing(
         &artist, &price, &symbol_short!("XLM"),
-        &token_id, &collection_id, &1u64,
+        &token_id, &collection_id, &1u64, &1u64,
         &valid_recipients(&env, &artist), &None::<u64>,
     );
     client.set_protocol_fee(&artist, &300u32);
@@ -185,7 +186,7 @@ fn test_create_listing_success() {
     client.add_token_to_whitelist(&token_id);
     let id = client.create_listing(
         &artist, &10_000_000_i128, &symbol_short!("XLM"),
-        &token_id, &collection_id, &1u64,
+        &token_id, &collection_id, &1u64, &1u64,
         &valid_recipients(&env, &artist), &None::<u64>,
     );
     assert_eq!(id, 1);
@@ -210,7 +211,7 @@ fn test_create_listing_zero_price() {
     client.add_token_to_whitelist(&token_id);
     client.create_listing(
         &artist, &0_i128, &symbol_short!("XLM"),
-        &token_id, &collection_id, &1u64,
+        &token_id, &collection_id, &1u64, &1u64,
         &valid_recipients(&env, &artist), &None::<u64>,
     );
 }
@@ -225,7 +226,7 @@ fn test_create_listing_seller_not_owner_fails() {
     StellarAssetClient::new(&env, &token_id).mint(&buyer, &1_000_000_i128);
     client.create_listing(
         &buyer, &1_000_000_i128, &symbol_short!("XLM"),
-        &token_id, &collection_id, &1u64,
+        &token_id, &collection_id, &1u64, &1u64,
         &valid_recipients(&env, &buyer), &None::<u64>,
     );
 }
@@ -242,13 +243,13 @@ fn test_create_listing_double_listing_fails() {
     // First listing succeeds
     client.create_listing(
         &artist, &1_000_000_i128, &symbol_short!("XLM"),
-        &token_id, &collection_id, &1u64,
+        &token_id, &collection_id, &1u64, &1u64,
         &valid_recipients(&env, &artist), &None::<u64>,
     );
     // Token is now held by marketplace — second attempt must fail
     client.create_listing(
         &artist, &2_000_000_i128, &symbol_short!("XLM"),
-        &token_id, &collection_id, &1u64,
+        &token_id, &collection_id, &1u64, &1u64,
         &valid_recipients(&env, &artist), &None::<u64>,
     );
 }
@@ -265,7 +266,7 @@ fn test_buy_artwork_success_nft_goes_to_buyer() {
     let price = 10_000_000_i128;
     let id = client.create_listing(
         &artist, &price, &symbol_short!("XLM"),
-        &token_id, &collection_id, &1u64,
+        &token_id, &collection_id, &1u64, &1u64,
         &valid_recipients(&env, &artist), &None::<u64>,
     );
     // NFT is in escrow now
@@ -297,7 +298,7 @@ fn test_buy_artwork_complex_split() {
     ];
     let id = client.create_listing(
         &artist, &price, &symbol_short!("XLM"),
-        &token_id, &collection_id, &1u64, &recipients, &None::<u64>,
+        &token_id, &collection_id, &1u64, &1u64, &recipients, &None::<u64>,
     );
     assert!(client.buy_artwork(&buyer, &id));
     let token = TokenClient::new(&env, &token_id);
@@ -318,7 +319,7 @@ fn test_cancel_listing_returns_nft_to_seller() {
     client.add_token_to_whitelist(&token_id);
     let id = client.create_listing(
         &artist, &5_000_000_i128, &symbol_short!("XLM"),
-        &token_id, &collection_id, &1u64,
+        &token_id, &collection_id, &1u64, &1u64,
         &valid_recipients(&env, &artist), &None::<u64>,
     );
     assert!(client.get_escrow(&collection_id, &1u64).is_some());
@@ -337,7 +338,7 @@ fn test_cancel_listing_rejects_pending_offers() {
     client.add_token_to_whitelist(&token_id);
     let id = client.create_listing(
         &artist, &5_000_000_i128, &symbol_short!("XLM"),
-        &token_id, &collection_id, &1u64,
+        &token_id, &collection_id, &1u64, &1u64,
         &valid_recipients(&env, &artist), &None::<u64>,
     );
     let oid = client.make_offer(&buyer, &id, &3_000_000_i128, &token_id, &None);
@@ -355,7 +356,7 @@ fn test_cancel_listing_wrong_artist() {
     client.add_token_to_whitelist(&token_id);
     let id = client.create_listing(
         &artist, &5_000_000_i128, &symbol_short!("XLM"),
-        &token_id, &collection_id, &1u64,
+        &token_id, &collection_id, &1u64, &1u64,
         &valid_recipients(&env, &artist), &None::<u64>,
     );
     client.cancel_listing(&buyer, &id);
@@ -373,7 +374,7 @@ fn test_expire_listing_returns_nft_to_seller() {
     let now = env.ledger().timestamp();
     let id = client.create_listing(
         &artist, &5_000_000_i128, &symbol_short!("XLM"),
-        &token_id, &collection_id, &1u64,
+        &token_id, &collection_id, &1u64, &1u64,
         &valid_recipients(&env, &artist), &Some(now + 1000),
     );
     env.ledger().set_timestamp(now + 2000);
@@ -392,7 +393,7 @@ fn test_expire_listing_before_expiry_fails() {
     let now = env.ledger().timestamp();
     let id = client.create_listing(
         &artist, &5_000_000_i128, &symbol_short!("XLM"),
-        &token_id, &collection_id, &1u64,
+        &token_id, &collection_id, &1u64, &1u64,
         &valid_recipients(&env, &artist), &Some(now + 9999),
     );
     client.expire_listing(&id);
@@ -406,7 +407,7 @@ fn test_expire_listing_emits_listing_cancelled_event() {
     let now = env.ledger().timestamp();
     let id = client.create_listing(
         &artist, &5_000_000_i128, &symbol_short!("XLM"),
-        &token_id, &collection_id, &1u64,
+        &token_id, &collection_id, &1u64, &1u64,
         &valid_recipients(&env, &artist), &Some(now + 1000),
     );
     env.ledger().set_timestamp(now + 2000);
@@ -429,7 +430,7 @@ fn test_buy_artwork_expired_listing_returns_false_and_cancels() {
     let now = env.ledger().timestamp();
     let id = client.create_listing(
         &artist, &5_000_000_i128, &symbol_short!("XLM"),
-        &token_id, &collection_id, &1u64,
+        &token_id, &collection_id, &1u64, &1u64,
         &valid_recipients(&env, &artist), &Some(now + 1000),
     );
     env.ledger().set_timestamp(now + 2000);
@@ -551,6 +552,7 @@ fn test_create_listing_then_auction_same_token_fails() {
         &symbol_short!("XLM"),
         &token_id,
         &collection_id,
+        &1u64,
         &1u64,
         &valid_recipients(&env, &artist),
         &None::<u64>,
@@ -712,6 +714,7 @@ fn test_royalty_secondary_sale() {
         &symbol_short!("XLM"),
         &token_id,
         &collection_id,
+        &1u64,
         &1u64,
         &valid_recipients(&env, &artist),
         &None::<u64>,
@@ -1298,6 +1301,7 @@ fn test_artist_revocation_flow() {
         &token_id,
         &collection_id,
         &1u64,
+        &1u64,
         &valid_recipients(&env, &artist),
         &None::<u64>,
     );
@@ -1330,6 +1334,7 @@ fn test_artist_revocation_flow() {
         &symbol_short!("XLM"),
         &token_id,
         &collection_id,
+        &1u64,
         &1u64,
         &valid_recipients(&env, &artist),
         &None::<u64>,
@@ -1385,6 +1390,7 @@ fn test_reinstated_artist_can_create_listing_and_auction() {
         &token_id,
         &collection_id,
         &1u64,
+        &1u64,
         &valid_recipients(&env, &artist),
         &None::<u64>,
     );
@@ -1415,6 +1421,7 @@ fn test_revoked_artist_existing_listing_remains_settleable() {
         &symbol_short!("XLM"),
         &token_id,
         &collection_id,
+        &1u64,
         &1u64,
         &valid_recipients(&env, &artist),
         &None::<u64>,
@@ -1607,6 +1614,7 @@ fn test_buy_artwork_emits_protocol_fee_collected_event() {
         &token_id,
         &collection_id,
         &1u64,
+        &1u64,
         &recipients,
         &None::<u64>,
     );
@@ -1668,6 +1676,7 @@ fn test_accept_offer_emits_protocol_fee_collected_event() {
         &symbol_short!("XLM"),
         &token_id,
         &collection_id,
+        &1u64,
         &1u64,
         &recipients,
         &None::<u64>,
@@ -1791,6 +1800,7 @@ fn test_no_fee_event_without_treasury() {
         &symbol_short!("XLM"),
         &token_id,
         &collection_id,
+        &1u64,
         &1u64,
         &recipients,
         &None::<u64>,
@@ -2368,6 +2378,7 @@ fn test_buy_artwork_transfers_correct_amounts_to_recipients() {
         &token_id,
         &collection_id,
         &1u64,
+        &1u64,
         &valid_recipients(&env, &artist),
         &None::<u64>,
     );
@@ -2396,6 +2407,7 @@ fn test_buy_artwork_pays_royalty_on_secondary_sale() {
         &symbol_short!("XLM"),
         &token_id,
         &collection_id,
+        &1u64,
         &1u64,
         &valid_recipients(&env, &artist),
         &None::<u64>,
@@ -2461,6 +2473,7 @@ fn test_buy_artwork_pays_treasury_fee() {
         &token_id,
         &collection_id,
         &1u64,
+        &1u64,
         &recipients,
         &None::<u64>,
     );
@@ -2504,6 +2517,7 @@ fn test_create_listing_while_paused_fails() {
         &symbol_short!("XLM"),
         &token_id,
         &collection_id,
+        &1u64,
         &1u64,
         &valid_recipients(&env, &artist),
         &None::<u64>,
@@ -2813,6 +2827,7 @@ fn test_create_listing_royalty_bps_max_allowed() {
         &token_id,
         &collection_id,
         &1u64,
+        &1u64,
         &valid_recipients(&env, &artist),
         &None::<u64>,
     );
@@ -2832,6 +2847,7 @@ fn test_create_listing_royalty_bps_too_high() {
         &symbol_short!("XLM"),
         &token_id,
         &collection_id,
+        &1u64,
         &1u64,
         &valid_recipients(&env, &artist),
         &None::<u64>,
@@ -2892,6 +2908,7 @@ fn test_buy_artwork_fails_if_token_delisted() {
         &symbol_short!("XLM"),
         &token_id,
         &collection_id,
+        &1u64,
         &1u64,
         &valid_recipients(&env, &artist),
         &None::<u64>,
@@ -3074,6 +3091,7 @@ fn test_validate_recipients_exactly_10000_bps_succeeds() {
         &token_id,
         &collection_id,
         &1u64,
+        &1u64,
         &recipients,
         &None::<u64>,
     );
@@ -3105,6 +3123,7 @@ fn test_validate_recipients_10001_bps_rejected() {
         &symbol_short!("XLM"),
         &token_id,
         &collection_id,
+        &1u64,
         &1u64,
         &recipients,
         &None::<u64>,
@@ -3157,6 +3176,7 @@ fn test_validate_recipients_single_recipient_at_limit_with_protocol_fee() {
         &symbol_short!("XLM"),
         &token_id,
         &collection_id,
+        &1u64,
         &1u64,
         &recipients,
         &None::<u64>,
@@ -3505,6 +3525,7 @@ fn test_new_listing_adopts_current_global_fee() {
         &token_id,
         &collection_id,
         &1u64,
+        &1u64,
         &recipients,
         &None::<u64>,
     );
@@ -3578,6 +3599,7 @@ fn test_buy_artwork_uses_snapshotted_fee_not_lowered_global() {
         &symbol_short!("XLM"),
         &token_id,
         &collection_id,
+        &1u64,
         &1u64,
         &recipients,
         &None::<u64>,
@@ -4061,6 +4083,7 @@ fn test_cancel_artist_listings_emits_admin_revoked_reason() {
         &token_id,
         &collection_id,
         &1u64,
+        &1u64,
         &valid_recipients(&env, &artist),
         &None::<u64>,
     );
@@ -4121,6 +4144,7 @@ fn test_cancel_artist_listings_refunds_pending_offers() {
         &symbol_short!("XLM"),
         &token_id,
         &collection_id,
+        &1u64,
         &1u64,
         &valid_recipients(&env, &artist),
         &None::<u64>,
@@ -4435,6 +4459,7 @@ fn test_err_contract_paused_create_listing() {
         &token_id,
         &collection_id,
         &1u64,
+        &1u64,
         &valid_recipients(&env, &artist),
         &None::<u64>,
     );
@@ -4455,6 +4480,7 @@ fn test_err_artist_revoked_create_listing() {
         &token_id,
         &collection_id,
         &1u64,
+        &1u64,
         &valid_recipients(&env, &artist),
         &None::<u64>,
     );
@@ -4474,6 +4500,7 @@ fn test_err_invalid_price_zero_listing_price() {
         &symbol_short!("XLM"),
         &token_id,
         &collection_id,
+        &1u64,
         &1u64,
         &valid_recipients(&env, &artist),
         &None::<u64>,
@@ -4500,6 +4527,7 @@ fn test_err_listing_not_active_update_cancelled() {
         &token_id,
         &collection_id,
         &1u64,
+        &1u64,
         &valid_recipients(&env, &artist),
         &None::<u64>,
     );
@@ -4525,6 +4553,7 @@ fn test_err_cannot_buy_own_listing() {
         &symbol_short!("XLM"),
         &token_id,
         &collection_id,
+        &1u64,
         &1u64,
         &valid_recipients(&env, &artist),
         &None::<u64>,
@@ -4587,6 +4616,7 @@ fn test_err_too_many_recipients() {
         &token_id,
         &collection_id,
         &1u64,
+        &1u64,
         &recipients,
         &None::<u64>,
     );
@@ -4616,6 +4646,7 @@ fn test_err_royalty_exceeds_limit() {
         &token_id,
         &collection_id,
         &1u64,
+        &1u64,
         &recipients,
         &None::<u64>,
     );
@@ -4633,6 +4664,7 @@ fn test_err_listing_sold_double_buy() {
         &symbol_short!("XLM"),
         &token_id,
         &collection_id,
+        &1u64,
         &1u64,
         &valid_recipients(&env, &artist),
         &None::<u64>,
@@ -4656,6 +4688,7 @@ fn test_err_listing_cancelled_buy() {
         &token_id,
         &collection_id,
         &1u64,
+        &1u64,
         &valid_recipients(&env, &artist),
         &None::<u64>,
     );
@@ -4678,6 +4711,7 @@ fn test_err_token_not_whitelisted_buy() {
         &symbol_short!("XLM"),
         &token_id,
         &collection_id,
+        &1u64,
         &1u64,
         &valid_recipients(&env, &artist),
         &None::<u64>,
@@ -5777,6 +5811,7 @@ fn test_auction_payout_matches_direct_sale_payout() {
         &token_id,
         &collection_id,
         &1u64,
+        &1u64,
         &valid_recipients(&env, &artist),
         &None::<u64>,
     );
@@ -5945,6 +5980,7 @@ fn test_auction_settlement_with_fee_and_royalty_matches_listing() {
         &symbol_short!("XLM"),
         &token_id,
         &collection_id,
+        &1u64,
         &1u64,
         &valid_recipients(&env, &artist),
         &None::<u64>,
@@ -7072,6 +7108,7 @@ fn test_create_listing_non_whitelisted_token_reverts() {
         &token_id,
         &collection_id,
         &1u64,
+        &1u64,
         &valid_recipients(&env, &artist),
         &None::<u64>,
     );
@@ -7091,6 +7128,7 @@ fn test_create_listing_whitelisted_token_succeeds() {
         &symbol_short!("XLM"),
         &token_id,
         &collection_id,
+        &1u64,
         &1u64,
         &valid_recipients(&env, &artist),
         &None::<u64>,
@@ -7114,6 +7152,7 @@ fn test_create_listing_empty_whitelist_accepts_any_token() {
         &symbol_short!("XLM"),
         &token_id,
         &collection_id,
+        &1u64,
         &1u64,
         &valid_recipients(&env, &artist),
         &None::<u64>,
@@ -7180,6 +7219,7 @@ fn test_make_offer_non_whitelisted_token_reverts() {
         &token_id,
         &collection_id,
         &1u64,
+        &1u64,
         &valid_recipients(&env, &artist),
         &None::<u64>,
     );
@@ -7209,6 +7249,7 @@ fn test_make_offer_whitelisted_token_succeeds() {
         &symbol_short!("XLM"),
         &token_id,
         &collection_id,
+        &1u64,
         &1u64,
         &valid_recipients(&env, &artist),
         &None::<u64>,
@@ -7243,6 +7284,7 @@ fn test_buy_artwork_token_removed_from_whitelist_after_listing() {
         &symbol_short!("XLM"),
         &token_id,
         &collection_id,
+        &1u64,
         &1u64,
         &valid_recipients(&env, &artist),
         &None::<u64>,
@@ -7279,6 +7321,7 @@ fn test_update_listing_does_not_move_nft() {
         &symbol_short!("XLM"),
         &token_id,
         &collection_id,
+        &1u64,
         &1u64,
         &recipients,
         &None::<u64>,
@@ -7524,6 +7567,7 @@ fn test_revoked_artist_existing_listing_still_settleable() {
         &token_id,
         &collection_id,
         &1u64,
+        &1u64,
         &valid_recipients(&env, &artist),
         &None::<u64>,
     );
@@ -7545,6 +7589,7 @@ fn test_revoked_artist_existing_auction_still_finalizable() {
         &token_id,
         &collection_id,
         &1u64,
+        &1u64,
         &valid_recipients(&env, &artist),
         &None::<u64>,
     );
@@ -7555,6 +7600,7 @@ fn test_revoked_artist_existing_auction_still_finalizable() {
         &token_id,
         &collection_id,
         &2u64,
+        &1u64,
         &valid_recipients(&env, &artist),
         &None::<u64>,
     );
