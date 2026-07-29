@@ -390,6 +390,50 @@ async function simulateView(
   }
 }
 
+// ── Auction configuration reads ─────────────────────────────────────────────────
+
+export interface AuctionConfig {
+  minBidIncrement: string; // i128 formatted as "${value}.0000000"
+  extensionWindow: string;  // u64 as decimal string
+  extensionTrigger: string; // u64 as decimal string
+}
+
+/**
+ * Reads global auction configuration from the contract via simulateTransaction.
+ * Calls get_min_bid_increment, get_auction_extension_window, and get_auction_extension_trigger.
+ */
+export async function fetchAuctionConfig(
+  server: rpc.Server,
+  contractId: string
+): Promise<AuctionConfig | null> {
+  try {
+    const [minIncrement, extensionWindow, extensionTrigger] = await Promise.all([
+      simulateView(server, contractId, 'get_min_bid_increment', []),
+      simulateView(server, contractId, 'get_auction_extension_window', []),
+      simulateView(server, contractId, 'get_auction_extension_trigger', []),
+    ]);
+
+    if (minIncrement === null || extensionWindow === null || extensionTrigger === null) {
+      return null;
+    }
+
+    const windowStr = (extensionWindow as unknown as bigint | number | string).toString();
+    const triggerStr = (extensionTrigger as unknown as bigint | number | string).toString();
+
+    return {
+      minBidIncrement: formatDecimal7(minIncrement),
+      extensionWindow: windowStr,
+      extensionTrigger: triggerStr,
+    };
+  } catch (err) {
+    logger.error('[chain-state] Failed to fetch auction config', {
+      contractId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return null;
+  }
+}
+
 /**
  * Reads Listing state via simulateTransaction of get_listing().
  * Use when CHAIN_STATE_MODE=simulate or as a fallback.
@@ -400,42 +444,25 @@ export async function fetchListingOnChainSimulate(
   contractId: string,
   listingId: bigint
 ): Promise<ChainListingState | null> {
-  const native = await simulateView(
-    server, contractId, 'get_listing',
-    [nativeToScVal(listingId, { type: 'u64' })]
-  );
+  const args = [nativeToScVal(listingId, { type: 'u64' })];
+  const native = await simulateView(server, contractId, 'get_listing', args);
   if (!native) return null;
-  try {
-    return decodeListingEntry(native);
-  } catch (err) {
-    logger.warn('[chain-state] Simulate: failed to decode listing', {
-      listingId: listingId.toString(),
-      error: err instanceof Error ? err.message : String(err),
-    });
-    return null;
-  }
+  return decodeListingEntry(native);
 }
 
-/** Reads Auction state via simulateTransaction of get_auction(). */
+/**
+ * Reads Auction state via simulateTransaction of get_auction().
+ * Use when CHAIN_STATE_MODE=simulate or as a fallback.
+ */
 export async function fetchAuctionOnChainSimulate(
   server: rpc.Server,
   contractId: string,
   auctionId: bigint
 ): Promise<ChainAuctionState | null> {
-  const native = await simulateView(
-    server, contractId, 'get_auction',
-    [nativeToScVal(auctionId, { type: 'u64' })]
-  );
+  const args = [nativeToScVal(auctionId, { type: 'u64' })];
+  const native = await simulateView(server, contractId, 'get_auction', args);
   if (!native) return null;
-  try {
-    return decodeAuctionEntry(native);
-  } catch (err) {
-    logger.warn('[chain-state] Simulate: failed to decode auction', {
-      auctionId: auctionId.toString(),
-      error: err instanceof Error ? err.message : String(err),
-    });
-    return null;
-  }
+  return decodeAuctionEntry(native);
 }
 
 // ── Raw-struct readers (for poller event enrichment) ─────────────────────────

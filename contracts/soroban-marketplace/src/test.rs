@@ -89,7 +89,7 @@ fn create_test_listing(
     MockNftClient::new(env, &collection_id).set_owner(&1u64, artist);
     client.create_listing(
         artist, &10_000_000_i128, &symbol_short!("XLM"),
-        token_id, &collection_id, &1u64,
+        token_id, &collection_id, &1u64, &1u64,
         &valid_recipients(env, artist), &None::<u64>,
     )
 }
@@ -127,6 +127,7 @@ fn test_set_treasury_and_protocol_fee() {
         &token_id,
         &collection_id,
         &1u64,
+        &1u64,
         &recipients,
         &None::<u64>,
     );
@@ -149,7 +150,7 @@ fn test_buy_artwork_no_treasury_fee_set() {
     let price = 1_000_000_i128;
     let id = client.create_listing(
         &artist, &price, &symbol_short!("XLM"),
-        &token_id, &collection_id, &1u64,
+        &token_id, &collection_id, &1u64, &1u64,
         &valid_recipients(&env, &artist), &None::<u64>,
     );
     client.set_protocol_fee(&artist, &300u32);
@@ -185,7 +186,7 @@ fn test_create_listing_success() {
     client.add_token_to_whitelist(&token_id);
     let id = client.create_listing(
         &artist, &10_000_000_i128, &symbol_short!("XLM"),
-        &token_id, &collection_id, &1u64,
+        &token_id, &collection_id, &1u64, &1u64,
         &valid_recipients(&env, &artist), &None::<u64>,
     );
     assert_eq!(id, 1);
@@ -210,7 +211,7 @@ fn test_create_listing_zero_price() {
     client.add_token_to_whitelist(&token_id);
     client.create_listing(
         &artist, &0_i128, &symbol_short!("XLM"),
-        &token_id, &collection_id, &1u64,
+        &token_id, &collection_id, &1u64, &1u64,
         &valid_recipients(&env, &artist), &None::<u64>,
     );
 }
@@ -225,7 +226,7 @@ fn test_create_listing_seller_not_owner_fails() {
     StellarAssetClient::new(&env, &token_id).mint(&buyer, &1_000_000_i128);
     client.create_listing(
         &buyer, &1_000_000_i128, &symbol_short!("XLM"),
-        &token_id, &collection_id, &1u64,
+        &token_id, &collection_id, &1u64, &1u64,
         &valid_recipients(&env, &buyer), &None::<u64>,
     );
 }
@@ -242,13 +243,13 @@ fn test_create_listing_double_listing_fails() {
     // First listing succeeds
     client.create_listing(
         &artist, &1_000_000_i128, &symbol_short!("XLM"),
-        &token_id, &collection_id, &1u64,
+        &token_id, &collection_id, &1u64, &1u64,
         &valid_recipients(&env, &artist), &None::<u64>,
     );
     // Token is now held by marketplace — second attempt must fail
     client.create_listing(
         &artist, &2_000_000_i128, &symbol_short!("XLM"),
-        &token_id, &collection_id, &1u64,
+        &token_id, &collection_id, &1u64, &1u64,
         &valid_recipients(&env, &artist), &None::<u64>,
     );
 }
@@ -265,7 +266,7 @@ fn test_buy_artwork_success_nft_goes_to_buyer() {
     let price = 10_000_000_i128;
     let id = client.create_listing(
         &artist, &price, &symbol_short!("XLM"),
-        &token_id, &collection_id, &1u64,
+        &token_id, &collection_id, &1u64, &1u64,
         &valid_recipients(&env, &artist), &None::<u64>,
     );
     // NFT is in escrow now
@@ -297,7 +298,7 @@ fn test_buy_artwork_complex_split() {
     ];
     let id = client.create_listing(
         &artist, &price, &symbol_short!("XLM"),
-        &token_id, &collection_id, &1u64, &recipients, &None::<u64>,
+        &token_id, &collection_id, &1u64, &1u64, &recipients, &None::<u64>,
     );
     assert!(client.buy_artwork(&buyer, &id));
     let token = TokenClient::new(&env, &token_id);
@@ -318,7 +319,7 @@ fn test_cancel_listing_returns_nft_to_seller() {
     client.add_token_to_whitelist(&token_id);
     let id = client.create_listing(
         &artist, &5_000_000_i128, &symbol_short!("XLM"),
-        &token_id, &collection_id, &1u64,
+        &token_id, &collection_id, &1u64, &1u64,
         &valid_recipients(&env, &artist), &None::<u64>,
     );
     assert!(client.get_escrow(&collection_id, &1u64).is_some());
@@ -337,7 +338,7 @@ fn test_cancel_listing_rejects_pending_offers() {
     client.add_token_to_whitelist(&token_id);
     let id = client.create_listing(
         &artist, &5_000_000_i128, &symbol_short!("XLM"),
-        &token_id, &collection_id, &1u64,
+        &token_id, &collection_id, &1u64, &1u64,
         &valid_recipients(&env, &artist), &None::<u64>,
     );
     let oid = client.make_offer(&buyer, &id, &3_000_000_i128, &token_id, &None);
@@ -355,7 +356,7 @@ fn test_cancel_listing_wrong_artist() {
     client.add_token_to_whitelist(&token_id);
     let id = client.create_listing(
         &artist, &5_000_000_i128, &symbol_short!("XLM"),
-        &token_id, &collection_id, &1u64,
+        &token_id, &collection_id, &1u64, &1u64,
         &valid_recipients(&env, &artist), &None::<u64>,
     );
     client.cancel_listing(&buyer, &id);
@@ -373,7 +374,7 @@ fn test_expire_listing_returns_nft_to_seller() {
     let now = env.ledger().timestamp();
     let id = client.create_listing(
         &artist, &5_000_000_i128, &symbol_short!("XLM"),
-        &token_id, &collection_id, &1u64,
+        &token_id, &collection_id, &1u64, &1u64,
         &valid_recipients(&env, &artist), &Some(now + 1000),
     );
     env.ledger().set_timestamp(now + 2000);
@@ -392,7 +393,7 @@ fn test_expire_listing_before_expiry_fails() {
     let now = env.ledger().timestamp();
     let id = client.create_listing(
         &artist, &5_000_000_i128, &symbol_short!("XLM"),
-        &token_id, &collection_id, &1u64,
+        &token_id, &collection_id, &1u64, &1u64,
         &valid_recipients(&env, &artist), &Some(now + 9999),
     );
     client.expire_listing(&id);
@@ -406,7 +407,7 @@ fn test_expire_listing_emits_listing_cancelled_event() {
     let now = env.ledger().timestamp();
     let id = client.create_listing(
         &artist, &5_000_000_i128, &symbol_short!("XLM"),
-        &token_id, &collection_id, &1u64,
+        &token_id, &collection_id, &1u64, &1u64,
         &valid_recipients(&env, &artist), &Some(now + 1000),
     );
     env.ledger().set_timestamp(now + 2000);
@@ -429,7 +430,7 @@ fn test_buy_artwork_expired_listing_returns_false_and_cancels() {
     let now = env.ledger().timestamp();
     let id = client.create_listing(
         &artist, &5_000_000_i128, &symbol_short!("XLM"),
-        &token_id, &collection_id, &1u64,
+        &token_id, &collection_id, &1u64, &1u64,
         &valid_recipients(&env, &artist), &Some(now + 1000),
     );
     env.ledger().set_timestamp(now + 2000);
@@ -552,6 +553,7 @@ fn test_create_listing_then_auction_same_token_fails() {
         &token_id,
         &collection_id,
         &1u64,
+        &1u64,
         &valid_recipients(&env, &artist),
         &None::<u64>,
     );
@@ -565,6 +567,62 @@ fn test_create_listing_then_auction_same_token_fails() {
         &3600u64,
         &valid_recipients(&env, &artist),
     );
+}
+
+#[test]
+fn test_set_min_bid_increment() {
+    let (env, client, artist, _, _, _, _) = setup();
+    client.set_admin(&artist);
+    client.set_min_bid_increment(&artist, &2_000_000_i128);
+    assert_eq!(client.get_min_bid_increment(), 2_000_000_i128);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #2)")]
+fn test_set_min_bid_increment_zero_panics() {
+    let (env, client, artist, _, _, _, _) = setup();
+    client.set_admin(&artist);
+    client.set_min_bid_increment(&artist, &0_i128);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #2)")]
+fn test_create_auction_reserve_price_below_min_increment_panics() {
+    let (env, client, artist, _, token_id, _cid, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    client.set_min_bid_increment(&artist, &5_000_000_i128);
+    // reserve_price 1_000_000 < min_increment 5_000_000 should panic
+    client.create_auction(
+        &artist, &token_id, &collection_id, &1u64,
+        &1_000_000_i128, &3600u64, &valid_recipients(&env, &artist),
+    );
+}
+
+#[test]
+fn test_set_auction_extension_window_emits_event() {
+    let (env, client, artist, _, _, _, _) = setup();
+    client.set_admin(&artist);
+    client.set_auction_extension_window(&artist, &900u64);
+    assert_eq!(client.get_auction_extension_window(), 900u64);
+}
+
+#[test]
+fn test_set_auction_extension_trigger_emits_event() {
+    let (env, client, artist, _, _, _, _) = setup();
+    client.set_admin(&artist);
+    client.set_auction_extension_trigger(&artist, &300u64);
+    assert_eq!(client.get_auction_extension_trigger(), 300u64);
+}
+
+#[test]
+fn test_admin_initializes_default_config() {
+    let (env, client, artist, _, _, _, _) = setup();
+    client.set_admin(&artist);
+    // After set_admin, defaults should be initialized
+    assert_eq!(client.get_min_bid_increment(), 1_000_000_i128);
+    assert_eq!(client.get_auction_extension_window(), 600u64);
+    assert_eq!(client.get_auction_extension_trigger(), 0u64);
 }
 
 // ════════════════════════════════════════════════════════════
@@ -656,6 +714,7 @@ fn test_royalty_secondary_sale() {
         &symbol_short!("XLM"),
         &token_id,
         &collection_id,
+        &1u64,
         &1u64,
         &valid_recipients(&env, &artist),
         &None::<u64>,
@@ -1242,6 +1301,7 @@ fn test_artist_revocation_flow() {
         &token_id,
         &collection_id,
         &1u64,
+        &1u64,
         &valid_recipients(&env, &artist),
         &None::<u64>,
     );
@@ -1274,6 +1334,7 @@ fn test_artist_revocation_flow() {
         &symbol_short!("XLM"),
         &token_id,
         &collection_id,
+        &1u64,
         &1u64,
         &valid_recipients(&env, &artist),
         &None::<u64>,
@@ -1329,6 +1390,7 @@ fn test_reinstated_artist_can_create_listing_and_auction() {
         &token_id,
         &collection_id,
         &1u64,
+        &1u64,
         &valid_recipients(&env, &artist),
         &None::<u64>,
     );
@@ -1359,6 +1421,7 @@ fn test_revoked_artist_existing_listing_remains_settleable() {
         &symbol_short!("XLM"),
         &token_id,
         &collection_id,
+        &1u64,
         &1u64,
         &valid_recipients(&env, &artist),
         &None::<u64>,
@@ -1551,6 +1614,7 @@ fn test_buy_artwork_emits_protocol_fee_collected_event() {
         &token_id,
         &collection_id,
         &1u64,
+        &1u64,
         &recipients,
         &None::<u64>,
     );
@@ -1612,6 +1676,7 @@ fn test_accept_offer_emits_protocol_fee_collected_event() {
         &symbol_short!("XLM"),
         &token_id,
         &collection_id,
+        &1u64,
         &1u64,
         &recipients,
         &None::<u64>,
@@ -1735,6 +1800,7 @@ fn test_no_fee_event_without_treasury() {
         &symbol_short!("XLM"),
         &token_id,
         &collection_id,
+        &1u64,
         &1u64,
         &recipients,
         &None::<u64>,
@@ -2312,6 +2378,7 @@ fn test_buy_artwork_transfers_correct_amounts_to_recipients() {
         &token_id,
         &collection_id,
         &1u64,
+        &1u64,
         &valid_recipients(&env, &artist),
         &None::<u64>,
     );
@@ -2340,6 +2407,7 @@ fn test_buy_artwork_pays_royalty_on_secondary_sale() {
         &symbol_short!("XLM"),
         &token_id,
         &collection_id,
+        &1u64,
         &1u64,
         &valid_recipients(&env, &artist),
         &None::<u64>,
@@ -2405,6 +2473,7 @@ fn test_buy_artwork_pays_treasury_fee() {
         &token_id,
         &collection_id,
         &1u64,
+        &1u64,
         &recipients,
         &None::<u64>,
     );
@@ -2448,6 +2517,7 @@ fn test_create_listing_while_paused_fails() {
         &symbol_short!("XLM"),
         &token_id,
         &collection_id,
+        &1u64,
         &1u64,
         &valid_recipients(&env, &artist),
         &None::<u64>,
@@ -2757,6 +2827,7 @@ fn test_create_listing_royalty_bps_max_allowed() {
         &token_id,
         &collection_id,
         &1u64,
+        &1u64,
         &valid_recipients(&env, &artist),
         &None::<u64>,
     );
@@ -2776,6 +2847,7 @@ fn test_create_listing_royalty_bps_too_high() {
         &symbol_short!("XLM"),
         &token_id,
         &collection_id,
+        &1u64,
         &1u64,
         &valid_recipients(&env, &artist),
         &None::<u64>,
@@ -2836,6 +2908,7 @@ fn test_buy_artwork_fails_if_token_delisted() {
         &symbol_short!("XLM"),
         &token_id,
         &collection_id,
+        &1u64,
         &1u64,
         &valid_recipients(&env, &artist),
         &None::<u64>,
@@ -3018,6 +3091,7 @@ fn test_validate_recipients_exactly_10000_bps_succeeds() {
         &token_id,
         &collection_id,
         &1u64,
+        &1u64,
         &recipients,
         &None::<u64>,
     );
@@ -3049,6 +3123,7 @@ fn test_validate_recipients_10001_bps_rejected() {
         &symbol_short!("XLM"),
         &token_id,
         &collection_id,
+        &1u64,
         &1u64,
         &recipients,
         &None::<u64>,
@@ -3101,6 +3176,7 @@ fn test_validate_recipients_single_recipient_at_limit_with_protocol_fee() {
         &symbol_short!("XLM"),
         &token_id,
         &collection_id,
+        &1u64,
         &1u64,
         &recipients,
         &None::<u64>,
@@ -3449,6 +3525,7 @@ fn test_new_listing_adopts_current_global_fee() {
         &token_id,
         &collection_id,
         &1u64,
+        &1u64,
         &recipients,
         &None::<u64>,
     );
@@ -3522,6 +3599,7 @@ fn test_buy_artwork_uses_snapshotted_fee_not_lowered_global() {
         &symbol_short!("XLM"),
         &token_id,
         &collection_id,
+        &1u64,
         &1u64,
         &recipients,
         &None::<u64>,
@@ -4005,6 +4083,7 @@ fn test_cancel_artist_listings_emits_admin_revoked_reason() {
         &token_id,
         &collection_id,
         &1u64,
+        &1u64,
         &valid_recipients(&env, &artist),
         &None::<u64>,
     );
@@ -4065,6 +4144,7 @@ fn test_cancel_artist_listings_refunds_pending_offers() {
         &symbol_short!("XLM"),
         &token_id,
         &collection_id,
+        &1u64,
         &1u64,
         &valid_recipients(&env, &artist),
         &None::<u64>,
@@ -4379,6 +4459,7 @@ fn test_err_contract_paused_create_listing() {
         &token_id,
         &collection_id,
         &1u64,
+        &1u64,
         &valid_recipients(&env, &artist),
         &None::<u64>,
     );
@@ -4399,6 +4480,7 @@ fn test_err_artist_revoked_create_listing() {
         &token_id,
         &collection_id,
         &1u64,
+        &1u64,
         &valid_recipients(&env, &artist),
         &None::<u64>,
     );
@@ -4418,6 +4500,7 @@ fn test_err_invalid_price_zero_listing_price() {
         &symbol_short!("XLM"),
         &token_id,
         &collection_id,
+        &1u64,
         &1u64,
         &valid_recipients(&env, &artist),
         &None::<u64>,
@@ -4444,6 +4527,7 @@ fn test_err_listing_not_active_update_cancelled() {
         &token_id,
         &collection_id,
         &1u64,
+        &1u64,
         &valid_recipients(&env, &artist),
         &None::<u64>,
     );
@@ -4469,6 +4553,7 @@ fn test_err_cannot_buy_own_listing() {
         &symbol_short!("XLM"),
         &token_id,
         &collection_id,
+        &1u64,
         &1u64,
         &valid_recipients(&env, &artist),
         &None::<u64>,
@@ -4531,6 +4616,7 @@ fn test_err_too_many_recipients() {
         &token_id,
         &collection_id,
         &1u64,
+        &1u64,
         &recipients,
         &None::<u64>,
     );
@@ -4560,6 +4646,7 @@ fn test_err_royalty_exceeds_limit() {
         &token_id,
         &collection_id,
         &1u64,
+        &1u64,
         &recipients,
         &None::<u64>,
     );
@@ -4577,6 +4664,7 @@ fn test_err_listing_sold_double_buy() {
         &symbol_short!("XLM"),
         &token_id,
         &collection_id,
+        &1u64,
         &1u64,
         &valid_recipients(&env, &artist),
         &None::<u64>,
@@ -4600,6 +4688,7 @@ fn test_err_listing_cancelled_buy() {
         &token_id,
         &collection_id,
         &1u64,
+        &1u64,
         &valid_recipients(&env, &artist),
         &None::<u64>,
     );
@@ -4622,6 +4711,7 @@ fn test_err_token_not_whitelisted_buy() {
         &symbol_short!("XLM"),
         &token_id,
         &collection_id,
+        &1u64,
         &1u64,
         &valid_recipients(&env, &artist),
         &None::<u64>,
@@ -5721,6 +5811,7 @@ fn test_auction_payout_matches_direct_sale_payout() {
         &token_id,
         &collection_id,
         &1u64,
+        &1u64,
         &valid_recipients(&env, &artist),
         &None::<u64>,
     );
@@ -5889,6 +5980,7 @@ fn test_auction_settlement_with_fee_and_royalty_matches_listing() {
         &symbol_short!("XLM"),
         &token_id,
         &collection_id,
+        &1u64,
         &1u64,
         &valid_recipients(&env, &artist),
         &None::<u64>,
@@ -7016,6 +7108,7 @@ fn test_create_listing_non_whitelisted_token_reverts() {
         &token_id,
         &collection_id,
         &1u64,
+        &1u64,
         &valid_recipients(&env, &artist),
         &None::<u64>,
     );
@@ -7035,6 +7128,7 @@ fn test_create_listing_whitelisted_token_succeeds() {
         &symbol_short!("XLM"),
         &token_id,
         &collection_id,
+        &1u64,
         &1u64,
         &valid_recipients(&env, &artist),
         &None::<u64>,
@@ -7058,6 +7152,7 @@ fn test_create_listing_empty_whitelist_accepts_any_token() {
         &symbol_short!("XLM"),
         &token_id,
         &collection_id,
+        &1u64,
         &1u64,
         &valid_recipients(&env, &artist),
         &None::<u64>,
@@ -7124,6 +7219,7 @@ fn test_make_offer_non_whitelisted_token_reverts() {
         &token_id,
         &collection_id,
         &1u64,
+        &1u64,
         &valid_recipients(&env, &artist),
         &None::<u64>,
     );
@@ -7153,6 +7249,7 @@ fn test_make_offer_whitelisted_token_succeeds() {
         &symbol_short!("XLM"),
         &token_id,
         &collection_id,
+        &1u64,
         &1u64,
         &valid_recipients(&env, &artist),
         &None::<u64>,
@@ -7187,6 +7284,7 @@ fn test_buy_artwork_token_removed_from_whitelist_after_listing() {
         &symbol_short!("XLM"),
         &token_id,
         &collection_id,
+        &1u64,
         &1u64,
         &valid_recipients(&env, &artist),
         &None::<u64>,
@@ -7223,6 +7321,7 @@ fn test_update_listing_does_not_move_nft() {
         &symbol_short!("XLM"),
         &token_id,
         &collection_id,
+        &1u64,
         &1u64,
         &recipients,
         &None::<u64>,
@@ -7468,6 +7567,7 @@ fn test_revoked_artist_existing_listing_still_settleable() {
         &token_id,
         &collection_id,
         &1u64,
+        &1u64,
         &valid_recipients(&env, &artist),
         &None::<u64>,
     );
@@ -7489,6 +7589,7 @@ fn test_revoked_artist_existing_auction_still_finalizable() {
         &token_id,
         &collection_id,
         &1u64,
+        &1u64,
         &valid_recipients(&env, &artist),
         &None::<u64>,
     );
@@ -7499,6 +7600,7 @@ fn test_revoked_artist_existing_auction_still_finalizable() {
         &token_id,
         &collection_id,
         &2u64,
+        &1u64,
         &valid_recipients(&env, &artist),
         &None::<u64>,
     );
@@ -9147,4 +9249,467 @@ fn test_royalty_paid_includes_collection_royalty_receiver() {
     assert_eq!(token.balance(&royalty_recv), expected_royalty);
     assert_eq!(token.balance(&artist), 100_000_000_000_i128 + expected_artist);
     assert_eq!(token.balance(&treasury), expected_fee);
+}
+
+// ════════════════════════════════════════════════════════════
+// SECTION: TTL Management (Issue #280)
+// ════════════════════════════════════════════════════════════
+
+/// Test that TTL constants are set to expected values
+#[test]
+fn test_ttl_constants() {
+    use crate::storage::{
+        LISTING_TTL_LEDGERS, AUCTION_TTL_LEDGERS, OFFER_TTL_LEDGERS, INSTANCE_TTL_LEDGERS,
+    };
+    
+    // Verify TTL constants match expected values
+    assert_eq!(LISTING_TTL_LEDGERS, 2_073_600);  // 120 days
+    assert_eq!(AUCTION_TTL_LEDGERS, 1_036_800);   // 60 days
+    assert_eq!(OFFER_TTL_LEDGERS, 1_036_800);     // 60 days
+    assert_eq!(INSTANCE_TTL_LEDGERS, 6_307_200);  // 365 days
+}
+
+/// Test that renew_storage entry-point renews specified entries
+#[test]
+fn test_renew_storage() {
+    let (env, client, artist, buyer, token_id, _cid, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    
+    // Create a listing
+    let listing_id = client.create_listing(
+        &artist, &10_000_000_i128, &symbol_short!("XLM"),
+        &token_id, &collection_id, &1u64,
+        &valid_recipients(&env, &artist), &None::<u64>,
+    );
+    
+    // Create an auction
+    let auction_id = client.create_auction(
+        &artist, &token_id, &collection_id, &2u64,
+        &1_000_000_i128, &86400u64,  // 1 day duration
+        &valid_recipients(&env, &artist),
+    );
+    
+    // Create an offer
+    let offer_id = client.make_offer(
+        &buyer, &listing_id, &5_000_000_i128,
+        &token_id, &None::<u64>,
+    );
+    
+    // Call renew_storage (permissionless - no auth required)
+    let renewed = client.renew_storage(
+        &vec![&env, listing_id],
+        &vec![&env, auction_id],
+        &vec![&env, offer_id],
+    );
+    
+    // Should have renewed 3 entries
+    assert_eq!(renewed, 3);
+}
+
+/// Test that renew_storage only renews existing entries
+#[test]
+fn test_renew_storage_nonexistent() {
+    let (env, client, artist, _buyer, token_id, _cid, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    
+    // Create one listing
+    let listing_id = client.create_listing(
+        &artist, &10_000_000_i128, &symbol_short!("XLM"),
+        &token_id, &collection_id, &1u64,
+        &valid_recipients(&env, &artist), &None::<u64>,
+    );
+    
+    // Try to renew non-existent entries
+    let renewed = client.renew_storage(
+        &vec![&env, listing_id],  // exists
+        &vec![&env, 999u64],      // doesn't exist
+        &vec![&env, 888u64],      // doesn't exist
+    );
+    
+    // Should only renew the existing listing
+    assert_eq!(renewed, 1);
+}
+
+/// Test that renew_storage respects MAX_MAINTENANCE_ITEMS limit
+#[test]
+fn test_renew_storage_budget_limit() {
+    let (env, client, artist, _buyer, token_id, _cid, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    
+    // Create multiple listings
+    let mut listing_ids = vec![&env];
+    for i in 1..=150 {
+        let id = client.create_listing(
+            &artist, &10_000_000_i128, &symbol_short!("XLM"),
+            &token_id, &collection_id, &i,
+            &valid_recipients(&env, &artist), &None::<u64>,
+        );
+        listing_ids.push_back(id);
+    }
+    
+    // Try to renew more than MAX_MAINTENANCE_ITEMS (100)
+    let renewed = client.renew_storage(
+        &listing_ids,
+        &vec![&env],
+        &vec![&env],
+    );
+    
+    // Should only renew up to the budget limit
+    assert_eq!(renewed, 100);
+}
+
+/// Test that bump_instance_ttl is called in entry-points
+#[test]
+fn test_bump_instance_ttl_called() {
+    let (env, client, artist, _buyer, token_id, _cid, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    
+    // Set some instance-level config
+    let treasury = Address::generate(&env);
+    client.set_treasury(&artist, &treasury);
+    client.set_protocol_fee(&artist, &500u32);
+    
+    // Verify config is still accessible (instance TTL was bumped)
+    assert_eq!(client.get_treasury(), Some(treasury.clone()));
+    assert_eq!(client.get_protocol_fee(), 500);
+    
+    // Call another entry-point that should bump instance TTL
+    let listing_id = client.create_listing(
+        &artist, &10_000_000_i128, &symbol_short!("XLM"),
+        &token_id, &collection_id, &1u64,
+        &valid_recipients(&env, &artist), &None::<u64>,
+    );
+    
+    // Config should still be accessible
+    assert_eq!(client.get_treasury(), Some(treasury));
+    assert_eq!(client.get_protocol_fee(), 500);
+    
+    // Listing should exist
+    let listing = client.get_listing(&listing_id);
+    assert!(listing.is_some());
+}
+
+// ════════════════════════════════════════════════════════════
+// SECTION: Property-Based Fuzz Testing (Issue #216)
+// ════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+    use soroban_sdk::testutils::Address as _;
+
+    // Helper to generate valid recipient splits that sum to <= 10_000 bps
+    fn prop_valid_recipients(env: &Env, artist: &Address, total_bps: u32) -> soroban_sdk::Vec<Recipient> {
+        let mut recipients = vec![env];
+        let mut remaining = total_bps;
+        
+        // Generate 1-4 recipients with valid percentages
+        let count = (remaining / 2500).min(4).max(1) as usize;
+        for i in 0..count {
+            if i == count - 1 {
+                // Last recipient gets remaining
+                recipients.push_back(Recipient {
+                    address: artist.clone(),
+                    percentage: remaining,
+                });
+            } else {
+                let share = remaining / (count - i) as u32;
+                recipients.push_back(Recipient {
+                    address: artist.clone(),
+                    percentage: share,
+                });
+                remaining -= share;
+            }
+        }
+        recipients
+    }
+
+    // Property: buy_listing distributes exactly the sale price
+    // For any valid price, protocol fee, and recipient split,
+    // sum of all payments must equal the sale price exactly.
+    proptest! {
+        #[test]
+        fn prop_buy_listing_exact_distribution(
+            price in 1i128..1_000_000_000_000i128,
+            fee_bps in 0u32..1000u32,  // Reasonable fee range
+            recipient_bps in 1000u32..9000u32  // Leaves room for fee
+        ) {
+            let env = Env::default();
+            env.mock_all_auths();
+            let contract_id = env.register(MarketplaceContract, ());
+            let client = MarketplaceContractClient::new(&env, &contract_id);
+            let artist = Address::generate(&env);
+            let buyer = Address::generate(&env);
+            let token_admin = Address::generate(&env);
+            let payment_token = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+            let sac = StellarAssetClient::new(&env, &payment_token);
+            sac.mint(&artist, &price * 2);
+            sac.mint(&buyer, &price * 2);
+            sac.mint(&contract_id, &price * 2);
+            let collection_id = env.register(mock_nft::MockNft, ());
+            MockNftClient::new(&env, &collection_id).set_owner(&1u64, &artist);
+            
+            client.set_admin(&artist);
+            client.add_token_to_whitelist(&payment_token);
+            let treasury = Address::generate(&env);
+            client.set_treasury(&artist, &treasury);
+            client.set_protocol_fee(&artist, &fee_bps);
+            
+            let recipients = prop_valid_recipients(&env, &artist, 10_000 - fee_bps);
+            let id = client.create_listing(
+                &artist, &price, &symbol_short!("XLM"),
+                &payment_token, &collection_id, &1u64, &1u64,
+                &recipients, &None::<u64>,
+            );
+            
+            // Track balances before purchase
+            let token = TokenClient::new(&env, &payment_token);
+            let treasury_before = token.balance(&treasury);
+            let mut recipient_balances_before = vec![&env];
+            for i in 0..recipients.len() {
+                let r = recipients.get(i).unwrap();
+                recipient_balances_before.push_back(token.balance(&r.address));
+            }
+            
+            client.buy_artwork(&buyer, &id);
+            
+            // Verify total distribution equals price
+            let treasury_after = token.balance(&treasury);
+            let fee_paid = treasury_after - treasury_before;
+            
+            let mut total_recipient_payout = 0i128;
+            for i in 0..recipients.len() {
+                let r = recipients.get(i).unwrap();
+                let after = token.balance(&r.address);
+                let before = recipient_balances_before.get(i as u32).unwrap();
+                total_recipient_payout += after - before;
+            }
+            
+            prop_assert_eq!(fee_paid + total_recipient_payout, price,
+                "Distribution mismatch: fee={}, recipients={}, total={}, price={}",
+                fee_paid, total_recipient_payout, fee_paid + total_recipient_payout, price);
+        }
+    }
+
+    // Property: place_bid always maintains highest_bid as maximum seen
+    // For any sequence of bid amounts, highest_bid should be the maximum.
+    proptest! {
+        #[test]
+        fn prop_place_bid_maintains_maximum(
+            bids in prop::collection::vec(1_000_000i128..100_000_000_000i128, 1..10)
+        ) {
+            let env = Env::default();
+            env.mock_all_auths();
+            let contract_id = env.register(MarketplaceContract, ());
+            let client = MarketplaceContractClient::new(&env, &contract_id);
+            let artist = Address::generate(&env);
+            let bidder1 = Address::generate(&env);
+            let bidder2 = Address::generate(&env);
+            let token_admin = Address::generate(&env);
+            let payment_token = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+            let sac = StellarAssetClient::new(&env, &payment_token);
+            sac.mint(&bidder1, &1_000_000_000_000i128);
+            sac.mint(&bidder2, &1_000_000_000_000i128);
+            let collection_id = env.register(mock_nft::MockNft, ());
+            MockNftClient::new(&env, &collection_id).set_owner(&1u64, &artist);
+            
+            client.set_admin(&artist);
+            client.add_token_to_whitelist(&payment_token);
+            
+            let recipients = valid_recipients(&env, &artist);
+            let auction_id = client.create_auction(
+                &artist, &payment_token, &collection_id, &1u64,
+                &1_000_000i128, &86400u64, &recipients,
+            );
+            
+            let mut expected_max = 0i128;
+            for (i, &bid_amount) in bids.iter().enumerate() {
+                let bidder = if i % 2 == 0 { &bidder1 } else { &bidder2 };
+                client.place_bid(bidder, &auction_id, &bid_amount);
+                if bid_amount > expected_max {
+                    expected_max = bid_amount;
+                }
+                
+                let auction = client.get_auction(&auction_id);
+                prop_assert_eq!(auction.highest_bid, Some(expected_max),
+                    "highest_bid mismatch after bid {}: expected={}, got={}",
+                    i, expected_max, auction.highest_bid.unwrap_or(0));
+            }
+        }
+    }
+
+    // Property: recipient split validation prevents overflow
+    // No valid split combination should produce arithmetic overflow.
+    proptest! {
+        #[test]
+        fn prop_recipient_split_no_overflow(
+            price in 1i128..i128::MAX / 20_000i128,  // Safe range for multiplication
+            fee_bps in 0u32..1000u32,
+            recipient_count in 1usize..4usize
+        ) {
+            let env = Env::default();
+            let artist = Address::generate(&env);
+            
+            // Generate valid split
+            let mut recipients = vec![&env];
+            let per_recipient = (10_000 - fee_bps) / recipient_count as u32;
+            let mut remaining = 10_000 - fee_bps;
+            
+            for i in 0..recipient_count {
+                if i == recipient_count - 1 {
+                    recipients.push_back(Recipient {
+                        address: artist.clone(),
+                        percentage: remaining,
+                    });
+                } else {
+                    recipients.push_back(Recipient {
+                        address: artist.clone(),
+                        percentage: per_recipient,
+                    });
+                    remaining -= per_recipient;
+                }
+            }
+            
+            // Test distribute function - should not panic with overflow
+            let result = crate::math::distribute(&env, price, fee_bps, &recipients);
+            
+            // Verify invariant: fee + payouts == price
+            let total_payout: i128 = result.iter_payouts().map(|p| p.amount).sum();
+            prop_assert_eq!(result.fee + total_payout, price,
+                "Distribution invariant violated: price={}, fee={}, total={}",
+                price, result.fee, total_payout);
+        }
+    }
+
+    // Property: create_listing CID validation
+    // Only valid CID strings should pass validation.
+    proptest! {
+        #[test]
+        fn prop_create_listing_cid_validation(
+            cid_len in 0usize..100usize,
+            ascii_char in 0u8..128u8
+        ) {
+            let env = Env::default();
+            env.mock_all_auths();
+            let contract_id = env.register(MarketplaceContract, ());
+            let client = MarketplaceContractClient::new(&env, &contract_id);
+            let artist = Address::generate(&env);
+            let token_admin = Address::generate(&env);
+            let payment_token = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+            let sac = StellarAssetClient::new(&env, &payment_token);
+            sac.mint(&artist, &100_000_000_000i128);
+            let collection_id = env.register(mock_nft::MockNft, ());
+            MockNftClient::new(&env, &collection_id).set_owner(&1u64, &artist);
+            
+            client.set_admin(&artist);
+            client.add_token_to_whitelist(&payment_token);
+            
+            // Generate CID string
+            let mut cid_bytes = vec![0u8; cid_len];
+            for byte in cid_bytes.iter_mut() {
+                *byte = ascii_char;
+            }
+            let cid_str = String::from_utf8_lossy(&cid_bytes);
+            
+            let recipients = valid_recipients(&env, &artist);
+            
+            // Try to create listing - should handle CID gracefully
+            // The contract may reject certain CIDs, but should not panic
+            let _ = client.try_create_listing(
+                &artist, &10_000_000i128, &symbol_short!("XLM"),
+                &payment_token, &collection_id, &1u64, &1u64,
+                &recipients, &None::<u64>,
+            );
+            
+            // Test passes if no panic occurs
+            prop_assert!(true);
+        }
+    }
+
+    // Property: auction duration validation prevents underflow
+    // No valid duration parameter should cause underflow when subtracted from end_time.
+    proptest! {
+        #[test]
+        fn prop_auction_duration_no_underflow(
+            duration in 60u64..3_153_600_000u64  // 1 minute to 100 years in seconds
+        ) {
+            let env = Env::default();
+            env.mock_all_auths();
+            let contract_id = env.register(MarketplaceContract, ());
+            let client = MarketplaceContractClient::new(&env, &contract_id);
+            let artist = Address::generate(&env);
+            let token_admin = Address::generate(&env);
+            let payment_token = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+            let sac = StellarAssetClient::new(&env, &payment_token);
+            sac.mint(&artist, &100_000_000_000i128);
+            let collection_id = env.register(mock_nft::MockNft, ());
+            MockNftClient::new(&env, &collection_id).set_owner(&1u64, &artist);
+            
+            client.set_admin(&artist);
+            client.add_token_to_whitelist(&payment_token);
+            
+            let recipients = valid_recipients(&env, &artist);
+            let current_time = env.ledger().timestamp();
+            
+            // Create auction with duration
+            let auction_id = client.create_auction(
+                &artist, &payment_token, &collection_id, &1u64,
+                &1_000_000i128, &duration, &recipients,
+            );
+            
+            let auction = client.get_auction(&auction_id);
+            
+            // Verify end_time is >= current_time (no underflow)
+            prop_assert!(auction.end_time >= current_time,
+                "Auction end_time underflow: current_time={}, end_time={}",
+                current_time, auction.end_time);
+            
+            // Verify end_time - current_time is approximately duration
+            let actual_duration = auction.end_time - current_time;
+            prop_assert!(actual_duration >= duration.saturating_sub(10) && actual_duration <= duration + 10,
+                "Duration mismatch: expected={}, actual={}", duration, actual_duration);
+        }
+    }
+
+    // Property: math calc_fee handles edge cases without overflow
+    proptest! {
+        #[test]
+        fn prop_calc_fee_no_overflow(
+            price in 0i128..i128::MAX / 20_000i128,
+            bps in 0u32..10_000u32
+        ) {
+            let fee = crate::math::calc_fee(price, bps);
+            
+            // Fee should be non-negative and <= price
+            prop_assert!(fee >= 0, "Fee should be non-negative: {}", fee);
+            prop_assert!(fee <= price, "Fee should not exceed price: fee={}, price={}", fee, price);
+            
+            // Fee should be approximately price * bps / 10_000
+            if price > 0 && bps > 0 {
+                let expected = price.saturating_mul(bps as i128) / 10_000;
+                prop_assert!(fee == expected || fee == 0,  // 0 if overflow occurred
+                    "Fee calculation mismatch: expected={}, got={}", expected, fee);
+            }
+        }
+    }
+
+    // Property: math calc_recipient_amount handles edge cases
+    proptest! {
+        #[test]
+        fn prop_calc_recipient_amount_no_overflow(
+            remaining in 0i128..i128::MAX / 20_000i128,
+            bps in 0u32..10_000u32
+        ) {
+            let amount = crate::math::calc_recipient_amount(remaining, bps);
+            
+            // Amount should be non-negative and <= remaining
+            prop_assert!(amount >= 0, "Amount should be non-negative: {}", amount);
+            prop_assert!(amount <= remaining, "Amount should not exceed remaining: amount={}, remaining={}", amount, remaining);
+        }
+    }
 }

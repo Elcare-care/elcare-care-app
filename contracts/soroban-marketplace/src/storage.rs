@@ -250,6 +250,27 @@ pub struct EscrowRecord {
     pub id: u64,
 }
 
+// ── TTL Constants (Issue #280) ───────────────────────────────────────────────────
+//
+// These constants define the Time-To-Live (TTL) for different storage entry types.
+// Values are in ledger numbers (assuming ~5s per ledger on mainnet).
+//
+// Safety buffer: 30 days = 518,400 ledgers
+// Maximum listing duration: 90 days = 1,555,200 ledgers
+// Maximum auction duration: 30 days = 518,400 ledgers
+// Maximum offer duration: 30 days = 518,400 ledgers
+//
+// LISTING_TTL_LEDGERS: 90 days max + 30 days buffer = 120 days = 2,073,600 ledgers
+// AUCTION_TTL_LEDGERS: 30 days max + 30 days buffer = 60 days = 1,036,800 ledgers
+// OFFER_TTL_LEDGERS: 30 days max + 30 days buffer = 60 days = 1,036,800 ledgers
+// INSTANCE_TTL_LEDGERS: Long-lived contract state = 365 days = 6,307,200 ledgers
+
+pub const LISTING_TTL_LEDGERS: u32 = 2_073_600;  // 120 days
+pub const AUCTION_TTL_LEDGERS: u32 = 1_036_800;   // 60 days
+pub const OFFER_TTL_LEDGERS: u32 = 1_036_800;     // 60 days
+pub const INSTANCE_TTL_LEDGERS: u32 = 6_307_200;  // 365 days
+
+// Legacy TTL constants (retained for backward compatibility)
 pub const LEDGER_TTL_BUMP: u32 = 432_000;
 pub const LEDGER_TTL_THRESHOLD: u32 = 144_000;
 pub const REENTRANCY_LOCK_TTL: u32 = 100;
@@ -258,6 +279,59 @@ pub fn bump_entry_ttl(env: &Env, key: &DataKey) {
     env.storage()
         .persistent()
         .extend_ttl(key, LEDGER_TTL_THRESHOLD, LEDGER_TTL_BUMP);
+}
+
+// ── Type-specific TTL bump helpers (Issue #280) ─────────────────────────────────
+
+/// Bump TTL for a listing entry using LISTING_TTL_LEDGERS
+pub fn bump_listing_ttl(env: &Env, listing_id: u64) {
+    let key = DataKey::Listing(listing_id);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, LEDGER_TTL_THRESHOLD, LISTING_TTL_LEDGERS);
+}
+
+/// Bump TTL for an auction entry using AUCTION_TTL_LEDGERS
+pub fn bump_auction_ttl(env: &Env, auction_id: u64) {
+    let key = DataKey::Auction(auction_id);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, LEDGER_TTL_THRESHOLD, AUCTION_TTL_LEDGERS);
+}
+
+/// Bump TTL for an offer entry using OFFER_TTL_LEDGERS
+pub fn bump_offer_ttl(env: &Env, offer_id: u64) {
+    let key = DataKey::Offer(offer_id);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, LEDGER_TTL_THRESHOLD, OFFER_TTL_LEDGERS);
+}
+
+/// Bump TTL for instance storage (contract-level state) using INSTANCE_TTL_LEDGERS
+pub fn bump_instance_ttl(env: &Env) {
+    // Bump all instance-level keys that should never expire
+    let instance_keys = vec![
+        DataKey::Admin,
+        DataKey::Treasury,
+        DataKey::ProtocolFeeBps,
+        DataKey::TokenWhitelist,
+        DataKey::IsPaused,
+        DataKey::MinBidIncrement,
+        DataKey::AuctionExtensionWindow,
+        DataKey::AuctionExtensionTrigger,
+        DataKey::MinPrice,
+        DataKey::MaxPrice,
+        DataKey::BidHistoryCap,
+        DataKey::AuctionMaxExtensions,
+    ];
+    
+    for key in instance_keys {
+        if env.storage().persistent().has(&key) {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, LEDGER_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        }
+    }
 }
 
 // ── Paged index engine ───────────────────────────────────────
@@ -576,7 +650,9 @@ pub fn increment_settlement_count(env: &Env, token: &Address) -> u64 {
 pub fn save_listing(env: &Env, listing: &Listing) {
     let key = DataKey::Listing(listing.listing_id);
     env.storage().persistent().set(&key, listing);
-    bump_entry_ttl(env, &key);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, LEDGER_TTL_THRESHOLD, LISTING_TTL_LEDGERS);
 }
 
 pub fn load_listing(env: &Env, listing_id: u64) -> Option<Listing> {
@@ -591,7 +667,9 @@ pub fn load_listing(env: &Env, listing_id: u64) -> Option<Listing> {
 pub fn save_auction(env: &Env, auction: &Auction) {
     let key = DataKey::Auction(auction.auction_id);
     env.storage().persistent().set(&key, auction);
-    bump_entry_ttl(env, &key);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, LEDGER_TTL_THRESHOLD, AUCTION_TTL_LEDGERS);
 }
 
 pub fn load_auction(env: &Env, auction_id: u64) -> Option<Auction> {
@@ -606,7 +684,9 @@ pub fn load_auction(env: &Env, auction_id: u64) -> Option<Auction> {
 pub fn save_offer(env: &Env, offer: &Offer) {
     let key = DataKey::Offer(offer.offer_id);
     env.storage().persistent().set(&key, offer);
-    bump_entry_ttl(env, &key);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, LEDGER_TTL_THRESHOLD, OFFER_TTL_LEDGERS);
 }
 
 pub fn load_offer(env: &Env, offer_id: u64) -> Option<Offer> {

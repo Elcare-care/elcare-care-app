@@ -29,6 +29,8 @@ import {
   getTopCollections,
   getTopArtists,
 } from '../stats.js';
+import { fetchAuctionConfig, AuctionConfig } from '../chain-state.js';
+import { rpc } from '@stellar/stellar-sdk';
 import {
   sseConnectionsTotal,
   sseActiveConnectionsGauge,
@@ -1488,6 +1490,41 @@ router.get('/search', mediumRateLimiter, validateQuery(searchQuerySchema), async
     res.json(result);
   } catch (err) {
     next(internalError('Failed to execute search'));
+  }
+});
+
+// ── GET /config/auction ────────────────────────────────────────────────────────────
+//
+// Returns current global auction configuration values from the contract.
+// Cached with 60-second TTL. Subscribes to config-update events for cache invalidation.
+
+router.get('/config/auction', cacheMiddleware(60), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    // Get the marketplace contract ID from tracked contracts
+    const contracts = await prisma.trackedContract.findMany({
+      where: { type: 'marketplace' },
+    });
+    
+    if (contracts.length === 0) {
+      return next(notFound('No marketplace contract tracked'));
+    }
+
+    const contractId = contracts[0].id;
+    const rpcUrl = process.env.STELLAR_RPC_URL;
+    if (!rpcUrl) {
+      return next(internalError('STELLAR_RPC_URL not configured'));
+    }
+
+    const server = new rpc.Server(rpcUrl);
+    const config = await fetchAuctionConfig(server, contractId);
+
+    if (!config) {
+      return next(internalError('Failed to fetch auction configuration from contract'));
+    }
+
+    res.json(config);
+  } catch (err) {
+    next(internalError('Failed to fetch auction configuration'));
   }
 });
 

@@ -57,6 +57,7 @@ export interface Listing {
   owner: string | null;
   created_at: number;
   expires_at?: number;
+  quantity?: number;
 }
 
 export interface BatchCreateListingInput {
@@ -64,6 +65,7 @@ export interface BatchCreateListingInput {
   tokenAddress?: string;
   collectionAddress: string;
   nftTokenId: number;
+  quantity?: number;
   recipients?: Array<{ address: string; percentage: number }>;
   expiresAt?: number | null;
 }
@@ -1307,6 +1309,100 @@ export async function unpauseFunction(
   ];
   await invokeContract(adminPublicKey, "unpause_function", args);
   return true;
+}
+
+// ── Auction configuration ────────────────────────────────────────────────────────
+
+export interface AuctionConfig {
+  minBidIncrement: string; // i128 formatted as "${value}.0000000"
+  extensionWindow: string;  // u64 as decimal string
+  extensionTrigger: string; // u64 as decimal string
+}
+
+/** get_min_bid_increment — read the global minimum bid increment. */
+export async function getMinBidIncrement(): Promise<bigint> {
+  const callerPublicKey = await getReadOnlyCallerPublicKey();
+  try {
+    const retVal = await invokeContract(callerPublicKey, "get_min_bid_increment", [], true);
+    return scValToNative(retVal) as bigint;
+  } catch {
+    return 1000000n; // Default: 0.1 XLM
+  }
+}
+
+/** set_min_bid_increment — admin function to set the minimum bid increment. */
+export async function setMinBidIncrement(
+  adminPublicKey: string,
+  increment: bigint
+): Promise<boolean> {
+  const args: xdr.ScVal[] = [
+    new Address(adminPublicKey).toScVal(),
+    nativeToScVal(increment, { type: "i128" }),
+  ];
+  await invokeContract(adminPublicKey, "set_min_bid_increment", args);
+  return true;
+}
+
+/** get_auction_extension_window — read the global extension window. */
+export async function getAuctionExtensionWindow(): Promise<bigint> {
+  const callerPublicKey = await getReadOnlyCallerPublicKey();
+  try {
+    const retVal = await invokeContract(callerPublicKey, "get_auction_extension_window", [], true);
+    return scValToNative(retVal) as bigint;
+  } catch {
+    return 600n; // Default: 600 seconds
+  }
+}
+
+/** set_auction_extension_window — admin function to set the extension window. */
+export async function setAuctionExtensionWindow(
+  adminPublicKey: string,
+  window: bigint
+): Promise<boolean> {
+  const args: xdr.ScVal[] = [
+    new Address(adminPublicKey).toScVal(),
+    nativeToScVal(window, { type: "u64" }),
+  ];
+  await invokeContract(adminPublicKey, "set_auction_extension_window", args);
+  return true;
+}
+
+/** get_auction_extension_trigger — read the global extension trigger. */
+export async function getAuctionExtensionTrigger(): Promise<bigint> {
+  const callerPublicKey = await getReadOnlyCallerPublicKey();
+  try {
+    const retVal = await invokeContract(callerPublicKey, "get_auction_extension_trigger", [], true);
+    return scValToNative(retVal) as bigint;
+  } catch {
+    return 0n; // Default: 0 seconds
+  }
+}
+
+/** set_auction_extension_trigger — admin function to set the extension trigger. */
+export async function setAuctionExtensionTrigger(
+  adminPublicKey: string,
+  trigger: bigint
+): Promise<boolean> {
+  const args: xdr.ScVal[] = [
+    new Address(adminPublicKey).toScVal(),
+    nativeToScVal(trigger, { type: "u64" }),
+  ];
+  await invokeContract(adminPublicKey, "set_auction_extension_trigger", args);
+  return true;
+}
+
+/** get_auction_config — fetch all auction configuration values at once. */
+export async function getAuctionConfig(): Promise<AuctionConfig> {
+  const [minIncrement, extensionWindow, extensionTrigger] = await Promise.all([
+    getMinBidIncrement(),
+    getAuctionExtensionWindow(),
+    getAuctionExtensionTrigger(),
+  ]);
+  return {
+    minBidIncrement: `${minIncrement}.0000000`,
+    extensionWindow: extensionWindow.toString(),
+    extensionTrigger: extensionTrigger.toString(),
+  };
 }
 
 /** is_function_paused — read the pause flag for a specific function. */

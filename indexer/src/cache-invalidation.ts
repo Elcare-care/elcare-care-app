@@ -17,7 +17,7 @@ import {
 // ── Key registry ──────────────────────────────────────────────────────────────
 // Keep this in one place so every producer and consumer agrees on key shape.
 
-export type ResourceKind = 'listing' | 'auction' | 'offer' | 'collection' | 'activity' | 'stats';
+export type ResourceKind = 'listing' | 'auction' | 'offer' | 'collection' | 'activity' | 'stats' | 'config';
 
 export type InvalidationScope = {
   kind: ResourceKind;
@@ -108,4 +108,8 @@ export async function invalidateWalletActivity(wallet: string): Promise<void> {
 
 export async function invalidateStats(): Promise<void> {
   await applyInvalidation({ kind: 'stats' });
+}
+
+export async function invalidateConfig(): Promise<void> {
+  await applyInvalidation({ kind: 'config', extraPatterns: ['cache:config:*'] });
 }

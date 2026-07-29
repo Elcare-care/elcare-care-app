@@ -32,12 +32,11 @@ import { collectMarketplaceEvents, MAX_LEDGER_WINDOW } from './event-sync.js';
 import { withRpcRetry } from './retry.js';
 import { logger } from './logger.js';
 import redis from './redis.js';
-import { applyInvalidation, invalidateListing, invalidateAuction, invalidateOffer, invalidateCollection, invalidateWalletActivity, invalidateStats } from './cache-invalidation.js';
+import { applyInvalidation, invalidateListing, invalidateAuction, invalidateOffer, invalidateCollection, invalidateWalletActivity, invalidateStats, invalidateConfig } from './cache-invalidation.js';
 import { loadConfig, parseTrackedContracts } from './config.js';
 import { enqueueIpfsFetch } from './ipfs-cache.js';
 import { promoteConfirmedEvents, rollbackReorg } from './reorg.js';
 import { acquireLease, releaseLease, renewLease, type LeaseRole } from './coordination/lease.js';
-import { applyInvalidation, invalidateListing, invalidateAuction, invalidateOffer, invalidateCollection, invalidateWalletActivity, invalidateStats } from './cache-invalidation.js';
 
 dotenv.config();
 
@@ -1335,6 +1334,12 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
           updatedAtLedger: ledgerSequence,
         }
       });
+      break;
+    }
+
+    // Auction configuration changes — invalidate config cache
+    case 'AUCTION_CONFIG_UPDATED': {
+      invalidateConfig().catch(() => {});
       break;
     }
 

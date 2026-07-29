@@ -78,11 +78,9 @@ const TOPIC_MAP: Record<string, string> = {
   'collection_unpaused': 'COLLECTION_UNPAUSED',
   'function_paused':     'FUNCTION_PAUSED',
   'function_unpaused':   'FUNCTION_UNPAUSED',
-  // Royalty settlement snapshot (Issue #270) and auction escrow recovery
-  // (Issue #271) — previously emitted on-chain but not mapped here, so the
-  // indexer silently dropped every one of these events. Fixed as part of
-  // Issue #278's "every indexed event has a documented version and schema".
-  'royalty_settlement':     'ROYALTY_SETTLEMENT',
+  // Auction configuration events
+  'auction_config_updated': 'AUCTION_CONFIG_UPDATED',
+  // Auction escrow recovery (Issue #271) — previously emitted on-chain but not mapped here
   'auction_bid_refunded':   'AUCTION_BID_REFUNDED',
   'auction_admin_cancelled':'AUCTION_ADMIN_CANCELLED',
   // Launchpad deploy events (topics[0] = "deploy", topics[1] = kind tag)

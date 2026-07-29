@@ -125,6 +125,10 @@ jobs:
         run: cargo build --target wasm32v1-none --release
       - name: Run Unit Tests
         run: cargo test
+      - name: Run Property-Based Fuzz Tests (Proptest)
+        run: cargo test --package soroban-marketplace proptests
+        env:
+          PROPTEST_CASES: 1000
 
   frontend:
     name: Build and Test Frontend
