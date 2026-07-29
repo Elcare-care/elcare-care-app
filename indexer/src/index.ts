@@ -13,6 +13,7 @@ import { startPolling, registerShutdownHook, stopPoller, gracefulShutdown } from
 import { rateLimiter, globalRateLimiter } from './api/rate-limit-middleware.js';
 import { metricsMiddleware, handleMetrics, requestLogger } from './metrics.js';
 import { isStalled } from './stall.js';
+import { authMiddleware } from './api/auth-middleware.js';
 import { errorHandler } from './api/errors.js';
 import { startReconciler } from './reconciler.js';
 import { validateRequiredEnv, loadKeeperConfig, loadConfig } from './config.js';
@@ -109,8 +110,8 @@ app.get('/version', (_req: express.Request, res: express.Response) => {
   });
 });
 
-// GET /health/details — full diagnostics, requires admin token
-app.get('/health/details', async (req: express.Request, res: express.Response) => {
+// GET /health/details — full diagnostics, requires operator token
+app.get('/health/details', authMiddleware('operator'), async (req: express.Request, res: express.Response) => {
   const adminToken = process.env.HEALTH_DETAILS_TOKEN;
   if (adminToken) {
     const provided = req.headers['x-admin-token'] ?? req.query.token;

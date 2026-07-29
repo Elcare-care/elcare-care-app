@@ -315,17 +315,8 @@ jobs:
       - name: Install Dependencies
         run: npm ci
         working-directory: indexer
-      - name: Generate OpenAPI spec
-        run: npm run generate-openapi
-        working-directory: indexer
-      - name: Diff against committed openapi.json
-        run: |
-          if ! git diff --exit-code openapi.json; then
-            echo ""
-            echo "ERROR: openapi.json is out of sync with the route definitions."
-            echo "Run 'npm run generate-openapi' in the indexer directory and commit the result."
-            exit 1
-          fi
+      - name: Check OpenAPI spec
+        run: npm run check-openapi
         working-directory: indexer
 
   release-validate:
