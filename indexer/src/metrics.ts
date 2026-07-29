@@ -353,6 +353,12 @@ export const keeperFeeBumpsTotal = new client.Counter({
   labelNames: ['entry_point'],
 });
 
+/** Number of storage entries within 50,000 ledgers of TTL expiry (Issue #280). */
+export const elcarehubEntriesNearExpiry = new client.Gauge({
+  name: 'elcarehub_entries_near_expiry',
+  help: 'Number of listings, auctions, and offers within 50,000 ledgers of their TTL expiry',
+});
+
 // ── Backfill / gap-repair metrics ─────────────────────────────────────────────
 
 /** Number of Open LedgerGap rows currently in the DB (set each gap-repair cycle). */

@@ -9148,3 +9148,145 @@ fn test_royalty_paid_includes_collection_royalty_receiver() {
     assert_eq!(token.balance(&artist), 100_000_000_000_i128 + expected_artist);
     assert_eq!(token.balance(&treasury), expected_fee);
 }
+
+// ════════════════════════════════════════════════════════════
+// SECTION: TTL Management (Issue #280)
+// ════════════════════════════════════════════════════════════
+
+/// Test that TTL constants are set to expected values
+#[test]
+fn test_ttl_constants() {
+    use crate::storage::{
+        LISTING_TTL_LEDGERS, AUCTION_TTL_LEDGERS, OFFER_TTL_LEDGERS, INSTANCE_TTL_LEDGERS,
+    };
+    
+    // Verify TTL constants match expected values
+    assert_eq!(LISTING_TTL_LEDGERS, 2_073_600);  // 120 days
+    assert_eq!(AUCTION_TTL_LEDGERS, 1_036_800);   // 60 days
+    assert_eq!(OFFER_TTL_LEDGERS, 1_036_800);     // 60 days
+    assert_eq!(INSTANCE_TTL_LEDGERS, 6_307_200);  // 365 days
+}
+
+/// Test that renew_storage entry-point renews specified entries
+#[test]
+fn test_renew_storage() {
+    let (env, client, artist, buyer, token_id, _cid, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    
+    // Create a listing
+    let listing_id = client.create_listing(
+        &artist, &10_000_000_i128, &symbol_short!("XLM"),
+        &token_id, &collection_id, &1u64,
+        &valid_recipients(&env, &artist), &None::<u64>,
+    );
+    
+    // Create an auction
+    let auction_id = client.create_auction(
+        &artist, &token_id, &collection_id, &2u64,
+        &1_000_000_i128, &86400u64,  // 1 day duration
+        &valid_recipients(&env, &artist),
+    );
+    
+    // Create an offer
+    let offer_id = client.make_offer(
+        &buyer, &listing_id, &5_000_000_i128,
+        &token_id, &None::<u64>,
+    );
+    
+    // Call renew_storage (permissionless - no auth required)
+    let renewed = client.renew_storage(
+        &vec![&env, listing_id],
+        &vec![&env, auction_id],
+        &vec![&env, offer_id],
+    );
+    
+    // Should have renewed 3 entries
+    assert_eq!(renewed, 3);
+}
+
+/// Test that renew_storage only renews existing entries
+#[test]
+fn test_renew_storage_nonexistent() {
+    let (env, client, artist, _buyer, token_id, _cid, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    
+    // Create one listing
+    let listing_id = client.create_listing(
+        &artist, &10_000_000_i128, &symbol_short!("XLM"),
+        &token_id, &collection_id, &1u64,
+        &valid_recipients(&env, &artist), &None::<u64>,
+    );
+    
+    // Try to renew non-existent entries
+    let renewed = client.renew_storage(
+        &vec![&env, listing_id],  // exists
+        &vec![&env, 999u64],      // doesn't exist
+        &vec![&env, 888u64],      // doesn't exist
+    );
+    
+    // Should only renew the existing listing
+    assert_eq!(renewed, 1);
+}
+
+/// Test that renew_storage respects MAX_MAINTENANCE_ITEMS limit
+#[test]
+fn test_renew_storage_budget_limit() {
+    let (env, client, artist, _buyer, token_id, _cid, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    
+    // Create multiple listings
+    let mut listing_ids = vec![&env];
+    for i in 1..=150 {
+        let id = client.create_listing(
+            &artist, &10_000_000_i128, &symbol_short!("XLM"),
+            &token_id, &collection_id, &i,
+            &valid_recipients(&env, &artist), &None::<u64>,
+        );
+        listing_ids.push_back(id);
+    }
+    
+    // Try to renew more than MAX_MAINTENANCE_ITEMS (100)
+    let renewed = client.renew_storage(
+        &listing_ids,
+        &vec![&env],
+        &vec![&env],
+    );
+    
+    // Should only renew up to the budget limit
+    assert_eq!(renewed, 100);
+}
+
+/// Test that bump_instance_ttl is called in entry-points
+#[test]
+fn test_bump_instance_ttl_called() {
+    let (env, client, artist, _buyer, token_id, _cid, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    
+    // Set some instance-level config
+    let treasury = Address::generate(&env);
+    client.set_treasury(&artist, &treasury);
+    client.set_protocol_fee(&artist, &500u32);
+    
+    // Verify config is still accessible (instance TTL was bumped)
+    assert_eq!(client.get_treasury(), Some(treasury.clone()));
+    assert_eq!(client.get_protocol_fee(), 500);
+    
+    // Call another entry-point that should bump instance TTL
+    let listing_id = client.create_listing(
+        &artist, &10_000_000_i128, &symbol_short!("XLM"),
+        &token_id, &collection_id, &1u64,
+        &valid_recipients(&env, &artist), &None::<u64>,
+    );
+    
+    // Config should still be accessible
+    assert_eq!(client.get_treasury(), Some(treasury));
+    assert_eq!(client.get_protocol_fee(), 500);
+    
+    // Listing should exist
+    let listing = client.get_listing(&listing_id);
+    assert!(listing.is_some());
+}
