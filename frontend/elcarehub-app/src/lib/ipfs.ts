@@ -66,7 +66,7 @@ export interface ArtworkMetadata {
   contentAdvisory?: string;
 }
 
-// ── Metadata validation (Issue #68) ──────────────────────────────────────────
+// ── Metadata validation (Issue #68 + Issue #7) ───────────────────────────────
 
 export type MetadataValidationError =
   | "MISSING_TITLE"
@@ -75,6 +75,19 @@ export type MetadataValidationError =
   | "ALT_TEXT_TOO_LONG"
   | "MISSING_IMAGE";
 
+export type ImageValidationError =
+  | "UNSUPPORTED_TYPE"
+  | "FILE_TOO_LARGE"
+  | "FILE_EMPTY"
+  | "DIMENSIONS_TOO_SMALL"
+  | "DIMENSIONS_TOO_LARGE";
+
+export interface ImageValidationResult {
+  valid: boolean;
+  errors: ImageValidationError[];
+  messages: string[];
+}
+
 export interface MetadataValidationResult {
   valid: boolean;
   errors: MetadataValidationError[];
@@ -82,6 +95,89 @@ export interface MetadataValidationResult {
 }
 
 const ALT_TEXT_MAX_LENGTH = 300;
+
+/** Allowed MIME types for artwork image uploads. */
+export const ALLOWED_IMAGE_TYPES = new Set([
+  "image/jpeg",
+  "image/png",
+  "image/gif",
+  "image/webp",
+  "image/svg+xml",
+]);
+
+/** Maximum allowed image file size (20 MB). */
+export const MAX_IMAGE_SIZE_BYTES = 20 * 1024 * 1024;
+
+/** Minimum artwork dimension in pixels (each side). */
+export const MIN_IMAGE_DIMENSION_PX = 100;
+
+/** Maximum artwork dimension in pixels (each side). */
+export const MAX_IMAGE_DIMENSION_PX = 8192;
+
+/**
+ * Validates an image File before upload.
+ * Checks MIME type, file size, and — when the environment supports
+ * createImageBitmap — pixel dimensions.
+ *
+ * The dimension check is best-effort: it is skipped in environments
+ * (Node.js test runners) where createImageBitmap is unavailable.
+ */
+export async function validateImageFile(
+  file: File
+): Promise<ImageValidationResult> {
+  const errors: ImageValidationError[] = [];
+  const messages: string[] = [];
+
+  // 1. MIME type
+  if (!ALLOWED_IMAGE_TYPES.has(file.type)) {
+    errors.push("UNSUPPORTED_TYPE");
+    messages.push(
+      `Unsupported image type "${file.type}". Allowed: JPEG, PNG, GIF, WebP, SVG.`
+    );
+  }
+
+  // 2. File size
+  if (file.size === 0) {
+    errors.push("FILE_EMPTY");
+    messages.push("File is empty.");
+  } else if (file.size > MAX_IMAGE_SIZE_BYTES) {
+    errors.push("FILE_TOO_LARGE");
+    messages.push(
+      `Image exceeds the 20 MB limit (${(file.size / 1024 / 1024).toFixed(1)} MB given).`
+    );
+  }
+
+  // 3. Pixel dimensions (browser only; skipped gracefully in tests / SSR)
+  if (
+    errors.length === 0 &&
+    typeof createImageBitmap === "function" &&
+    !file.type.includes("svg")
+  ) {
+    try {
+      const bitmap = await createImageBitmap(file);
+      const { width, height } = bitmap;
+      bitmap.close();
+      if (width < MIN_IMAGE_DIMENSION_PX || height < MIN_IMAGE_DIMENSION_PX) {
+        errors.push("DIMENSIONS_TOO_SMALL");
+        messages.push(
+          `Image dimensions (${width}×${height}px) are below the minimum of ${MIN_IMAGE_DIMENSION_PX}×${MIN_IMAGE_DIMENSION_PX}px.`
+        );
+      } else if (
+        width > MAX_IMAGE_DIMENSION_PX ||
+        height > MAX_IMAGE_DIMENSION_PX
+      ) {
+        errors.push("DIMENSIONS_TOO_LARGE");
+        messages.push(
+          `Image dimensions (${width}×${height}px) exceed the maximum of ${MAX_IMAGE_DIMENSION_PX}×${MAX_IMAGE_DIMENSION_PX}px.`
+        );
+      }
+    } catch {
+      // Dimension check failure is non-fatal; proceed with upload
+    }
+  }
+
+  return { valid: errors.length === 0, errors, messages };
+}
 
 /**
  * Validates artwork metadata before IPFS upload.
@@ -122,6 +218,16 @@ export function validateArtworkMetadata(
   return { valid: errors.length === 0, errors, messages };
 }
 
+/** Computes a SHA-256 hex digest of a File's binary content (browser only). */
+export async function computeFileHash(file: File): Promise<string> {
+  if (typeof crypto === "undefined" || !crypto.subtle) return "";
+  const buffer = await file.arrayBuffer();
+  const hashBuffer = await crypto.subtle.digest("SHA-256", buffer);
+  return Array.from(new Uint8Array(hashBuffer))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
 /** Result of any IPFS upload (enriched with idempotency info) */
 export interface IpfsUploadResult {
   cid: string;
@@ -141,13 +247,24 @@ export interface IpfsUploadResult {
 
 /**
  * Uploads an artwork image to IPFS via Pinata.
- * Validates file size and MIME type server-side before pinning.
+ * Validates file type and size locally before uploading; throws
+ * ImageValidationError[] when the file does not meet requirements.
  * Returns a stable CID even on retried/duplicate requests.
  */
 export async function uploadImageToIPFS(
   file: File,
   name?: string
 ): Promise<IpfsUploadResult> {
+  // Client-side validation before any network request
+  const validation = await validateImageFile(file);
+  if (!validation.valid) {
+    const err = new Error(
+      `Image validation failed: ${validation.messages.join(" ")}`
+    ) as Error & { validationErrors: ImageValidationError[] };
+    err.validationErrors = validation.errors;
+    throw err;
+  }
+
   const formData = new FormData();
   formData.append("file", file);
   formData.append("name", name ?? file.name);

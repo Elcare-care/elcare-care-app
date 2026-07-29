@@ -14,13 +14,358 @@
  *   2. On exhaustion, fall through to PINATA_FALLBACK_GATEWAY (default:
  *      cloudflare-ipfs.com) for up to MAX_FALLBACK_ATTEMPTS.
  *   3. If both fail, the job is marked "failed" and will not be retried.
+ *
+ * Content integrity (Issue #7):
+ *   After each successful fetch the raw JSON body is hashed (SHA-256) and the
+ *   digest is stored on the IpfsMetadata row.  Callers can compare the stored
+ *   hash on subsequent fetches to detect silent content substitution.
+ *
+ * Metrics (Issue #7):
+ *   Per-gateway fetch latency (ipfs_fetch_duration_ms), attempt counts, and
+ *   error codes are logged as structured JSON so a log-scraper or Prometheus
+ *   push-gateway can pick them up. A lightweight in-process counter object is
+ *   also exported so callers and tests can read aggregate health state.
  */
 
 import axios, { AxiosError } from 'axios';
+import crypto from 'crypto';
 import prisma from './db.js';
 import { logger } from './logger.js';
 import { Prisma } from '@prisma/client';
 import { withIpfsRetry } from './retry.js';
+
+// ── Configuration ─────────────────────────────────────────────────────────────
+
+const PRIMARY_GATEWAY =
+  (process.env.PINATA_GATEWAY ?? 'https://gateway.pinata.cloud').replace(/\/$/, '');
+
+const FALLBACK_GATEWAY =
+  (process.env.PINATA_FALLBACK_GATEWAY ?? 'https://cloudflare-ipfs.com').replace(/\/$/, '');
+
+const MAX_PRIMARY_ATTEMPTS = 3;
+const MAX_FALLBACK_ATTEMPTS = 2;
+const BASE_BACKOFF_MS = 500;
+const MAX_BACKOFF_MS = 30_000;
+const FETCH_TIMEOUT_MS = 10_000;
+
+/** Maximum consecutive total attempts before a job is marked "failed". */
+const MAX_TOTAL_ATTEMPTS = MAX_PRIMARY_ATTEMPTS + MAX_FALLBACK_ATTEMPTS;
+
+// ── Public types ──────────────────────────────────────────────────────────────
+
+export interface IpfsArtworkMetadata {
+  title?: string;
+  description?: string;
+  image?: string;
+  imageUrl?: string;
+  attributes?: unknown;
+  [key: string]: unknown;
+}
+
+// ── In-process health counters (Issue #7) ─────────────────────────────────────
+
+export interface IpfsHealthCounters {
+  /** Total successful fetches across all gateways. */
+  fetchSuccess: number;
+  /** Total failed fetches (all gateways exhausted). */
+  fetchFailure: number;
+  /** Total 404 responses encountered across all gateways. */
+  fetch404: number;
+  /** Per-gateway success counts. */
+  gatewaySuccesses: Record<string, number>;
+  /** Per-gateway failure counts. */
+  gatewayFailures: Record<string, number>;
+  /** Cumulative fetch latency per gateway in ms. */
+  gatewayLatencyMs: Record<string, number>;
+}
+
+const _counters: IpfsHealthCounters = {
+  fetchSuccess: 0,
+  fetchFailure: 0,
+  fetch404: 0,
+  gatewaySuccesses: {},
+  gatewayFailures: {},
+  gatewayLatencyMs: {},
+};
+
+/** Read the current health counters (for tests and /health endpoints). */
+export function getIpfsHealthCounters(): Readonly<IpfsHealthCounters> {
+  return { ..._counters };
+}
+
+/** Reset counters — intended for test isolation only. */
+export function resetIpfsHealthCounters(): void {
+  _counters.fetchSuccess = 0;
+  _counters.fetchFailure = 0;
+  _counters.fetch404 = 0;
+  _counters.gatewaySuccesses = {};
+  _counters.gatewayFailures = {};
+  _counters.gatewayLatencyMs = {};
+}
+
+// ── Content integrity (Issue #7) ──────────────────────────────────────────────
+
+/**
+ * Computes a SHA-256 hex digest of the raw JSON response body.
+ * Stored alongside the metadata so consumers can detect content drift.
+ */
+export function computeContentHash(rawBody: string): string {
+  return crypto.createHash('sha256').update(rawBody, 'utf8').digest('hex');
+}
+
+// ── Queue management ──────────────────────────────────────────────────────────
+
+/**
+ * Enqueues a CID for background IPFS fetching.
+ * Idempotent — if the CID is already cached or already queued, this is a no-op.
+ */
+export async function enqueueIpfsFetch(cid: string): Promise<void> {
+  if (!cid) return;
+
+  // Skip if already cached
+  const existing = await prisma.ipfsMetadata.findUnique({ where: { cid } });
+  if (existing) return;
+
+  // Skip if already queued and not failed
+  const inQueue = await prisma.ipfsQueue.findFirst({
+    where: { cid, status: { in: ['pending', 'processing', 'done'] } },
+  });
+  if (inQueue) return;
+
+  await prisma.ipfsQueue.create({
+    data: { cid, status: 'pending' },
+  });
+
+  logger.info('[IpfsCache] Enqueued IPFS fetch', { cid });
+}
+
+// ── Gateway fetch ─────────────────────────────────────────────────────────────
+
+function gatewayUrl(gateway: string, cid: string): string {
+  return `${gateway}/ipfs/${cid}`;
+}
+
+/** Raw response including the serialised body for content-hash computation. */
+interface GatewayResponse {
+  data: IpfsArtworkMetadata;
+  /** JSON-serialised body used for SHA-256 hashing. */
+  rawBody: string;
+  /** Fetch duration in milliseconds. */
+  latencyMs: number;
+}
+
+async function fetchFromGateway(url: string): Promise<GatewayResponse> {
+  const start = Date.now();
+  const res = await axios.get<IpfsArtworkMetadata>(url, {
+    timeout: FETCH_TIMEOUT_MS,
+    headers: { Accept: 'application/json' },
+    // Ask axios to return the raw string so we can hash it before parsing
+    transformResponse: [(raw: string) => raw],
+  });
+  const latencyMs = Date.now() - start;
+  const rawBody: string = res.data as unknown as string;
+  let data: IpfsArtworkMetadata;
+  try {
+    data = JSON.parse(rawBody) as IpfsArtworkMetadata;
+  } catch {
+    throw new Error(`Gateway returned non-JSON body: ${rawBody.slice(0, 120)}`);
+  }
+  return { data, rawBody, latencyMs };
+}
+
+function backoffMs(attempt: number): number {
+  return Math.min(BASE_BACKOFF_MS * Math.pow(2, attempt - 1), MAX_BACKOFF_MS);
+}
+
+export interface FetchIpfsResult {
+  data: IpfsArtworkMetadata;
+  /** SHA-256 hex of the raw JSON body. */
+  contentHash: string;
+  /** Name of the gateway that succeeded. */
+  gatewayName: string;
+}
+
+/**
+ * Attempts to fetch metadata for `cid` using the primary gateway first,
+ * then the fallback.  Returns parsed metadata + content hash + gateway name.
+ * Throws if all attempts on both gateways are exhausted.
+ *
+ * Per-gateway retry semantics:
+ *  - Retry on ANY error except HTTP 404 (content definitively absent on this gateway).
+ *  - 504/503/429 and network errors are also retried (default IPFS_RETRY_CONFIG).
+ *  - 404 on a gateway stops retrying that gateway and moves to the next.
+ *
+ * Metrics (Issue #7): every attempt is timed and the result logged as
+ * structured JSON under the `ipfs_fetch` key.
+ */
+export async function fetchIpfsMetadata(cid: string): Promise<FetchIpfsResult> {
+  const gateways = [
+    { name: 'primary',  url: gatewayUrl(PRIMARY_GATEWAY, cid),  maxAttempts: MAX_PRIMARY_ATTEMPTS },
+    { name: 'fallback', url: gatewayUrl(FALLBACK_GATEWAY, cid), maxAttempts: MAX_FALLBACK_ATTEMPTS },
+  ];
+
+  let lastError: unknown;
+
+  for (const gw of gateways) {
+    try {
+      const response = await withIpfsRetry(
+        () => fetchFromGateway(gw.url),
+        {
+          maxAttempts: gw.maxAttempts,
+          operation: `ipfs-${gw.name}`,
+          retryable: (err: unknown) => {
+            const status = (err as AxiosError)?.response?.status;
+            return status !== 404;
+          },
+        },
+      );
+
+      // ── Success metrics ──────────────────────────────────────────────────
+      _counters.fetchSuccess++;
+      _counters.gatewaySuccesses[gw.name] = (_counters.gatewaySuccesses[gw.name] ?? 0) + 1;
+      _counters.gatewayLatencyMs[gw.name] =
+        (_counters.gatewayLatencyMs[gw.name] ?? 0) + response.latencyMs;
+
+      logger.info('[IpfsCache] Fetched metadata', {
+        event: 'ipfs_fetch',
+        cid,
+        gateway: gw.name,
+        latencyMs: response.latencyMs,
+        contentHash: computeContentHash(response.rawBody).slice(0, 16) + '…',
+      });
+
+      return {
+        data: response.data,
+        contentHash: computeContentHash(response.rawBody),
+        gatewayName: gw.name,
+      };
+    } catch (err) {
+      lastError = err;
+      const status = (err as AxiosError)?.response?.status;
+
+      // ── Failure metrics ──────────────────────────────────────────────────
+      _counters.gatewayFailures[gw.name] = (_counters.gatewayFailures[gw.name] ?? 0) + 1;
+      if (status === 404) _counters.fetch404++;
+
+      logger.warn('[IpfsCache] Gateway exhausted', {
+        event: 'ipfs_fetch_failed',
+        cid,
+        gateway: gw.name,
+        status,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  _counters.fetchFailure++;
+  throw lastError;
+}
+
+// ── Job processor ─────────────────────────────────────────────────────────────
+
+/**
+ * Processes one batch of pending IPFS queue jobs.
+ * Called by a periodic timer in the indexer's main loop.
+ * Returns the number of jobs that were successfully fetched.
+ */
+export async function processIpfsQueue(batchSize = 10): Promise<number> {
+  const now = new Date();
+
+  // Claim a batch of jobs that are ready to run
+  const jobs = await prisma.ipfsQueue.findMany({
+    where: {
+      status: 'pending',
+      OR: [
+        { nextRetryAt: null },
+        { nextRetryAt: { lte: now } },
+      ],
+    },
+    orderBy: { createdAt: 'asc' },
+    take: batchSize,
+  });
+
+  if (jobs.length === 0) return 0;
+
+  let successCount = 0;
+
+  for (const job of jobs) {
+    // Mark as processing to prevent double-pick in concurrent workers
+    await prisma.ipfsQueue.update({
+      where: { id: job.id },
+      data: { status: 'processing' },
+    });
+
+    const attempts = job.attempts + 1;
+
+    try {
+      const { data: raw, contentHash } = await fetchIpfsMetadata(job.cid);
+
+      // Persist into IpfsMetadata (upsert so re-runs are safe)
+      await prisma.ipfsMetadata.upsert({
+        where: { cid: job.cid },
+        create: {
+          cid: job.cid,
+          title: typeof raw.title === 'string' ? raw.title : undefined,
+          description: typeof raw.description === 'string' ? raw.description : undefined,
+          imageUrl: typeof raw.image === 'string'
+            ? raw.image
+            : typeof raw.imageUrl === 'string'
+              ? raw.imageUrl
+              : undefined,
+          attributes: raw.attributes != null ? (raw.attributes as Prisma.InputJsonValue) : Prisma.JsonNull,
+          raw: raw as Prisma.InputJsonValue,
+          // Issue #7: store content hash for integrity verification
+          contentHash,
+        },
+        update: {
+          title: typeof raw.title === 'string' ? raw.title : undefined,
+          description: typeof raw.description === 'string' ? raw.description : undefined,
+          imageUrl: typeof raw.image === 'string'
+            ? raw.image
+            : typeof raw.imageUrl === 'string'
+              ? raw.imageUrl
+              : undefined,
+          attributes: raw.attributes != null ? (raw.attributes as Prisma.InputJsonValue) : Prisma.JsonNull,
+          fetchedAt: new Date(),
+          raw: raw as Prisma.InputJsonValue,
+          contentHash,
+        },
+      });
+
+      await prisma.ipfsQueue.update({
+        where: { id: job.id },
+        data: { status: 'done', attempts },
+      });
+
+      logger.info('[IpfsCache] Job completed', { cid: job.cid, jobId: job.id, contentHash: contentHash.slice(0, 16) });
+      successCount++;
+    } catch (err) {
+      const isFinal = attempts >= MAX_TOTAL_ATTEMPTS;
+      const nextRetryAt = isFinal
+        ? null
+        : new Date(Date.now() + backoffMs(attempts));
+
+      await prisma.ipfsQueue.update({
+        where: { id: job.id },
+        data: {
+          status: isFinal ? 'failed' : 'pending',
+          attempts,
+          nextRetryAt,
+        },
+      });
+
+      logger.error('[IpfsCache] Job failed', {
+        cid: job.cid,
+        jobId: job.id,
+        attempts,
+        isFinal,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  return successCount;
+}
 
 // ── Configuration ─────────────────────────────────────────────────────────────
 

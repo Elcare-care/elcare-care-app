@@ -900,11 +900,31 @@ export async function fetchListingById(id: number): Promise<any | null> {
 export type MarketplaceSSEEventType =
   | "LISTING_CREATED"
   | "LISTING_CANCELLED"
+  | "LISTING_UPDATED"
+  | "LISTING_PRICE_UPDATED"
+  | "LISTING_EXPIRED"
   | "ARTWORK_SOLD"
   | "BID_PLACED"
+  | "AUCTION_CREATED"
   | "AUCTION_FINALIZED"
+  | "AUCTION_RESOLVED"
   | "AUCTION_CANCELLED"
   | "AUCTION_EXTENDED"
+  | "AUCTION_BID_REFUNDED"
+  | "AUCTION_ADMIN_CANCELLED"
+  | "OFFER_MADE"
+  | "OFFER_ACCEPTED"
+  | "OFFER_REJECTED"
+  | "OFFER_WITHDRAWN"
+  | "OFFER_RECLAIMED"
+  | "DEPLOY_NORMAL_721"
+  | "DEPLOY_NORMAL_1155"
+  | "DEPLOY_LAZY_721"
+  | "DEPLOY_LAZY_1155"
+  | "ROYALTY_PAID"
+  | "ROYALTY_SETTLEMENT"
+  | "CONTRACT_PAUSED"
+  | "CONTRACT_UNPAUSED"
   | "REORG"
   | "CRITICAL_REORG";
 
@@ -919,6 +939,87 @@ export interface MarketplaceSSEEvent {
   timestamp?: string;
   depth?: number;
   message?: string;
+}
+
+/**
+ * Returns a short human-readable summary for an SSE event, suitable for
+ * activity feeds and toast messages.
+ */
+export function summariseSSEEvent(event: MarketplaceSSEEvent): string {
+  const d = event.data ?? {};
+  const fmtAmount = (v: unknown): string => {
+    const n = Number(String(v ?? 0));
+    if (!Number.isFinite(n) || n === 0) return "";
+    return `${(n / 1e7).toLocaleString("en-US", { maximumFractionDigits: 4 })} XLM`;
+  };
+  switch (event.type) {
+    case "LISTING_CREATED":
+      return `New listing #${event.listingId ?? d.listing_id} for ${fmtAmount(d.price)}`.trim();
+    case "LISTING_CANCELLED":
+      return `Listing #${event.listingId ?? d.listing_id} cancelled`;
+    case "LISTING_EXPIRED":
+      return `Listing #${event.listingId ?? d.listing_id} expired`;
+    case "LISTING_PRICE_UPDATED": {
+      const newP = fmtAmount(d.new_price);
+      return `Listing #${event.listingId ?? d.listing_id} price updated${newP ? ` to ${newP}` : ""}`;
+    }
+    case "ARTWORK_SOLD": {
+      const p = fmtAmount(d.price);
+      return `Listing #${event.listingId ?? d.listing_id} sold${p ? ` for ${p}` : ""}`;
+    }
+    case "AUCTION_CREATED":
+      return `Auction #${event.auctionId ?? d.auction_id} started — reserve ${fmtAmount(d.reserve_price)}`.trim();
+    case "BID_PLACED": {
+      const amt = fmtAmount(d.bid_amount);
+      return `Bid of ${amt} on auction #${event.auctionId ?? d.auction_id}`;
+    }
+    case "AUCTION_FINALIZED":
+    case "AUCTION_RESOLVED": {
+      const amt = fmtAmount(d.amount);
+      return d.winner
+        ? `Auction #${event.auctionId ?? d.auction_id} finalized — winning bid ${amt}`
+        : `Auction #${event.auctionId ?? d.auction_id} ended with no bids`;
+    }
+    case "AUCTION_EXTENDED":
+      return `Auction #${event.auctionId ?? d.auction_id} extended`;
+    case "AUCTION_CANCELLED":
+      return `Auction #${event.auctionId ?? d.auction_id} cancelled`;
+    case "AUCTION_ADMIN_CANCELLED":
+      return `Auction #${event.auctionId ?? d.auction_id} force-cancelled by admin`;
+    case "AUCTION_BID_REFUNDED": {
+      const amt = fmtAmount(d.amount);
+      return `Bid refund of ${amt} on auction #${event.auctionId ?? d.auction_id}`;
+    }
+    case "OFFER_MADE": {
+      const amt = fmtAmount(d.amount);
+      return `Offer of ${amt} on listing #${event.listingId ?? d.listing_id}`;
+    }
+    case "OFFER_ACCEPTED":
+      return `Offer accepted on listing #${event.listingId ?? d.listing_id}`;
+    case "OFFER_REJECTED":
+      return `Offer rejected on listing #${event.listingId ?? d.listing_id}`;
+    case "OFFER_WITHDRAWN":
+      return `Offer withdrawn on listing #${event.listingId ?? d.listing_id}`;
+    case "OFFER_RECLAIMED":
+      return `Offer reclaimed on listing #${event.listingId ?? d.listing_id}`;
+    case "DEPLOY_NORMAL_721":
+    case "DEPLOY_NORMAL_1155":
+    case "DEPLOY_LAZY_721":
+    case "DEPLOY_LAZY_1155":
+      return `New ${event.type.replace("DEPLOY_", "").replace("_", " ")} collection deployed`;
+    case "ROYALTY_PAID":
+      return `Royalties paid for listing #${event.listingId ?? d.listing_id ?? d.auction_id}`;
+    case "CONTRACT_PAUSED":
+      return "Marketplace paused";
+    case "CONTRACT_UNPAUSED":
+      return "Marketplace resumed";
+    case "REORG":
+      return `Chain reorganisation detected (depth: ${event.depth ?? "?"})`;
+    case "CRITICAL_REORG":
+      return `Critical reorg — depth ${event.depth ?? "?"}`;
+    default:
+      return `Marketplace event: ${event.type}`;
+  }
 }
 
 /** Options for {@link subscribeToMarketplaceEvents}. */
@@ -965,11 +1066,31 @@ export interface SSESubscription {
 const SSE_RELEVANT_TYPES = new Set<string>([
   "LISTING_CREATED",
   "LISTING_CANCELLED",
+  "LISTING_UPDATED",
+  "LISTING_PRICE_UPDATED",
+  "LISTING_EXPIRED",
   "ARTWORK_SOLD",
   "BID_PLACED",
+  "AUCTION_CREATED",
   "AUCTION_FINALIZED",
+  "AUCTION_RESOLVED",
   "AUCTION_CANCELLED",
   "AUCTION_EXTENDED",
+  "AUCTION_BID_REFUNDED",
+  "AUCTION_ADMIN_CANCELLED",
+  "OFFER_MADE",
+  "OFFER_ACCEPTED",
+  "OFFER_REJECTED",
+  "OFFER_WITHDRAWN",
+  "OFFER_RECLAIMED",
+  "DEPLOY_NORMAL_721",
+  "DEPLOY_NORMAL_1155",
+  "DEPLOY_LAZY_721",
+  "DEPLOY_LAZY_1155",
+  "ROYALTY_PAID",
+  "ROYALTY_SETTLEMENT",
+  "CONTRACT_PAUSED",
+  "CONTRACT_UNPAUSED",
   "REORG",
   "CRITICAL_REORG",
 ]);
@@ -982,13 +1103,15 @@ function parseSSEData(rawData: string): MarketplaceSSEEvent | null {
     return {
       type: type as MarketplaceSSEEventType,
       listingId:
-        parsed.listingId != null ? Number(parsed.listingId) : undefined,
+        parsed.listingId != null ? Number(parsed.listingId) :
+        parsed.listing_id != null ? Number(parsed.listing_id) : undefined,
       auctionId:
-        parsed.auctionId != null ? Number(parsed.auctionId) : undefined,
+        parsed.auctionId != null ? Number(parsed.auctionId) :
+        parsed.auction_id != null ? Number(parsed.auction_id) : undefined,
       data:
         typeof parsed.data === "object" && parsed.data !== null
           ? (parsed.data as Record<string, unknown>)
-          : undefined,
+          : (typeof parsed === "object" ? parsed : undefined),
       // Re-org specific fields
       from_ledger: parsed.from_ledger != null ? Number(parsed.from_ledger) : undefined,
       to_ledger: parsed.to_ledger != null ? Number(parsed.to_ledger) : undefined,
@@ -1232,4 +1355,50 @@ export async function fetchArtistMetrics(
     console.warn("[indexer] fetchArtistMetrics:", e instanceof Error ? e.message : e);
   }
   return empty;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Activity feed — recent platform events
+// ─────────────────────────────────────────────────────────────
+
+/** A raw marketplace event row from the indexer, shaped for the activity feed. */
+export interface ActivityFeedEvent {
+  id: number;
+  eventType: string;
+  listingId: string | null;
+  actor: string;
+  data: Record<string, unknown>;
+  ledgerSequence: number;
+  ledgerTimestamp: string | null;
+  /** Human-readable summary generated client-side */
+  summary?: string;
+}
+
+/**
+ * Fetch the most recent marketplace events for the global activity feed.
+ * Endpoint: GET /activity/recent
+ */
+export async function fetchRecentActivity(limit = 20): Promise<ActivityFeedEvent[]> {
+  try {
+    const raw = await fetchWithRetry<unknown>(`/activity/recent?limit=${limit}`);
+    if (!Array.isArray(raw)) return [];
+    return (raw as unknown[])
+      .filter((item): item is Record<string, unknown> =>
+        item !== null && typeof item === "object"
+      )
+      .map((item) => ({
+        id: typeof item.id === "number" ? item.id : 0,
+        eventType: typeof item.eventType === "string" ? item.eventType : "UNKNOWN",
+        listingId: item.listingId != null ? String(item.listingId) : null,
+        actor: typeof item.actor === "string" ? item.actor : "",
+        data: typeof item.data === "object" && item.data !== null
+          ? (item.data as Record<string, unknown>)
+          : {},
+        ledgerSequence: typeof item.ledgerSequence === "number" ? item.ledgerSequence : 0,
+        ledgerTimestamp: typeof item.ledgerTimestamp === "string" ? item.ledgerTimestamp : null,
+      }));
+  } catch (e) {
+    console.warn("[indexer] fetchRecentActivity:", e instanceof Error ? e.message : e);
+    return [];
+  }
 }

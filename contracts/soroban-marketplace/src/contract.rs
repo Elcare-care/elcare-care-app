@@ -617,10 +617,11 @@ impl MarketplaceContract {
     /// they already captured their fee at creation time.
     pub fn set_collection_fee_bps(env: Env, admin: Address, collection: Address, bps: u32) {
         bump_instance_ttl(&env);
-        admin.require_auth();
-        if admin != Self::get_admin(env.clone()).expect("admin not set") {
-            panic_with_error!(&env, MarketplaceError::Unauthorized);
-        }
+        // Scoped to ProtocolConfig role (Issue #9): per-collection fee overrides
+        // are a protocol configuration concern, same as the global fee.  This
+        // replaces the previous raw admin-equality check so the ProtocolConfig
+        // role holder can manage fees independently of the Admin key.
+        Self::require_role(&env, &admin, RoleType::ProtocolConfig);
         if bps > 10_000 {
             panic_with_error!(&env, MarketplaceError::InvalidPrice);
         }
@@ -628,16 +629,14 @@ impl MarketplaceContract {
         crate::events::emit_collection_fee_set(&env, collection, bps);
     }
 
-    /// Remove the per-collection fee override (admin-only).
+    /// Remove the per-collection fee override.
     ///
     /// After this call, new listings and auctions for `collection` will fall
     /// back to the global protocol fee (`get_protocol_fee`).
     pub fn clear_collection_fee_bps(env: Env, admin: Address, collection: Address) {
         bump_instance_ttl(&env);
-        admin.require_auth();
-        if admin != Self::get_admin(env.clone()).expect("admin not set") {
-            panic_with_error!(&env, MarketplaceError::Unauthorized);
-        }
+        // Scoped to ProtocolConfig role (Issue #9): mirrors set_collection_fee_bps.
+        Self::require_role(&env, &admin, RoleType::ProtocolConfig);
         clear_collection_fee_bps_storage(&env, &collection);
         crate::events::emit_collection_fee_cleared(&env, collection);
     }
@@ -1153,10 +1152,9 @@ impl MarketplaceContract {
     /// Returns the number of records actually refreshed this call.
     pub fn extend_active_ttls(env: Env, admin: Address, max_items: u32) -> u32 {
         bump_instance_ttl(&env);
-        admin.require_auth();
-        if admin != Self::get_admin(env.clone()).expect("admin not set") {
-            panic_with_error!(&env, MarketplaceError::Unauthorized);
-        }
+        // Scoped to ProtocolConfig role (Issue #9): TTL maintenance is a
+        // protocol-operations concern, not an emergency pause action.
+        Self::require_role(&env, &admin, RoleType::ProtocolConfig);
 
         let budget_cap = max_items.min(MAX_MAINTENANCE_ITEMS);
         let total_listings = active_listings_len(&env);
@@ -1269,10 +1267,9 @@ impl MarketplaceContract {
         auction_ids: Vec<u64>,
     ) -> u32 {
         bump_instance_ttl(&env);
-        admin.require_auth();
-        if admin != Self::get_admin(env.clone()).expect("admin not set") {
-            panic_with_error!(&env, MarketplaceError::Unauthorized);
-        }
+        // Scoped to ProtocolConfig role (Issue #9): lock-cleanup is a maintenance
+        // operation matching the same authority that manages TTL sweeps.
+        Self::require_role(&env, &admin, RoleType::ProtocolConfig);
 
         let mut cleared: u32 = 0;
         let mut budget = MAX_MAINTENANCE_ITEMS;
@@ -1365,9 +1362,11 @@ impl MarketplaceContract {
 
     // ── Token Whitelist ──────────────────────────────────────
 
-    pub fn add_token_to_whitelist(env: Env, token: Address) {
+    pub fn add_token_to_whitelist(env: Env, admin: Address, token: Address) {
         bump_instance_ttl(&env);
-        Self::require_admin(&env);
+        // Scoped to ProtocolConfig role (Issue #9): token whitelist management is
+        // a protocol configuration concern, not a general admin operation.
+        Self::require_role(&env, &admin, RoleType::ProtocolConfig);
         // Boundary validation (Issue #282): reject the marketplace's own
         // address before it can ever land in the whitelist. Decimals/asset
         // identity for the token are the off-chain registry's job (see
@@ -2639,6 +2638,41 @@ impl MarketplaceContract {
         let admin = env.storage().persistent()
             .get::<_, Address>(&key).expect("admin not set");
         admin.require_auth();
+    }
+
+    /// Authorize `caller` as the current holder of `role` (falling back to
+    /// `Admin` when no explicit holder has been assigned, so existing
+    /// single-admin deployments work unchanged).
+    ///
+    /// Calls `caller.require_auth()` if the check passes, or panics with
+    /// `Unauthorized` if the caller is not the role holder.
+    fn require_role(env: &Env, caller: &Address, role: RoleType) {
+        let holder = crate::storage::get_role_storage(env, &role)
+            .unwrap_or_else(|| {
+                env.storage()
+                    .persistent()
+                    .get::<_, Address>(&DataKey::Admin)
+                    .expect("admin not set")
+            });
+        if *caller != holder {
+            panic_with_error!(env, MarketplaceError::Unauthorized);
+        }
+        caller.require_auth();
+    }
+
+    /// Like `require_role` but resolves the current invoker from `env` rather
+    /// than accepting an explicit `caller` argument.  Used in entry points where
+    /// there is no dedicated `admin: Address` parameter (e.g. `revoke_artist`,
+    /// `reinstate_artist`).
+    fn require_role_auth(env: &Env, role: RoleType) {
+        let holder = crate::storage::get_role_storage(env, &role)
+            .unwrap_or_else(|| {
+                env.storage()
+                    .persistent()
+                    .get::<_, Address>(&DataKey::Admin)
+                    .expect("admin not set")
+            });
+        holder.require_auth();
     }
 
     /// Authorize `caller` (already `require_auth`ed) as either the auction's

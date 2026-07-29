@@ -1561,4 +1561,8 @@ router.get('/config/auction', cacheMiddleware(60), async (req: Request, res: Res
   }
 });
 
+// ── Notification routes (Issue #8) ────────────────────────────────────────────
+import notificationRouter from './notification-routes.js';
+router.use(notificationRouter);
+
 export default router;
