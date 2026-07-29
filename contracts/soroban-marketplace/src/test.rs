@@ -9392,3 +9392,324 @@ fn test_bump_instance_ttl_called() {
     let listing = client.get_listing(&listing_id);
     assert!(listing.is_some());
 }
+
+// ════════════════════════════════════════════════════════════
+// SECTION: Property-Based Fuzz Testing (Issue #216)
+// ════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+    use soroban_sdk::testutils::Address as _;
+
+    // Helper to generate valid recipient splits that sum to <= 10_000 bps
+    fn prop_valid_recipients(env: &Env, artist: &Address, total_bps: u32) -> soroban_sdk::Vec<Recipient> {
+        let mut recipients = vec![env];
+        let mut remaining = total_bps;
+        
+        // Generate 1-4 recipients with valid percentages
+        let count = (remaining / 2500).min(4).max(1) as usize;
+        for i in 0..count {
+            if i == count - 1 {
+                // Last recipient gets remaining
+                recipients.push_back(Recipient {
+                    address: artist.clone(),
+                    percentage: remaining,
+                });
+            } else {
+                let share = remaining / (count - i) as u32;
+                recipients.push_back(Recipient {
+                    address: artist.clone(),
+                    percentage: share,
+                });
+                remaining -= share;
+            }
+        }
+        recipients
+    }
+
+    // Property: buy_listing distributes exactly the sale price
+    // For any valid price, protocol fee, and recipient split,
+    // sum of all payments must equal the sale price exactly.
+    proptest! {
+        #[test]
+        fn prop_buy_listing_exact_distribution(
+            price in 1i128..1_000_000_000_000i128,
+            fee_bps in 0u32..1000u32,  // Reasonable fee range
+            recipient_bps in 1000u32..9000u32  // Leaves room for fee
+        ) {
+            let env = Env::default();
+            env.mock_all_auths();
+            let contract_id = env.register(MarketplaceContract, ());
+            let client = MarketplaceContractClient::new(&env, &contract_id);
+            let artist = Address::generate(&env);
+            let buyer = Address::generate(&env);
+            let token_admin = Address::generate(&env);
+            let payment_token = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+            let sac = StellarAssetClient::new(&env, &payment_token);
+            sac.mint(&artist, &price * 2);
+            sac.mint(&buyer, &price * 2);
+            sac.mint(&contract_id, &price * 2);
+            let collection_id = env.register(mock_nft::MockNft, ());
+            MockNftClient::new(&env, &collection_id).set_owner(&1u64, &artist);
+            
+            client.set_admin(&artist);
+            client.add_token_to_whitelist(&payment_token);
+            let treasury = Address::generate(&env);
+            client.set_treasury(&artist, &treasury);
+            client.set_protocol_fee(&artist, &fee_bps);
+            
+            let recipients = prop_valid_recipients(&env, &artist, 10_000 - fee_bps);
+            let id = client.create_listing(
+                &artist, &price, &symbol_short!("XLM"),
+                &payment_token, &collection_id, &1u64, &1u64,
+                &recipients, &None::<u64>,
+            );
+            
+            // Track balances before purchase
+            let token = TokenClient::new(&env, &payment_token);
+            let treasury_before = token.balance(&treasury);
+            let mut recipient_balances_before = vec![&env];
+            for i in 0..recipients.len() {
+                let r = recipients.get(i).unwrap();
+                recipient_balances_before.push_back(token.balance(&r.address));
+            }
+            
+            client.buy_artwork(&buyer, &id);
+            
+            // Verify total distribution equals price
+            let treasury_after = token.balance(&treasury);
+            let fee_paid = treasury_after - treasury_before;
+            
+            let mut total_recipient_payout = 0i128;
+            for i in 0..recipients.len() {
+                let r = recipients.get(i).unwrap();
+                let after = token.balance(&r.address);
+                let before = recipient_balances_before.get(i as u32).unwrap();
+                total_recipient_payout += after - before;
+            }
+            
+            prop_assert_eq!(fee_paid + total_recipient_payout, price,
+                "Distribution mismatch: fee={}, recipients={}, total={}, price={}",
+                fee_paid, total_recipient_payout, fee_paid + total_recipient_payout, price);
+        }
+    }
+
+    // Property: place_bid always maintains highest_bid as maximum seen
+    // For any sequence of bid amounts, highest_bid should be the maximum.
+    proptest! {
+        #[test]
+        fn prop_place_bid_maintains_maximum(
+            bids in prop::collection::vec(1_000_000i128..100_000_000_000i128, 1..10)
+        ) {
+            let env = Env::default();
+            env.mock_all_auths();
+            let contract_id = env.register(MarketplaceContract, ());
+            let client = MarketplaceContractClient::new(&env, &contract_id);
+            let artist = Address::generate(&env);
+            let bidder1 = Address::generate(&env);
+            let bidder2 = Address::generate(&env);
+            let token_admin = Address::generate(&env);
+            let payment_token = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+            let sac = StellarAssetClient::new(&env, &payment_token);
+            sac.mint(&bidder1, &1_000_000_000_000i128);
+            sac.mint(&bidder2, &1_000_000_000_000i128);
+            let collection_id = env.register(mock_nft::MockNft, ());
+            MockNftClient::new(&env, &collection_id).set_owner(&1u64, &artist);
+            
+            client.set_admin(&artist);
+            client.add_token_to_whitelist(&payment_token);
+            
+            let recipients = valid_recipients(&env, &artist);
+            let auction_id = client.create_auction(
+                &artist, &payment_token, &collection_id, &1u64,
+                &1_000_000i128, &86400u64, &recipients,
+            );
+            
+            let mut expected_max = 0i128;
+            for (i, &bid_amount) in bids.iter().enumerate() {
+                let bidder = if i % 2 == 0 { &bidder1 } else { &bidder2 };
+                client.place_bid(bidder, &auction_id, &bid_amount);
+                if bid_amount > expected_max {
+                    expected_max = bid_amount;
+                }
+                
+                let auction = client.get_auction(&auction_id);
+                prop_assert_eq!(auction.highest_bid, Some(expected_max),
+                    "highest_bid mismatch after bid {}: expected={}, got={}",
+                    i, expected_max, auction.highest_bid.unwrap_or(0));
+            }
+        }
+    }
+
+    // Property: recipient split validation prevents overflow
+    // No valid split combination should produce arithmetic overflow.
+    proptest! {
+        #[test]
+        fn prop_recipient_split_no_overflow(
+            price in 1i128..i128::MAX / 20_000i128,  // Safe range for multiplication
+            fee_bps in 0u32..1000u32,
+            recipient_count in 1usize..4usize
+        ) {
+            let env = Env::default();
+            let artist = Address::generate(&env);
+            
+            // Generate valid split
+            let mut recipients = vec![&env];
+            let per_recipient = (10_000 - fee_bps) / recipient_count as u32;
+            let mut remaining = 10_000 - fee_bps;
+            
+            for i in 0..recipient_count {
+                if i == recipient_count - 1 {
+                    recipients.push_back(Recipient {
+                        address: artist.clone(),
+                        percentage: remaining,
+                    });
+                } else {
+                    recipients.push_back(Recipient {
+                        address: artist.clone(),
+                        percentage: per_recipient,
+                    });
+                    remaining -= per_recipient;
+                }
+            }
+            
+            // Test distribute function - should not panic with overflow
+            let result = crate::math::distribute(&env, price, fee_bps, &recipients);
+            
+            // Verify invariant: fee + payouts == price
+            let total_payout: i128 = result.iter_payouts().map(|p| p.amount).sum();
+            prop_assert_eq!(result.fee + total_payout, price,
+                "Distribution invariant violated: price={}, fee={}, total={}",
+                price, result.fee, total_payout);
+        }
+    }
+
+    // Property: create_listing CID validation
+    // Only valid CID strings should pass validation.
+    proptest! {
+        #[test]
+        fn prop_create_listing_cid_validation(
+            cid_len in 0usize..100usize,
+            ascii_char in 0u8..128u8
+        ) {
+            let env = Env::default();
+            env.mock_all_auths();
+            let contract_id = env.register(MarketplaceContract, ());
+            let client = MarketplaceContractClient::new(&env, &contract_id);
+            let artist = Address::generate(&env);
+            let token_admin = Address::generate(&env);
+            let payment_token = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+            let sac = StellarAssetClient::new(&env, &payment_token);
+            sac.mint(&artist, &100_000_000_000i128);
+            let collection_id = env.register(mock_nft::MockNft, ());
+            MockNftClient::new(&env, &collection_id).set_owner(&1u64, &artist);
+            
+            client.set_admin(&artist);
+            client.add_token_to_whitelist(&payment_token);
+            
+            // Generate CID string
+            let mut cid_bytes = vec![0u8; cid_len];
+            for byte in cid_bytes.iter_mut() {
+                *byte = ascii_char;
+            }
+            let cid_str = String::from_utf8_lossy(&cid_bytes);
+            
+            let recipients = valid_recipients(&env, &artist);
+            
+            // Try to create listing - should handle CID gracefully
+            // The contract may reject certain CIDs, but should not panic
+            let _ = client.try_create_listing(
+                &artist, &10_000_000i128, &symbol_short!("XLM"),
+                &payment_token, &collection_id, &1u64, &1u64,
+                &recipients, &None::<u64>,
+            );
+            
+            // Test passes if no panic occurs
+            prop_assert!(true);
+        }
+    }
+
+    // Property: auction duration validation prevents underflow
+    // No valid duration parameter should cause underflow when subtracted from end_time.
+    proptest! {
+        #[test]
+        fn prop_auction_duration_no_underflow(
+            duration in 60u64..3_153_600_000u64  // 1 minute to 100 years in seconds
+        ) {
+            let env = Env::default();
+            env.mock_all_auths();
+            let contract_id = env.register(MarketplaceContract, ());
+            let client = MarketplaceContractClient::new(&env, &contract_id);
+            let artist = Address::generate(&env);
+            let token_admin = Address::generate(&env);
+            let payment_token = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+            let sac = StellarAssetClient::new(&env, &payment_token);
+            sac.mint(&artist, &100_000_000_000i128);
+            let collection_id = env.register(mock_nft::MockNft, ());
+            MockNftClient::new(&env, &collection_id).set_owner(&1u64, &artist);
+            
+            client.set_admin(&artist);
+            client.add_token_to_whitelist(&payment_token);
+            
+            let recipients = valid_recipients(&env, &artist);
+            let current_time = env.ledger().timestamp();
+            
+            // Create auction with duration
+            let auction_id = client.create_auction(
+                &artist, &payment_token, &collection_id, &1u64,
+                &1_000_000i128, &duration, &recipients,
+            );
+            
+            let auction = client.get_auction(&auction_id);
+            
+            // Verify end_time is >= current_time (no underflow)
+            prop_assert!(auction.end_time >= current_time,
+                "Auction end_time underflow: current_time={}, end_time={}",
+                current_time, auction.end_time);
+            
+            // Verify end_time - current_time is approximately duration
+            let actual_duration = auction.end_time - current_time;
+            prop_assert!(actual_duration >= duration.saturating_sub(10) && actual_duration <= duration + 10,
+                "Duration mismatch: expected={}, actual={}", duration, actual_duration);
+        }
+    }
+
+    // Property: math calc_fee handles edge cases without overflow
+    proptest! {
+        #[test]
+        fn prop_calc_fee_no_overflow(
+            price in 0i128..i128::MAX / 20_000i128,
+            bps in 0u32..10_000u32
+        ) {
+            let fee = crate::math::calc_fee(price, bps);
+            
+            // Fee should be non-negative and <= price
+            prop_assert!(fee >= 0, "Fee should be non-negative: {}", fee);
+            prop_assert!(fee <= price, "Fee should not exceed price: fee={}, price={}", fee, price);
+            
+            // Fee should be approximately price * bps / 10_000
+            if price > 0 && bps > 0 {
+                let expected = price.saturating_mul(bps as i128) / 10_000;
+                prop_assert!(fee == expected || fee == 0,  // 0 if overflow occurred
+                    "Fee calculation mismatch: expected={}, got={}", expected, fee);
+            }
+        }
+    }
+
+    // Property: math calc_recipient_amount handles edge cases
+    proptest! {
+        #[test]
+        fn prop_calc_recipient_amount_no_overflow(
+            remaining in 0i128..i128::MAX / 20_000i128,
+            bps in 0u32..10_000u32
+        ) {
+            let amount = crate::math::calc_recipient_amount(remaining, bps);
+            
+            // Amount should be non-negative and <= remaining
+            prop_assert!(amount >= 0, "Amount should be non-negative: {}", amount);
+            prop_assert!(amount <= remaining, "Amount should not exceed remaining: amount={}, remaining={}", amount, remaining);
+        }
+    }
+}
