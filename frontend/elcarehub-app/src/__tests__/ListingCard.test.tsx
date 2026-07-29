@@ -295,10 +295,128 @@ describe('ListingCard', () => {
     });
   });
 
-  // ── IPFS gateway fallback tests ──────────────────────────────────────────
+// ── IPFS gateway fallback tests ──────────────────────────────────────────────
 
   it('advances to the next gateway URL when the current image fails to load', async () => {
     render(<ListingCard listing={makeListing()} />);
+
+    await waitFor(() => {
+      const img = screen.getByRole('img') as HTMLImageElement;
+      expect(img.src).toContain('mock-pinata.example.com');
+    });
+
+    screen.getByRole('img').dispatchEvent(new Event('error', { bubbles: true }));
+
+    await waitFor(() => {
+      const img = screen.getByRole('img') as HTMLImageElement;
+      expect(img.src).toContain('ipfs.io');
+    });
+  });
+
+  it('shows the placeholder when all gateway URLs have been exhausted', async () => {
+    render(<ListingCard listing={makeListing()} />);
+
+    await waitFor(() => {
+      expect(screen.getByRole('img')).toBeInTheDocument();
+    });
+
+    // Fail primary → fallback to ipfs.io
+    screen.getByRole('img').dispatchEvent(new Event('error', { bubbles: true }));
+    await waitFor(() => {
+      expect(screen.getByRole('img').getAttribute('src')).toContain('ipfs.io');
+    });
+
+    // Fail ipfs.io → fallback to cloudflare-ipfs.com
+    screen.getByRole('img').dispatchEvent(new Event('error', { bubbles: true }));
+    await waitFor(() => {
+      expect(screen.getByRole('img').getAttribute('src')).toContain('cloudflare-ipfs.com');
+    });
+
+    // All gateways exhausted → placeholder
+    screen.getByRole('img').dispatchEvent(new Event('error', { bubbles: true }));
+    await waitFor(() => {
+      expect(screen.queryByRole('img')).not.toBeInTheDocument();
+      expect(screen.getByTestId('artwork-missing')).toBeInTheDocument();
+    });
+  });
+
+  // ── Retry button (Issue #7 degraded rendering) ───────────────────────────
+
+  it('shows retry button when metadata fetch fails and retries remain', async () => {
+    const { fetchMetadata } = jest.requireMock('@/lib/ipfs');
+    fetchMetadata.mockRejectedValueOnce(new Error('IPFS down'));
+
+    render(<ListingCard listing={makeListing()} />);
+    await waitFor(() => {
+      expect(screen.getByTestId('artwork-unavailable')).toBeInTheDocument();
+    });
+    expect(screen.getByTestId('artwork-retry-btn')).toBeInTheDocument();
+  });
+
+  it('retries metadata fetch when retry button is clicked', async () => {
+    const { fetchMetadata } = jest.requireMock('@/lib/ipfs');
+    const mockMeta = { title: 'Recovered', description: '', image: 'QmOk' };
+    fetchMetadata
+      .mockRejectedValueOnce(new Error('IPFS down'))
+      .mockResolvedValueOnce(mockMeta);
+
+    render(<ListingCard listing={makeListing()} />);
+    await waitFor(() => expect(screen.getByTestId('artwork-retry-btn')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByTestId('artwork-retry-btn'));
+
+    await waitFor(() => {
+      expect(screen.queryByTestId('artwork-unavailable')).not.toBeInTheDocument();
+      expect(screen.getByText('Recovered')).toBeInTheDocument();
+    });
+    expect(fetchMetadata).toHaveBeenCalledTimes(2);
+  });
+
+  it('shows artwork-missing (not retry) after max retries exhausted', async () => {
+    const { fetchMetadata } = jest.requireMock('@/lib/ipfs');
+    // Fail 3 times (initial + 2 retries = MAX_METADATA_RETRIES)
+    fetchMetadata.mockRejectedValue(new Error('persistent failure'));
+
+    render(<ListingCard listing={makeListing()} />);
+    await waitFor(() => expect(screen.getByTestId('artwork-retry-btn')).toBeInTheDocument());
+
+    // Retry 1
+    fireEvent.click(screen.getByTestId('artwork-retry-btn'));
+    await waitFor(() => expect(screen.getByTestId('artwork-retry-btn')).toBeInTheDocument());
+
+    // Retry 2 (last allowed)
+    fireEvent.click(screen.getByTestId('artwork-retry-btn'));
+    await waitFor(() => {
+      // After exhausting retries, falls through to artwork-missing
+      expect(screen.queryByTestId('artwork-retry-btn')).not.toBeInTheDocument();
+      expect(screen.getByTestId('artwork-missing')).toBeInTheDocument();
+    });
+  });
+
+  // ── Content advisory overlay (Issue #7) ────────────────────────────────────
+
+  it('renders content-advisory overlay when metadata.contentAdvisory is set', async () => {
+    const { fetchMetadata } = jest.requireMock('@/lib/ipfs');
+    fetchMetadata.mockResolvedValueOnce({
+      title: 'Sensitive Art',
+      description: '',
+      image: 'QmSensitive',
+      contentAdvisory: 'Contains graphic content',
+    });
+
+    render(<ListingCard listing={makeListing()} />);
+    await waitFor(() => {
+      expect(screen.getByTestId('content-advisory-overlay')).toBeInTheDocument();
+      expect(screen.getByText('Contains graphic content')).toBeInTheDocument();
+    });
+  });
+
+  it('does not render content-advisory overlay when contentAdvisory is absent', async () => {
+    render(<ListingCard listing={makeListing()} />);
+    await waitFor(() => {
+      expect(screen.queryByTestId('content-advisory-overlay')).not.toBeInTheDocument();
+    });
+  });
 
     await waitFor(() => {
       const img = screen.getByRole('img') as HTMLImageElement;

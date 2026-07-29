@@ -156,6 +156,9 @@ jobs:
       - name: Run Lint
         run: npm run lint
         working-directory: frontend/elcarehub-app
+      - name: TypeScript type-check
+        run: npx tsc --noEmit
+        working-directory: frontend/elcarehub-app
       - name: Validate Contract Error Coverage
         run: node scripts/contract-errors/validate-error-coverage.mjs
       - name: Run Build
@@ -276,6 +279,9 @@ jobs:
       - name: Run Lint
         run: npm run lint
         working-directory: indexer
+      - name: TypeScript type-check
+        run: npx tsc --noEmit
+        working-directory: indexer
       - name: Run Build
         run: npm run build
         working-directory: indexer
@@ -322,6 +328,49 @@ jobs:
       - name: Check OpenAPI spec
         run: npm run check-openapi
         working-directory: indexer
+
+  coverage-gate:
+    name: Coverage Quality Gate
+    runs-on: ubuntu-latest
+    needs: [frontend, indexer]
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Cache frontend node_modules
+        uses: actions/cache@v4
+        with:
+          path: frontend/elcarehub-app/node_modules
+          key: ${{ runner.os }}-node-20-${{ hashFiles('frontend/elcarehub-app/package-lock.json') }}
+          restore-keys: ${{ runner.os }}-node-20-
+      - name: Cache indexer node_modules
+        uses: actions/cache@v4
+        with:
+          path: indexer/node_modules
+          key: ${{ runner.os }}-indexer-20-${{ hashFiles('indexer/package-lock.json') }}
+          restore-keys: ${{ runner.os }}-indexer-20-
+      - name: Install frontend deps
+        run: npm ci
+        working-directory: frontend/elcarehub-app
+      - name: Install indexer deps
+        run: npm ci
+        working-directory: indexer
+      # Enforce that coverage does not regress below the thresholds in
+      # jest.config.js and vitest.config.mts. Both commands exit non-zero if
+      # any threshold is violated so this job fails the PR before merge.
+      - name: Frontend coverage gate
+        run: npm run test:coverage -- --ci
+        working-directory: frontend/elcarehub-app
+        env:
+          CI: true
+      - name: Indexer coverage gate
+        run: npx vitest run --coverage --reporter=verbose
+        working-directory: indexer
+        env:
+          CI: true
 
   release-validate:
     name: Release Version Validation
