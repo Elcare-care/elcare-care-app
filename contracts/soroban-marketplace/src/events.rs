@@ -997,6 +997,24 @@ pub fn emit_role_proposal_cancelled(
     .publish(env);
 }
 
+/// Emit `token_whitelisted` when a token is added to the whitelist (Issue #208).
+pub fn emit_token_whitelisted(env: &Env, token: &Address, added_by: &Address) {
+    TokenWhitelistedEvent {
+        token: token.clone(),
+        added_by: added_by.clone(),
+    }
+    .publish(env);
+}
+
+/// Emit `token_removed` when a token is removed from the whitelist (Issue #208).
+pub fn emit_token_removed(env: &Env, token: &Address, removed_by: &Address) {
+    TokenRemovedEvent {
+        token: token.clone(),
+        removed_by: removed_by.clone(),
+    }
+    .publish(env);
+}
+
 /// Emit `role_migrated` when `migrate_roles` assigns an explicit holder to a
 /// role that was previously falling back to `Admin`.
 pub fn emit_role_migrated(env: &Env, role: crate::types::RoleType, authority: Address) {

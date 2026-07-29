@@ -221,6 +221,8 @@ impl LazyMint721 {
         next_id: u64,
     ) -> Result<(), Error> {
         if voucher.valid_until != 0 && env.ledger().sequence() > voucher.valid_until as u32 {
+            env.events()
+                .publish((symbol_short!("expired"),), voucher.nonce);
             return Err(Error::VoucherExpired);
         }
         // Replay protection uses the voucher's nonce (not token_id) so the same

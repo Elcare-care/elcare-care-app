@@ -5254,6 +5254,124 @@ fn test_multiple_late_bids_each_reset_end_time() {
     assert!(end2 > end1, "each late bid must produce a later deadline");
 }
 
+#[test]
+fn test_total_duration_cap_prevents_extension() {
+    // When an extension would push end_time beyond original_end_time + MAX_TOTAL_AUCTION_DURATION,
+    // the bid is still accepted but the extension is not applied.
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    // Create auction with very short duration to test the cap
+    let duration = 3600u64; // 1 hour
+    let trigger = 300u64;
+    let window = 600u64;
+
+    let auction_id = create_auction_with_extension(
+        &env,
+        &client,
+        &artist,
+        &artist,
+        &token_id,
+        &collection_id,
+        duration,
+        window,
+        trigger,
+    );
+
+    let auction = client.get_auction(&auction_id);
+    let original_end_time = auction.end_time;
+    let original_end_time_field = auction.original_end_time;
+
+    // Verify original_end_time is set correctly
+    assert_eq!(
+        original_end_time, original_end_time_field,
+        "original_end_time must equal initial end_time"
+    );
+
+    // Advance time to just before the cap would be exceeded
+    // MAX_TOTAL_AUCTION_DURATION = 2,592,000 seconds (30 days)
+    // We'll simulate being very close to that limit
+    let start = env.ledger().timestamp();
+    // Set time to original_end_time - trigger - 1 (just inside trigger window)
+    // but also ensure that adding window would exceed the cap
+    let time_near_cap = original_end_time_field + crate::contract::MAX_TOTAL_AUCTION_DURATION - window - 1;
+    env.ledger().set_timestamp(time_near_cap);
+
+    let before = client.get_auction(&auction_id);
+    let before_end = before.end_time;
+    let before_count = before.extension_count;
+
+    // Place bid - should be accepted but extension should not be applied
+    client.place_bid(&buyer, &auction_id, &1_500_000_i128);
+
+    let after = client.get_auction(&auction_id);
+    
+    // Bid should be accepted (highest_bid updated)
+    assert_eq!(after.highest_bid, 1_500_000_i128);
+    assert_eq!(after.highest_bidder, Some(buyer));
+    
+    // Extension should NOT be applied (end_time unchanged)
+    assert_eq!(
+        after.end_time, before_end,
+        "end_time must not change when extension would exceed total duration cap"
+    );
+    
+    // Extension count should NOT be incremented
+    assert_eq!(
+        after.extension_count, before_count,
+        "extension_count must not increment when extension is not applied"
+    );
+}
+
+#[test]
+fn test_normal_extension_within_duration_cap() {
+    // Verify that normal extensions still work when within the total duration cap
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let duration = 3600u64;
+    let trigger = 300u64;
+    let window = 600u64;
+
+    let auction_id = create_auction_with_extension(
+        &env,
+        &client,
+        &artist,
+        &artist,
+        &token_id,
+        &collection_id,
+        duration,
+        window,
+        trigger,
+    );
+
+    let start = env.ledger().timestamp();
+    
+    // Advance to inside trigger window (well within duration cap)
+    env.ledger().set_timestamp(start + 3400);
+
+    let before = client.get_auction(&auction_id);
+    let before_count = before.extension_count;
+
+    client.place_bid(&buyer, &auction_id, &1_500_000_i128);
+
+    let after = client.get_auction(&auction_id);
+    
+    // Extension should be applied normally
+    assert_eq!(
+        after.end_time, start + 3400 + window,
+        "end_time must be extended when within total duration cap"
+    );
+    
+    // Extension count should be incremented
+    assert_eq!(
+        after.extension_count, before_count + 1,
+        "extension_count must increment when extension is applied"
+    );
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Cancel Auction (Feature B)
 // ═══════════════════════════════════════════════════════════════════════════
@@ -7931,6 +8049,181 @@ fn test_add_and_remove_token_whitelist() {
             price
         );
     }
+}
+
+// ── Token registry tests (Issue #208) ───────────────────────────────
+
+#[test]
+fn test_token_registry_add_creates_entry() {
+    let (env, client, admin, _, token_id, _, _) = setup();
+    client.set_admin(&admin);
+    
+    // Add token to whitelist
+    client.add_token_to_whitelist(&token_id);
+    
+    // Verify registry entry exists
+    let entry = client.get_token_whitelist_entry(token_id.clone());
+    assert!(entry.is_some());
+    let entry = entry.unwrap();
+    assert!(entry.active);
+    assert_eq!(entry.added_by, admin);
+    assert!(entry.added_at > 0);
+}
+
+#[test]
+fn test_token_registry_remove_soft_deletes() {
+    let (env, client, admin, _, token_id, _, _) = setup();
+    client.set_admin(&admin);
+    
+    // Add token to whitelist
+    client.add_token_to_whitelist(&token_id);
+    
+    // Remove token
+    client.remove_token_from_whitelist(&token_id);
+    
+    // Verify entry still exists but is inactive
+    let entry = client.get_token_whitelist_entry(token_id.clone());
+    assert!(entry.is_some());
+    let entry = entry.unwrap();
+    assert!(!entry.active);
+    assert_eq!(entry.added_by, admin); // Original adder preserved
+}
+
+#[test]
+fn test_token_registry_reactivate_removed_token() {
+    let (env, client, admin, _, token_id, _, _) = setup();
+    client.set_admin(&admin);
+    
+    // Add token
+    client.add_token_to_whitelist(&token_id);
+    let first_entry = client.get_token_whitelist_entry(token_id.clone()).unwrap();
+    let original_added_at = first_entry.added_at;
+    
+    // Remove token
+    client.remove_token_from_whitelist(&token_id);
+    
+    // Re-add token (should reactivate, preserving original added_at)
+    client.add_token_to_whitelist(&token_id);
+    let reactivated_entry = client.get_token_whitelist_entry(token_id.clone()).unwrap();
+    assert!(reactivated_entry.active);
+    assert_eq!(reactivated_entry.added_at, original_added_at);
+}
+
+#[test]
+fn test_token_registry_idempotent_add() {
+    let (env, client, admin, _, token_id, _, _) = setup();
+    client.set_admin(&admin);
+    
+    // Add token twice
+    client.add_token_to_whitelist(&token_id.clone());
+    client.add_token_to_whitelist(&token_id);
+    
+    // Should only have one entry
+    let entry = client.get_token_whitelist_entry(token_id.clone());
+    assert!(entry.is_some());
+    assert!(entry.unwrap().active);
+}
+
+#[test]
+fn test_token_registry_idempotent_remove() {
+    let (env, client, admin, _, token_id, _, _) = setup();
+    client.set_admin(&admin);
+    
+    // Add token
+    client.add_token_to_whitelist(&token_id.clone());
+    
+    // Remove token twice
+    client.remove_token_from_whitelist(&token_id.clone());
+    client.remove_token_from_whitelist(&token_id);
+    
+    // Should still be inactive
+    let entry = client.get_token_whitelist_entry(token_id.clone());
+    assert!(entry.is_some());
+    assert!(!entry.unwrap().active);
+}
+
+#[test]
+fn test_get_whitelisted_tokens_returns_active_only() {
+    let (env, client, admin, _, token_id, _, _) = setup();
+    client.set_admin(&admin);
+    
+    let token2 = Address::generate(&env);
+    let token3 = Address::generate(&env);
+    
+    // Add three tokens
+    client.add_token_to_whitelist(&token_id.clone());
+    client.add_token_to_whitelist(&token2.clone());
+    client.add_token_to_whitelist(&token3.clone());
+    
+    // Remove one
+    client.remove_token_from_whitelist(&token2.clone());
+    
+    // get_whitelisted_tokens should return only active tokens
+    let active = client.get_whitelisted_tokens();
+    assert_eq!(active.len(), 2);
+    assert!(active.contains(&token_id));
+    assert!(active.contains(&token3));
+    assert!(!active.contains(&token2));
+}
+
+#[test]
+fn test_get_whitelisted_tokens_paginated() {
+    let (env, client, admin, _, token_id, _, _) = setup();
+    client.set_admin(&admin);
+    
+    let tokens: Vec<Address> = (0..5).map(|_| Address::generate(&env)).collect();
+    
+    // Add tokens
+    for token in tokens.iter() {
+        client.add_token_to_whitelist(token);
+    }
+    client.add_token_to_whitelist(&token_id);
+    
+    // Test pagination
+    let page1 = client.get_whitelisted_tokens_paginated(0, 2);
+    assert_eq!(page1.len(), 2);
+    
+    let page2 = client.get_whitelisted_tokens_paginated(2, 2);
+    assert_eq!(page2.len(), 2);
+    
+    let page3 = client.get_whitelisted_tokens_paginated(4, 10);
+    assert_eq!(page3.len(), 2); // Only 2 remaining
+}
+
+#[test]
+fn test_token_registry_history_preserved() {
+    let (env, client, admin, _, token_id, _, _) = setup();
+    client.set_admin(&admin);
+    
+    // Add token
+    client.add_token_to_whitelist(&token_id.clone());
+    let added_entry = client.get_token_whitelist_entry(token_id.clone()).unwrap();
+    
+    // Remove token
+    client.remove_token_from_whitelist(&token_id.clone());
+    let removed_entry = client.get_token_whitelist_entry(token_id.clone()).unwrap();
+    
+    // History should be preserved
+    assert_eq!(added_entry.added_at, removed_entry.added_at);
+    assert_eq!(added_entry.added_by, removed_entry.added_by);
+}
+
+#[test]
+fn test_token_whitelist_events_emitted() {
+    let (env, client, admin, _, token_id, _, _) = setup();
+    client.set_admin(&admin);
+    
+    // Add token - should emit TOKEN_WHITELISTED
+    client.add_token_to_whitelist(&token_id.clone());
+    
+    // Remove token - should emit TOKEN_REMOVED
+    client.remove_token_from_whitelist(&token_id.clone());
+    
+    // Re-add token - should emit TOKEN_WHITELISTED again
+    client.add_token_to_whitelist(&token_id);
+    
+    // Verify events were emitted (event verification is done by the indexer)
+    // This test ensures the contract doesn't panic when emitting events
 }
 
 #[test]

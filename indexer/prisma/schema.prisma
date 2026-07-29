@@ -116,6 +116,10 @@ model Auction {
   updatedAtLedger Int
   createdAt       DateTime      @default(now())
   updatedAt       DateTime      @updatedAt
+  /// Running count of extensions applied so far (from AuctionExtended events)
+  extensionCount  Int           @default(0)
+  /// Original end time set at auction creation, used to enforce total duration cap
+  originalEndTime BigInt
   @@index([updatedAtLedger])
   @@index([status, updatedAtLedger])
   @@index([creator, updatedAtLedger])
@@ -136,6 +140,25 @@ model Offer {
   updatedAt       DateTime    @updatedAt
   @@index([listingId])
   @@index([listingId, updatedAtLedger])
+}
+
+// ── Token whitelist registry (Issue #208) ─────────────────────────────────
+//
+// Tracks all tokens ever added to the whitelist with full audit trail.
+// Soft delete pattern: removed tokens have active=false but remain in the table.
+
+model WhitelistedToken {
+  address         String   @id
+  active          Boolean  @default(true)
+  addedAtLedger   Int
+  removedAtLedger  Int?
+  addedBy         String
+  removedBy       String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([active])
+  @@index([addedAtLedger])
 }
 
 model Bid {
@@ -206,6 +229,8 @@ model Collection {
   /// Per-collection protocol fee override in basis points (0–10 000).
   /// Null means no override is set and the global protocol fee applies.
   feeBpsOverride  Int?
+  /// Whether the collection metadata has been permanently frozen.
+  metadataFrozen  Boolean  @default(false)
   createdAt       DateTime @default(now())
   // GIN-indexed tsvector updated by collection_search_vector_trigger.
   searchVector    Unsupported("tsvector")?

@@ -122,6 +122,14 @@ const ADMIN_PROPOSAL_TTL: u64 = 604_800; // 7 days
 /// auctions that expire almost immediately.
 const MIN_AUCTION_DURATION: u64 = 3_600; // 1 hour
 
+/// Maximum total auction duration in seconds (30 days).
+///
+/// An auction's end_time cannot exceed original_end_time + MAX_TOTAL_AUCTION_DURATION
+/// even with anti-sniping extensions. This prevents adversarial bidders from
+/// indefinitely extending an auction by placing small qualifying bids just before
+/// each deadline.
+const MAX_TOTAL_AUCTION_DURATION: u64 = 2_592_000; // 30 days
+
 /// Maximum number of listing ids accepted by one `cancel_listings` batch.
 const MAX_BATCH_CANCEL: u32 = 10;
 
@@ -1366,30 +1374,73 @@ impl MarketplaceContract {
         // `validate_token_asset` doc comment); this is deliberately a cheap,
         // on-chain-only sanity check.
         Self::validate_token_asset(&env, &token, None);
-        let key = crate::storage::DataKey::TokenWhitelist;
-        let mut wl = env.storage().persistent()
-            .get::<_, Vec<Address>>(&key).unwrap_or(Vec::new(&env));
-        // Idempotent by design: re-whitelisting an already-present token is a
-        // no-op rather than an error, so an admin re-running a setup script
-        // can never accidentally create duplicate entries.
-        if !wl.contains(&token) { wl.push_back(token); env.storage().persistent().set(&key, &wl); }
+
+        // Check if token is already whitelisted (active or removed)
+        let existing = crate::storage::get_token_whitelist_entry(&env, &token);
+        if let Some(entry) = existing {
+            if entry.active {
+                // Already active - no-op (idempotent)
+                return;
+            } else {
+                // Previously removed - reactivate it
+                let updated = crate::storage::TokenWhitelistEntry {
+                    added_at: entry.added_at,
+                    added_by: entry.added_by,
+                    active: true,
+                };
+                crate::storage::set_token_whitelist_entry(&env, &token, &updated);
+                crate::events::emit_token_whitelisted(&env, &token, &env.invoker());
+                return;
+            }
+        }
+
+        // New token - create registry entry
+        let now = env.ledger().timestamp();
+        let entry = crate::storage::TokenWhitelistEntry {
+            added_at: now,
+            added_by: env.invoker(),
+            active: true,
+        };
+        crate::storage::set_token_whitelist_entry(&env, &token, &entry);
+        crate::storage::add_token_to_whitelist_index(&env, &token);
+        crate::events::emit_token_whitelisted(&env, &token, &env.invoker());
     }
 
     pub fn remove_token_from_whitelist(env: Env, token: Address) {
         bump_instance_ttl(&env);
         Self::require_role_auth(&env, RoleType::ProtocolConfig);
-        let key = crate::storage::DataKey::TokenWhitelist;
-        let wl = env.storage().persistent()
-            .get::<_, Vec<Address>>(&key).unwrap_or(Vec::new(&env));
-        let mut nw = Vec::new(&env);
-        for t in wl.iter() { if t != token { nw.push_back(t.clone()); } }
-        env.storage().persistent().set(&key, &nw);
+
+        // Check if token exists in registry
+        let existing = crate::storage::get_token_whitelist_entry(&env, &token);
+        if let Some(mut entry) = existing {
+            if !entry.active {
+                // Already removed - no-op (idempotent)
+                return;
+            }
+            // Soft delete: set active to false, preserve history
+            entry.active = false;
+            crate::storage::set_token_whitelist_entry(&env, &token, &entry);
+            crate::events::emit_token_removed(&env, &token, &env.invoker());
+        }
+        // If token was never whitelisted, do nothing (no-op)
     }
 
-    pub fn get_token_whitelist(env: Env) -> Vec<Address> {
-        let key = crate::storage::DataKey::TokenWhitelist;
-        env.storage().persistent()
-            .get::<_, Vec<Address>>(&key).unwrap_or(Vec::new(&env))
+    /// Get all currently whitelisted tokens (active only).
+    /// View function for querying the whitelist.
+    pub fn get_whitelisted_tokens(env: Env) -> Vec<Address> {
+        crate::storage::get_all_token_registry(&env)
+    }
+
+    /// Get paginated whitelisted tokens (active only).
+    /// View function for querying the whitelist with pagination.
+    pub fn get_whitelisted_tokens_paginated(env: Env, start: u32, limit: u32) -> Vec<Address> {
+        crate::storage::get_token_registry_range(&env, start, limit)
+    }
+
+    /// Get the whitelist entry for a specific token (for history/audit).
+    /// Returns None if the token was never whitelisted.
+    pub fn get_token_whitelist_entry(env: Env, token: Address) -> Option<crate::storage::TokenWhitelistEntry> {
+        crate::storage::get_token_whitelist_entry(&env, &token)
     }
 
     // ── create_listing ───────────────────────────────────────
@@ -1786,6 +1837,7 @@ impl MarketplaceContract {
             status: AuctionStatus::Active, recipients,
             min_increment, extension_window, extension_trigger, protocol_fee_bps,
             bid_history_cap, max_extensions, extension_count: 0,
+            original_end_time: end_time,
         };
         save_auction(&env, &auction);
         add_artist_auction_id(&env, &creator, auction_id);
@@ -1845,22 +1897,36 @@ impl MarketplaceContract {
             if auction.extension_window == 0 {
                 panic_with_error!(&env, MarketplaceError::InvalidExtensionWindow);
             }
-            let prev_end_time = auction.end_time;
-            auction.end_time = now.checked_add(auction.extension_window).unwrap_or(auction.end_time);
-            auction.extension_count = auction.extension_count.saturating_add(1);
-            extended = true;
-            save_auction(&env, &auction);
-            append_bid_record(&env, auction_id,
-                &BidRecord { bidder: bidder.clone(), amount, ledger: env.ledger().sequence() },
-                auction.bid_history_cap,
-            );
-            BidPlacedEvent { auction_id, bidder: bidder.clone(), bid_amount: amount }.publish(&env);
-            AuctionExtendedEvent {
-                auction_id,
-                prev_end_time,
-                new_end_time: auction.end_time,
-                extension_count: auction.extension_count,
-            }.publish(&env);
+            // Enforce total duration cap - extension cannot push end_time beyond
+            // original_end_time + MAX_TOTAL_AUCTION_DURATION.
+            let proposed_end_time = now.checked_add(auction.extension_window).unwrap_or(auction.end_time);
+            let max_allowed_end_time = auction.original_end_time.saturating_add(MAX_TOTAL_AUCTION_DURATION);
+            if proposed_end_time > max_allowed_end_time {
+                // Bid is still accepted, but extension is not applied
+                save_auction(&env, &auction);
+                append_bid_record(&env, auction_id,
+                    &BidRecord { bidder: bidder.clone(), amount, ledger: env.ledger().sequence() },
+                    auction.bid_history_cap,
+                );
+                BidPlacedEvent { auction_id, bidder: bidder.clone(), bid_amount: amount }.publish(&env);
+            } else {
+                let prev_end_time = auction.end_time;
+                auction.end_time = proposed_end_time;
+                auction.extension_count = auction.extension_count.saturating_add(1);
+                extended = true;
+                save_auction(&env, &auction);
+                append_bid_record(&env, auction_id,
+                    &BidRecord { bidder: bidder.clone(), amount, ledger: env.ledger().sequence() },
+                    auction.bid_history_cap,
+                );
+                BidPlacedEvent { auction_id, bidder: bidder.clone(), bid_amount: amount }.publish(&env);
+                AuctionExtendedEvent {
+                    auction_id,
+                    prev_end_time,
+                    new_end_time: auction.end_time,
+                    extension_count: auction.extension_count,
+                }.publish(&env);
+            }
         } else {
             save_auction(&env, &auction);
             append_bid_record(&env, auction_id,
@@ -2628,17 +2694,7 @@ impl MarketplaceContract {
     }
 
     fn is_token_whitelisted(env: &Env, token: &Address) -> bool {
-        let key = crate::storage::DataKey::TokenWhitelist;
-        let whitelist = env
-            .storage()
-            .persistent()
-            .get::<_, Vec<Address>>(&key)
-            .unwrap_or(Vec::new(env));
-        if whitelist.is_empty() {
-            true
-        } else {
-            whitelist.contains(token)
-        }
+        crate::storage::is_token_whitelisted(env, token)
     }
 
     // ── IPFS CID validation (Issue #206) ─────────────────────────────────────

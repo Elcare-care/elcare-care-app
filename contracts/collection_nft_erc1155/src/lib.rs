@@ -89,6 +89,8 @@ pub enum DataKey {
     BaseUri,
     /// bool — permanently frozen when true.
     MetadataFrozen,
+    /// bool — per-token metadata frozen when true.
+    TokenFrozen(u64),
     // Persistent storage
     Balance(Address, u64),            // (account, token_id) → u128
     ApprovedForAll(Address, Address), // (owner, operator) → bool
@@ -337,6 +339,106 @@ impl NormalNFT1155 {
         env.storage()
             .instance()
             .get::<DataKey, bool>(&DataKey::MetadataFrozen)
+            .unwrap_or(false)
+    }
+
+    /// Permanently freeze metadata for a specific token. Can only be called once
+    /// per token; subsequent calls revert with `AlreadyFrozen`. Callable by the
+    /// collection owner or any holder of the token.
+    pub fn freeze_token(env: Env, caller: Address, token_id: u64) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
+        caller.require_auth();
+        
+        // Verify token exists (has been minted)
+        if !env.storage().persistent().has(&DataKey::TokenUri(token_id)) {
+            return Err(Error::TokenNotFound);
+        }
+        
+        // Allow creator or any token holder
+        let creator = Self::only_creator(&env).ok();
+        let balance = env.storage().persistent().get(&DataKey::Balance(caller.clone(), token_id)).unwrap_or(0);
+        
+        if creator != Some(caller.clone()) && balance == 0 {
+            return Err(Error::NotApproved);
+        }
+        
+        if env
+            .storage()
+            .persistent()
+            .get::<DataKey, bool>(&DataKey::TokenFrozen(token_id))
+            .unwrap_or(false)
+        {
+            return Err(Error::AlreadyFrozen);
+        }
+        
+        env.storage()
+            .persistent()
+            .set(&DataKey::TokenFrozen(token_id), &true);
+        env.storage().persistent().extend_ttl(
+            &DataKey::TokenFrozen(token_id),
+            TTL_THRESHOLD,
+            TTL_BUMP,
+        );
+        
+        env.events()
+            .publish((symbol_short!("token_frz"),), token_id);
+        Ok(())
+    }
+
+    /// Update the URI for a specific token. Reverts if either the collection
+    /// or the token's metadata is frozen. Callable only by creator.
+    pub fn set_token_uri(env: Env, token_id: u64, uri: String) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
+        let creator = Self::only_creator(&env)?;
+        
+        // Check collection-level freeze
+        if env
+            .storage()
+            .instance()
+            .get::<DataKey, bool>(&DataKey::MetadataFrozen)
+            .unwrap_or(false)
+        {
+            return Err(Error::MetadataFrozen);
+        }
+        
+        // Check token-level freeze
+        if env
+            .storage()
+            .persistent()
+            .get::<DataKey, bool>(&DataKey::TokenFrozen(token_id))
+            .unwrap_or(false)
+        {
+            return Err(Error::MetadataFrozen);
+        }
+        
+        // Verify token exists
+        if !env.storage().persistent().has(&DataKey::TokenUri(token_id)) {
+            return Err(Error::TokenNotFound);
+        }
+        
+        validate_uri(&uri)?;
+        let old_uri: Option<String> = env.storage().persistent().get(&DataKey::TokenUri(token_id));
+        env.storage()
+            .persistent()
+            .set(&DataKey::TokenUri(token_id), &uri);
+        env.storage().persistent().extend_ttl(
+            &DataKey::TokenUri(token_id),
+            TTL_THRESHOLD,
+            TTL_BUMP,
+        );
+        
+        env.events().publish(
+            (symbol_short!("token_meta_upd"), creator),
+            (token_id, old_uri, uri),
+        );
+        Ok(())
+    }
+
+    /// Returns `true` if a specific token's metadata has been permanently frozen.
+    pub fn is_token_frozen(env: Env, token_id: u64) -> bool {
+        env.storage()
+            .persistent()
+            .get::<DataKey, bool>(&DataKey::TokenFrozen(token_id))
             .unwrap_or(false)
     }
 

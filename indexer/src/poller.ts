@@ -1149,6 +1149,7 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
           auctionId: listingId, creator, collection, nftTokenId, token, reservePrice,
           highestBid: '0', highestBidder: null, endTime, status: 'Active' as const,
           recipients, createdAtLedger: ledgerSequence, updatedAtLedger: ledgerSequence,
+          extensionCount: 0, originalEndTime: endTime,
         },
         update: {
           creator, collection, nftTokenId, token, reservePrice, endTime,
@@ -1227,9 +1228,53 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
         if (count === 0) logger.warn('AUCTION_CANCELLED: auction not found', { eventType, auctionId: listingId?.toString(), ledger: ledgerSequence });
         prisma.auction.count({ where: { status: 'Active' } })
           .then((n) => activeAuctionsGauge.set(n)).catch(() => {});
+      } else if (eventType === 'AUCTION_EXTENDED') {
+        // Update auction's endTime and extensionCount from the extension event
+        const { count } = await db.auction.updateMany({
+          where: { auctionId: listingId },
+          data: {
+            endTime: BigInt(data.new_end_time),
+            extensionCount: Number(data.extension_count),
+            updatedAtLedger: ledgerSequence,
+          },
+        });
+        if (count === 0) logger.warn('AUCTION_EXTENDED: auction not found', { eventType, auctionId: listingId?.toString(), ledger: ledgerSequence });
       }
       invalidateAuction(listingId.toString()).catch(() => {});
 
+      break;
+    }
+
+    case 'TOKEN_WHITELISTED': {
+      await db.whitelistedToken.upsert({
+        where: { address: data.token },
+        create: {
+          address: data.token,
+          active: true,
+          addedAtLedger: ledgerSequence,
+          addedBy: data.added_by,
+        },
+        update: {
+          active: true,
+          addedAtLedger: ledgerSequence,
+          addedBy: data.added_by,
+          removedAtLedger: null,
+          removedBy: null,
+        },
+      });
+      break;
+    }
+
+    case 'TOKEN_REMOVED': {
+      const { count } = await db.whitelistedToken.updateMany({
+        where: { address: data.token },
+        data: {
+          active: false,
+          removedAtLedger: ledgerSequence,
+          removedBy: data.removed_by,
+        },
+      });
+      if (count === 0) logger.warn('TOKEN_REMOVED: token not found in whitelist', { eventType, token: data.token, ledger: ledgerSequence });
       break;
     }
 

@@ -193,7 +193,11 @@ export interface AuctionCancelledData {
 
 export interface AuctionExtendedData {
   auction_id: bigint;
+  /** End time before the extension was applied */
+  prev_end_time: bigint;
   new_end_time: bigint;
+  /** Which extension this is (1-based); allows consumers to detect cap proximity */
+  extension_count: bigint;
 }
 
 export interface OfferMadeData {
@@ -268,6 +272,18 @@ export interface RoyaltySettlementData {
   ledger_sequence?: bigint;
   /** Absent on events emitted before Issue #278; treated as version 0. */
   schema_version?: number;
+}
+
+/** Emitted when a token is added to the whitelist (Issue #208). */
+export interface TokenWhitelistedData {
+  token: string;
+  added_by: string;
+}
+
+/** Emitted when a token is removed from the whitelist (Issue #208). */
+export interface TokenRemovedData {
+  token: string;
+  removed_by: string;
 }
 
 /** One `{address, amount}` payout entry of a ROYALTY_PAID breakdown. */
@@ -539,7 +555,27 @@ export const AUCTION_EXTENDED_SCHEMA: ContractEventSchema = {
   type: 'AUCTION_EXTENDED',
   data: [
     { name: 'auction_id', type: 'bigint' },
+    { name: 'prev_end_time', type: 'bigint' },
     { name: 'new_end_time', type: 'bigint' },
+    { name: 'extension_count', type: 'bigint' },
+  ],
+};
+
+/** Emitted when a token is added to the whitelist (Issue #208). */
+export const TOKEN_WHITELISTED_SCHEMA: ContractEventSchema = {
+  type: 'TOKEN_WHITELISTED',
+  data: [
+    { name: 'token', type: 'string' },
+    { name: 'added_by', type: 'string' },
+  ],
+};
+
+/** Emitted when a token is removed from the whitelist (Issue #208). */
+export const TOKEN_REMOVED_SCHEMA: ContractEventSchema = {
+  type: 'TOKEN_REMOVED',
+  data: [
+    { name: 'token', type: 'string' },
+    { name: 'removed_by', type: 'string' },
   ],
 };
 
@@ -633,19 +669,6 @@ export const ROYALTY_SETTLEMENT_SCHEMA: ContractEventSchema = {
     { name: 'ledger_sequence', type: 'bigint', optional: true },
     // Issue #278: additive, absent on pre-upgrade historical events.
     { name: 'schema_version', type: 'number', optional: true },
-  ],
-};
-
-// Royalty settlement snapshot (Issue #270); backs the accounting
-// reconciliation added by Issue #279 — see RoyaltySettlementData above.
-export const ROYALTY_SETTLEMENT_SCHEMA: ContractEventSchema = {
-  type: 'ROYALTY_SETTLEMENT',
-  data: [
-    { name: 'id', type: 'bigint' },
-    { name: 'recipients', type: 'array', optional: true },
-    { name: 'total_amount', type: 'bigint' },
-    { name: 'token', type: 'string' },
-    { name: 'ledger_sequence', type: 'bigint', optional: true },
   ],
 };
 
@@ -777,6 +800,8 @@ export const SCHEMA_REGISTRY: Map<string, ContractEventSchema> = new Map([
   ['ROYALTY_PAID', ROYALTY_PAID_SCHEMA],
   ['PROTOCOL_FEE_COLLECTED', PROTOCOL_FEE_COLLECTED_SCHEMA],
   ['ROYALTY_SETTLEMENT', ROYALTY_SETTLEMENT_SCHEMA],
+  ['TOKEN_WHITELISTED', TOKEN_WHITELISTED_SCHEMA],
+  ['TOKEN_REMOVED', TOKEN_REMOVED_SCHEMA],
   ['ARTIST_REVOKED', ARTIST_REVOKED_SCHEMA],
   ['ARTIST_REINSTATED', ARTIST_REINSTATED_SCHEMA],
   ['ADMIN_TRANSFER_PROPOSED', ADMIN_TRANSFER_PROPOSED_SCHEMA],

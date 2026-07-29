@@ -174,8 +174,25 @@ export function useModeration(adminPublicKey: string | null) {
     return { revoke, reinstate, checkStatus, isProcessing, error };
 }
 
+export interface WhitelistedToken {
+    address: string;
+    addedAtLedger: number;
+    addedBy: string;
+}
+
+export interface TokenHistory {
+    address: string;
+    active: boolean;
+    addedAtLedger: number;
+    addedBy: string;
+    removedAtLedger: number | null;
+    removedBy: string | null;
+    createdAt: string;
+    updatedAt: string;
+}
+
 export function useTokenManagement(adminPublicKey: string | null) {
-    const [whitelistedTokens, setWhitelistedTokens] = useState<string[]>([]);
+    const [whitelistedTokens, setWhitelistedTokens] = useState<WhitelistedToken[]>([]);
     const [isLoading, setIsLoading] = useState(false);
     const [isProcessing, setIsProcessing] = useState(false);
     const [error, setError] = useState<string | null>(null);
@@ -184,8 +201,10 @@ export function useTokenManagement(adminPublicKey: string | null) {
         setIsLoading(true);
         setError(null);
         try {
-            const tokens = await getTokenWhitelist();
-            setWhitelistedTokens(tokens);
+            const response = await fetch(`${config.indexerUrl}/tokens`);
+            if (!response.ok) throw new Error('Failed to fetch tokens');
+            const data = await response.json();
+            setWhitelistedTokens(data.tokens || []);
         } catch (err: unknown) {
             setError(err instanceof Error ? err.message : "Failed to load whitelist");
         } finally {
@@ -197,6 +216,16 @@ export function useTokenManagement(adminPublicKey: string | null) {
         refresh();
     }, [refresh]);
 
+    const getTokenHistory = useCallback(async (address: string): Promise<TokenHistory | null> => {
+        try {
+            const response = await fetch(`${config.indexerUrl}/tokens/${address}/history`);
+            if (!response.ok) return null;
+            return await response.json();
+        } catch {
+            return null;
+        }
+    }, []);
+
     const whitelist = async (tokenAddress: string) => {
         if (!adminPublicKey) return;
         setIsProcessing(true);
@@ -207,7 +236,11 @@ export function useTokenManagement(adminPublicKey: string | null) {
         });
         // Optimistic update
         const prev = [...whitelistedTokens];
-        setWhitelistedTokens(curr => [...curr, tokenAddress]);
+        setWhitelistedTokens(curr => [...curr, { 
+            address: tokenAddress, 
+            addedAtLedger: 0, 
+            addedBy: adminPublicKey 
+        }]);
 
         try {
             const result = await addTokenToWhitelist(adminPublicKey, tokenAddress);
@@ -217,6 +250,7 @@ export function useTokenManagement(adminPublicKey: string | null) {
                 network: config.network,
                 contractId: config.contractId,
             });
+            await refresh(); // Refresh to get actual data from indexer
             return true;
         } catch (err: unknown) {
             setWhitelistedTokens(prev); // Rollback
@@ -245,7 +279,7 @@ export function useTokenManagement(adminPublicKey: string | null) {
         });
         // Optimistic update
         const prev = [...whitelistedTokens];
-        setWhitelistedTokens(curr => curr.filter(t => t !== tokenAddress));
+        setWhitelistedTokens(curr => curr.filter(t => t.address !== tokenAddress));
 
         try {
             const result = await removeTokenFromWhitelist(adminPublicKey, tokenAddress);
@@ -255,6 +289,7 @@ export function useTokenManagement(adminPublicKey: string | null) {
                 network: config.network,
                 contractId: config.contractId,
             });
+            await refresh(); // Refresh to get actual data from indexer
             return true;
         } catch (err: unknown) {
             setWhitelistedTokens(prev); // Rollback
@@ -273,7 +308,7 @@ export function useTokenManagement(adminPublicKey: string | null) {
         }
     };
 
-    return { whitelistedTokens, whitelist, unwhitelist, isLoading, isProcessing, error, refresh };
+    return { whitelistedTokens, whitelist, unwhitelist, isLoading, isProcessing, error, refresh, getTokenHistory };
 }
 
 /**

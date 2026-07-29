@@ -115,6 +115,10 @@ pub enum MarketplaceError {
     /// The token is already held in marketplace escrow for another listing
     /// or auction (double-listing guard).
     TokenAlreadyEscrowed = 50,
+    /// An anti-sniping extension would push the auction's end_time beyond
+    /// original_end_time + MAX_TOTAL_AUCTION_DURATION. The bid is still
+    /// accepted, but the extension is not applied.
+    AuctionDurationLimitReached = 51,
 }
 
 #[contracttype]
@@ -245,6 +249,10 @@ pub struct Auction {
     pub max_extensions: u32,
     /// Running count of extensions applied so far.
     pub extension_count: u32,
+    /// Original end time set at auction creation, used to enforce the
+    /// maximum total auction duration cap. Extensions cannot push end_time
+    /// beyond original_end_time + MAX_TOTAL_AUCTION_DURATION.
+    pub original_end_time: u64,
 }
 
 #[contracttype]

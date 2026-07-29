@@ -711,9 +711,11 @@ router.get('/collections', lightRateLimiter, cacheMiddleware(TTL.COLLECTIONS), v
 
     // Attach a resolved fee_bps field: collection override when set, otherwise null
     // (clients should fall back to the global fee from GET /stats or contract view).
+    // Also include metadataFrozen field for frontend freeze controls.
     const withFee = results.map((c) => ({
       ...c,
       fee_bps: c.feeBpsOverride ?? null,
+      metadataFrozen: c.metadataFrozen ?? false,
     }));
 
     res.json(serialize(withFee));
@@ -746,6 +748,37 @@ router.get('/collections/:address/fee', lightRateLimiter, async (req: Request, r
     res.json(result);
   } catch (err) {
     next(internalError('Failed to fetch collection fee'));
+  }
+});
+
+// ── GET /collections/:address/vouchers ─────────────────────────────────────────
+// Returns vouchers for a collection with status filtering (nonce-based replay protection)
+
+router.get('/collections/:address/vouchers', async (req: Request, res: Response, next: NextFunction) => {
+  const address = req.params.address as string;
+  const { status, limit, offset } = req.query as any;
+  try {
+    const where: any = { collection: address };
+    if (status && ['Issued', 'Redeemed', 'Revoked', 'Expired'].includes(status as string)) {
+      where.status = status;
+    }
+    const take = Math.min(limit ? parseInt(limit) : 50, 200);
+    const skip = offset ? parseInt(offset) : 0;
+
+    const [vouchers, total] = await Promise.all([
+      prisma.voucher.findMany({
+        where,
+        orderBy: { createdAtLedger: 'desc' },
+        take,
+        skip,
+      }),
+      prisma.voucher.count({ where }),
+    ]);
+
+    res.setHeader('X-Total-Count', String(total));
+    res.json(serialize(vouchers));
+  } catch (err) {
+    next(internalError('Failed to fetch vouchers'));
   }
 });
 

@@ -83,6 +83,17 @@ const TOPIC_MAP: Record<string, string> = {
   // Auction escrow recovery (Issue #271) — previously emitted on-chain but not mapped here
   'auction_bid_refunded':   'AUCTION_BID_REFUNDED',
   'auction_admin_cancelled':'AUCTION_ADMIN_CANCELLED',
+  // Token whitelist events (Issue #208)
+  'token_whitelisted':      'TOKEN_WHITELISTED',
+  'token_removed':          'TOKEN_REMOVED',
+  // Voucher lifecycle events (nonce-based replay protection)
+  'redeemed':               'VOUCHER_REDEEMED',
+  'revoke':                 'VOUCHER_REVOKED',
+  'expired':                'VOUCHER_EXPIRED',
+  // Metadata freeze events (per-token and per-collection)
+  'token_frz':              'TOKEN_METADATA_FROZEN',
+  'token_meta_upd':         'TOKEN_METADATA_UPDATED',
+  'meta_frz':               'COLLECTION_METADATA_FROZEN',
   // Launchpad deploy events (topics[0] = "deploy", topics[1] = kind tag)
   'dep_n721':  'DEPLOY_NORMAL_721',
   'dep_n1155': 'DEPLOY_NORMAL_1155',

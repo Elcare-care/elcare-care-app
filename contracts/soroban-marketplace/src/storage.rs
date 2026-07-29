@@ -91,6 +91,10 @@ pub enum IndexId {
     OffererOffers(Address),
     /// All offer ids ever made on a listing (append-only).
     ListingOffers(u64),
+    /// All token addresses ever added to the whitelist (append-only, Issue #208).
+    /// Used for pagination through the token registry. Includes both active and
+    /// removed tokens to maintain full audit trail.
+    TokenWhitelist,
 }
 
 /// A pending two-step admin rotation.
@@ -164,7 +168,17 @@ pub enum DataKey {
     /// `migrate` and removed once migrated.
     ArtistListings(Address),
     Admin,
+    /// LEGACY (pre-1.1.0): flat Vec<Address> whitelist. Superseded by
+    /// TokenWhitelistEntry(Address) map for O(1) lookups and history tracking.
+    /// Only read by migration; removed once migrated.
     TokenWhitelist,
+    /// Token whitelist registry entry (Issue #208). Maps token address to
+    /// TokenWhitelistEntry with history tracking.
+    TokenWhitelistEntry(Address),
+    /// Total count of tokens ever added to the whitelist (Issue #208).
+    TokenWhitelistCount,
+    /// Maps registry ID to token address for pagination (Issue #208).
+    TokenWhitelistId(u64),
     Treasury,
     ProtocolFeeBps,
     AuctionCount,
@@ -874,6 +888,114 @@ pub fn clear_escrow_record(env: &Env, collection: &Address, token_id: u64) {
     env.storage()
         .persistent()
         .remove(&DataKey::EscrowedToken(collection.clone(), token_id));
+}
+
+// ── Token whitelist registry (Issue #208) ───────────────────
+//
+// Replaces the flat Vec whitelist with a map-based registry for O(1) lookups
+// and full audit trail. Each token address maps to a TokenWhitelistEntry.
+
+/// Check if a token is currently whitelisted (active: true). O(1) lookup.
+pub fn is_token_whitelisted(env: &Env, token: &Address) -> bool {
+    let key = DataKey::TokenWhitelistEntry(token.clone());
+    let entry = env.storage().persistent().get::<DataKey, TokenWhitelistEntry>(&key);
+    match entry {
+        Some(e) => {
+            if e.active {
+                bump_entry_ttl(env, &key);
+                true
+            } else {
+                false
+            }
+        }
+        None => false,
+    }
+}
+
+/// Get the whitelist entry for a token, if it exists (active or removed).
+pub fn get_token_whitelist_entry(env: &Env, token: &Address) -> Option<TokenWhitelistEntry> {
+    let key = DataKey::TokenWhitelistEntry(token.clone());
+    let entry = env.storage().persistent().get::<DataKey, TokenWhitelistEntry>(&key);
+    if entry.is_some() {
+        bump_entry_ttl(env, &key);
+    }
+    entry
+}
+
+/// Save or update a token whitelist entry.
+pub fn set_token_whitelist_entry(env: &Env, token: &Address, entry: &TokenWhitelistEntry) {
+    let key = DataKey::TokenWhitelistEntry(token.clone());
+    env.storage().persistent().set(&key, entry);
+    bump_entry_ttl(env, &key);
+}
+
+/// Add a token address to the whitelist index (for pagination).
+/// Called when a token is first whitelisted. Returns the token's registry ID.
+pub fn add_token_to_whitelist_index(env: &Env, token: &Address) -> u64 {
+    let count = get_token_whitelist_count(env) + 1;
+    set_token_whitelist_count(env, count);
+    // Store the mapping from ID to Address
+    let key = DataKey::TokenWhitelistId(count);
+    env.storage().persistent().set(&key, token);
+    bump_entry_ttl(env, &key);
+    // Add the ID to the index for pagination
+    index_append(env, &IndexId::TokenWhitelist, count);
+    count
+}
+
+/// Get the total number of tokens ever added to the whitelist.
+pub fn get_token_whitelist_count(env: &Env) -> u64 {
+    env.storage()
+        .persistent()
+        .get::<DataKey, u64>(&DataKey::TokenWhitelistCount)
+        .unwrap_or(0)
+}
+
+/// Set the total number of tokens in the whitelist.
+pub fn set_token_whitelist_count(env: &Env, count: u64) {
+    env.storage().persistent().set(&DataKey::TokenWhitelistCount, &count);
+    bump_entry_ttl(env, &DataKey::TokenWhitelistCount);
+}
+
+/// Get token address by its registry ID.
+pub fn get_token_by_id(env: &Env, id: u64) -> Option<Address> {
+    let key = DataKey::TokenWhitelistId(id);
+    let token = env.storage().persistent().get::<DataKey, Address>(&key);
+    if token.is_some() {
+        bump_entry_ttl(env, &key);
+    }
+    token
+}
+
+/// Get paginated token registry entries (addresses only).
+/// Returns up to `limit` token addresses starting at `offset`.
+pub fn get_token_registry_range(env: &Env, start: u32, limit: u32) -> Vec<Address> {
+    let ids = index_range(env, &IndexId::TokenWhitelist, start, limit);
+    let mut tokens = Vec::new(env);
+    for id in ids.iter() {
+        if let Some(token) = get_token_by_id(env, id) {
+            tokens.push_back(token);
+        }
+    }
+    tokens
+}
+
+/// Get all token addresses in the registry (for view functions and tests).
+pub fn get_all_token_registry(env: &Env) -> Vec<Address> {
+    let ids = index_all(env, &IndexId::TokenWhitelist);
+    let mut tokens = Vec::new(env);
+    for id in ids.iter() {
+        if let Some(token) = get_token_by_id(env, id) {
+            tokens.push_back(token);
+        }
+    }
+    tokens
+}
+
+/// Get the full audit trail (TokenWhitelistEntry) for a specific token.
+/// Returns the entry if the token has ever been whitelisted (active or removed).
+pub fn token_whitelist_history(env: &Env, token: &Address) -> Option<TokenWhitelistEntry> {
+    get_token_whitelist_entry(env, token)
 }
 
 // ── Batched cancel_artist_listings cursor ────────────────────
