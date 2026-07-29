@@ -92,6 +92,8 @@ pub const AUCTION_BID_REFUNDED: &str = "auction_bid_refunded";
 pub const AUCTION_ADMIN_CANCELLED: &str = "auction_admin_cancelled";
 // Revocation cascade incomplete signal (Issue #214)
 pub const REVOCATION_INCOMPLETE: &str = "revocation_incomplete";
+// Auction configuration update events
+pub const AUCTION_CONFIG_UPDATED: &str = "auction_config_updated";
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -908,6 +910,43 @@ impl RoleMigratedEvent {
         env.events()
             .publish((soroban_sdk::Symbol::new(env, ROLE_MIGRATED),), self);
     }
+}
+
+// ── Auction configuration update events ───────────────────────────────────────
+
+/// Emitted when an admin updates a global auction configuration parameter.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuctionConfigUpdatedEvent {
+    /// The configuration field that was updated (e.g., "min_bid_increment", "extension_window").
+    pub field: soroban_sdk::Symbol,
+    /// The previous value (None if the field was previously unset).
+    pub old_value: Option<i128>,
+    /// The new value.
+    pub new_value: Option<i128>,
+}
+
+impl AuctionConfigUpdatedEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, AUCTION_CONFIG_UPDATED),), self);
+    }
+}
+
+/// Emit `auction_config_updated` for a configuration change.
+pub fn emit_auction_config_updated(
+    env: &Env,
+    field: soroban_sdk::Symbol,
+    old_value: Option<i128>,
+    new_value: Option<i128>,
+) {
+    AuctionConfigUpdatedEvent {
+        field,
+        old_value,
+        new_value,
+    }
+    .publish(env);
 }
 
 /// Emit `role_transfer_proposed` for a newly-created role rotation proposal.

@@ -42,6 +42,10 @@ export type AuditAction =
   // Fee management
   | "fee.collection_set"
   | "fee.collection_clear"
+  // Auction configuration
+  | "auction_config.set_min_increment"
+  | "auction_config.set_extension_window"
+  | "auction_config.set_extension_trigger"
   // Session lifecycle
   | "session.start"
   | "session.end"

@@ -40,7 +40,7 @@ use crate::{
 
 /// Semantic version — bump on every breaking storage change.
 const CONTRACT_VERSION: &str = "1.1.0";
-const DEFAULT_MIN_BID_INCREMENT: i128 = 1;
+const DEFAULT_MIN_BID_INCREMENT: i128 = 1_000_000; // 0.1 XLM in stroops
 const DEFAULT_EXTENSION_WINDOW: u64 = 600;
 const DEFAULT_EXTENSION_TRIGGER: u64 = 0;
 
@@ -155,6 +155,10 @@ impl MarketplaceContract {
         }
         admin.require_auth();
         env.storage().persistent().set(&key, &admin);
+        // Initialize default auction configuration values
+        crate::storage::set_min_bid_increment_storage(&env, DEFAULT_MIN_BID_INCREMENT);
+        crate::storage::set_auction_extension_window_storage(&env, DEFAULT_EXTENSION_WINDOW);
+        crate::storage::set_auction_extension_trigger_storage(&env, DEFAULT_EXTENSION_TRIGGER);
     }
 
     pub fn get_admin(env: Env) -> Option<Address> {
@@ -639,8 +643,10 @@ impl MarketplaceContract {
     pub fn set_min_bid_increment(env: Env, admin: Address, increment: i128) {
         bump_instance_ttl(&env);
         Self::require_role(&env, &admin, RoleType::ProtocolConfig);
-        if increment < 0 { panic_with_error!(&env, MarketplaceError::InvalidPrice); }
+        if increment <= 0 { panic_with_error!(&env, MarketplaceError::InvalidPrice); }
+        let old_value = crate::storage::get_min_bid_increment_storage(&env);
         crate::storage::set_min_bid_increment_storage(&env, increment);
+        crate::events::emit_auction_config_updated(&env, soroban_sdk::Symbol::new(&env, "min_bid_increment"), old_value, Some(increment));
     }
 
     pub fn get_min_bid_increment(env: Env) -> i128 {
@@ -683,7 +689,9 @@ impl MarketplaceContract {
     pub fn set_auction_extension_window(env: Env, admin: Address, window: u64) {
         bump_instance_ttl(&env);
         Self::require_role(&env, &admin, RoleType::ProtocolConfig);
+        let old_value = get_auction_extension_window_storage(&env);
         set_auction_extension_window_storage(&env, window);
+        crate::events::emit_auction_config_updated(&env, soroban_sdk::Symbol::new(&env, "extension_window"), old_value.map(|v| v as i128), Some(window as i128));
     }
 
     pub fn get_auction_extension_window(env: Env) -> u64 {
@@ -693,7 +701,9 @@ impl MarketplaceContract {
     pub fn set_auction_extension_trigger(env: Env, admin: Address, trigger: u64) {
         bump_instance_ttl(&env);
         Self::require_role(&env, &admin, RoleType::ProtocolConfig);
+        let old_value = get_auction_extension_trigger_storage(&env);
         set_auction_extension_trigger_storage(&env, trigger);
+        crate::events::emit_auction_config_updated(&env, soroban_sdk::Symbol::new(&env, "extension_trigger"), old_value.map(|v| v as i128), Some(trigger as i128));
     }
 
     pub fn get_auction_extension_trigger(env: Env) -> u64 {
@@ -1695,7 +1705,9 @@ impl MarketplaceContract {
         );
         creator.require_auth();
         Self::require_not_revoked(&env, &creator);
-        if reserve_price <= 0 { panic_with_error!(&env, MarketplaceError::InvalidPrice); }
+        let min_increment = crate::storage::get_min_bid_increment_storage(&env)
+            .unwrap_or(DEFAULT_MIN_BID_INCREMENT);
+        if reserve_price < min_increment { panic_with_error!(&env, MarketplaceError::InvalidPrice); }
         if duration < MIN_AUCTION_DURATION {
             panic_with_error!(&env, MarketplaceError::InvalidAuctionDuration);
         }

@@ -567,6 +567,62 @@ fn test_create_listing_then_auction_same_token_fails() {
     );
 }
 
+#[test]
+fn test_set_min_bid_increment() {
+    let (env, client, artist, _, _, _, _) = setup();
+    client.set_admin(&artist);
+    client.set_min_bid_increment(&artist, &2_000_000_i128);
+    assert_eq!(client.get_min_bid_increment(), 2_000_000_i128);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #2)")]
+fn test_set_min_bid_increment_zero_panics() {
+    let (env, client, artist, _, _, _, _) = setup();
+    client.set_admin(&artist);
+    client.set_min_bid_increment(&artist, &0_i128);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #2)")]
+fn test_create_auction_reserve_price_below_min_increment_panics() {
+    let (env, client, artist, _, token_id, _cid, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    client.set_min_bid_increment(&artist, &5_000_000_i128);
+    // reserve_price 1_000_000 < min_increment 5_000_000 should panic
+    client.create_auction(
+        &artist, &token_id, &collection_id, &1u64,
+        &1_000_000_i128, &3600u64, &valid_recipients(&env, &artist),
+    );
+}
+
+#[test]
+fn test_set_auction_extension_window_emits_event() {
+    let (env, client, artist, _, _, _, _) = setup();
+    client.set_admin(&artist);
+    client.set_auction_extension_window(&artist, &900u64);
+    assert_eq!(client.get_auction_extension_window(), 900u64);
+}
+
+#[test]
+fn test_set_auction_extension_trigger_emits_event() {
+    let (env, client, artist, _, _, _, _) = setup();
+    client.set_admin(&artist);
+    client.set_auction_extension_trigger(&artist, &300u64);
+    assert_eq!(client.get_auction_extension_trigger(), 300u64);
+}
+
+#[test]
+fn test_admin_initializes_default_config() {
+    let (env, client, artist, _, _, _, _) = setup();
+    client.set_admin(&artist);
+    // After set_admin, defaults should be initialized
+    assert_eq!(client.get_min_bid_increment(), 1_000_000_i128);
+    assert_eq!(client.get_auction_extension_window(), 600u64);
+    assert_eq!(client.get_auction_extension_trigger(), 0u64);
+}
+
 // ════════════════════════════════════════════════════════════
 // SECTION 7: accept_offer — NFT goes to accepted offerer
 // ════════════════════════════════════════════════════════════
