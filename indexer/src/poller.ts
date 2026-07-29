@@ -37,6 +37,12 @@ import { loadConfig, parseTrackedContracts } from './config.js';
 import { enqueueIpfsFetch } from './ipfs-cache.js';
 import { promoteConfirmedEvents, rollbackReorg } from './reorg.js';
 import { acquireLease, releaseLease, renewLease, type LeaseRole } from './coordination/lease.js';
+import { recoveryFSM } from './recovery-state-machine.js';
+import {
+  reorgRollbackDurationSeconds,
+  gapRepairDurationSeconds,
+  gapLengthLedgers,
+} from './recovery-metrics.js';
 
 dotenv.config();
 
@@ -268,6 +274,7 @@ const server = new rpc.Server(RPC_URL);
  */
 export async function revertLedgers(safeAtLedger: number): Promise<void> {
   logger.warn('Reorg: rolling back', { safeAtLedger });
+  const rollbackStart = Date.now();
   await prisma.$transaction(async (tx) => {
     // Remove events that occurred after the safe checkpoint
     await tx.marketplaceEvent.deleteMany({
@@ -310,7 +317,13 @@ export async function revertLedgers(safeAtLedger: number): Promise<void> {
     // Issue #286: also rollback offer and bid state inside the transaction
     await rollbackReorg(safeAtLedger, tx);
   });
-  logger.info('Reorg: rollback complete', { resumeFromLedger: safeAtLedger + 1 });
+  const rollbackDurationSec = (Date.now() - rollbackStart) / 1000;
+  reorgRollbackDurationSeconds.observe(rollbackDurationSec);
+  logger.info('Reorg: rollback complete', {
+    resumeFromLedger: safeAtLedger + 1,
+    durationSeconds: rollbackDurationSec.toFixed(3),
+  });
+  recoveryFSM.reorgRollbackComplete(safeAtLedger);
 }
 
 /** SyncState fields for a ledger advance; omits hash when fetch failed so we keep the prior checkpoint. */
@@ -515,10 +528,14 @@ async function pollContract(
                   fromLedger: contract.lastLedger,
                   toLedger: safeLedger,
                 });
+                recoveryFSM.toHalted(
+                  `Re-org depth ${rollbackDepth} exceeds MAX_ROLLBACK_DEPTH (${config.maxRollbackDepth})`
+                );
                 emitCriticalReorgEvent(contract.lastLedger, safeLedger, rollbackDepth);
                 continue; // loop back, where _pollerHalted will block
               }
 
+              recoveryFSM.toReorgRollback(contract.lastLedger, safeLedger, rollbackDepth);
               await revertLedgers(safeLedger);
               await prisma.trackedContract.update({
                 where: { id: contract.id },
@@ -681,9 +698,11 @@ async function pollContract(
       }
 
       localErrors = 0;
+      recoveryFSM.toSync();
     } catch (error) {
       localErrors += 1;
       recordRpcFailure();
+      recoveryFSM.toRetry(error instanceof Error ? error.message : String(error));
       const backoff = Math.min(BASE_BACKOFF_MS * Math.pow(2, localErrors - 1), MAX_BACKOFF_MS);
       logger.error('pollContract: error in loop', {
         contractId: contractRow.contractId,

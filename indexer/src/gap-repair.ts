@@ -37,6 +37,11 @@ import {
   openGapsGauge,
   openGapLedgersTotalGauge,
 } from './metrics.js';
+import { recoveryFSM } from './recovery-state-machine.js';
+import {
+  gapRepairDurationSeconds,
+  gapLengthLedgers,
+} from './recovery-metrics.js';
 
 dotenv.config();
 
@@ -120,6 +125,11 @@ export async function repairGap(gapId: number): Promise<GapRepairResult> {
     gapId, fromLedger: gap.fromLedger, toLedger: gap.toLedger,
   });
 
+  const repairStart = Date.now();
+  const ledgerCount = gap.toLedger - gap.fromLedger + 1;
+  recoveryFSM.toGapRepair(gapId, gap.fromLedger, gap.toLedger);
+  gapLengthLedgers.observe(ledgerCount);
+
   let jobId: number | null = null;
 
   try {
@@ -141,14 +151,19 @@ export async function repairGap(gapId: number): Promise<GapRepairResult> {
     );
 
     jobId = result.jobId;
+    const durationSec = (Date.now() - repairStart) / 1000;
+    gapRepairDurationSeconds.observe(durationSec);
 
     await prisma.ledgerGap.update({
       where: { id: gapId },
       data:  { status: 'Repaired', error: null },
     });
 
+    recoveryFSM.gapRepairComplete(gapId);
     logger.info('gap-repair: gap repaired', {
       gapId, jobId, totalInserted: result.totalInserted,
+      durationSeconds: durationSec.toFixed(2),
+      ledgerCount,
     });
 
     return {
@@ -158,13 +173,19 @@ export async function repairGap(gapId: number): Promise<GapRepairResult> {
 
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);
+    const durationSec = (Date.now() - repairStart) / 1000;
+    gapRepairDurationSeconds.observe(durationSec);
 
     await prisma.ledgerGap.update({
       where: { id: gapId },
       data:  { status: 'Failed', error: errMsg.slice(0, 4096) },
     });
 
-    logger.error('gap-repair: gap repair failed', { gapId, jobId, err: errMsg });
+    recoveryFSM.gapRepairFailed(gapId, errMsg);
+    logger.error('gap-repair: gap repair failed', {
+      gapId, jobId, err: errMsg,
+      durationSeconds: durationSec.toFixed(2),
+    });
 
     return {
       gapId, fromLedger: gap.fromLedger, toLedger: gap.toLedger,
