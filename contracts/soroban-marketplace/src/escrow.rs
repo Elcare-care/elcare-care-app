@@ -57,6 +57,35 @@ pub(crate) fn transfer_nft(
     );
 }
 
+/// Call `batch_transfer_from(operator, from, to, ids, amounts, data)` on `collection`.
+/// Used for ERC-1155 batch transfers.
+pub(crate) fn batch_transfer_nft(
+    env: &Env,
+    collection: &Address,
+    operator: &Address,
+    from: &Address,
+    to: &Address,
+    token_id: u64,
+    amount: u128,
+) {
+    let ids = soroban_sdk::vec![env, token_id.into_val(env)];
+    let amounts = soroban_sdk::vec![env, amount.into_val(env)];
+    let data = soroban_sdk::Bytes::new(&env);
+    env.invoke_contract::<()>(
+        collection,
+        &soroban_sdk::Symbol::new(env, "batch_transfer_from"),
+        soroban_sdk::vec![
+            env,
+            operator.into_val(env),
+            from.into_val(env),
+            to.into_val(env),
+            ids.into_val(env),
+            amounts.into_val(env),
+            data.into_val(env),
+        ],
+    );
+}
+
 // ── Public API ───────────────────────────────────────────────
 
 /// Pull `(collection, token_id)` into contract custody for a new listing/auction.
@@ -123,6 +152,45 @@ pub fn release_nft(
         &env.current_contract_address(),
         recipient,
         token_id,
+    );
+
+    // Effect — clear escrow index (after successful transfer)
+    clear_escrow_record(env, collection, token_id);
+
+    // Emit NftReleased
+    crate::events::NftReleasedEvent {
+        id: listing_or_auction_id,
+        collection: collection.clone(),
+        token_id,
+        recipient: recipient.clone(),
+        ledger_sequence,
+    }
+    .publish(env);
+}
+
+/// Release an escrowed ERC-1155 NFT with quantity to `recipient` and clear the escrow index.
+///
+/// Uses batch_transfer_from for ERC-1155 collections to transfer the specified quantity.
+/// Transfers marketplace → recipient, then removes the EscrowedToken record.
+/// Emits NftReleasedEvent after a successful transfer.
+pub fn release_nft_with_quantity(
+    env: &Env,
+    collection: &Address,
+    token_id: u64,
+    quantity: u64,
+    recipient: &Address,
+    ledger_sequence: u32,
+    listing_or_auction_id: u64,
+) {
+    // Interaction — transfer NFT out of custody using batch transfer for ERC-1155
+    batch_transfer_nft(
+        env,
+        collection,
+        &env.current_contract_address(),
+        &env.current_contract_address(),
+        recipient,
+        token_id,
+        quantity as u128,
     );
 
     // Effect — clear escrow index (after successful transfer)

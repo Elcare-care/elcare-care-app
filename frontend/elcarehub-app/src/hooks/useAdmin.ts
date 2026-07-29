@@ -21,7 +21,12 @@ import {
     proposeAdmin,
     acceptAdmin,
     cancelAdminProposal,
-    type PendingAdminProposal
+    getAuctionConfig,
+    setMinBidIncrement,
+    setAuctionExtensionWindow,
+    setAuctionExtensionTrigger,
+    type PendingAdminProposal,
+    type AuctionConfig
 } from "@/lib/contract";
 import { Horizon } from "@stellar/stellar-sdk";
 import { config } from "@/lib/config";
@@ -658,5 +663,97 @@ export function usePauseControls(adminPublicKey: string | null) {
         toggleGlobal,
         toggleCollection,
         toggleFunction,
+    };
+}
+
+// ── Auction configuration ────────────────────────────────────────────────────────
+
+export function useAuctionConfig(adminPublicKey: string | null) {
+    const [config, setConfig] = useState<AuctionConfig | null>(null);
+    const [isLoading, setIsLoading] = useState(false);
+    const [isProcessing, setIsProcessing] = useState(false);
+    const [error, setError] = useState<string | null>(null);
+
+    const refresh = useCallback(async () => {
+        if (!adminPublicKey) return;
+        setIsLoading(true);
+        setError(null);
+        try {
+            const data = await getAuctionConfig();
+            setConfig(data);
+        } catch (err: unknown) {
+            setError(err instanceof Error ? err.message : "Failed to load auction config");
+        } finally {
+            setIsLoading(false);
+        }
+    }, [adminPublicKey]);
+
+    useEffect(() => {
+        refresh();
+    }, [refresh]);
+
+    const setMinBid = useCallback(async (increment: bigint) => {
+        if (!adminPublicKey) return;
+        setIsProcessing(true);
+        setError(null);
+        emitAuditEvent("auction_config.set_min_increment", adminPublicKey, "initiated", {
+            value: increment.toString(),
+        });
+        try {
+            await setMinBidIncrement(adminPublicKey, increment);
+            await refresh();
+        } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : "Failed to set min bid increment";
+            setError(msg);
+        } finally {
+            setIsProcessing(false);
+        }
+    }, [adminPublicKey, refresh]);
+
+    const setExtensionWindow = useCallback(async (window: bigint) => {
+        if (!adminPublicKey) return;
+        setIsProcessing(true);
+        setError(null);
+        emitAuditEvent("auction_config.set_extension_window", adminPublicKey, "initiated", {
+            value: window.toString(),
+        });
+        try {
+            await setAuctionExtensionWindow(adminPublicKey, window);
+            await refresh();
+        } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : "Failed to set extension window";
+            setError(msg);
+        } finally {
+            setIsProcessing(false);
+        }
+    }, [adminPublicKey, refresh]);
+
+    const setExtensionTrigger = useCallback(async (trigger: bigint) => {
+        if (!adminPublicKey) return;
+        setIsProcessing(true);
+        setError(null);
+        emitAuditEvent("auction_config.set_extension_trigger", adminPublicKey, "initiated", {
+            value: trigger.toString(),
+        });
+        try {
+            await setAuctionExtensionTrigger(adminPublicKey, trigger);
+            await refresh();
+        } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : "Failed to set extension trigger";
+            setError(msg);
+        } finally {
+            setIsProcessing(false);
+        }
+    }, [adminPublicKey, refresh]);
+
+    return {
+        config,
+        isLoading,
+        isProcessing,
+        error,
+        refresh,
+        setMinBid,
+        setExtensionWindow,
+        setExtensionTrigger,
     };
 }

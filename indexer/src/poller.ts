@@ -32,12 +32,11 @@ import { collectMarketplaceEvents, MAX_LEDGER_WINDOW } from './event-sync.js';
 import { withRpcRetry } from './retry.js';
 import { logger } from './logger.js';
 import redis from './redis.js';
-import { applyInvalidation, invalidateListing, invalidateAuction, invalidateOffer, invalidateCollection, invalidateWalletActivity, invalidateStats } from './cache-invalidation.js';
+import { applyInvalidation, invalidateListing, invalidateAuction, invalidateOffer, invalidateCollection, invalidateWalletActivity, invalidateStats, invalidateConfig } from './cache-invalidation.js';
 import { loadConfig, parseTrackedContracts } from './config.js';
 import { enqueueIpfsFetch } from './ipfs-cache.js';
 import { promoteConfirmedEvents, rollbackReorg } from './reorg.js';
 import { acquireLease, releaseLease, renewLease, type LeaseRole } from './coordination/lease.js';
-import { applyInvalidation, invalidateListing, invalidateAuction, invalidateOffer, invalidateCollection, invalidateWalletActivity, invalidateStats } from './cache-invalidation.js';
 
 dotenv.config();
 
@@ -1383,94 +1382,9 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
       break;
     }
 
-    // Voucher lifecycle events (nonce-based replay protection)
-    case 'VOUCHER_REDEEMED': {
-      const nonce = BigInt(data.nonce ?? 0);
-      const tokenId = BigInt(data.token_id ?? 0);
-      const collection = event.contractId;
-      await db.voucher.upsert({
-        where: { collection_nonce: { collection, nonce } },
-        create: {
-          nonce,
-          collection,
-          tokenId,
-          status: 'Redeemed',
-          createdAtLedger: ledgerSequence,
-          updatedAtLedger: ledgerSequence,
-        },
-        update: {
-          status: 'Redeemed',
-          updatedAtLedger: ledgerSequence,
-        },
-      });
-      break;
-    }
-
-    case 'VOUCHER_REVOKED': {
-      const nonce = BigInt(data.nonce ?? 0);
-      const collection = event.contractId;
-      await db.voucher.upsert({
-        where: { collection_nonce: { collection, nonce } },
-        create: {
-          nonce,
-          collection,
-          tokenId: 0n, // unknown from revoke event
-          status: 'Revoked',
-          createdAtLedger: ledgerSequence,
-          updatedAtLedger: ledgerSequence,
-        },
-        update: {
-          status: 'Revoked',
-          updatedAtLedger: ledgerSequence,
-        },
-      });
-      break;
-    }
-
-    case 'VOUCHER_EXPIRED': {
-      const nonce = BigInt(data.nonce ?? 0);
-      const collection = event.contractId;
-      await db.voucher.upsert({
-        where: { collection_nonce: { collection, nonce } },
-        create: {
-          nonce,
-          collection,
-          tokenId: 0n, // unknown from expired event
-          status: 'Expired',
-          createdAtLedger: ledgerSequence,
-          updatedAtLedger: ledgerSequence,
-        },
-        update: {
-          status: 'Expired',
-          updatedAtLedger: ledgerSequence,
-        },
-      });
-      break;
-    }
-
-    // Metadata freeze events (per-token and per-collection)
-    case 'COLLECTION_METADATA_FROZEN': {
-      const collection = event.contractId;
-      await db.collection.updateMany({
-        where: { contractAddress: collection },
-        data: { metadataFrozen: true },
-      });
-      invalidateCollection(collection).catch(() => {});
-      break;
-    }
-
-    case 'TOKEN_METADATA_FROZEN': {
-      // Token-level freeze - track in MarketplaceEvent for listing visibility
-      // The token_id is in the event data
-      const tokenId = BigInt(data.token_id ?? 0);
-      logger.info('Token metadata frozen', { collection: event.contractId, tokenId, ledger: ledgerSequence });
-      break;
-    }
-
-    case 'TOKEN_METADATA_UPDATED': {
-      // Token metadata updated - track for audit trail
-      const tokenId = BigInt(data.token_id ?? 0);
-      logger.info('Token metadata updated', { collection: event.contractId, tokenId, ledger: ledgerSequence });
+    // Auction configuration changes — invalidate config cache
+    case 'AUCTION_CONFIG_UPDATED': {
+      invalidateConfig().catch(() => {});
       break;
     }
 

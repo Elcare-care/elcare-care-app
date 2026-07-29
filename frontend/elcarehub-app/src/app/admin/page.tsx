@@ -7,7 +7,7 @@
 import { useState, useCallback, useEffect } from "react";
 import { StrKey } from "@stellar/stellar-sdk";
 import { useWallet } from "@/hooks/useWallet";
-import { useAdminStats, useModeration, useTokenManagement, useAdminCheck, useAdminTransfer, usePauseControls, PAUSABLE_FUNCTIONS, type PausableFunction, type WhitelistedToken, type TokenHistory } from "@/hooks/useAdmin";
+import { useAdminStats, useModeration, useTokenManagement, useAdminCheck, useAdminTransfer, usePauseControls, useAuctionConfig, PAUSABLE_FUNCTIONS, type PausableFunction } from "@/hooks/useAdmin";
 import { useAdminSession } from "@/hooks/useAdminSession";
 import { AdminConfirmationModal } from "@/components/AdminConfirmationModal";
 import {
@@ -103,6 +103,18 @@ export default function AdminPage() {
         toggleCollection: toggleCollectionPause,
         toggleFunction: toggleFunctionPause,
     } = usePauseControls(publicKey);
+
+    // Auction configuration
+    const {
+        config: auctionConfig,
+        isLoading: isAuctionConfigLoading,
+        isProcessing: isAuctionConfigProcessing,
+        error: auctionConfigError,
+        refresh: refreshAuctionConfig,
+        setMinBid,
+        setExtensionWindow,
+        setExtensionTrigger,
+    } = useAuctionConfig(publicKey);
 
     // Collection rows for circuit-breaker (loaded from indexer on mount)
     const [collectionPauseRows, setCollectionPauseRows] = useState<
@@ -699,6 +711,161 @@ export default function AdminPage() {
                                     <p className="text-xs italic">No additional SRC-20 tokens whitelisted.</p>
                                 </div>
                             )}
+                        </div>
+                    </section>
+
+                    {/* Auction Configuration */}
+                    <section className="rounded-3xl bg-white p-8 shadow-sm border border-brand-100">
+                        <div className="mb-6 flex items-center gap-3">
+                            <div className="rounded-xl bg-purple-100 p-2.5">
+                                <Clock className="h-6 w-6 text-purple-600" />
+                            </div>
+                            <div>
+                                <h2 className="font-display text-2xl font-bold text-midnight-950">Auction Configuration</h2>
+                                <p className="mt-0.5 text-sm text-gray-500">Global auction timing and bid increment settings.</p>
+                            </div>
+                            <button
+                                type="button"
+                                onClick={() => { refreshAuctionConfig(); }}
+                                className="ml-auto flex items-center gap-1.5 rounded-full bg-gray-50 px-4 py-2 text-xs font-semibold text-gray-500 hover:bg-gray-100 border border-gray-200 transition-all"
+                            >
+                                <Loader2 className={`h-3.5 w-3.5 ${isAuctionConfigLoading ? "animate-spin" : ""}`} />
+                                Refresh
+                            </button>
+                        </div>
+
+                        {auctionConfigError && (
+                            <div className="mb-4 flex items-center gap-2 rounded-xl bg-red-50 p-3 text-sm text-red-600 border border-red-100">
+                                <AlertCircle className="h-4 w-4 shrink-0" />
+                                {auctionConfigError}
+                            </div>
+                        )}
+
+                        <div className="space-y-6">
+                            {/* Minimum Bid Increment */}
+                            <div className="rounded-2xl border border-gray-100 p-6">
+                                <div className="mb-4">
+                                    <h3 className="font-bold text-midnight-950">Minimum Bid Increment</h3>
+                                    <p className="mt-0.5 text-sm text-gray-500">Smallest amount by which a bid must exceed the current highest bid.</p>
+                                </div>
+                                <div className="flex items-center gap-4">
+                                    <div className="flex-1">
+                                        <div className="mb-2 text-xs font-semibold uppercase tracking-wider text-gray-400">Current Value</div>
+                                        <div className="font-mono text-lg font-bold text-midnight-900">
+                                            {auctionConfig ? stroopsToXlm(auctionConfig.minBidIncrement) : "Loading..."}
+                                        </div>
+                                    </div>
+                                    <div className="flex-1">
+                                        <label className="mb-2 block text-xs font-semibold uppercase tracking-wider text-gray-400">New Value (XLM)</label>
+                                        <input
+                                            type="number"
+                                            step="0.0000001"
+                                            min="0.0000001"
+                                            placeholder="0.1"
+                                            className="w-full rounded-xl border border-gray-200 py-2.5 px-4 text-sm focus:border-purple-500 focus:outline-none focus:ring-1 focus:ring-purple-500"
+                                            id="min-bid-input"
+                                        />
+                                    </div>
+                                    <button
+                                        type="button"
+                                        disabled={isAuctionConfigProcessing}
+                                        onClick={async () => {
+                                            const input = document.getElementById('min-bid-input') as HTMLInputElement;
+                                            const value = parseFloat(input.value);
+                                            if (isNaN(value) || value <= 0) return;
+                                            const stroops = Math.floor(value * 10_000_000);
+                                            await setMinBid(BigInt(stroops));
+                                            input.value = '';
+                                        }}
+                                        className="mt-5 flex items-center gap-2 rounded-xl bg-purple-600 px-5 py-2.5 text-sm font-bold text-white transition-all hover:bg-purple-700 disabled:opacity-50 shadow-md shadow-purple-200"
+                                    >
+                                        {isAuctionConfigProcessing ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />}
+                                        Update
+                                    </button>
+                                </div>
+                            </div>
+
+                            {/* Extension Window */}
+                            <div className="rounded-2xl border border-gray-100 p-6">
+                                <div className="mb-4">
+                                    <h3 className="font-bold text-midnight-950">Extension Window</h3>
+                                    <p className="mt-0.5 text-sm text-gray-500">Time added to auction end when a bid is placed near expiration (anti-sniping).</p>
+                                </div>
+                                <div className="flex items-center gap-4">
+                                    <div className="flex-1">
+                                        <div className="mb-2 text-xs font-semibold uppercase tracking-wider text-gray-400">Current Value</div>
+                                        <div className="font-mono text-lg font-bold text-midnight-900">
+                                            {auctionConfig ? `${auctionConfig.extensionWindow}s` : "Loading..."}
+                                        </div>
+                                    </div>
+                                    <div className="flex-1">
+                                        <label className="mb-2 block text-xs font-semibold uppercase tracking-wider text-gray-400">New Value (seconds)</label>
+                                        <input
+                                            type="number"
+                                            min="0"
+                                            placeholder="600"
+                                            className="w-full rounded-xl border border-gray-200 py-2.5 px-4 text-sm focus:border-purple-500 focus:outline-none focus:ring-1 focus:ring-purple-500"
+                                            id="extension-window-input"
+                                        />
+                                    </div>
+                                    <button
+                                        type="button"
+                                        disabled={isAuctionConfigProcessing}
+                                        onClick={async () => {
+                                            const input = document.getElementById('extension-window-input') as HTMLInputElement;
+                                            const value = parseInt(input.value, 10);
+                                            if (isNaN(value) || value < 0) return;
+                                            await setExtensionWindow(BigInt(value));
+                                            input.value = '';
+                                        }}
+                                        className="mt-5 flex items-center gap-2 rounded-xl bg-purple-600 px-5 py-2.5 text-sm font-bold text-white transition-all hover:bg-purple-700 disabled:opacity-50 shadow-md shadow-purple-200"
+                                    >
+                                        {isAuctionConfigProcessing ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />}
+                                        Update
+                                    </button>
+                                </div>
+                            </div>
+
+                            {/* Extension Trigger */}
+                            <div className="rounded-2xl border border-gray-100 p-6">
+                                <div className="mb-4">
+                                    <h3 className="font-bold text-midnight-950">Extension Trigger</h3>
+                                    <p className="mt-0.5 text-sm text-gray-500">Time remaining before auction end when extension window activates (0 = disabled).</p>
+                                </div>
+                                <div className="flex items-center gap-4">
+                                    <div className="flex-1">
+                                        <div className="mb-2 text-xs font-semibold uppercase tracking-wider text-gray-400">Current Value</div>
+                                        <div className="font-mono text-lg font-bold text-midnight-900">
+                                            {auctionConfig ? `${auctionConfig.extensionTrigger}s` : "Loading..."}
+                                        </div>
+                                    </div>
+                                    <div className="flex-1">
+                                        <label className="mb-2 block text-xs font-semibold uppercase tracking-wider text-gray-400">New Value (seconds)</label>
+                                        <input
+                                            type="number"
+                                            min="0"
+                                            placeholder="0"
+                                            className="w-full rounded-xl border border-gray-200 py-2.5 px-4 text-sm focus:border-purple-500 focus:outline-none focus:ring-1 focus:ring-purple-500"
+                                            id="extension-trigger-input"
+                                        />
+                                    </div>
+                                    <button
+                                        type="button"
+                                        disabled={isAuctionConfigProcessing}
+                                        onClick={async () => {
+                                            const input = document.getElementById('extension-trigger-input') as HTMLInputElement;
+                                            const value = parseInt(input.value, 10);
+                                            if (isNaN(value) || value < 0) return;
+                                            await setExtensionTrigger(BigInt(value));
+                                            input.value = '';
+                                        }}
+                                        className="mt-5 flex items-center gap-2 rounded-xl bg-purple-600 px-5 py-2.5 text-sm font-bold text-white transition-all hover:bg-purple-700 disabled:opacity-50 shadow-md shadow-purple-200"
+                                    >
+                                        {isAuctionConfigProcessing ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />}
+                                        Update
+                                    </button>
+                                </div>
+                            </div>
                         </div>
                     </section>
 

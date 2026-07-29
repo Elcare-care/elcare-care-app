@@ -47,6 +47,7 @@ interface FormState {
   metadataCid: string;
   collectionAddress: string;
   nftTokenId: number;
+  quantity: number;
   price: number;
   tokenAddress: string;
   recipients: RecipientInput[];
@@ -56,6 +57,7 @@ interface FieldErrors {
   metadataCid?: string;
   collectionAddress?: string;
   nftTokenId?: string;
+  quantity?: string;
   price?: string;
   tokenAddress?: string;
   recipients?: string;

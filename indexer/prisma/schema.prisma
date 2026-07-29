@@ -521,35 +521,193 @@ model Discrepancy {
   @@index([detectedAt])
 }
 
-// ── Voucher tracking (nonce-based replay protection) ────────────────────────
+// ── Archive tables (Issue #295) ────────────────────────────────────────────────
 //
-// Tracks voucher lifecycle for lazy-mint contracts. Each voucher has a unique
-// nonce that can only be redeemed once. Status transitions:
-//   issued → redeemed | revoked | expired
-//
-// Populated from contract events: redeemed, revoke, expired
+// These tables mirror the hot/warm tables and receive rows moved by the
+// archival job once they exceed the retention window.  The archive tables are
+// append-only; rows are never updated or deleted after insertion.
+// Each row carries `archivedAt` and `archiveChecksum` for provenance.
 
-enum VoucherStatus {
-  Issued
-  Redeemed
-  Revoked
-  Expired
+model ArchivedMarketplaceEvent {
+  id             Int      @id @default(autoincrement())
+  listingId       BigInt?
+  eventType       String
+  actor           String
+  data            Json
+  ledgerSequence  Int
+  ledgerTimestamp DateTime @default(now())
+  eventHash       String?
+  contractId      String   @default("")
+  confirmed       Boolean  @default(false)
+  archivedAt      DateTime @default(now())
+  archiveChecksum String
+
+  @@index([ledgerSequence])
+  @@index([contractId, ledgerSequence])
+  @@index([archivedAt])
 }
 
-model Voucher {
-  id              Int          @id @default(autoincrement())
-  nonce           BigInt
-  collection      String       // contract address
-  tokenId         BigInt
-  status          VoucherStatus @default(Issued)
-  createdAtLedger Int
-  updatedAtLedger Int
-  createdAt       DateTime     @default(now())
-  updatedAt       DateTime     @updatedAt
+model ArchivedPriceHistory {
+  id              Int      @id @default(autoincrement())
+  listingId        BigInt
+  oldPrice         Decimal  @db.Decimal(32, 7)
+  newPrice         Decimal  @db.Decimal(32, 7)
+  changedBy        String   @default("")
+  changedAtLedger  Int
+  changedAt        DateTime @default(now())
+  archivedAt       DateTime @default(now())
+  archiveChecksum  String
 
-  @@unique([collection, nonce])
-  @@index([collection])
+  @@index([listingId])
+  @@index([archivedAt])
+}
+
+model ArchivedLedgerCheckpoint {
+  id              Int      @id @default(autoincrement())
+  contractId      String
+  windowStart     Int
+  windowEnd       Int
+  ledgerHash      String?
+  eventCount      Int      @default(0)
+  status          String   @default("fetched")
+  error           String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @default(now())
+  archivedAt      DateTime @default(now())
+  archiveChecksum String
+
+  @@index([contractId, windowEnd])
+  @@index([archivedAt])
+}
+
+model ArchivedBackfillJob {
+  id               Int      @id @default(autoincrement())
+  startLedger      Int
+  endLedger        Int
+  checkpointLedger Int      @default(0)
+  status           String   @default("Pending")
+  rpcUrl           String
+  error            String?
+  totalInserted    Int      @default(0)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @default(now())
+  gapId            Int?
+  archivedAt       DateTime @default(now())
+  archiveChecksum  String
+
   @@index([status])
-  @@index([collection, status])
-  @@index([createdAtLedger])
+  @@index([archivedAt])
+}
+
+model ArchivedLedgerGap {
+  id          Int      @id @default(autoincrement())
+  fromLedger  Int
+  toLedger    Int
+  source      String
+  status      String   @default("Open")
+  error       String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @default(now())
+  archivedAt  DateTime @default(now())
+  archiveChecksum String
+
+  @@index([status])
+  @@index([archivedAt])
+}
+
+model ArchivedDeadLetterEvent {
+  id             Int      @id @default(autoincrement())
+  network        String   @default("")
+  contractId     String
+  ledgerSequence Int
+  txHash         String
+  eventIndex     Int
+  rawTopics      Json
+  rawValue       String   @default("")
+  errorCode      String
+  errorMessage   String
+  parserVersion  String   @default("")
+  status         String   @default("Pending")
+  attempts       Int      @default(0)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @default(now())
+  archivedAt     DateTime @default(now())
+  archiveChecksum String
+
+  @@index([status])
+  @@index([contractId, ledgerSequence])
+  @@index([archivedAt])
+}
+
+model ArchivedReconciliationRepair {
+  id           Int      @id @default(autoincrement())
+  modelType    String   // "listing" | "auction" | "offer" | "collection"
+  recordId     String
+  field        String
+  oldValue     String
+  newValue     String
+  reason       String
+  sourceLedger Int
+  status       String   @default("Applied")
+  createdAt    DateTime @default(now())
+  archivedAt   DateTime @default(now())
+  archiveChecksum String
+
+  @@index([modelType, recordId])
+  @@index([archivedAt])
+}
+
+model ArchivedReconciliationRun {
+  id                  Int      @id @default(autoincrement())
+  startedAt           DateTime @default(now())
+  completedAt         DateTime?
+  sampledListings     Int      @default(0)
+  sampledAuctions     Int      @default(0)
+  discrepanciesFound  Int      @default(0)
+  repairsApplied      Int      @default(0)
+  skippedRecords      Int      @default(0)
+  dryRun              Boolean  @default(false)
+  errorMessage        String?
+  archivedAt          DateTime @default(now())
+  archiveChecksum     String
+
+  @@index([startedAt])
+  @@index([archivedAt])
+}
+
+model ArchivedDiscrepancy {
+  id           Int      @id @default(autoincrement())
+  runId        Int
+  kind         String
+  entityId     String
+  field        String
+  dbValue      String
+  chainValue   String
+  resolved     Boolean @default(false)
+  detectedAt   DateTime @default(now())
+  resolvedAt   DateTime?
+  archivedAt   DateTime @default(now())
+  archiveChecksum String
+
+  @@index([runId])
+  @@index([kind, entityId])
+  @@index([archivedAt])
+}
+
+model ArchivedKeeperAction {
+  id          Int      @id @default(autoincrement())
+  targetType  String
+  targetId    BigInt
+  txHash      String?
+  status      String   @default("Pending")
+  attempts    Int      @default(0)
+  lastError   String?
+  feePaid     BigInt?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @default(now())
+  archivedAt  DateTime @default(now())
+  archiveChecksum String
+
+  @@index([targetType, status])
+  @@index([archivedAt])
 }

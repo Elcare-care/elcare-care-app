@@ -4,7 +4,7 @@ import redis from '../redis.js';
 import { Prisma } from '@prisma/client';
 import { cacheMiddleware } from './cache-middleware.js';
 import { etagMiddleware } from './etag-middleware.js';
-import { strictRateLimiter } from './rate-limit-middleware.js';
+import { strictRateLimiter, sseConcurrencyGuard, heavyRateLimiter } from './rate-limit-middleware.js';
 import { badRequest, notFound, internalError } from './errors.js';
 import { versioningMiddleware, ok, validateResponse, ListingResponseV1, AuctionResponseV1, OfferResponseV1, CollectionResponseV1 } from './versioning.js';
 import { applyDecodedEvents, isPollerHalted, getHaltReason, resumePoller, revertLedgers } from '../poller.js';
@@ -29,6 +29,8 @@ import {
   getTopCollections,
   getTopArtists,
 } from '../stats.js';
+import { fetchAuctionConfig, AuctionConfig } from '../chain-state.js';
+import { rpc } from '@stellar/stellar-sdk';
 import {
   sseConnectionsTotal,
   sseActiveConnectionsGauge,
@@ -36,6 +38,7 @@ import {
 } from '../metrics.js';
 import { TTL } from '../cache-warmer.js';
 import { withDecimalAmounts } from '../token-metadata.js';
+import { authMiddleware, classifyRoute } from './auth-middleware.js';
 
 // ── SSE registry ───────────────────────────────────────────────────────────────
 
@@ -233,7 +236,7 @@ function sanitiseTsQuery(raw: string): string {
   return raw.replace(/[&|!:<>()]/g, ' ').trim();
 }
 
-router.get('/listings', cacheMiddleware(TTL.LISTINGS_LIST), validateQuery(listingsQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
+router.get('/listings', lightRateLimiter, cacheMiddleware(TTL.LISTINGS_LIST), validateQuery(listingsQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
   const { artist, owner, status, limit, offset, minPrice, maxPrice, search, cursor_ledger, cursor_direction } =
     (req as any).validatedQuery;
   try {
@@ -383,7 +386,7 @@ router.get('/listings', cacheMiddleware(TTL.LISTINGS_LIST), validateQuery(listin
 
 // ── GET /listings/:id ─────────────────────────────────────────────────────────
 
-router.get('/listings/:id', cacheMiddleware(TTL.LISTING_DETAIL), async (req: Request, res: Response, next: NextFunction) => {
+router.get('/listings/:id', lightRateLimiter, cacheMiddleware(TTL.LISTING_DETAIL), async (req: Request, res: Response, next: NextFunction) => {
   const { id } = req.params;
   try {
     const listing = await prisma.listing.findUnique({
@@ -404,7 +407,7 @@ router.get('/listings/:id', cacheMiddleware(TTL.LISTING_DETAIL), async (req: Req
 
 // ── GET /listings/:id/history ─────────────────────────────────────────────────
 
-router.get('/listings/:id/history', async (req: Request, res: Response, next: NextFunction) => {
+router.get('/listings/:id/history', heavyRateLimiter, async (req: Request, res: Response, next: NextFunction) => {NextFunction) => {
   const id = req.params.id as string;
   if (!/^\d+$/.test(id)) {
     return next(badRequest('Invalid ID format'));
@@ -454,7 +457,7 @@ router.get('/listings/:id/history', async (req: Request, res: Response, next: Ne
 // Each row carries oldPrice, newPrice, changedBy (artist address), the ledger
 // sequence, and the wall-clock timestamp so the frontend can render a chart.
 
-router.get('/listings/:id/price-history', cacheMiddleware(60), async (req: Request, res: Response, next: NextFunction) => {
+router.get('/listings/:id/price-history', lightRateLimiter, cacheMiddleware(60), async (req: Request, res: Response, next: NextFunction) => {
   const id = req.params.id as string;
   if (!/^\d+$/.test(id)) {
     return next(badRequest('Invalid listing ID format'));
@@ -487,7 +490,7 @@ router.get('/listings/:id/price-history', cacheMiddleware(60), async (req: Reque
 // refresh job, and returns the result.  Returns 404 when the content cannot be
 // fetched from any gateway.
 
-router.get('/ipfs/:cid', cacheMiddleware(300), async (req: Request, res: Response, next: NextFunction) => {
+router.get('/ipfs/:cid', mediumRateLimiter, cacheMiddleware(300), async (req: Request, res: Response, next: NextFunction) => {
   const cid = req.params.cid as string;
   if (!cid || !/^[a-zA-Z0-9]+$/.test(cid)) {
     return next(badRequest('Invalid CID format'));
@@ -543,7 +546,7 @@ router.get('/ipfs/:cid', cacheMiddleware(300), async (req: Request, res: Respons
 
 // ── GET /auctions ─────────────────────────────────────────────────────────────
 
-router.get('/auctions', cacheMiddleware(TTL.AUCTIONS_LIST), validateQuery(auctionsQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
+router.get('/auctions', lightRateLimiter, cacheMiddleware(TTL.AUCTIONS_LIST), validateQuery(auctionsQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
   const { creator, status, limit, offset, cursor_ledger, cursor_direction } = (req as any).validatedQuery;
   try {
     const where: any = {};
@@ -574,7 +577,7 @@ router.get('/auctions', cacheMiddleware(TTL.AUCTIONS_LIST), validateQuery(auctio
 
 // ── GET /auctions/:id ─────────────────────────────────────────────────────────
 
-router.get('/auctions/:id', cacheMiddleware(TTL.AUCTION_DETAIL), async (req: Request, res: Response, next: NextFunction) => {
+router.get('/auctions/:id', lightRateLimiter, cacheMiddleware(TTL.AUCTION_DETAIL), async (req: Request, res: Response, next: NextFunction) => {
   const id = req.params.id as string;
   if (!/^\d+$/.test(id)) {
     return next(badRequest('Invalid ID format'));
@@ -602,7 +605,7 @@ router.get('/auctions/:id', cacheMiddleware(TTL.AUCTION_DETAIL), async (req: Req
 // compute the currently-blocked address set, and returns the raw event history
 // alongside it for audit views.
 
-router.get('/auctions/:id/blocked-bidders', async (req: Request, res: Response, next: NextFunction) => {
+router.get('/auctions/:id/blocked-bidders', lightRateLimiter, async (req: Request, res: Response, next: NextFunction) => {
   const id = req.params.id as string;
   if (!/^\d+$/.test(id)) {
     return next(badRequest('Invalid ID format'));
@@ -636,7 +639,7 @@ router.get('/auctions/:id/blocked-bidders', async (req: Request, res: Response, 
 
 // ── GET /offers ───────────────────────────────────────────────────────────────
 
-router.get('/offers', validateQuery(offersQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
+router.get('/offers', lightRateLimiter, validateQuery(offersQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
   const { listing_id, limit, offset, cursor_ledger, cursor_direction } = (req as any).validatedQuery;
   try {
     const where: any = {};
@@ -682,7 +685,7 @@ router.get('/activity/recent', cacheMiddleware(TTL.ACTIVITY_RECENT), async (req:
 
 // ── GET /collections ──────────────────────────────────────────────────────────
 
-router.get('/collections', cacheMiddleware(TTL.COLLECTIONS), validateQuery(collectionsQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
+router.get('/collections', lightRateLimiter, cacheMiddleware(TTL.COLLECTIONS), validateQuery(collectionsQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
   const { kind, creator, limit, offset, cursor_ledger, cursor_direction } = (req as any).validatedQuery;
   try {
     const where: any = {};
@@ -726,7 +729,7 @@ router.get('/collections', cacheMiddleware(TTL.COLLECTIONS), validateQuery(colle
 // address, or null when the collection is using the global default fee.
 // Response is Redis-cached with a 30-second TTL.
 
-router.get('/collections/:address/fee', async (req: Request, res: Response, next: NextFunction) => {
+router.get('/collections/:address/fee', lightRateLimiter, async (req: Request, res: Response, next: NextFunction) => {
   const address = req.params.address as string;
   if (!address) return next(badRequest('Collection address is required'));
 
@@ -781,7 +784,7 @@ router.get('/collections/:address/vouchers', async (req: Request, res: Response,
 
 // ── GET /creators/:address/collections ───────────────────────────────────────
 
-router.get('/creators/:address/collections', validateQuery(creatorCollectionsQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
+router.get('/creators/:address/collections', lightRateLimiter, validateQuery(creatorCollectionsQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
   const address = req.params.address as string;
   if (!isValidStellarAddress(address)) {
     return next(badRequest('Invalid creator address: must be a valid 56-character Stellar G-address'));
@@ -895,7 +898,7 @@ router.get('/wallets/:address/royalty-stats', strictRateLimiter, async (req: Req
 // the given recipient address, newest-first, optionally bounded to the
 // inclusive ledger-sequence window [from, to]. Cached for 60 seconds.
 
-router.get('/wallets/:address/royalty-breakdown', cacheMiddleware(60), validateQuery(royaltyBreakdownQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
+router.get('/wallets/:address/royalty-breakdown', lightRateLimiter, cacheMiddleware(60), validateQuery(royaltyBreakdownQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
   const address = req.params.address as string;
   if (!isValidStellarAddress(address)) {
     return next(badRequest(STELLAR_ADDRESS_ERROR));
@@ -935,7 +938,7 @@ router.get('/wallets/:address/royalty-breakdown', cacheMiddleware(60), validateQ
 
 // ── GET /stats ────────────────────────────────────────────────────────────────
 
-router.get('/stats', validateQuery(statsQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
+router.get('/stats', lightRateLimiter, validateQuery(statsQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
   const { from, to, range } = (req as any).validatedQuery;
   try {
     let dateFrom: Date | undefined;
@@ -1014,8 +1017,7 @@ router.get('/stats', validateQuery(statsQuerySchema), async (req: Request, res: 
 });
 
 // GET /events — Server-Sent Events stream with keep-alive heartbeats
-router.get('/events', (req: Request, res: Response) => {
-    // Check connection limit
+router.get('/events', sseConcurrencyGuard, (req: Request, res: Response) => {
     if (sseClients.size >= MAX_SSE_CONNECTIONS) {
         return res.status(503).json({ error: 'Too many SSE connections' });
     }
@@ -1047,7 +1049,7 @@ router.get('/events', (req: Request, res: Response) => {
 // Returns mints-over-time, volume-over-time, and conversion rate aggregates
 // for a given artist, scoped by an optional ?range=day|week|month query param.
 
-router.get('/artists/:address/metrics', cacheMiddleware(60), validateQuery(artistMetricsQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
+router.get('/artists/:address/metrics', lightRateLimiter, cacheMiddleware(60), validateQuery(artistMetricsQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
   const address = req.params.address as string;
   const { range } = (req as any).validatedQuery;
 
@@ -1129,7 +1131,7 @@ router.get('/artists/:address/metrics', cacheMiddleware(60), validateQuery(artis
 // field-level discrepancies.  Returns { lastRun: null } when no run has been
 // recorded yet.
 
-router.get('/reconciliation/status', async (_req: Request, res: Response, next: NextFunction) => {
+router.get('/reconciliation/status', operationalRateLimiter, authMiddleware('operator'), async (_req: Request, res: Response, next: NextFunction) => {
   try {
     const { getReconciliationStatus } = await import('../reconciler.js');
     const status = await getReconciliationStatus();
@@ -1145,7 +1147,7 @@ router.get('/reconciliation/status', async (_req: Request, res: Response, next: 
 // throughput (events/s), ETA, and ledger range.  Returns running: false when
 // no backfill is currently active.
 
-router.get('/backfill/status', async (_req: Request, res: Response, next: NextFunction) => {
+router.get('/backfill/status', operationalRateLimiter, authMiddleware('operator'), async (_req: Request, res: Response, next: NextFunction) => {
   try {
     const { getBackfillStatus } = await import('../backfill.js');
     res.json(getBackfillStatus());
@@ -1162,7 +1164,7 @@ router.get('/backfill/status', async (_req: Request, res: Response, next: NextFu
 //   - the most recent 20 actions (for quick operator triage)
 //   - stats from the last completed cycle
 
-router.get('/keeper/status', async (req: Request, res: Response, next: NextFunction) => {
+router.get('/keeper/status', operationalRateLimiter, authMiddleware('operator'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     // Lazy-import to avoid a hard dependency when the keeper is disabled.
     const { getLastCycleStats, isKeeperRunning } = await import('../keeper/index.js');
@@ -1207,7 +1209,7 @@ router.get('/keeper/status', async (req: Request, res: Response, next: NextFunct
 // Returns ledger gaps with optional filtering by status/source.
 // Also includes a summary of open gaps and total missing ledgers.
 
-router.get('/sync/gaps', validateQuery(syncGapsQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
+router.get('/sync/gaps', operationalRateLimiter, authMiddleware('operator'), validateQuery(syncGapsQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
   const { status, source, limit, offset } = (req as any).validatedQuery;
   try {
     const where: any = {};
@@ -1251,7 +1253,7 @@ router.get('/sync/gaps', validateQuery(syncGapsQuerySchema), async (req: Request
 
 // ── GET /sync/gaps/:id ────────────────────────────────────────────────────────
 
-router.get('/sync/gaps/:id', async (req: Request, res: Response, next: NextFunction) => {
+router.get('/sync/gaps/:id', operationalRateLimiter, authMiddleware('operator'), async (req: Request, res: Response, next: NextFunction) => {
   const id = parseInt(String(req.params.id), 10);
   if (isNaN(id)) return next(badRequest('Gap ID must be an integer'));
   try {
@@ -1270,7 +1272,7 @@ router.get('/sync/gaps/:id', async (req: Request, res: Response, next: NextFunct
 //
 // BackfillJob listing for operator visibility.
 
-router.get('/sync/jobs', async (req: Request, res: Response, next: NextFunction) => {
+router.get('/sync/jobs', operationalRateLimiter, authMiddleware('operator'), async (req: Request, res: Response, next: NextFunction) => {
   const status = req.query.status as string | undefined;
   try {
     const where: any = {};
@@ -1288,7 +1290,7 @@ router.get('/sync/jobs', async (req: Request, res: Response, next: NextFunction)
 
 // ── GET /sync/jobs/:id ────────────────────────────────────────────────────────
 
-router.get('/sync/jobs/:id', async (req: Request, res: Response, next: NextFunction) => {
+router.get('/sync/jobs/:id', operationalRateLimiter, authMiddleware('operator'), async (req: Request, res: Response, next: NextFunction) => {
   const id = parseInt(String(req.params.id), 10);
   if (isNaN(id)) return next(badRequest('Job ID must be an integer'));
   try {
@@ -1304,7 +1306,7 @@ router.get('/sync/jobs/:id', async (req: Request, res: Response, next: NextFunct
 //
 // List all tracked contracts with their current sync status.
 
-router.get('/admin/contracts', async (req: Request, res: Response, next: NextFunction) => {
+router.get('/admin/contracts', operationalRateLimiter, authMiddleware('operator'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const contracts = await prisma.trackedContract.findMany({
       orderBy: { createdAt: 'asc' },
@@ -1319,7 +1321,7 @@ router.get('/admin/contracts', async (req: Request, res: Response, next: NextFun
 //
 // Add a new contract to track. Body: { contractId, type, label?, startLedger? }
 
-router.post('/admin/contracts', async (req: Request, res: Response, next: NextFunction) => {
+router.post('/admin/contracts', operationalRateLimiter, authMiddleware('operator'), async (req: Request, res: Response, next: NextFunction) => {
   const { contractId, type, label = '', startLedger = 0 } = req.body ?? {};
 
   if (!contractId || typeof contractId !== 'string' || contractId.trim() === '') {
@@ -1359,7 +1361,7 @@ router.post('/admin/contracts', async (req: Request, res: Response, next: NextFu
 //
 // Deactivate a tracked contract. The polling loop will stop on the next tick.
 
-router.delete('/admin/contracts/:id', async (req: Request, res: Response, next: NextFunction) => {
+router.delete('/admin/contracts/:id', operationalRateLimiter, authMiddleware('operator'), async (req: Request, res: Response, next: NextFunction) => {
   const id = parseInt(req.params.id, 10);
   if (isNaN(id)) return next(badRequest('Contract ID must be an integer'));
 
@@ -1396,7 +1398,7 @@ router.delete('/admin/contracts/:id', async (req: Request, res: Response, next: 
 // }
 // Entity buckets not requested in ?types= are omitted from the response.
 
-router.get('/search', validateQuery(searchQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
+router.get('/search', mediumRateLimiter, validateQuery(searchQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
   const { q, types, limit } = (req as any).validatedQuery as {
     q: string;
     types: Array<'listings' | 'auctions' | 'collections'>;
@@ -1524,53 +1526,38 @@ router.get('/search', validateQuery(searchQuerySchema), async (req: Request, res
   }
 });
 
-// ── GET /tokens (Issue #208) ─────────────────────────────────────────────────────
+// ── GET /config/auction ────────────────────────────────────────────────────────────
+//
+// Returns current global auction configuration values from the contract.
+// Cached with 60-second TTL. Subscribes to config-update events for cache invalidation.
 
-router.get('/tokens', cacheMiddleware(60), async (req: Request, res: Response, next: NextFunction) => {
+router.get('/config/auction', cacheMiddleware(60), async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const tokens = await prisma.whitelistedToken.findMany({
-      where: { active: true },
-      orderBy: { addedAtLedger: 'desc' },
+    // Get the marketplace contract ID from tracked contracts
+    const contracts = await prisma.trackedContract.findMany({
+      where: { type: 'marketplace' },
     });
-    res.json({
-      tokens: tokens.map((t: any) => ({
-        address: t.address,
-        addedAtLedger: t.addedAtLedger,
-        addedBy: t.addedBy,
-      })),
-      total: tokens.length,
-    });
-  } catch (err) {
-    next(internalError('Failed to fetch whitelisted tokens'));
-  }
-});
-
-// ── GET /tokens/:address/history (Issue #208) ───────────────────────────────────
-
-router.get('/tokens/:address/history', async (req: Request, res: Response, next: NextFunction) => {
-  const address = req.params.address as string;
-  if (!isValidStellarAddress(address)) {
-    return next(badRequest(STELLAR_ADDRESS_ERROR));
-  }
-  try {
-    const token = await prisma.whitelistedToken.findUnique({
-      where: { address },
-    });
-    if (!token) {
-      return next(notFound('Token not found in whitelist registry'));
+    
+    if (contracts.length === 0) {
+      return next(notFound('No marketplace contract tracked'));
     }
-    res.json({
-      address: token.address,
-      active: token.active,
-      addedAtLedger: token.addedAtLedger,
-      addedBy: token.addedBy,
-      removedAtLedger: token.removedAtLedger,
-      removedBy: token.removedBy,
-      createdAt: token.createdAt,
-      updatedAt: token.updatedAt,
-    });
+
+    const contractId = contracts[0].id;
+    const rpcUrl = process.env.STELLAR_RPC_URL;
+    if (!rpcUrl) {
+      return next(internalError('STELLAR_RPC_URL not configured'));
+    }
+
+    const server = new rpc.Server(rpcUrl);
+    const config = await fetchAuctionConfig(server, contractId);
+
+    if (!config) {
+      return next(internalError('Failed to fetch auction configuration from contract'));
+    }
+
+    res.json(config);
   } catch (err) {
-    next(internalError('Failed to fetch token history'));
+    next(internalError('Failed to fetch auction configuration'));
   }
 });
 

@@ -92,9 +92,8 @@ pub const AUCTION_BID_REFUNDED: &str = "auction_bid_refunded";
 pub const AUCTION_ADMIN_CANCELLED: &str = "auction_admin_cancelled";
 // Revocation cascade incomplete signal (Issue #214)
 pub const REVOCATION_INCOMPLETE: &str = "revocation_incomplete";
-// Token whitelist events (Issue #208)
-pub const TOKEN_WHITELISTED: &str = "token_whitelisted";
-pub const TOKEN_REMOVED: &str = "token_removed";
+// Auction configuration update events
+pub const AUCTION_CONFIG_UPDATED: &str = "auction_config_updated";
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -913,32 +912,41 @@ impl RoleMigratedEvent {
     }
 }
 
-/// Emitted when a token is added to the whitelist (Issue #208).
+// ── Auction configuration update events ───────────────────────────────────────
+
+/// Emitted when an admin updates a global auction configuration parameter.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TokenWhitelistedEvent {
-    pub token: Address,
-    pub added_by: Address,
+pub struct AuctionConfigUpdatedEvent {
+    /// The configuration field that was updated (e.g., "min_bid_increment", "extension_window").
+    pub field: soroban_sdk::Symbol,
+    /// The previous value (None if the field was previously unset).
+    pub old_value: Option<i128>,
+    /// The new value.
+    pub new_value: Option<i128>,
 }
-impl TokenWhitelistedEvent {
+
+impl AuctionConfigUpdatedEvent {
+    #[allow(deprecated)]
     pub fn publish(self, env: &Env) {
         env.events()
-            .publish((soroban_sdk::Symbol::new(env, TOKEN_WHITELISTED),), self);
+            .publish((soroban_sdk::Symbol::new(env, AUCTION_CONFIG_UPDATED),), self);
     }
 }
 
-/// Emitted when a token is removed from the whitelist (Issue #208).
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TokenRemovedEvent {
-    pub token: Address,
-    pub removed_by: Address,
-}
-impl TokenRemovedEvent {
-    pub fn publish(self, env: &Env) {
-        env.events()
-            .publish((soroban_sdk::Symbol::new(env, TOKEN_REMOVED),), self);
+/// Emit `auction_config_updated` for a configuration change.
+pub fn emit_auction_config_updated(
+    env: &Env,
+    field: soroban_sdk::Symbol,
+    old_value: Option<i128>,
+    new_value: Option<i128>,
+) {
+    AuctionConfigUpdatedEvent {
+        field,
+        old_value,
+        new_value,
     }
+    .publish(env);
 }
 
 /// Emit `role_transfer_proposed` for a newly-created role rotation proposal.

@@ -543,7 +543,286 @@ registry.registerPath({
  * Call once at startup; the result is stable and can be cached.
  */
 export function buildOpenApiDocument() {
-  const generator = new OpenApiGeneratorV3(registry.definitions);
+  // GET /health/details
+registry.registerPath({
+  method: 'get',
+  path: '/health/details',
+  tags: ['System'],
+  summary: 'Full diagnostics (operator only)',
+  description: 'Returns detailed health information. Requires X-Operator-Token header. Returns 401/403 without valid credentials.',
+  security: [{ operatorToken: [] }],
+  responses: {
+    200: { description: 'Detailed health', content: { 'application/json': { schema: z.record(z.string(), z.unknown()) } } },
+    401: { description: 'Missing or invalid operator token', content: { 'application/json': { schema: ErrorResponseSchema } } },
+    403: { description: 'Operator access not allowed from this IP', content: { 'application/json': { schema: ErrorResponseSchema } } },
+  },
+});
+
+// GET /reconciliation/status
+registry.registerPath({
+  method: 'get',
+  path: '/reconciliation/status',
+  tags: ['Operational'],
+  summary: 'Reconciliation status (operator only)',
+  description: 'Returns the last reconciliation run with counts and discrepancies. Requires operator token.',
+  security: [{ operatorToken: [] }],
+  responses: {
+    200: { description: 'Reconciliation status', content: { 'application/json': { schema: z.record(z.string(), z.unknown()) } } },
+    401: { description: 'Missing or invalid operator token', content: { 'application/json': { schema: ErrorResponseSchema } } },
+    403: { description: 'Operator access not allowed from this IP', content: { 'application/json': { schema: ErrorResponseSchema } } },
+  },
+});
+
+// GET /backfill/status
+registry.registerPath({
+  method: 'get',
+  path: '/backfill/status',
+  tags: ['Operational'],
+  summary: 'Backfill job status (operator only)',
+  description: 'Returns the current state of any running backfill job. Requires operator token.',
+  security: [{ operatorToken: [] }],
+  responses: {
+    200: { description: 'Backfill status', content: { 'application/json': { schema: z.record(z.string(), z.unknown()) } } },
+    401: { description: 'Missing or invalid operator token', content: { 'application/json': { schema: ErrorResponseSchema } } },
+    403: { description: 'Operator access not allowed from this IP', content: { 'application/json': { schema: ErrorResponseSchema } } },
+  },
+});
+
+// GET /keeper/status
+registry.registerPath({
+  method: 'get',
+  path: '/keeper/status',
+  tags: ['Operational'],
+  summary: 'Keeper operational state (operator only)',
+  description: 'Returns keeper running state, action counts, and recent actions. Requires operator token.',
+  security: [{ operatorToken: [] }],
+  responses: {
+    200: { description: 'Keeper status', content: { 'application/json': { schema: z.record(z.string(), z.unknown()) } } },
+    401: { description: 'Missing or invalid operator token', content: { 'application/json': { schema: ErrorResponseSchema } } },
+    403: { description: 'Operator access not allowed from this IP', content: { 'application/json': { schema: ErrorResponseSchema } } },
+  },
+});
+
+// GET /sync/gaps
+registry.registerPath({
+  method: 'get',
+  path: '/sync/gaps',
+  tags: ['Operational'],
+  summary: 'Ledger gap list (operator only)',
+  description: 'Returns ledger gaps with summary. Requires operator token.',
+  security: [{ operatorToken: [] }],
+  request: {
+    query: z.object({
+      status: z.enum(['Open', 'Repairing', 'Repaired', 'Failed']).optional(),
+      source: z.enum(['rpc_window_skip', 'reorg', 'manual']).optional(),
+      limit: z.coerce.number().int().positive().max(500).optional(),
+      offset: z.coerce.number().int().nonnegative().max(10000).optional(),
+    }),
+  },
+  responses: {
+    200: { description: 'Gap list', content: { 'application/json': { schema: z.record(z.string(), z.unknown()) } } },
+    401: { description: 'Missing or invalid operator token', content: { 'application/json': { schema: ErrorResponseSchema } } },
+    403: { description: 'Operator access not allowed from this IP', content: { 'application/json': { schema: ErrorResponseSchema } } },
+  },
+});
+
+// GET /sync/gaps/:id
+registry.registerPath({
+  method: 'get',
+  path: '/sync/gaps/{id}',
+  tags: ['Operational'],
+  summary: 'Single gap detail (operator only)',
+  description: 'Returns a single LedgerGap by ID. Requires operator token.',
+  security: [{ operatorToken: [] }],
+  request: { params: z.object({ id: z.string().openapi({ description: 'Gap ID' }) }) },
+  responses: {
+    200: { description: 'Gap detail', content: { 'application/json': { schema: z.record(z.string(), z.unknown()) } } },
+    400: { description: 'Invalid gap ID', content: { 'application/json': { schema: ErrorResponseSchema } } },
+    404: { description: 'Gap not found', content: { 'application/json': { schema: ErrorResponseSchema } } },
+    401: { description: 'Missing or invalid operator token', content: { 'application/json': { schema: ErrorResponseSchema } } },
+    403: { description: 'Operator access not allowed from this IP', content: { 'application/json': { schema: ErrorResponseSchema } } },
+  },
+});
+
+// GET /sync/jobs
+registry.registerPath({
+  method: 'get',
+  path: '/sync/jobs',
+  tags: ['Operational'],
+  summary: 'Backfill job list (operator only)',
+  description: 'Returns recent BackfillJob rows. Requires operator token.',
+  security: [{ operatorToken: [] }],
+  request: {
+    query: z.object({
+      status: z.enum(['Pending', 'Running', 'Completed', 'Failed', 'Cancelled']).optional(),
+    }),
+  },
+  responses: {
+    200: { description: 'Job list', content: { 'application/json': { schema: z.array(z.record(z.string(), z.unknown())) } } },
+    401: { description: 'Missing or invalid operator token', content: { 'application/json': { schema: ErrorResponseSchema } } },
+    403: { description: 'Operator access not allowed from this IP', content: { 'application/json': { schema: ErrorResponseSchema } } },
+  },
+});
+
+// GET /sync/jobs/:id
+registry.registerPath({
+  method: 'get',
+  path: '/sync/jobs/{id}',
+  tags: ['Operational'],
+  summary: 'Single backfill job (operator only)',
+  description: 'Returns a single BackfillJob by ID. Requires operator token.',
+  security: [{ operatorToken: [] }],
+  request: { params: z.object({ id: z.string().openapi({ description: 'Job ID' }) }) },
+  responses: {
+    200: { description: 'Job detail', content: { 'application/json': { schema: z.record(z.string(), z.unknown()) } } },
+    400: { description: 'Invalid job ID', content: { 'application/json': { schema: ErrorResponseSchema } } },
+    404: { description: 'Job not found', content: { 'application/json': { schema: ErrorResponseSchema } } },
+    401: { description: 'Missing or invalid operator token', content: { 'application/json': { schema: ErrorResponseSchema } } },
+    403: { description: 'Operator access not allowed from this IP', content: { 'application/json': { schema: ErrorResponseSchema } } },
+  },
+});
+
+// GET /admin/contracts
+registry.registerPath({
+  method: 'get',
+  path: '/admin/contracts',
+  tags: ['Admin'],
+  summary: 'List tracked contracts (operator only)',
+  description: 'Returns all tracked contracts with sync status. Requires operator token.',
+  security: [{ operatorToken: [] }],
+  responses: {
+    200: { description: 'Contract list', content: { 'application/json': { schema: z.array(z.record(z.string(), z.unknown())) } } },
+    401: { description: 'Missing or invalid operator token', content: { 'application/json': { schema: ErrorResponseSchema } } },
+    403: { description: 'Operator access not allowed from this IP', content: { 'application/json': { schema: ErrorResponseSchema } } },
+  },
+});
+
+// POST /admin/contracts
+registry.registerPath({
+  method: 'post',
+  path: '/admin/contracts',
+  tags: ['Admin'],
+  summary: 'Add tracked contract (operator only)',
+  description: 'Add a new contract to track. Body: { contractId, type, label?, startLedger? }. Requires operator token.',
+  security: [{ operatorToken: [] }],
+  request: {
+    body: {
+      content: {
+        'application/json': {
+          schema: z.object({
+            contractId: z.string().min(1),
+            type: z.enum(['marketplace', 'launchpad']),
+            label: z.string().default(''),
+            startLedger: z.number().int().min(0).default(0),
+          }),
+        },
+      },
+    },
+  },
+  responses: {
+    201: { description: 'Contract created', content: { 'application/json': { schema: z.record(z.string(), z.unknown()) } } },
+    400: { description: 'Invalid request body', content: { 'application/json': { schema: ErrorResponseSchema } } },
+    401: { description: 'Missing or invalid operator token', content: { 'application/json': { schema: ErrorResponseSchema } } },
+    403: { description: 'Operator access not allowed from this IP', content: { 'application/json': { schema: ErrorResponseSchema } } },
+  },
+});
+
+// DELETE /admin/contracts/:id
+registry.registerPath({
+  method: 'delete',
+  path: '/admin/contracts/{id}',
+  tags: ['Admin'],
+  summary: 'Deactivate tracked contract (operator only)',
+  description: 'Deactivate a tracked contract by DB ID. Requires operator token.',
+  security: [{ operatorToken: [] }],
+  request: { params: z.object({ id: z.string().openapi({ description: 'TrackedContract DB ID' }) }) },
+  responses: {
+    204: { description: 'Contract deactivated' },
+    400: { description: 'Invalid contract ID', content: { 'application/json': { schema: ErrorResponseSchema } } },
+    401: { description: 'Missing or invalid operator token', content: { 'application/json': { schema: ErrorResponseSchema } } },
+    403: { description: 'Operator access not allowed from this IP', content: { 'application/json': { schema: ErrorResponseSchema } } },
+  },
+});
+
+// GET /search
+registry.registerPath({
+  method: 'get',
+  path: '/search',
+  tags: ['Search'],
+  summary: 'Cross-entity full-text search',
+  description: 'Search across listings, auctions, and collections. Supports FTS for queries >= 3 chars, ILIKE fallback for shorter queries.',
+  request: {
+    query: z.object({
+      q: z.string().min(1),
+      types: z.string().default('listings,auctions,collections').optional(),
+      limit: z.coerce.number().int().positive().max(50).optional().default(10),
+    }),
+  },
+  responses: {
+    200: {
+      description: 'Search results grouped by entity type',
+      content: { 'application/json': { schema: z.record(z.string(), z.unknown()) } },
+    },
+    400: { description: 'Invalid query', content: { 'application/json': { schema: ErrorResponseSchema } } },
+  },
+});
+
+// GET /metrics
+registry.registerPath({
+  method: 'get',
+  path: '/metrics',
+  tags: ['System'],
+  summary: 'Prometheus metrics',
+  description: 'Exposes http_request_duration_seconds, latest_ledger_processed, network_latest_ledger, and sync_latency_ledgers.',
+  responses: {
+    200: {
+       description: 'Prometheus text format',
+       content: { 'text/plain': { schema: { type: 'string' } } },
+     },
+  },
+});
+
+// GET /openapi.json
+registry.registerPath({
+  method: 'get',
+  path: '/openapi.json',
+  tags: ['System'],
+  summary: 'OpenAPI specification',
+  description: 'Returns the machine-readable API specification.',
+  responses: {
+    200: {
+      description: 'OpenAPI 3.0 JSON document',
+      content: { 'application/json': { schema: z.record(z.string(), z.unknown()) } },
+    },
+  },
+});
+
+// GET /docs
+registry.registerPath({
+  method: 'get',
+  path: '/docs',
+  tags: ['System'],
+  summary: 'API documentation',
+  description: 'Human-readable API documentation page.',
+  responses: {
+    200: {
+      description: 'HTML documentation',
+      content: { 'text/html': { schema: { type: 'string' } } },
+    },
+  },
+});
+
+const securitySchemes = {
+  operatorToken: {
+    type: 'apiKey',
+    in: 'header' as const,
+    name: 'X-Operator-Token',
+  },
+};
+
+const generator = new OpenApiGeneratorV3(registry.definitions);
+
+export function buildOpenApiDocument() {
   return generator.generateDocument({
     openapi: '3.0.0',
     info: {
@@ -558,5 +837,9 @@ export function buildOpenApiDocument() {
       { url: 'http://localhost:4000', description: 'Local development' },
       { url: 'https://indexer.elcarehub.io', description: 'Production' },
     ],
+    components: {
+      securitySchemes,
+    },
+    security: [{ operatorToken: [] }],
   });
 }
