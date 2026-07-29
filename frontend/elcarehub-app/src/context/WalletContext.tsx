@@ -1,13 +1,21 @@
 "use client";
 
-import { createContext, useContext, ReactNode, useMemo, useCallback, useEffect, useState } from "react";
+import {
+  createContext,
+  useContext,
+  ReactNode,
+  useMemo,
+  useCallback,
+  useEffect,
+  useState,
+} from "react";
 import { useWallet, WalletState, WalletStatus } from "@/hooks/useWallet";
 import { useMagicWallet, MagicWalletState } from "@/hooks/useMagicWallet";
 import { useLobstrWallet } from "@/hooks/useLobstrWallet";
-import { 
-  saveWalletState, 
-  loadWalletState, 
-  clearWalletState, 
+import {
+  saveWalletState,
+  loadWalletState,
+  clearWalletState,
   clearPendingActionState,
   WalletConnectorId,
   // Legacy imports for backwards compat
@@ -15,8 +23,17 @@ import {
   clearWalletProvider,
 } from "@/lib/wallet-persistence";
 import { getWalletPreferences } from "@/lib/wallet-preferences";
+import { config } from "@/lib/config";
+import type { WalletAdapterError } from "@/lib/wallet-adapter";
+import {
+  useWalletErrorState,
+  resolveProviderError,
+  type WalletErrorState,
+} from "@/hooks/useWalletState";
 
 export type WalletType = "freighter" | "lobstr" | "magic" | null;
+
+// ── Unified wallet state ──────────────────────────────────────────────────────
 
 export interface UnifiedWalletState {
   walletType: WalletType;
@@ -26,6 +43,7 @@ export interface UnifiedWalletState {
   isConnected: boolean;
   isConnecting: boolean;
   isWrongNetwork: boolean;
+  /** @deprecated Use `walletErrorState` for typed errors. Kept for back-compat. */
   error: string | null;
   status: WalletStatus | "MAGIC_CONNECTED" | "DISCONNECTED";
   networkPassphrase: string | null;
@@ -41,6 +59,44 @@ export interface UnifiedWalletState {
   connectLobstr: () => Promise<void>;
   connectMagicEmail: (email: string) => Promise<void>;
   connectMagicPasskey: () => Promise<void>;
+
+  // ── Structured error state (new) ──────────────────────────────────────────
+
+  /**
+   * Per-plane structured error state. Prefer this over `error` (string) for
+   * any new UI that needs contextual guidance or typed error handling.
+   *
+   * Planes:
+   *   connection  — install / rejection / wrong-network / account-unavailable
+   *   signing     — user declined signing / sign failed
+   *   transaction — simulation failure / RPC error / indexer timeout
+   *   general     — unexpected catch-all
+   */
+  walletErrorState: WalletErrorState;
+
+  /**
+   * Highest-priority active error across all planes.
+   * Priority order: signing > connection > transaction > general.
+   */
+  activeWalletError: WalletAdapterError | null;
+
+  /** True when any error plane has a value. */
+  hasWalletError: boolean;
+
+  /**
+   * Set an error on the signing plane (call from transaction hooks after a
+   * wallet rejection or sign failure).
+   */
+  setSigningError(raw: unknown): void;
+
+  /**
+   * Set an error on the transaction plane (call from contract.ts / useTxLifecycle
+   * after an RPC or simulation error).
+   */
+  setTransactionError(raw: unknown): void;
+
+  /** Clear all error planes (called on disconnect, modal close, or retry). */
+  clearAllWalletErrors(): void;
 }
 
 const WalletContext = createContext<UnifiedWalletState | null>(null);
@@ -51,46 +107,59 @@ export function WalletProvider({ children }: { children: ReactNode }) {
   const magic = useMagicWallet();
   const [initialized, setInitialized] = useState(false);
 
-  // Auto-reconnect on mount (respects user preference and expiration)
+  // Structured error state
+  const {
+    walletErrorState,
+    activeError: activeWalletError,
+    hasError: hasWalletError,
+    setConnectionError,
+    setSigningError,
+    setTransactionError,
+    clearAllErrors: clearAllWalletErrors,
+    clearConnectionError,
+  } = useWalletErrorState();
+
+  // ── Auto-reconnect on mount ────────────────────────────────────────────────
   useEffect(() => {
     const reconnect = async () => {
       const prefs = getWalletPreferences();
-      
-      // If user disabled auto-connect or remember-wallet, skip
+
       if (!prefs.autoConnect || !prefs.rememberWallet) {
         setInitialized(true);
         return;
       }
 
-      // Try to load persisted wallet state
       const savedWallet = loadWalletState();
       if (!savedWallet) {
         setInitialized(true);
         return;
       }
 
-      // If state is expired or corrupted, it will have been cleared by loadWalletState
       try {
-        if (savedWallet.connectorId === 'freighter' && freighter.isInstalled) {
+        if (savedWallet.connectorId === "freighter" && freighter.isInstalled) {
           await freighter.connect();
-        } else if (savedWallet.connectorId === 'lobstr' && lobstr.isInstalled) {
+        } else if (savedWallet.connectorId === "lobstr" && lobstr.isInstalled) {
           await lobstr.connect();
-        } else if (savedWallet.connectorId === 'magic') {
+        } else if (savedWallet.connectorId === "magic") {
           await magic.refresh();
         } else {
           clearWalletState();
         }
       } catch (err) {
-        console.error('Auto-reconnect failed:', err);
+        console.error("Auto-reconnect failed:", err);
         clearWalletState();
+        // Don't surface auto-reconnect errors to the user — they'll see the
+        // disconnected state and can connect manually.
       } finally {
         setInitialized(true);
       }
     };
 
     reconnect();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []); // Only on mount
 
+  // ── Derive active provider ─────────────────────────────────────────────────
   const walletType: WalletType = freighter.isConnected
     ? "freighter"
     : lobstr.isConnected
@@ -105,9 +174,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     ? lobstr
     : null;
 
-  const publicKey =
-    activeWallet?.publicKey ?? magic.publicAddress ?? null;
-
+  const publicKey = activeWallet?.publicKey ?? magic.publicAddress ?? null;
   const balance = activeWallet?.balance ?? null;
   const isLoadingBalance = activeWallet?.isLoadingBalance ?? false;
 
@@ -119,63 +186,136 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     ? "MAGIC_CONNECTED"
     : "DISCONNECTED";
 
+  // ── Sync provider string errors → structured connection error ──────────────
+  // This runs on every render but is guarded by the reducer's identity check
+  // so it only dispatches when something actually changes.
+  useEffect(() => {
+    // Resolve the active provider's error into a typed WalletAdapterError
+    let resolved: WalletAdapterError | null = null;
+
+    if (walletType === "freighter") {
+      resolved = resolveProviderError({
+        rawError: freighter.error,
+        isWrongNetwork: freighter.isWrongNetwork,
+        isInstalled: freighter.isInstalled,
+        networkPassphrase: freighter.networkPassphrase,
+        expectedPassphrase: config.networkPassphrase,
+        providerName: "Freighter",
+      });
+    } else if (walletType === "lobstr") {
+      resolved = resolveProviderError({
+        rawError: lobstr.error,
+        isWrongNetwork: lobstr.isWrongNetwork,
+        isInstalled: lobstr.isInstalled,
+        networkPassphrase: lobstr.networkPassphrase,
+        expectedPassphrase: config.networkPassphrase,
+        providerName: "Lobstr",
+      });
+    } else if (walletType === "magic") {
+      resolved = magic.error
+        ? { kind: "UNKNOWN", message: magic.error }
+        : null;
+    }
+
+    if (resolved) {
+      setConnectionError(resolved);
+    } else {
+      clearConnectionError();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    walletType,
+    freighter.error,
+    freighter.isWrongNetwork,
+    lobstr.error,
+    lobstr.isWrongNetwork,
+    magic.error,
+  ]);
+
+  // ── Legacy `error` string (backwards compat) ───────────────────────────────
+  const legacyError: string | null =
+    freighter.error ?? lobstr.error ?? magic.error ?? null;
+
+  // ── Actions ────────────────────────────────────────────────────────────────
   const connect = useCallback(async () => {
-    // Default connect tries Freighter first
     await freighter.connect();
   }, [freighter]);
 
   const disconnect = useCallback(() => {
-    // Clear pending action state on disconnect (safety: prevents orphaned state)
     clearPendingActionState();
-    
     freighter.disconnect();
     lobstr.disconnect();
-    // Magic logout is async; fire and forget
     if (magic.isConnected) magic.logout().catch(console.error);
     clearWalletState();
-  }, [freighter, lobstr, magic]);
+    clearAllWalletErrors();
+  }, [freighter, lobstr, magic, clearAllWalletErrors]);
 
   const refresh = useCallback(async () => {
     await Promise.all([freighter.refresh(), lobstr.refresh()]);
   }, [freighter, lobstr]);
 
-  // Wrapper to persist provider choice with new schema
+  // ── Per-wallet connect helpers with persistence ────────────────────────────
   const connectFreighterWithPersist = useCallback(async () => {
-    await freighter.connect();
-    if (freighter.isConnected && freighter.publicKey) {
-      // Persist wallet state: address + connector + network
-      const chainId = freighter.networkPassphrase === 'Test SDF Network ; September 2015'
-        ? 0 // Testnet
-        : 1; // Public
-      saveWalletState(freighter.publicKey, 'freighter', chainId);
+    clearAllWalletErrors();
+    try {
+      await freighter.connect();
+      if (freighter.isConnected && freighter.publicKey) {
+        const chainId =
+          freighter.networkPassphrase === "Test SDF Network ; September 2015"
+            ? 0
+            : 1;
+        saveWalletState(freighter.publicKey, "freighter", chainId);
+      }
+    } catch (err) {
+      setConnectionError(err);
+      throw err;
     }
-  }, [freighter]);
+  }, [freighter, clearAllWalletErrors, setConnectionError]);
 
   const connectLobstrWithPersist = useCallback(async () => {
-    await lobstr.connect();
-    if (lobstr.isConnected && lobstr.publicKey) {
-      // Lobstr doesn't expose network passphrase; default to chainId 1 (public)
-      saveWalletState(lobstr.publicKey, 'lobstr', 1);
+    clearAllWalletErrors();
+    try {
+      await lobstr.connect();
+      if (lobstr.isConnected && lobstr.publicKey) {
+        saveWalletState(lobstr.publicKey, "lobstr", 1);
+      }
+    } catch (err) {
+      setConnectionError(err);
+      throw err;
     }
-  }, [lobstr]);
+  }, [lobstr, clearAllWalletErrors, setConnectionError]);
 
-  // Magic connect wrappers
-  const connectMagicEmail = useCallback(async (email: string) => {
-    await magic.loginWithEmail(email);
-    if (magic.isConnected && magic.publicAddress) {
-      // Magic network: assume public (1)
-      saveWalletState(magic.publicAddress, 'magic', 1);
-    }
-  }, [magic]);
+  const connectMagicEmail = useCallback(
+    async (email: string) => {
+      clearAllWalletErrors();
+      try {
+        await magic.loginWithEmail(email);
+        if (magic.isConnected && magic.publicAddress) {
+          saveWalletState(magic.publicAddress, "magic", 1);
+        }
+      } catch (err) {
+        setConnectionError(err);
+        throw err;
+      }
+    },
+    [magic, clearAllWalletErrors, setConnectionError]
+  );
 
   const connectMagicPasskey = useCallback(async () => {
-    await magic.loginWithPasskey();
-    if (magic.isConnected && magic.publicAddress) {
-      saveWalletState(magic.publicAddress, 'magic', 1);
+    clearAllWalletErrors();
+    try {
+      await magic.loginWithPasskey();
+      if (magic.isConnected && magic.publicAddress) {
+        saveWalletState(magic.publicAddress, "magic", 1);
+      }
+    } catch (err) {
+      setConnectionError(err);
+      throw err;
     }
-  }, [magic]);
+  }, [magic, clearAllWalletErrors, setConnectionError]);
 
-  const value = useMemo(
+  // ── Context value ─────────────────────────────────────────────────────────
+  const value = useMemo<UnifiedWalletState>(
     () => ({
       walletType,
       publicKey,
@@ -187,7 +327,8 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       isWrongNetwork: activeWallet?.isWrongNetwork ?? false,
       networkPassphrase: activeWallet?.networkPassphrase ?? null,
       isInstalled: freighter.isInstalled || lobstr.isInstalled,
-      error: freighter.error ?? lobstr.error ?? magic.error,
+      // Legacy string error (back-compat)
+      error: legacyError,
       status,
       connect,
       disconnect,
@@ -199,6 +340,13 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       connectLobstr: connectLobstrWithPersist,
       connectMagicEmail,
       connectMagicPasskey,
+      // Structured error state
+      walletErrorState,
+      activeWalletError,
+      hasWalletError,
+      setSigningError,
+      setTransactionError,
+      clearAllWalletErrors,
     }),
     [
       walletType,
@@ -207,6 +355,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       isLoadingBalance,
       status,
       activeWallet,
+      legacyError,
       freighter,
       lobstr,
       magic,
@@ -217,6 +366,12 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       connectLobstrWithPersist,
       connectMagicEmail,
       connectMagicPasskey,
+      walletErrorState,
+      activeWalletError,
+      hasWalletError,
+      setSigningError,
+      setTransactionError,
+      clearAllWalletErrors,
     ]
   );
 

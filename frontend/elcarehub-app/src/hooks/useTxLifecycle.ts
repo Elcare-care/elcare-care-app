@@ -160,18 +160,26 @@ export function classifyTxError(err: unknown): TxErrorCategory {
     msg.includes("user rejected") ||
     msg.includes("rejected by user") ||
     msg.includes("cancelled") ||
-    msg.includes("canceled")
+    msg.includes("canceled") ||
+    msg.includes("user denied") ||
+    msg.includes("sign request was rejected") ||
+    msg.includes("request rejected") ||
+    msg.includes("declined")
   ) {
     return "wallet_rejection";
   }
 
-  // Soroban simulation failures
+  // Soroban simulation / preflight failures
   if (
     msg.includes("simulation") ||
     msg.includes("simulate") ||
     msg.includes("preflight") ||
     msg.includes("contract error") ||
-    msg.includes("invoke_host_function")
+    msg.includes("invoke_host_function") ||
+    msg.includes("insufficient funds") ||
+    msg.includes("insufficient balance") ||
+    msg.includes("below minimum") ||
+    msg.includes("error(contract")
   ) {
     return "simulation_failure";
   }
@@ -185,12 +193,60 @@ export function classifyTxError(err: unknown): TxErrorCategory {
     msg.includes("submit") ||
     msg.includes("503") ||
     msg.includes("502") ||
-    msg.includes("429")
+    msg.includes("429") ||
+    msg.includes("econnreset") ||
+    msg.includes("econnrefused") ||
+    msg.includes("etimedout") ||
+    msg.includes("fetch failed") ||
+    msg.includes("failed to fetch")
   ) {
     return "rpc_failure";
   }
 
   return "unknown";
+}
+
+/**
+ * Build a user-facing error message from a raw error, enriching the raw
+ * message with context about the transaction action where helpful.
+ *
+ * Returns a plain string suitable for display in TxErrorPanel.
+ */
+export function buildTxErrorMessage(
+  err: unknown,
+  action: string,
+  category: TxErrorCategory
+): string {
+  const raw = err instanceof Error ? err.message : typeof err === "string" ? err : "";
+
+  switch (category) {
+    case "wallet_rejection":
+      return `You declined the ${action} request in your wallet. Nothing was submitted.`;
+
+    case "simulation_failure": {
+      // Surface contract error codes when present
+      const codeMatch = raw.match(/error\(contract,\s*#(\d+)\)/i);
+      const code = codeMatch ? ` (contract error #${codeMatch[1]})` : "";
+      if (raw.toLowerCase().includes("insufficient")) {
+        return `Insufficient funds to complete this ${action}. Check your balance and try again.${code}`;
+      }
+      return `${action} could not be simulated${code}. Refresh the page and try again — the listing state may have changed.`;
+    }
+
+    case "rpc_failure":
+      if (raw.includes("429"))
+        return `The Stellar network is busy. Wait a moment and retry your ${action}.`;
+      if (raw.toLowerCase().includes("timeout"))
+        return `The network request timed out while processing your ${action}. Try again.`;
+      return `A network error occurred during ${action}. Check your connection and try again.`;
+
+    case "indexer_delay":
+      return `Your ${action} was confirmed on-chain but the indexer hasn't caught up yet. This usually resolves within 30 seconds.`;
+
+    case "unknown":
+    default:
+      return raw || `${action} failed. Please try again.`;
+  }
 }
 
 /** Attempt to extract a transaction hash from a raw SDK result. */
@@ -326,10 +382,7 @@ export function useTxLifecycle(
         }
 
         const category = classifyTxError(err);
-        const message =
-          err instanceof Error
-            ? err.message
-            : `${action} failed. Please try again.`;
+        const message  = buildTxErrorMessage(err, action, category);
         transition({
           state: "error",
           error: { category, message, originalError: err },
