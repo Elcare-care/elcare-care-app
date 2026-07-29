@@ -100,6 +100,7 @@ The platform celebrates African heritage — from Benin bronze sculptures to Tin
 - Redis caching with per-endpoint TTL
 - Server-Sent Events (SSE) for live UI updates
 - Backfill CLI for replaying missed ledger ranges
+- Tiered retention and archival for event history (see `docs/retention-archival.md`)
 
 ---
 
@@ -295,6 +296,9 @@ npm run test:e2e
 ## API Reference
 
 Base URL: `http://localhost:4000`
+
+- **OpenAPI spec**: `GET /openapi.json` (machine-readable)
+- **SSE protocol**: see `docs/sse-protocol.md`
 
 ### Listings
 
