@@ -414,6 +414,19 @@ export const backfillLockContentions = new client.Counter({
   help: 'Number of times a BackfillJob advisory lock was already held by another worker',
 });
 
+// ── User-facing transaction error metrics (#417) ──────────────────────────────
+
+/**
+ * Counts every user-facing transaction error by category.
+ * Increment whenever a write action (listing, purchase, bid, offer, deploy)
+ * fails and the error is surfaced to the user. Labels match TxErrorCategory.
+ */
+export const txSubmissionErrorsTotal = new client.Counter({
+  name: 'elcarehub_tx_submission_errors_total',
+  help: 'Total user-facing transaction submission errors, by category',
+  labelNames: ['category'],
+});
+
 // ── Dead-letter metrics (#287) ────────────────────────────────────────────────
 
 /** Total events that failed to parse and were persisted to dead-letter storage. */
