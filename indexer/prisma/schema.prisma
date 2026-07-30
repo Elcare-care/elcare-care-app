@@ -492,6 +492,8 @@ model ReconciliationRun {
   completedAt         DateTime?
   sampledListings     Int           @default(0)
   sampledAuctions     Int           @default(0)
+  sampledOffers       Int           @default(0)
+  sampledCollections  Int           @default(0)
   discrepanciesFound  Int           @default(0)
   repairsApplied      Int           @default(0)
   skippedRecords      Int           @default(0)

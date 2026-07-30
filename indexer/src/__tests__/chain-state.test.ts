@@ -34,6 +34,11 @@ import {
   fetchAuctionOnChain,
   fetchListingsBatch,
   fetchAuctionsBatch,
+  buildOfferKey,
+  decodeOfferEntry,
+  fetchOfferOnChain,
+  fetchOffersBatch,
+  decodeCollectionEntry,
 } from '../chain-state';
 
 // ── Test constants ────────────────────────────────────────────────────────────
@@ -504,5 +509,232 @@ describe('fetchAuctionsBatch', () => {
     expect(entry7).not.toBeNull();
     expect(entry7!.status).toBe('Finalized');
     expect(result.get('8')).toBeNull();
+  });
+});
+
+// ── Offer ScVal fixture ───────────────────────────────────────────────────────
+
+function makeOfferScVal(opts: {
+  status?: string;
+  amount?: bigint;
+  offerer?: string | null;
+  expiresAt?: bigint | null;
+} = {}): xdr.ScVal {
+  const {
+    status    = 'Pending',
+    amount    = 500_000_000n,
+    offerer   = null,
+    expiresAt = null,
+  } = opts;
+
+  return xdr.ScVal.scvMap([
+    new xdr.ScMapEntry({
+      key: xdr.ScVal.scvSymbol('status'),
+      val: xdr.ScVal.scvSymbol(status),
+    }),
+    new xdr.ScMapEntry({
+      key: xdr.ScVal.scvSymbol('amount'),
+      val: nativeToScVal(amount, { type: 'i128' }),
+    }),
+    new xdr.ScMapEntry({
+      key: xdr.ScVal.scvSymbol('offerer'),
+      val: offerer == null
+        ? xdr.ScVal.scvVoid()
+        : nativeToScVal(offerer, { type: 'address' }),
+    }),
+    new xdr.ScMapEntry({
+      key: xdr.ScVal.scvSymbol('expires_at'),
+      val: expiresAt == null
+        ? xdr.ScVal.scvVoid()
+        : nativeToScVal(expiresAt, { type: 'u64' }),
+    }),
+  ]);
+}
+
+// ── buildOfferKey ─────────────────────────────────────────────────────────────
+
+describe('buildOfferKey', () => {
+  it('produces an ScvMap with one Offer→ScvU64 entry', () => {
+    const key = buildOfferKey(7n);
+    const entries = key.map()!;
+    expect(entries).toHaveLength(1);
+    expect(entries[0].key().sym()).toBe('Offer');
+    expect(scValToNative(entries[0].val())).toBe(7n);
+  });
+
+  it('produces distinct XDR from buildListingKey and buildAuctionKey for the same id', () => {
+    const id = 42n;
+    expect(buildOfferKey(id).toXDR('base64')).not.toBe(buildListingKey(id).toXDR('base64'));
+    expect(buildOfferKey(id).toXDR('base64')).not.toBe(buildAuctionKey(id).toXDR('base64'));
+  });
+
+  it('serialises id=0n without throwing', () => {
+    expect(() => buildOfferKey(0n).toXDR('base64')).not.toThrow();
+    expect(scValToNative(buildOfferKey(0n).map()![0].val())).toBe(0n);
+  });
+});
+
+// ── decodeOfferEntry ──────────────────────────────────────────────────────────
+
+describe('decodeOfferEntry — status variants', () => {
+  it.each([['Pending'], ['Accepted'], ['Rejected'], ['Withdrawn']])(
+    'decodes %s status',
+    (status) => {
+      const native = scValToNative(makeOfferScVal({ status })) as Record<string, unknown>;
+      expect(decodeOfferEntry(native).status).toBe(status);
+    }
+  );
+
+  it('throws on unknown status', () => {
+    const native = scValToNative(makeOfferScVal({ status: 'Active' })) as Record<string, unknown>;
+    expect(() => decodeOfferEntry(native)).toThrow(/offer/);
+  });
+
+  it('throws on Reclaimed (indexer-only synthetic status)', () => {
+    const native = scValToNative(makeOfferScVal({ status: 'Reclaimed' })) as Record<string, unknown>;
+    expect(() => decodeOfferEntry(native)).toThrow(/offer/);
+  });
+});
+
+describe('decodeOfferEntry — amount field', () => {
+  it('formats 0n amount as "0.0000000"', () => {
+    const native = scValToNative(makeOfferScVal({ amount: 0n })) as Record<string, unknown>;
+    expect(decodeOfferEntry(native).amount).toBe('0.0000000');
+  });
+
+  it('formats non-zero amount correctly', () => {
+    const native = scValToNative(makeOfferScVal({ amount: 1_500_000_000n })) as Record<string, unknown>;
+    expect(decodeOfferEntry(native).amount).toBe('1500000000.0000000');
+  });
+});
+
+describe('decodeOfferEntry — Option<offerer>', () => {
+  it('returns null when offerer is None (ScvVoid)', () => {
+    const native = scValToNative(makeOfferScVal({ offerer: null })) as Record<string, unknown>;
+    expect(decodeOfferEntry(native).offerer).toBeNull();
+  });
+
+  it('returns address string when offerer is Some', () => {
+    const addr = 'GA5WUJ54Z23KILLCUOUNAKTPBVZWKMQVO4O6EQ5GHLAERIMLLHNCSKYH';
+    const native = scValToNative(makeOfferScVal({ offerer: addr })) as Record<string, unknown>;
+    expect(decodeOfferEntry(native).offerer).toBe(addr);
+  });
+});
+
+describe('decodeOfferEntry — Option<expires_at>', () => {
+  it('returns null when expires_at is None', () => {
+    const native = scValToNative(makeOfferScVal({ expiresAt: null })) as Record<string, unknown>;
+    expect(decodeOfferEntry(native).expiresAt).toBeNull();
+  });
+
+  it('returns bigint when expires_at is Some', () => {
+    const native = scValToNative(makeOfferScVal({ expiresAt: 2_000_000_000n })) as Record<string, unknown>;
+    expect(decodeOfferEntry(native).expiresAt).toBe(2_000_000_000n);
+  });
+});
+
+// ── fetchOfferOnChain — RPC behaviour ────────────────────────────────────────
+
+describe('fetchOfferOnChain — entry not found', () => {
+  it('returns null when getLedgerEntries returns empty entries', async () => {
+    const server = mockServer({ entries: [] });
+    const result = await fetchOfferOnChain(server, TEST_CONTRACT, 1n);
+    expect(result).toBeNull();
+  });
+});
+
+describe('fetchOfferOnChain — XDR round-trip', () => {
+  it('decodes a Pending offer with no offerer or expiry', async () => {
+    const scVal = makeOfferScVal({ status: 'Pending', amount: 250_000_000n });
+    const server = mockServer({ entries: [makeEntryResult(buildOfferKey(10n), scVal)] });
+    const result = await fetchOfferOnChain(server, TEST_CONTRACT, 10n);
+
+    expect(result).not.toBeNull();
+    expect(result!.status).toBe('Pending');
+    expect(result!.amount).toBe('250000000.0000000');
+    expect(result!.offerer).toBeNull();
+    expect(result!.expiresAt).toBeNull();
+  });
+
+  it('decodes an Accepted offer with offerer and expiry set', async () => {
+    const addr = 'GA5WUJ54Z23KILLCUOUNAKTPBVZWKMQVO4O6EQ5GHLAERIMLLHNCSKYH';
+    const scVal = makeOfferScVal({ status: 'Accepted', amount: 100n, offerer: addr, expiresAt: 9_999n });
+    const server = mockServer({ entries: [makeEntryResult(buildOfferKey(20n), scVal)] });
+    const result = await fetchOfferOnChain(server, TEST_CONTRACT, 20n);
+
+    expect(result!.status).toBe('Accepted');
+    expect(result!.offerer).toBe(addr);
+    expect(result!.expiresAt).toBe(9_999n);
+  });
+});
+
+// ── fetchOffersBatch ──────────────────────────────────────────────────────────
+
+describe('fetchOffersBatch', () => {
+  it('returns empty map without calling RPC for empty input', async () => {
+    const server = { getLedgerEntries: vi.fn() } as any;
+    const result = await fetchOffersBatch(server, TEST_CONTRACT, []);
+    expect(result.size).toBe(0);
+    expect(server.getLedgerEntries).not.toHaveBeenCalled();
+  });
+
+  it('maps all ids to null when RPC throws', async () => {
+    const server = mockServer({ throws: new Error('network error') });
+    const result = await fetchOffersBatch(server, TEST_CONTRACT, [100n, 200n]);
+    expect(result.get('100')).toBeNull();
+    expect(result.get('200')).toBeNull();
+  });
+
+  it('decodes matched entries and maps missing ids to null', async () => {
+    const scVal = makeOfferScVal({ status: 'Withdrawn', amount: 999n });
+    const server = mockServer({ entries: [makeEntryResult(buildOfferKey(50n), scVal)] });
+    const result = await fetchOffersBatch(server, TEST_CONTRACT, [50n, 51n]);
+
+    const entry50 = result.get('50');
+    expect(entry50).not.toBeNull();
+    expect(entry50!.status).toBe('Withdrawn');
+    expect(result.get('51')).toBeNull();
+  });
+});
+
+// ── decodeCollectionEntry ─────────────────────────────────────────────────────
+
+describe('decodeCollectionEntry', () => {
+  it('extracts numeric platform_fee_bps', () => {
+    const native: Record<string, unknown> = {
+      platform_fee_bps: 500, kind: 'Normal721', creator: 'GCREATOR',
+    };
+    const result = decodeCollectionEntry(native);
+    expect(result.feeBpsOverride).toBe(500);
+    expect(result.kind).toBe('Normal721');
+    expect(result.creator).toBe('GCREATOR');
+  });
+
+  it('extracts bigint platform_fee_bps (contract may return u32 as bigint)', () => {
+    const native: Record<string, unknown> = {
+      platform_fee_bps: 250n, kind: 'LazyMint1155', creator: null,
+    };
+    const result = decodeCollectionEntry(native);
+    expect(result.feeBpsOverride).toBe(250);
+    expect(result.kind).toBe('LazyMint1155');
+    expect(result.creator).toBeNull();
+  });
+
+  it('returns null feeBpsOverride when field is missing', () => {
+    const native: Record<string, unknown> = { kind: 'Normal1155' };
+    const result = decodeCollectionEntry(native);
+    expect(result.feeBpsOverride).toBeNull();
+  });
+
+  it('returns null kind when field is absent or non-string', () => {
+    const native: Record<string, unknown> = { platform_fee_bps: 100, kind: 42 };
+    const result = decodeCollectionEntry(native);
+    expect(result.kind).toBeNull();
+  });
+
+  it('returns null creator when field is absent or non-string', () => {
+    const native: Record<string, unknown> = { creator: undefined };
+    const result = decodeCollectionEntry(native);
+    expect(result.creator).toBeNull();
   });
 });
