@@ -7,7 +7,7 @@
 import { useState, useCallback, useEffect } from "react";
 import { StrKey } from "@stellar/stellar-sdk";
 import { useWallet } from "@/hooks/useWallet";
-import { useAdminStats, useModeration, useTokenManagement, useAdminCheck, useAdminTransfer, usePauseControls, useAuctionConfig, PAUSABLE_FUNCTIONS, type PausableFunction } from "@/hooks/useAdmin";
+import { useAdminStats, useModeration, useTokenManagement, useAdminCheck, useAdminTransfer, usePauseControls, useAuctionConfig, useListingOversight, PAUSABLE_FUNCTIONS, type PausableFunction } from "@/hooks/useAdmin";
 import { useAdminSession } from "@/hooks/useAdminSession";
 import { AdminConfirmationModal } from "@/components/AdminConfirmationModal";
 import {
@@ -31,11 +31,13 @@ import {
     Clock,
     X,
     ChevronRight,
+    ChevronLeft,
     AlertTriangle,
     ShieldOff,
     ToggleLeft,
     ToggleRight,
     Zap,
+    List,
 } from "lucide-react";
 import { stroopsToXlm } from "@/lib/contract";
 
@@ -115,6 +117,20 @@ export default function AdminPage() {
         setExtensionWindow,
         setExtensionTrigger,
     } = useAuctionConfig(publicKey);
+
+    // Listing oversight with search + pagination
+    const {
+        listings: oversightListings,
+        totalCount: oversightTotal,
+        page: oversightPage,
+        totalPages: oversightTotalPages,
+        setPage: setOversightPage,
+        filter: oversightFilter,
+        setFilter: setOversightFilter,
+        isLoading: isOversightLoading,
+        error: oversightError,
+        refresh: refreshOversight,
+    } = useListingOversight(isAdmin ? publicKey : null);
 
     // Collection rows for circuit-breaker (loaded from indexer on mount)
     const [collectionPauseRows, setCollectionPauseRows] = useState<
@@ -1114,7 +1130,128 @@ export default function AdminPage() {
                         )}
                     </section>
                 </div>
-            </div >
+
+                {/* ── Listing Oversight ────────────────────────────────────────── */}
+                <section className="mt-8 rounded-3xl bg-white p-8 shadow-sm border border-brand-100">
+                    <div className="mb-6 flex items-center justify-between gap-3">
+                        <div className="flex items-center gap-3">
+                            <div className="rounded-xl bg-brand-100 p-2.5">
+                                <List className="h-6 w-6 text-brand-600" />
+                            </div>
+                            <div>
+                                <h2 className="font-display text-2xl font-bold text-midnight-950">Listing Oversight</h2>
+                                <p className="text-sm text-gray-500 mt-0.5">
+                                    {isOversightLoading ? "Loading…" : `${oversightTotal} listing${oversightTotal !== 1 ? "s" : ""} total`}
+                                </p>
+                            </div>
+                        </div>
+                        <button
+                            type="button"
+                            onClick={refreshOversight}
+                            className="flex items-center gap-2 rounded-full border border-gray-200 bg-white px-4 py-2 text-sm font-semibold text-gray-600 hover:bg-gray-50 transition-all"
+                        >
+                            <Loader2 className={`h-3.5 w-3.5 ${isOversightLoading ? "animate-spin" : ""}`} />
+                            Refresh
+                        </button>
+                    </div>
+
+                    {/* Filter */}
+                    <div className="mb-4 relative">
+                        <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-gray-400" />
+                        <input
+                            type="text"
+                            placeholder="Filter by artist, collection, or status…"
+                            value={oversightFilter}
+                            onChange={(e) => { setOversightFilter(e.target.value); setOversightPage(0); }}
+                            className="w-full rounded-xl border border-gray-200 py-3 pl-10 pr-4 text-sm focus:border-brand-500 focus:outline-none focus:ring-1 focus:ring-brand-500"
+                        />
+                    </div>
+
+                    {oversightError && (
+                        <div className="mb-4 flex items-center gap-2 rounded-xl bg-red-50 p-4 text-sm text-red-600 border border-red-100">
+                            <AlertCircle className="h-4 w-4 shrink-0" />{oversightError}
+                        </div>
+                    )}
+
+                    {isOversightLoading ? (
+                        <div className="flex items-center justify-center py-16 text-gray-400">
+                            <Loader2 className="h-6 w-6 animate-spin mr-3" />
+                            <span className="text-sm font-medium">Loading listings…</span>
+                        </div>
+                    ) : oversightListings.length === 0 ? (
+                        <div className="flex flex-col items-center justify-center py-16 text-gray-400">
+                            <List className="h-10 w-10 mb-3 opacity-30" />
+                            <p className="text-sm font-medium">
+                                {oversightFilter ? "No listings match the current filter." : "No listings found."}
+                            </p>
+                        </div>
+                    ) : (
+                        <div className="overflow-x-auto rounded-2xl border border-gray-100">
+                            <table className="w-full text-sm">
+                                <thead>
+                                    <tr className="border-b border-gray-100 bg-gray-50/60">
+                                        <th className="px-4 py-3 text-left text-xs font-bold uppercase tracking-wider text-gray-400">ID</th>
+                                        <th className="px-4 py-3 text-left text-xs font-bold uppercase tracking-wider text-gray-400">Artist</th>
+                                        <th className="px-4 py-3 text-left text-xs font-bold uppercase tracking-wider text-gray-400">Collection</th>
+                                        <th className="px-4 py-3 text-left text-xs font-bold uppercase tracking-wider text-gray-400">Status</th>
+                                        <th className="px-4 py-3 text-right text-xs font-bold uppercase tracking-wider text-gray-400">Created</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {oversightListings.map((l) => (
+                                        <tr key={l.listing_id} className="border-b border-gray-50 hover:bg-gray-50/40 transition-colors">
+                                            <td className="px-4 py-3 font-mono text-xs text-gray-600">#{l.listing_id}</td>
+                                            <td className="px-4 py-3 font-mono text-xs text-gray-700 max-w-[160px] truncate" title={l.artist}>{l.artist}</td>
+                                            <td className="px-4 py-3 font-mono text-xs text-gray-700 max-w-[160px] truncate" title={l.collection}>{l.collection}</td>
+                                            <td className="px-4 py-3">
+                                                <span className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-semibold ${
+                                                    l.status === "Active"
+                                                        ? "bg-green-50 text-green-700"
+                                                        : l.status === "Sold"
+                                                        ? "bg-blue-50 text-blue-700"
+                                                        : "bg-gray-100 text-gray-500"
+                                                }`}>
+                                                    {l.status}
+                                                </span>
+                                            </td>
+                                            <td className="px-4 py-3 text-right text-xs text-gray-400">
+                                                {new Date(l.created_at * 1000).toLocaleDateString()}
+                                            </td>
+                                        </tr>
+                                    ))}
+                                </tbody>
+                            </table>
+                        </div>
+                    )}
+
+                    {/* Pagination */}
+                    {oversightTotalPages > 1 && (
+                        <div className="mt-4 flex items-center justify-between text-sm text-gray-500">
+                            <span>
+                                Page {oversightPage + 1} of {oversightTotalPages} ({oversightTotal} total)
+                            </span>
+                            <div className="flex items-center gap-2">
+                                <button
+                                    type="button"
+                                    disabled={oversightPage === 0}
+                                    onClick={() => setOversightPage((p) => Math.max(0, p - 1))}
+                                    className="flex items-center gap-1 rounded-lg border border-gray-200 px-3 py-1.5 text-xs font-semibold hover:bg-gray-50 disabled:opacity-40 disabled:cursor-not-allowed transition-all"
+                                >
+                                    <ChevronLeft className="h-3.5 w-3.5" /> Prev
+                                </button>
+                                <button
+                                    type="button"
+                                    disabled={oversightPage >= oversightTotalPages - 1}
+                                    onClick={() => setOversightPage((p) => Math.min(oversightTotalPages - 1, p + 1))}
+                                    className="flex items-center gap-1 rounded-lg border border-gray-200 px-3 py-1.5 text-xs font-semibold hover:bg-gray-50 disabled:opacity-40 disabled:cursor-not-allowed transition-all"
+                                >
+                                    Next <ChevronRight className="h-3.5 w-3.5" />
+                                </button>
+                            </div>
+                        </div>
+                    )}
+                </section>
+            </div>
 
             <AdminConfirmationModal
                 isOpen={confirmConfig.isOpen}
