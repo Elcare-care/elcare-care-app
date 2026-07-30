@@ -152,6 +152,12 @@ const COLLECTION_NFT_ERC1155_ERRORS: ContractErrorDefinition[] = [
   { code: 12, name: "InvalidBps", message: "The royalty basis-points value is invalid.", retryable: false, action: "adjust_input" },
   { code: 13, name: "AlreadyMigrated", message: "This collection has already been migrated to the current version.", retryable: false, action: "none" },
   { code: 14, name: "UnsupportedMigration", message: "This migration path isn't supported — upgrades must be sequential.", retryable: false, action: "contact_support" },
+  { code: 15, name: "EmptyUri", message: "A token URI cannot be empty.", retryable: false, action: "adjust_input" },
+  { code: 16, name: "UriTooLong", message: "The token URI exceeds the maximum allowed length.", retryable: false, action: "adjust_input" },
+  { code: 17, name: "ZeroAmount", message: "Amount must be greater than zero.", retryable: false, action: "adjust_input" },
+  { code: 18, name: "EmptyBatch", message: "Batch cannot be empty.", retryable: false, action: "adjust_input" },
+  { code: 19, name: "BatchTooLarge", message: "Batch exceeds the maximum allowed size. Please split into smaller batches.", retryable: false, action: "adjust_input" },
+  { code: 20, name: "TokenNotFound", message: "This token was not found in this collection.", retryable: false, action: "refresh_and_retry" },
 ];
 
 const LAZY_MINT_ERC721_ERRORS: ContractErrorDefinition[] = [
