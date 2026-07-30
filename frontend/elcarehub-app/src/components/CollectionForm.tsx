@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState, useCallback } from "react";
+import { StrKey } from "@stellar/stellar-sdk";
 import {
   useDeployCollection,
   useDeploySalt,
@@ -15,6 +16,15 @@ import { CollectionKind } from "@/lib/launchpad";
 import { DEFAULT_TOKEN } from "@/config/tokens";
 import { useSupportedTokens } from "@/hooks/useSupportedTokens";
 import { getDefaultSupportedToken } from "@/lib/token-support";
+import { config } from "@/lib/config";
+
+function isValidStellarAddress(addr: string): boolean {
+  try {
+    return StrKey.isValidEd25519PublicKey(addr.trim());
+  } catch {
+    return false;
+  }
+}
 
 const STEPS = ["Collection Kind", "Details", "Economics", "Review"] as const;
 
@@ -160,6 +170,39 @@ export function CollectionForm() {
   );
   const preflightBlocked = !!preflight && preflight.errors.length > 0;
 
+  const [nextAttempted, setNextAttempted] = useState(false);
+
+  // Reset validation hints whenever the wizard step changes.
+  useEffect(() => {
+    setNextAttempted(false);
+  }, [step]);
+
+  const fieldErrors = useMemo(() => {
+    const errors: Record<string, string> = {};
+    if (step === 1) {
+      if (!form.name.trim()) errors.name = "Collection name is required.";
+      if (is721) {
+        if (!form.symbol.trim()) {
+          errors.symbol = "Symbol is required for 721 collections.";
+        } else if (!/^[A-Z0-9]{1,10}$/.test(form.symbol)) {
+          errors.symbol = "Symbol must be 1–10 uppercase letters or digits (A–Z, 0–9).";
+        }
+        if (!Number.isInteger(form.maxSupply) || form.maxSupply < 1) {
+          errors.maxSupply = "Max supply must be a whole number of at least 1.";
+        }
+      }
+    }
+    if (step === 2) {
+      if (form.royaltyBps < 0 || form.royaltyBps > 10000) {
+        errors.royaltyBps = "Royalty must be between 0 and 10,000 BPS.";
+      }
+      if (form.royaltyReceiver && !isValidStellarAddress(form.royaltyReceiver)) {
+        errors.royaltyReceiver = "Must be a valid Stellar address starting with G.";
+      }
+    }
+    return errors;
+  }, [step, form, is721]);
+
   const stepValid = useMemo(() => {
     switch (step) {
       case 0:
@@ -167,10 +210,14 @@ export function CollectionForm() {
       case 1:
         if (!form.name.trim()) return false;
         if (is721 && !form.symbol.trim()) return false;
+        if (is721 && !/^[A-Z0-9]{1,10}$/.test(form.symbol)) return false;
         if (is721 && form.maxSupply < 1) return false;
         return true;
       case 2:
-        return form.royaltyBps >= 0 && form.royaltyBps <= 10000 && hasSupportedTokens;
+        if (form.royaltyBps < 0 || form.royaltyBps > 10000) return false;
+        if (!hasSupportedTokens) return false;
+        if (form.royaltyReceiver && !isValidStellarAddress(form.royaltyReceiver)) return false;
+        return true;
       case 3:
         return true;
       default:
@@ -231,6 +278,14 @@ export function CollectionForm() {
           <div className="w-full p-4 bg-gray-50 rounded-2xl break-all font-mono text-sm text-gray-600 border border-gray-100">
             {successAddress}
           </div>
+          <a
+            href={`https://stellar.expert/explorer/${config.network}/contract/${successAddress}`}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="flex items-center justify-center gap-1.5 text-xs text-brand-600 hover:text-brand-700 font-medium transition-colors"
+          >
+            <ExternalLink size={12} /> View on Stellar Explorer
+          </a>
         </div>
 
         {/* Post-deployment checklist */}
@@ -464,9 +519,14 @@ export function CollectionForm() {
                   required
                   value={form.name}
                   onChange={(e) => setForm({ ...form, name: e.target.value })}
-                  className="w-full rounded-2xl border border-gray-200 bg-gray-50/50 px-5 py-4 text-base focus:border-brand-500 focus:bg-white focus:outline-none transition-all shadow-sm font-inter"
+                  className={`w-full rounded-2xl border bg-gray-50/50 px-5 py-4 text-base focus:bg-white focus:outline-none transition-all shadow-sm font-inter ${nextAttempted && fieldErrors.name ? "border-red-400 focus:border-red-500" : "border-gray-200 focus:border-brand-500"}`}
                   placeholder="e.g. African Legends"
                 />
+                {nextAttempted && fieldErrors.name && (
+                  <p className="mt-1.5 flex items-center gap-1.5 text-xs font-medium text-red-600" role="alert">
+                    <AlertTriangle size={12} aria-hidden="true" />{fieldErrors.name}
+                  </p>
+                )}
               </div>
 
               {is721 && (
@@ -481,10 +541,15 @@ export function CollectionForm() {
                       onChange={(e) =>
                         setForm({ ...form, symbol: e.target.value.toUpperCase() })
                       }
-                      className="w-full rounded-2xl border border-gray-200 bg-gray-50/50 px-5 py-4 text-base focus:border-brand-500 focus:bg-white focus:outline-none transition-all shadow-sm font-inter"
+                      className={`w-full rounded-2xl border bg-gray-50/50 px-5 py-4 text-base focus:bg-white focus:outline-none transition-all shadow-sm font-inter ${nextAttempted && fieldErrors.symbol ? "border-red-400 focus:border-red-500" : "border-gray-200 focus:border-brand-500"}`}
                       placeholder="e.g. AFRL"
                       maxLength={10}
                     />
+                    {nextAttempted && fieldErrors.symbol && (
+                      <p className="mt-1.5 flex items-center gap-1.5 text-xs font-medium text-red-600" role="alert">
+                        <AlertTriangle size={12} aria-hidden="true" />{fieldErrors.symbol}
+                      </p>
+                    )}
                   </div>
                   <div className="space-y-2">
                     <label className="block text-sm font-bold text-gray-950 uppercase tracking-wider font-inter">
@@ -498,8 +563,13 @@ export function CollectionForm() {
                       onChange={(e) =>
                         setForm({ ...form, maxSupply: parseInt(e.target.value) || 1 })
                       }
-                      className="w-full rounded-2xl border border-gray-200 bg-gray-50/50 px-5 py-4 text-base focus:border-brand-500 focus:bg-white focus:outline-none transition-all shadow-sm font-inter"
+                      className={`w-full rounded-2xl border bg-gray-50/50 px-5 py-4 text-base focus:bg-white focus:outline-none transition-all shadow-sm font-inter ${nextAttempted && fieldErrors.maxSupply ? "border-red-400 focus:border-red-500" : "border-gray-200 focus:border-brand-500"}`}
                     />
+                    {nextAttempted && fieldErrors.maxSupply && (
+                      <p className="mt-1.5 flex items-center gap-1.5 text-xs font-medium text-red-600" role="alert">
+                        <AlertTriangle size={12} aria-hidden="true" />{fieldErrors.maxSupply}
+                      </p>
+                    )}
                   </div>
                 </>
               )}
@@ -540,6 +610,11 @@ export function CollectionForm() {
                 <p className="text-xs text-gray-500 font-inter">
                   Basis points: 500 = 5%, 1000 = 10%
                 </p>
+                {nextAttempted && fieldErrors.royaltyBps && (
+                  <p className="mt-1.5 flex items-center gap-1.5 text-xs font-medium text-red-600" role="alert">
+                    <AlertTriangle size={12} aria-hidden="true" />{fieldErrors.royaltyBps}
+                  </p>
+                )}
               </div>
 
               <div className="space-y-2">
@@ -572,9 +647,14 @@ export function CollectionForm() {
                 <input
                   value={form.royaltyReceiver}
                   onChange={(e) => setForm({ ...form, royaltyReceiver: e.target.value })}
-                  className="w-full rounded-2xl border border-gray-200 bg-gray-50/50 px-5 py-4 text-base focus:border-brand-500 focus:bg-white focus:outline-none transition-all shadow-sm font-inter font-mono text-sm"
+                  className={`w-full rounded-2xl border bg-gray-50/50 px-5 py-4 text-base focus:bg-white focus:outline-none transition-all shadow-sm font-inter font-mono text-sm ${nextAttempted && fieldErrors.royaltyReceiver ? "border-red-400 focus:border-red-500" : "border-gray-200 focus:border-brand-500"}`}
                   placeholder={publicKey || "G... (defaults to creator)"}
                 />
+                {nextAttempted && fieldErrors.royaltyReceiver && (
+                  <p className="mt-1.5 flex items-center gap-1.5 text-xs font-medium text-red-600" role="alert">
+                    <AlertTriangle size={12} aria-hidden="true" />{fieldErrors.royaltyReceiver}
+                  </p>
+                )}
               </div>
             </div>
           </div>
@@ -729,9 +809,16 @@ export function CollectionForm() {
           {step < STEPS.length - 1 && (
             <button
               type="button"
-              disabled={!stepValid}
-              onClick={() => setStep((s) => s + 1)}
-              className="flex items-center gap-2 px-8 py-3 rounded-xl bg-brand-500 text-white font-bold hover:bg-brand-600 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+              aria-disabled={!stepValid}
+              onClick={() => {
+                if (!stepValid) {
+                  setNextAttempted(true);
+                  return;
+                }
+                setNextAttempted(false);
+                setStep((s) => s + 1);
+              }}
+              className={`flex items-center gap-2 px-8 py-3 rounded-xl bg-brand-500 text-white font-bold hover:bg-brand-600 transition-all ${!stepValid ? "opacity-50 cursor-not-allowed" : ""}`}
             >
               Next
               <ArrowRight size={18} />

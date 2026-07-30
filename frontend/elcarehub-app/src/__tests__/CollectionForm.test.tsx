@@ -68,9 +68,26 @@ jest.mock("lucide-react", () =>
       "ArrowRight",
       "ArrowLeft",
       "Check",
+      "AlertTriangle",
+      "Info",
+      "ExternalLink",
+      "Save",
+      "X",
     ].map((name) => [name, () => <span data-testid={`icon-${name}`} />])
   )
 );
+
+jest.mock("@stellar/stellar-sdk", () => ({
+  StrKey: {
+    isValidEd25519PublicKey: (addr: string) =>
+      typeof addr === "string" && addr.startsWith("G") && addr.length === 56,
+    decodeEd25519PublicKey: () => new Uint8Array(32),
+  },
+}));
+
+jest.mock("@/lib/config", () => ({
+  config: { network: "testnet", contractId: "CTEST" },
+}));
 
 import { CollectionForm } from "@/components/CollectionForm";
 
@@ -290,6 +307,94 @@ describe("CollectionForm wizard", () => {
           "error"
         )
       );
+    });
+
+    it("shows explorer link after successful deploy", async () => {
+      mockDeploy.mockResolvedValueOnce("CDEPLOYED_ADDRESS_123");
+      const user = userEvent.setup();
+      await goToStep3(user);
+      await user.click(screen.getByRole("button", { name: /deploy collection/i }));
+      await waitFor(() =>
+        expect(screen.getByText(/view on stellar explorer/i)).toBeInTheDocument()
+      );
+    });
+  });
+
+  // ── Validation error messages ──────────────────────────────────────────────
+
+  describe("Step 1 — field-level validation errors", () => {
+    it("shows 'Collection name is required' when Next is clicked with empty name", async () => {
+      const user = userEvent.setup();
+      render(<CollectionForm />);
+      await user.click(screen.getByRole("button", { name: /next/i })); // step 0 → 1
+      // Now on step 1 with no name entered
+      await user.click(screen.getByRole("button", { name: /next/i }));
+      expect(
+        await screen.findByText(/collection name is required/i)
+      ).toBeInTheDocument();
+    });
+
+    it("shows symbol error when symbol contains special characters", async () => {
+      const user = userEvent.setup();
+      render(<CollectionForm />);
+      await user.click(screen.getByRole("button", { name: /next/i })); // step 0 → 1
+      await user.type(screen.getByPlaceholderText(/african legends/i), "My NFT");
+      const symbolInput = screen.getByPlaceholderText(/AFRL/i);
+      await user.clear(symbolInput);
+      await user.type(symbolInput, "MY!@#");
+      await user.click(screen.getByRole("button", { name: /next/i }));
+      expect(
+        await screen.findByText(/uppercase letters or digits/i)
+      ).toBeInTheDocument();
+    });
+
+    it("does not show errors when all step 1 fields are valid", async () => {
+      const user = userEvent.setup();
+      render(<CollectionForm />);
+      await user.click(screen.getByRole("button", { name: /next/i })); // step 0 → 1
+      await user.type(screen.getByPlaceholderText(/african legends/i), "My NFT");
+      const symbolInput = screen.getByPlaceholderText(/AFRL/i);
+      await user.clear(symbolInput);
+      await user.type(symbolInput, "MYNFT");
+      await user.click(screen.getByRole("button", { name: /next/i }));
+      // Should advance to step 2 — no error messages shown
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+      expect(screen.getByText(/economics/i)).toBeInTheDocument();
+    });
+  });
+
+  describe("Step 2 — royaltyReceiver address validation", () => {
+    async function goToStep2(user: ReturnType<typeof userEvent.setup>) {
+      render(<CollectionForm />);
+      await user.click(screen.getByRole("button", { name: /next/i }));
+      await user.type(screen.getByPlaceholderText(/african legends/i), "My NFT");
+      const symbolInput = screen.getByPlaceholderText(/AFRL/i);
+      await user.clear(symbolInput);
+      await user.type(symbolInput, "MYNFT");
+      await user.click(screen.getByRole("button", { name: /next/i }));
+    }
+
+    it("shows address error when royaltyReceiver is not a valid Stellar address", async () => {
+      const user = userEvent.setup();
+      await goToStep2(user);
+      const receiverInput = screen.getByPlaceholderText(/defaults to creator/i);
+      await user.clear(receiverInput);
+      await user.type(receiverInput, "not-a-stellar-address");
+      await user.click(screen.getByRole("button", { name: /next/i }));
+      expect(
+        await screen.findByText(/valid stellar address/i)
+      ).toBeInTheDocument();
+    });
+
+    it("allows empty royaltyReceiver (defaults to creator)", async () => {
+      const user = userEvent.setup();
+      await goToStep2(user);
+      const receiverInput = screen.getByPlaceholderText(/defaults to creator/i);
+      await user.clear(receiverInput);
+      await user.click(screen.getByRole("button", { name: /next/i }));
+      // Should advance to Review step without error
+      expect(screen.queryByText(/valid stellar address/i)).not.toBeInTheDocument();
+      expect(screen.getByText(/review.*deploy/i)).toBeInTheDocument();
     });
   });
 });
