@@ -22,8 +22,8 @@
 #![allow(clippy::too_many_arguments, deprecated)]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Bytes, Env, String,
-    Vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Bytes, BytesN, Env,
+    String, Vec,
 };
 
 const TTL_THRESHOLD: u32 = 50_000;
@@ -66,6 +66,8 @@ pub enum Error {
     EmptyBatch = 18,
     /// Batch exceeds maximum size.
     BatchTooLarge = 19,
+    /// Token does not exist.
+    TokenNotFound = 20,
 }
 
 // ─── Storage Keys ─────────────────────────────────────────────────────────────
@@ -179,12 +181,12 @@ impl NormalNFT1155 {
         Ok(())
     }
 
-    // ── Supply cap and per-wallet limit management ────────────────────────
+    // ── WASM upgrade ──────────────────────────────────────────────────────
 
-    /// Set the maximum mintable supply for a specific token_id.
-    /// Pass 0 to remove the cap.
+    /// Replace the contract WASM. Callable only by creator.
     pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
         Self::extend_instance_ttl(&env);
+        Self::only_creator(&env)?;
         let old_wasm_hash: BytesN<32> = env
             .storage()
             .instance()
@@ -348,20 +350,29 @@ impl NormalNFT1155 {
     pub fn freeze_token(env: Env, caller: Address, token_id: u64) -> Result<(), Error> {
         Self::extend_instance_ttl(&env);
         caller.require_auth();
-        
+
         // Verify token exists (has been minted)
         if !env.storage().persistent().has(&DataKey::TokenUri(token_id)) {
             return Err(Error::TokenNotFound);
         }
-        
-        // Allow creator or any token holder
-        let creator = Self::only_creator(&env).ok();
-        let balance = env.storage().persistent().get(&DataKey::Balance(caller.clone(), token_id)).unwrap_or(0);
-        
-        if creator != Some(caller.clone()) && balance == 0 {
+
+        // Allow creator or any token holder — read creator address directly
+        // without calling only_creator() which would require creator auth.
+        let creator: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Creator)
+            .ok_or(Error::NotInitialized)?;
+        let balance: u128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Balance(caller.clone(), token_id))
+            .unwrap_or(0);
+
+        if caller != creator && balance == 0 {
             return Err(Error::NotApproved);
         }
-        
+
         if env
             .storage()
             .persistent()
@@ -370,7 +381,7 @@ impl NormalNFT1155 {
         {
             return Err(Error::AlreadyFrozen);
         }
-        
+
         env.storage()
             .persistent()
             .set(&DataKey::TokenFrozen(token_id), &true);
@@ -379,7 +390,7 @@ impl NormalNFT1155 {
             TTL_THRESHOLD,
             TTL_BUMP,
         );
-        
+
         env.events()
             .publish((symbol_short!("token_frz"),), token_id);
         Ok(())
@@ -548,22 +559,26 @@ impl NormalNFT1155 {
     /// Create a brand new token type, auto-assign the next ID.
     /// Returns the new token_id.
     ///
-    /// Blocked while paused. Enforces per-wallet limit if set.
+    /// `amount` may be 0 to register a token type without minting any supply
+    /// yet (useful when setting a max supply before first mint).
+    /// Blocked while paused. Enforces per-wallet limit if amount > 0.
     pub fn mint_new(env: Env, to: Address, amount: u128, uri: String) -> Result<u64, Error> {
         Self::extend_instance_ttl(&env);
         Self::only_creator(&env)?;
         Self::require_not_paused(&env)?;
-        if amount == 0 {
-            return Err(Error::ZeroAmount);
-        }
+        validate_uri(&uri)?;
         let token_id: u64 = env
             .storage()
             .instance()
             .get(&DataKey::NextTokenId)
             .unwrap_or(0);
-        Self::_check_wallet_limit(&env, &to, token_id, amount)?;
+        if amount > 0 {
+            Self::_check_wallet_limit(&env, &to, token_id, amount)?;
+        }
         Self::_mint(&env, &to, token_id, amount, &uri);
-        Self::_update_wallet_minted(&env, &to, token_id, amount);
+        if amount > 0 {
+            Self::_update_wallet_minted(&env, &to, token_id, amount);
+        }
         env.storage()
             .instance()
             .set(&DataKey::NextTokenId, &(token_id + 1));
