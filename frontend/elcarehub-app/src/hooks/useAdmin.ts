@@ -13,6 +13,7 @@ import {
     getAdmin,
     revokeArtist,
     reinstateArtist,
+    type Listing,
     isArtistRevoked,
     addTokenToWhitelist,
     removeTokenFromWhitelist,
@@ -755,5 +756,86 @@ export function useAuctionConfig(adminPublicKey: string | null) {
         setMinBid,
         setExtensionWindow,
         setExtensionTrigger,
+    };
+}
+
+// ── useListingOversight ───────────────────────────────────────────────────────
+
+const LISTING_PAGE_SIZE = 20;
+
+export interface ListingOversightRow {
+    listing_id: number;
+    artist: string;
+    collection: string;
+    status: string;
+    price: bigint;
+    currency: string;
+    created_at: number;
+}
+
+export function useListingOversight(adminPublicKey: string | null) {
+    const [allListings, setAllListings] = useState<ListingOversightRow[]>([]);
+    const [page, setPage] = useState(0);
+    const [filter, setFilter] = useState('');
+    const [isLoading, setIsLoading] = useState(false);
+    const [error, setError] = useState<string | null>(null);
+
+    const refresh = useCallback(async () => {
+        if (!adminPublicKey) return;
+        setIsLoading(true);
+        setError(null);
+        try {
+            const raw: Listing[] = await getAllListings();
+            setAllListings(
+                raw.map((l) => ({
+                    listing_id: l.listing_id,
+                    artist: l.artist,
+                    collection: l.collection,
+                    status: l.status,
+                    price: l.price,
+                    currency: l.currency,
+                    created_at: l.created_at,
+                }))
+            );
+            setPage(0);
+        } catch (err: unknown) {
+            setError(err instanceof Error ? err.message : 'Failed to load listings');
+        } finally {
+            setIsLoading(false);
+        }
+    }, [adminPublicKey]);
+
+    useEffect(() => {
+        refresh();
+    }, [refresh]);
+
+    const filtered = allListings.filter((l) => {
+        if (!filter) return true;
+        const q = filter.toLowerCase();
+        return (
+            l.artist.toLowerCase().includes(q) ||
+            l.collection.toLowerCase().includes(q) ||
+            l.status.toLowerCase().includes(q)
+        );
+    });
+
+    const totalPages = Math.max(1, Math.ceil(filtered.length / LISTING_PAGE_SIZE));
+    const safePage = Math.min(page, totalPages - 1);
+    const paginated = filtered.slice(
+        safePage * LISTING_PAGE_SIZE,
+        (safePage + 1) * LISTING_PAGE_SIZE
+    );
+
+    return {
+        listings: paginated,
+        totalCount: filtered.length,
+        page: safePage,
+        totalPages,
+        setPage,
+        filter,
+        setFilter,
+        isLoading,
+        error,
+        refresh,
     };
 }

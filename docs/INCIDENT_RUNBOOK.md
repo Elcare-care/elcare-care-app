@@ -19,6 +19,7 @@ For the threat surface these procedures address, see [THREAT_MODEL.md](THREAT_MO
 5. [Keeper subsystem operations](#5-keeper-subsystem-operations)
 
 **Quick links to extended runbooks:**
+- [Observability Alerts & Dashboard Guide](./runbooks/observability-alerts.md)
 - [Stalled Ingestion](./runbooks/stalled-ingestion.md)
 - [Chain Reorganization](./runbooks/reorganization.md)
 - [Database Outage](./runbooks/database-outage.md)

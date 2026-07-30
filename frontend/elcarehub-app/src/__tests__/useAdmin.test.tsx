@@ -51,6 +51,7 @@ import {
   useModeration,
   useTokenManagement,
   useAdminCheck,
+  useListingOversight,
 } from '@/hooks/useAdmin';
 
 // ── useAdminStats ─────────────────────────────────────────────────────────────
@@ -290,5 +291,81 @@ describe('useAdminCheck', () => {
     }
     render(<Comp />);
     await waitFor(() => expect(screen.getByTestId('admin').textContent).toBe('false'));
+  });
+});
+
+// ── useListingOversight ───────────────────────────────────────────────────────
+
+describe('useListingOversight', () => {
+  beforeEach(() => jest.clearAllMocks());
+
+  const mockListings = [
+    { listing_id: 1, artist: 'GA', collection: 'CA', token_id: 1, price: 100n, currency: 'XLM', token: 'XLM', recipients: [], status: 'Active', owner: null, created_at: 1000000 },
+    { listing_id: 2, artist: 'GB', collection: 'CB', token_id: 2, price: 200n, currency: 'XLM', token: 'XLM', recipients: [], status: 'Sold', owner: 'GX', created_at: 1000001 },
+    { listing_id: 3, artist: 'GA', collection: 'CC', token_id: 3, price: 300n, currency: 'XLM', token: 'XLM', recipients: [], status: 'Cancelled', owner: null, created_at: 1000002 },
+  ];
+
+  it('loads listings and returns first page when admin key is provided', async () => {
+    mockGetAllListings.mockResolvedValueOnce(mockListings);
+    function Comp() {
+      const { listings, totalCount, isLoading } = useListingOversight('GADMIN');
+      if (isLoading) return <span data-testid="loading">yes</span>;
+      return (
+        <div>
+          <span data-testid="count">{totalCount}</span>
+          <span data-testid="first">{listings[0]?.listing_id}</span>
+        </div>
+      );
+    }
+    render(<Comp />);
+    await waitFor(() => expect(screen.getByTestId('count').textContent).toBe('3'));
+    expect(screen.getByTestId('first').textContent).toBe('1');
+  });
+
+  it('returns empty list and does not call getAllListings when admin key is null', () => {
+    function Comp() {
+      const { listings, isLoading } = useListingOversight(null);
+      return (
+        <div>
+          <span data-testid="count">{listings.length}</span>
+          <span data-testid="loading">{String(isLoading)}</span>
+        </div>
+      );
+    }
+    render(<Comp />);
+    expect(screen.getByTestId('count').textContent).toBe('0');
+    expect(mockGetAllListings).not.toHaveBeenCalled();
+  });
+
+  it('filters by artist address when filter is set', async () => {
+    mockGetAllListings.mockResolvedValueOnce(mockListings);
+    function Comp() {
+      const { listings, totalCount, setFilter, isLoading } = useListingOversight('GADMIN');
+      if (isLoading) return <span data-testid="loading">yes</span>;
+      return (
+        <div>
+          <button onClick={() => setFilter('gb')}>Filter GB</button>
+          <span data-testid="count">{totalCount}</span>
+          <span data-testid="first-artist">{listings[0]?.artist}</span>
+        </div>
+      );
+    }
+    const user = userEvent.setup();
+    render(<Comp />);
+    await waitFor(() => expect(screen.queryByTestId('loading')).not.toBeInTheDocument());
+    await user.click(screen.getByRole('button', { name: /filter gb/i }));
+    expect(screen.getByTestId('count').textContent).toBe('1');
+    expect(screen.getByTestId('first-artist').textContent).toBe('GB');
+  });
+
+  it('shows error message when getAllListings rejects', async () => {
+    mockGetAllListings.mockRejectedValueOnce(new Error('Network error'));
+    function Comp() {
+      const { error, isLoading } = useListingOversight('GADMIN');
+      if (isLoading) return <span data-testid="loading">yes</span>;
+      return <span data-testid="error">{error ?? 'none'}</span>;
+    }
+    render(<Comp />);
+    await waitFor(() => expect(screen.getByTestId('error').textContent).toMatch(/network error/i));
   });
 });
