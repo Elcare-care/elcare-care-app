@@ -1,10 +1,11 @@
 import { Router, Request, Response, NextFunction } from 'express';
+import { z } from 'zod';
 import prisma from '../db.js';
 import redis from '../redis.js';
 import { Prisma } from '@prisma/client';
 import { cacheMiddleware } from './cache-middleware.js';
 import { etagMiddleware } from './etag-middleware.js';
-import { strictRateLimiter, sseConcurrencyGuard, heavyRateLimiter } from './rate-limit-middleware.js';
+import { strictRateLimiter, sseConcurrencyGuard, heavyRateLimiter, lightRateLimiter, mediumRateLimiter, operationalRateLimiter } from './rate-limit-middleware.js';
 import { badRequest, notFound, internalError } from './errors.js';
 import { versioningMiddleware, ok, validateResponse, ListingResponseV1, AuctionResponseV1, OfferResponseV1, CollectionResponseV1 } from './versioning.js';
 import { applyDecodedEvents, isPollerHalted, getHaltReason, resumePoller, revertLedgers } from '../poller.js';
@@ -21,6 +22,7 @@ import {
   syncGapsQuerySchema,
   artistMetricsQuerySchema,
   royaltyBreakdownQuerySchema,
+  searchQuerySchema,
 } from './query-schemas.js';
 import { isValidStellarAddress, STELLAR_ADDRESS_ERROR } from '../stellar-address.js';
 import {
@@ -367,6 +369,12 @@ router.get('/listings', lightRateLimiter, cacheMiddleware(TTL.LISTINGS_LIST), va
     res.setHeader('X-Next-Cursor', nextCursor);
     res.setHeader('X-Total-Count', String(total));
 
+    // When search is active always return { listings, total } shape
+    // (consistent with the FTS path above).
+    if (search) {
+      return res.json({ listings: serialize(results), total });
+    }
+
     if (limit !== undefined || offset !== undefined || cursor_ledger !== undefined) {
       const validated = validateResponse(z.object({ listings: ListingResponseV1.array(), total: z.number() }), {
         listings: serialize(results),
@@ -376,9 +384,6 @@ router.get('/listings', lightRateLimiter, cacheMiddleware(TTL.LISTINGS_LIST), va
     }
     const validated = validateResponse(ListingResponseV1.array(), serialize(results));
     return ok(res, validated);
-      return res.json({ listings: serializeListings(results), total });
-    }
-    res.json(serializeListings(results));
   } catch (err) {
     next(internalError('Failed to fetch listings'));
   }
@@ -407,7 +412,7 @@ router.get('/listings/:id', lightRateLimiter, cacheMiddleware(TTL.LISTING_DETAIL
 
 // ── GET /listings/:id/history ─────────────────────────────────────────────────
 
-router.get('/listings/:id/history', heavyRateLimiter, async (req: Request, res: Response, next: NextFunction) => {NextFunction) => {
+router.get('/listings/:id/history', heavyRateLimiter, async (req: Request, res: Response, next: NextFunction) => {
   const id = req.params.id as string;
   if (!/^\d+$/.test(id)) {
     return next(badRequest('Invalid ID format'));
