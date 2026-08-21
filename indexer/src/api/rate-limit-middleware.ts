@@ -1,4 +1,4 @@
-import rateLimit from 'express-rate-limit';
+import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
 import { Request, Response, NextFunction } from 'express';
 
 // ── Resource cost classes ──────────────────────────────────────────────────────
@@ -32,7 +32,8 @@ function getRateLimitKey(req: Request): string {
   if (typeof queryWallet === 'string' && queryWallet.length > 0) {
     return `wallet:${queryWallet}`;
   }
-  return `ip:${req.ip || req.socket.remoteAddress || 'unknown'}`;
+  // Use ipKeyGenerator for correct IPv6 normalisation
+  return `ip:${ipKeyGenerator(req.ip ?? req.socket.remoteAddress ?? 'unknown')}`;
 }
 
 // ── Shared rate-limit options factory ─────────────────────────────────────────
@@ -43,7 +44,7 @@ function baseOptions(cost: ResourceCost, message?: string) {
     windowMs: limits.windowMs,
     max: limits.max,
     keyGenerator: getRateLimitKey,
-    standardHeaders: 'draft-8',
+    standardHeaders: 'draft-6' as const,
     legacyHeaders: false,
     message: {
       error: message || 'Rate limit exceeded',
@@ -68,7 +69,7 @@ export const globalRateLimiter = rateLimit({
   windowMs: 60_000,
   max: GLOBAL_LIMIT,
   keyGenerator: getRateLimitKey,
-  standardHeaders: 'draft-8',
+  standardHeaders: 'draft-6' as const,
   legacyHeaders: false,
   message: {
     error: 'Too many requests, please try again later.',

@@ -442,7 +442,8 @@ export const LISTING_CANCELLED_SCHEMA: ContractEventSchema = {
   data: [
     { name: 'listing_id', type: 'bigint' },
     { name: 'cancelled_by', type: 'string', optional: true },
-    { name: 'reason', type: 'object', optional: true },
+    // reason can be an enum object { tag: N } OR a plain string in legacy builds
+    { name: 'reason', type: 'any', optional: true },
     { name: 'ledger_sequence', type: 'bigint', optional: true },
   ],
 };
@@ -939,7 +940,10 @@ export function decodeWithSchema<T = unknown>(
     // Validate type for present fields
     const actualType = typeof value;
 
-    if (field.type === 'array') {
+    if (field.type === 'any') {
+      // 'any' accepts any non-absent value — no further type check needed
+      continue;
+    } else if (field.type === 'array') {
       if (!Array.isArray(value)) {
         return {
           ok: false,

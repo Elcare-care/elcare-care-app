@@ -7,12 +7,12 @@
  * back to database reads.
  */
 
-import redis, { invalidateKey, invalidatePattern } from '../redis.js';
-import { logger } from '../logger.js';
+import redis, { invalidateKey, invalidatePattern } from './redis.js';
+import { logger } from './logger.js';
 import {
   cacheInvalidationsTotal,
   cacheInvalidationFailuresTotal,
-} from '../metrics.js';
+} from './metrics.js';
 
 // ── Key registry ──────────────────────────────────────────────────────────────
 // Keep this in one place so every producer and consumer agrees on key shape.
