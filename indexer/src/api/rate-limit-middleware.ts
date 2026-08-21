@@ -1,4 +1,4 @@
-import rateLimit from 'express-rate-limit';
+import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
 import { Request, Response, NextFunction } from 'express';
 
 // ── Resource cost classes ──────────────────────────────────────────────────────
@@ -32,7 +32,8 @@ function getRateLimitKey(req: Request): string {
   if (typeof queryWallet === 'string' && queryWallet.length > 0) {
     return `wallet:${queryWallet}`;
   }
-  return `ip:${req.ip || req.socket.remoteAddress || 'unknown'}`;
+  // Use ipKeyGenerator for correct IPv6 normalisation
+  return `ip:${ipKeyGenerator(req)}`;
 }
 
 // ── Shared rate-limit options factory ─────────────────────────────────────────

@@ -16,7 +16,7 @@
  *   - If the lease is missing or expired, a replacement worker can acquire.
  */
 
-import prisma, { closeWritePool } from './db.js';
+import prisma, { closeWritePool } from '../db.js';
 import { logger } from '../logger.js';
 import {
   indexerWorkerLeaseGauge,
