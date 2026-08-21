@@ -33,7 +33,7 @@ function getRateLimitKey(req: Request): string {
     return `wallet:${queryWallet}`;
   }
   // Use ipKeyGenerator for correct IPv6 normalisation
-  return `ip:${ipKeyGenerator(req.ip ?? req.socket.remoteAddress ?? 'unknown')}`;
+  return `ip:${ipKeyGenerator(req)}`;
 }
 
 // ── Shared rate-limit options factory ─────────────────────────────────────────

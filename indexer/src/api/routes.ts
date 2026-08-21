@@ -369,14 +369,21 @@ router.get('/listings', lightRateLimiter, cacheMiddleware(TTL.LISTINGS_LIST), va
     res.setHeader('X-Next-Cursor', nextCursor);
     res.setHeader('X-Total-Count', String(total));
 
+    // When search is active always return { listings, total } shape
+    // (consistent with the FTS path above).
     if (search) {
       return res.json({ listings: serialize(results), total });
     }
 
     if (limit !== undefined || offset !== undefined || cursor_ledger !== undefined) {
-      return res.json({ listings: serialize(results), total });
+      const validated = validateResponse(z.object({ listings: ListingResponseV1.array(), total: z.number() }), {
+        listings: serialize(results),
+        total: Number(total),
+      });
+      return ok(res, validated);
     }
-    return res.json(serialize(results));
+    const validated = validateResponse(ListingResponseV1.array(), serialize(results));
+    return ok(res, validated);
   } catch (err) {
     next(internalError('Failed to fetch listings'));
   }
