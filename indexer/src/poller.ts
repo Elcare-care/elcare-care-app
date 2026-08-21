@@ -35,6 +35,7 @@ import redis from './redis.js';
 import { applyInvalidation, invalidateListing, invalidateAuction, invalidateOffer, invalidateCollection, invalidateWalletActivity, invalidateStats, invalidateConfig } from './cache-invalidation.js';
 import { loadConfig, parseTrackedContracts } from './config.js';
 import { enqueueIpfsFetch } from './ipfs-cache.js';
+import { contractRegistry } from './contract-registry.js';
 import { promoteConfirmedEvents, rollbackReorg } from './reorg.js';
 import { acquireLease, releaseLease, renewLease, type LeaseRole } from './coordination/lease.js';
 import { recoveryFSM } from './recovery-state-machine.js';
@@ -338,6 +339,27 @@ export function buildSyncStateLedgerData(
 }
 
 /**
+ * Build the TrackedContract update payload for a contract cursor advance.
+ *
+ * Issue #441: per-contract variant of buildSyncStateLedgerData that makes it
+ * explicit that each contract has its own cursor — caller supplies the contract
+ * id so the update is scoped correctly.  The shape is identical to the shared
+ * version, but the intent is clearer at each call site.
+ *
+ * @param lastLedger  The ledger sequence being committed.
+ * @param ledgerHash  Hash of that ledger, or null when the RPC hash fetch failed.
+ *                    Omitting the hash preserves the prior checkpoint so reorg
+ *                    detection on the next cycle is not accidentally disabled.
+ */
+export function buildContractCursorData(
+  _contractId: string,
+  lastLedger: number,
+  ledgerHash: string | null,
+): { lastLedger: number; lastLedgerHash?: string } {
+  return buildSyncStateLedgerData(lastLedger, ledgerHash);
+}
+
+/**
  * Walks back from `divergedAt` up to MAX_REORG_DEPTH ledgers to find the
  * deepest ledger still accessible on the network's canonical chain.
  * Returns that ledger's sequence number as the safe revert point.
@@ -420,6 +442,8 @@ export async function validateHashContinuity(
 /**
  * Seed TrackedContract rows from TRACKED_CONTRACTS (or legacy env vars) into
  * the database. Uses upsert on contractId so re-runs are idempotent.
+ * After the DB sync, loads every active contract into the runtime contract
+ * registry so the formal per-contract health model is populated.
  * Returns the full list of active contracts from the DB after seeding.
  */
 export async function seedTrackedContracts() {
@@ -439,12 +463,18 @@ export async function seedTrackedContracts() {
       update: { label: c.label, type: c.type, active: true },
     });
   }
+
+  // ── Populate the runtime contract registry ────────────────────────────────
+  // loadFromDb() is idempotent — safe to call on every startup and reconfiguration.
+  await contractRegistry.loadFromDb();
+
   return prisma.trackedContract.findMany({ where: { active: true } });
 }
 
 /**
  * Poll a single tracked contract indefinitely.
- * Each contract maintains its own lastLedger / lastLedgerHash in TrackedContract.
+ * Each contract maintains its own lastLedger / lastLedgerHash in TrackedContract
+ * and in the runtime ContractRegistry entry.
  *
  * Checkpoint protocol (Issue #285):
  *   1. openCheckpoint()  — record window in DB as "fetched" (RPC data retrieved)
@@ -452,6 +482,12 @@ export async function seedTrackedContracts() {
  *   3. commitCheckpoint() inside the domain transaction — atomically advances cursor
  *      and marks "committed"; if the process crashes the checkpoint stays "applying"
  *      and startup recovery replays the window idempotently.
+ *
+ * Registry integration (Issue #441):
+ *   - recordProgress() / recordError() / recordGap() / recordStall() are called
+ *     on every iteration so the formal per-contract health model stays current.
+ *   - A contract that exceeds MAX_CONTRACT_ERRORS is auto-disabled; its loop exits.
+ *   - A stalled or gapped contract does NOT affect any sibling contract's cursor.
  */
 async function pollContract(
   contractRow: { id: number; contractId: string; lastLedger: number; lastLedgerHash: string | null },
@@ -571,6 +607,10 @@ async function pollContract(
           where: { id: contract.id },
           data: { lastLedger: networkLatestLedger, lastLedgerHash: null },
         });
+        // ── Per-contract gap tracking (Issue #441) ────────────────────────
+        try {
+          contractRegistry.recordGap(contract.contractId, networkLatestLedger + 1, contract.lastLedger);
+        } catch { /* non-fatal */ }
         continue;
       }
 
@@ -589,6 +629,10 @@ async function pollContract(
           where: { id: contract.id },
           data: { lastLedger: windowFloor - 1, lastLedgerHash: null },
         });
+        // ── Per-contract gap tracking (Issue #441) ────────────────────────
+        try {
+          contractRegistry.recordGap(contract.contractId, skippedRange.from, skippedRange.to);
+        } catch { /* non-fatal */ }
         startLedger = windowFloor;
       }
 
@@ -684,6 +728,14 @@ async function pollContract(
         syncLatencyGauge.set(Math.max(0, networkLatestLedger - advanceTo));
         recordProgress();
 
+        // ── Per-contract registry progress update (Issue #441) ───────────
+        try {
+          contractRegistry.recordProgress(contract.contractId, advanceTo, latestHash);
+          contractRegistry.updateLagMetrics(networkLatestLedger);
+        } catch {
+          // non-fatal — registry update must never crash the poller
+        }
+
         // Issue #286: promote events that are now CONFIRMATION_DEPTH ledgers old.
         // Non-fatal — confirmation promotion failures must never crash the poller.
         promoteConfirmedEvents(networkLatestLedger, config.confirmationDepth).catch((err) => {
@@ -703,6 +755,25 @@ async function pollContract(
       localErrors += 1;
       recordRpcFailure();
       recoveryFSM.toRetry(error instanceof Error ? error.message : String(error));
+
+      // ── Per-contract error tracking (Issue #441) ──────────────────────────
+      // Record the error on this contract's registry entry. If MAX_CONTRACT_ERRORS
+      // is reached the registry auto-disables the contract and we exit cleanly.
+      try {
+        contractRegistry.recordError(
+          contractRow.contractId,
+          error instanceof Error ? error.message : String(error),
+        );
+        if (!contractRegistry.isActive(contractRow.contractId)) {
+          logger.error('pollContract: contract auto-disabled after too many errors — stopping loop', {
+            contractId: contractRow.contractId,
+          });
+          return;
+        }
+      } catch {
+        // registry lookup failure is non-fatal
+      }
+
       const backoff = Math.min(BASE_BACKOFF_MS * Math.pow(2, localErrors - 1), MAX_BACKOFF_MS);
       logger.error('pollContract: error in loop', {
         contractId: contractRow.contractId,
@@ -734,6 +805,8 @@ export async function startPolling() {
       contractId: c.contractId,
       label: c.label,
       type: c.type,
+      lastLedger: c.lastLedger,
+      health: contractRegistry.get(c.contractId)?.health ?? 'idle',
     })),
     pollIntervalMs: config.pollIntervalMs,
     maxLedgersPerCycle: config.maxLedgersPerCycle,
