@@ -250,6 +250,32 @@ pub enum DataKey {
     /// separate per-auction key — not a field on `Auction` — so auctions that
     /// never block anyone pay no extra storage.
     AuctionBlockedBidders(u64),
+    /// Explicit holder of one of the four role axes (Issue #267). When absent
+    /// for a given role, the contract Admin is the fallback holder.
+    Role(crate::types::RoleType),
+    /// Pending two-step role-transfer proposal (Issue #267). Mirrors
+    /// `PendingAdmin` semantics with a per-role key.
+    PendingRole(crate::types::RoleType),
+    /// Lifetime protocol-fee total collected, keyed by payment token address
+    /// (Issue #279). Monotonically increasing; never reset.
+    ProtocolFeeTotal(Address),
+    /// Lifetime royalty-settlement total, keyed by payment token address
+    /// (Issue #279). Accumulates the gross sale value of every settlement.
+    RoyaltyTotal(Address),
+    /// Lifetime settlement count, keyed by payment token address (Issue #279).
+    SettlementCount(Address),
+    /// Resumable progress cursor for the `extend_active_ttls` TTL-sweep
+    /// maintenance loop (Issue #280).
+    TtlSweepState,
+    /// Per-collection protocol fee override in basis points (Issue #322).
+    /// When present, new listings/auctions for this collection snapshot this
+    /// value instead of the global protocol fee.
+    CollectionFeeBps(Address),
+    /// Operator-readable marker recording whether the migration for a given
+    /// version was interrupted (has a cursor) or completed cleanly. Stored
+    /// alongside `MigrationCursor`/`MigrationDone` to support the
+    /// `get_migration_status` view.
+    MigrationStuck(soroban_sdk::String),
 }
 
 /// Custody record for an NFT held by the marketplace, keyed by
@@ -262,6 +288,46 @@ pub struct EscrowRecord {
     pub is_listing: bool,
     /// The listing_id or auction_id the escrow is bound to.
     pub id: u64,
+}
+
+/// Registry entry for a payment token that has been (or was previously)
+/// whitelisted for use in listings, auctions, and offers (Issue #208).
+///
+/// Stored under `DataKey::TokenWhitelistEntry(token)`.  `active = false` is a
+/// soft-delete: the historical record is preserved for audit, but the token
+/// is no longer accepted for new operations.
+#[contracttype]
+#[derive(Clone)]
+pub struct TokenWhitelistEntry {
+    /// Ledger timestamp at which the token was first whitelisted.
+    pub added_at: u64,
+    /// Address that performed the `add_token_to_whitelist` call.
+    pub added_by: Address,
+    /// `true` while the token is actively accepted; `false` after soft-removal.
+    pub active: bool,
+}
+
+/// Operator-facing summary of the current migration state for one contract
+/// version. Returned by `MarketplaceContract::get_migration_status`.
+#[contracttype]
+#[derive(Clone)]
+pub struct MigrationStatus {
+    /// The contract version this status describes.
+    pub version: soroban_sdk::String,
+    /// `true` when the migration for this version completed successfully.
+    pub is_done: bool,
+    /// `true` when a cursor exists but `MigrationDone` has not been set —
+    /// i.e. the migration was started but not yet finished.
+    pub is_in_progress: bool,
+    /// `true` when `migrate_step` has been called at least once but the
+    /// migration was not completed in a single invocation (was interrupted).
+    /// Distinct from `is_in_progress`: the stuck marker persists across
+    /// calls even if the cursor advanced; it is only cleared on completion.
+    pub is_stuck: bool,
+    /// Current phase (0-based; meaningful only when `is_in_progress = true`).
+    pub phase: u32,
+    /// Current cursor within the active phase.
+    pub cursor: u64,
 }
 
 // ── TTL Constants (Issue #280) ───────────────────────────────────────────────────
@@ -323,8 +389,7 @@ pub fn bump_offer_ttl(env: &Env, offer_id: u64) {
 
 /// Bump TTL for instance storage (contract-level state) using INSTANCE_TTL_LEDGERS
 pub fn bump_instance_ttl(env: &Env) {
-    // Bump all instance-level keys that should never expire
-    let instance_keys = vec![
+    let instance_keys: [DataKey; 12] = [
         DataKey::Admin,
         DataKey::Treasury,
         DataKey::ProtocolFeeBps,
@@ -338,7 +403,6 @@ pub fn bump_instance_ttl(env: &Env) {
         DataKey::BidHistoryCap,
         DataKey::AuctionMaxExtensions,
     ];
-    
     for key in instance_keys {
         if env.storage().persistent().has(&key) {
             env.storage()
@@ -504,6 +568,31 @@ pub fn index_range(env: &Env, id: &IndexId, start: u32, limit: u32) -> Vec<u64> 
 /// view functions and tests; transaction paths must use `index_range`.
 pub fn index_all(env: &Env, id: &IndexId) -> Vec<u64> {
     index_range(env, id, 0, index_len(env, id))
+}
+
+/// Check whether `value` is present anywhere in the index (O(n) page scan).
+///
+/// Reserved for migration postcondition assertions and tests — do not call
+/// from normal transaction paths where the cost would be unbounded.
+pub fn index_contains(env: &Env, id: &IndexId, value: u64) -> bool {
+    let len = index_len(env, id);
+    if len == 0 {
+        return false;
+    }
+    let page_count = (len + INDEX_PAGE_SIZE - 1) / INDEX_PAGE_SIZE;
+    for p in 0..page_count {
+        if index_load_page(env, id, p).contains(value) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Return the number of pages currently allocated for the index.
+/// Consistent with `ceil(index_len / INDEX_PAGE_SIZE)`.
+pub fn index_page_count(env: &Env, id: &IndexId) -> u32 {
+    let len = index_len(env, id);
+    if len == 0 { 0 } else { (len + INDEX_PAGE_SIZE - 1) / INDEX_PAGE_SIZE }
 }
 
 // ── Counters ─────────────────────────────────────────────────
@@ -896,7 +985,11 @@ pub fn clear_escrow_record(env: &Env, collection: &Address, token_id: u64) {
 // and full audit trail. Each token address maps to a TokenWhitelistEntry.
 
 /// Check if a token is currently whitelisted (active: true). O(1) lookup.
+/// When no tokens have ever been added (count == 0), all tokens are allowed.
 pub fn is_token_whitelisted(env: &Env, token: &Address) -> bool {
+    if get_token_whitelist_count(env) == 0 {
+        return true;
+    }
     let key = DataKey::TokenWhitelistEntry(token.clone());
     let entry = env.storage().persistent().get::<DataKey, TokenWhitelistEntry>(&key);
     match entry {
@@ -974,19 +1067,23 @@ pub fn get_token_registry_range(env: &Env, start: u32, limit: u32) -> Vec<Addres
     let mut tokens = Vec::new(env);
     for id in ids.iter() {
         if let Some(token) = get_token_by_id(env, id) {
-            tokens.push_back(token);
+            if is_token_whitelisted(env, &token) {
+                tokens.push_back(token);
+            }
         }
     }
     tokens
 }
 
-/// Get all token addresses in the registry (for view functions and tests).
+/// Get all ACTIVE token addresses in the registry (excludes soft-deleted entries).
 pub fn get_all_token_registry(env: &Env) -> Vec<Address> {
     let ids = index_all(env, &IndexId::TokenWhitelist);
     let mut tokens = Vec::new(env);
     for id in ids.iter() {
         if let Some(token) = get_token_by_id(env, id) {
-            tokens.push_back(token);
+            if is_token_whitelisted(env, &token) {
+                tokens.push_back(token);
+            }
         }
     }
     tokens
@@ -1488,6 +1585,39 @@ pub fn clear_migration_progress(env: &Env, version: &soroban_sdk::String) {
         .remove(&DataKey::MigrationCursor(version.clone()));
 }
 
+// ── Migration stuck marker ─────────────────────────────────────
+//
+// Written by `run_migration` whenever it saves partial progress (remaining > 0),
+// indicating the migration was interrupted and requires further `migrate_step`
+// calls. Cleared only when the migration completes so that the operator can
+// distinguish "has never been started" (is_stuck = false, no cursor) from
+// "was interrupted at least once" (is_stuck = true).
+
+pub fn set_migration_stuck(env: &Env, version: &soroban_sdk::String) {
+    let key = DataKey::MigrationStuck(version.clone());
+    env.storage().persistent().set(&key, &true);
+    bump_entry_ttl(env, &key);
+}
+
+pub fn clear_migration_stuck(env: &Env, version: &soroban_sdk::String) {
+    env.storage()
+        .persistent()
+        .remove(&DataKey::MigrationStuck(version.clone()));
+}
+
+pub fn is_migration_stuck(env: &Env, version: &soroban_sdk::String) -> bool {
+    let key = DataKey::MigrationStuck(version.clone());
+    let stuck = env
+        .storage()
+        .persistent()
+        .get::<_, bool>(&key)
+        .unwrap_or(false);
+    if stuck {
+        bump_entry_ttl(env, &key);
+    }
+    stuck
+}
+
 // ── TTL-sweep cursor (Issue #280) ─────────────────────────────
 
 /// Load the resumable progress of the `extend_active_ttls` maintenance
@@ -1514,6 +1644,54 @@ pub fn take_legacy_index_vec(env: &Env, key: &DataKey) -> Option<Vec<u64>> {
         env.storage().persistent().remove(key);
     }
     value
+}
+
+// ── Per-collection fee overrides (Issue #322) ────────────────────────────────
+
+pub fn set_collection_fee_bps_storage(env: &Env, collection: &Address, bps: u32) {
+    let key = DataKey::CollectionFeeBps(collection.clone());
+    env.storage().persistent().set(&key, &bps);
+    bump_entry_ttl(env, &key);
+}
+
+pub fn get_collection_fee_bps_storage(env: &Env, collection: &Address) -> Option<u32> {
+    let key = DataKey::CollectionFeeBps(collection.clone());
+    let value = env.storage().persistent().get::<DataKey, u32>(&key);
+    if value.is_some() {
+        bump_entry_ttl(env, &key);
+    }
+    value
+}
+
+pub fn clear_collection_fee_bps_storage(env: &Env, collection: &Address) {
+    env.storage()
+        .persistent()
+        .remove(&DataKey::CollectionFeeBps(collection.clone()));
+}
+
+// ── Migration status view helper ─────────────────────────────────────────────
+
+/// Compute the operator-facing migration status for `version`.
+pub fn get_migration_status_storage(env: &Env, version: &soroban_sdk::String) -> MigrationStatus {
+    let is_done = is_migration_done(env, version);
+    let cursor_key = DataKey::MigrationCursor(version.clone());
+    let progress_opt = env
+        .storage()
+        .persistent()
+        .get::<DataKey, MigrationProgress>(&cursor_key);
+    let is_in_progress = !is_done && progress_opt.is_some();
+    let is_stuck = !is_done && is_migration_stuck(env, version);
+    let (phase, cursor) = progress_opt
+        .map(|p| (p.phase, p.cursor))
+        .unwrap_or((0, 0));
+    MigrationStatus {
+        version: version.clone(),
+        is_done,
+        is_in_progress,
+        is_stuck,
+        phase,
+        cursor,
+    }
 }
 
 // ── Bid-history cap ──────────────────────────────────────────

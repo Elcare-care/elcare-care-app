@@ -1,6 +1,25 @@
 // types.rs
 use soroban_sdk::{contracterror, contracttype, Address, Symbol};
 
+/// Four independent role axes that govern privileged entry points (Issue #267).
+///
+/// Every entry point is owned by exactly one role. When no explicit holder has
+/// been assigned for a role, it falls back to the contract `Admin`, so existing
+/// single-admin deployments keep working unchanged until an operator opts in via
+/// `migrate_roles` or `propose_role_transfer`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RoleType {
+    /// Manages price bounds, treasury, fees, bid/auction config parameters.
+    ProtocolConfig,
+    /// Controls global/collection/function circuit breakers.
+    EmergencyPause,
+    /// Artist revocation, reinstatement, and collection-level listing cleanup.
+    CollectionAdmin,
+    /// Storage and version migration entry points.
+    Upgrade,
+}
+
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(u32)]
@@ -119,6 +138,12 @@ pub enum MarketplaceError {
     /// original_end_time + MAX_TOTAL_AUCTION_DURATION. The bid is still
     /// accepted, but the extension is not applied.
     AuctionDurationLimitReached = 51,
+    /// `accept_role_transfer` or `cancel_role_proposal` was called when no
+    /// role-transfer proposal is currently pending for this role.
+    NoRoleProposalPending = 52,
+    /// `accept_role_transfer` was called after the pending role proposal's
+    /// `expires_at` ledger timestamp has passed. The proposal must be re-issued.
+    RoleProposalExpired = 53,
 }
 
 #[contracttype]
