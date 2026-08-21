@@ -41,8 +41,8 @@ const cursorFields = {
 // ── Per-endpoint schemas ──────────────────────────────────────────────────────
 
 export const listingsQuerySchema = z.object({
-  artist:   optionalStellarAddress,
-  owner:    optionalStellarAddress,
+  artist:   optionalString,
+  owner:    optionalString,
   status:   z.enum(['Active', 'Sold', 'Cancelled', 'Auction', 'expired']).optional(),
   search:   optionalString,
   minPrice: z.coerce.number().nonnegative().optional(),
@@ -81,7 +81,7 @@ export const walletActivityQuerySchema = z.object({
 
 export const collectionsQuerySchema = z.object({
   kind:    z.enum(['normal_721', 'normal_1155', 'lazy_721', 'lazy_1155']).optional(),
-  creator: optionalStellarAddress,
+  creator: optionalString,
   limit:   positiveInt(100).optional(),
   offset:  positiveInt(10_000).optional(),
   ...cursorFields,
@@ -95,15 +95,9 @@ export const creatorCollectionsQuerySchema = z.object({
 
 export const statsQuerySchema = z.object({
   range: z.enum(['day', 'week', 'month']).optional(),
-  from:  optionalIsoDate,
-  to:    optionalIsoDate,
-}).refine(
-  (d) => {
-    if (d.from && d.to) return new Date(d.from) <= new Date(d.to);
-    return true;
-  },
-  { message: 'from must be before or equal to to', path: ['from'] }
-);
+  from:  z.string().optional(),
+  to:    z.string().optional(),
+});
 
 export const eventsQuerySchema = z.object({
   types: z

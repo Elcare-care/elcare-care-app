@@ -44,7 +44,7 @@ function baseOptions(cost: ResourceCost, message?: string) {
     windowMs: limits.windowMs,
     max: limits.max,
     keyGenerator: getRateLimitKey,
-    standardHeaders: 'draft-8',
+    standardHeaders: 'draft-6' as const,
     legacyHeaders: false,
     message: {
       error: message || 'Rate limit exceeded',
@@ -69,7 +69,7 @@ export const globalRateLimiter = rateLimit({
   windowMs: 60_000,
   max: GLOBAL_LIMIT,
   keyGenerator: getRateLimitKey,
-  standardHeaders: 'draft-8',
+  standardHeaders: 'draft-6' as const,
   legacyHeaders: false,
   message: {
     error: 'Too many requests, please try again later.',
