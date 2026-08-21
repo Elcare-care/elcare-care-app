@@ -68,8 +68,8 @@ pub(crate) fn batch_transfer_nft(
     token_id: u64,
     amount: u128,
 ) {
-    let ids = soroban_sdk::vec![env, token_id.into_val(env)];
-    let amounts = soroban_sdk::vec![env, amount.into_val(env)];
+    let ids: soroban_sdk::Vec<soroban_sdk::Val> = soroban_sdk::vec![env, token_id.into_val(env)];
+    let amounts: soroban_sdk::Vec<soroban_sdk::Val> = soroban_sdk::vec![env, amount.into_val(env)];
     let data = soroban_sdk::Bytes::new(&env);
     env.invoke_contract::<()>(
         collection,

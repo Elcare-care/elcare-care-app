@@ -94,6 +94,17 @@ pub const AUCTION_ADMIN_CANCELLED: &str = "auction_admin_cancelled";
 pub const REVOCATION_INCOMPLETE: &str = "revocation_incomplete";
 // Auction configuration update events
 pub const AUCTION_CONFIG_UPDATED: &str = "auction_config_updated";
+// Auction blocked-bidder registry events (Issue #199)
+pub const AUCTION_BIDDER_BLOCKED: &str = "bidder_blocked";
+pub const AUCTION_BIDDER_UNBLOCKED: &str = "bidder_unblocked";
+// Token whitelist events (Issue #208)
+pub const TOKEN_WHITELISTED: &str = "token_whitelisted";
+pub const TOKEN_REMOVED: &str = "token_removed";
+// Bounded maintenance observability (Issue #280)
+pub const TTL_ANOMALY: &str = "ttl_anomaly";
+pub const CLEANUP_SUMMARY: &str = "cleanup_summary";
+// Migration phase observability
+pub const MIGRATION_PHASE_COMPLETE: &str = "migration_phase_complete";
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1019,4 +1030,103 @@ pub fn emit_token_removed(env: &Env, token: &Address, removed_by: &Address) {
 /// role that was previously falling back to `Admin`.
 pub fn emit_role_migrated(env: &Env, role: crate::types::RoleType, authority: Address) {
     RoleMigratedEvent { role, authority }.publish(env);
+}
+
+// ── Token whitelist events (Issue #208) ──────────────────────────────────────
+
+/// Emitted when a new token is added to the protocol whitelist.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TokenWhitelistedEvent {
+    pub token: Address,
+    pub added_by: Address,
+}
+
+impl TokenWhitelistedEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, TOKEN_WHITELISTED),), self);
+    }
+}
+
+/// Emitted when a token is (soft-)removed from the protocol whitelist.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TokenRemovedEvent {
+    pub token: Address,
+    pub removed_by: Address,
+}
+
+impl TokenRemovedEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, TOKEN_REMOVED),), self);
+    }
+}
+
+// ── TTL-maintenance observability (Issue #280) ────────────────────────────────
+
+/// Emitted by `extend_active_ttls` when a record found in the `ActiveListings`
+/// index or the sequential auction id space is not in the expected Active state
+/// (or is missing entirely). Surfaces index/state drift to off-chain operators.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TtlAnomalyEvent {
+    /// "listing" or "auction"
+    pub subject: soroban_sdk::Symbol,
+    pub id: u64,
+    pub ledger_sequence: u32,
+}
+
+impl TtlAnomalyEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, TTL_ANOMALY),), self);
+    }
+}
+
+/// Emitted at the end of each `extend_active_ttls` / `cleanup_expired_locks` /
+/// `renew_storage` call so off-chain keepers can observe how much work was done.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CleanupSummaryEvent {
+    /// Identifies which maintenance operation produced this event:
+    /// "ttl_extend" | "lock_cleanup" | "storage_renewal"
+    pub kind: soroban_sdk::Symbol,
+    pub items_processed: u32,
+    pub ledger_sequence: u32,
+}
+
+impl CleanupSummaryEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, CLEANUP_SUMMARY),), self);
+    }
+}
+
+// ── Migration phase observability ─────────────────────────────────────────────
+
+/// Emitted when a migration phase transitions to the next, carrying postcondition
+/// counts so operators can verify no records were lost or duplicated.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MigrationPhaseCompletedEvent {
+    pub version: soroban_sdk::String,
+    /// Phase that just completed (0-based).
+    pub phase: u32,
+    /// Number of records processed in this phase.
+    pub records_processed: u64,
+    pub ledger_sequence: u32,
+}
+
+impl MigrationPhaseCompletedEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, MIGRATION_PHASE_COMPLETE),), self);
+    }
 }
