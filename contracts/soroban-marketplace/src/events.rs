@@ -85,6 +85,10 @@ pub const ROLE_TRANSFER_PROPOSED: &str = "role_transfer_proposed";
 pub const ROLE_TRANSFERRED: &str = "role_transferred";
 pub const ROLE_PROPOSAL_CANCELLED: &str = "role_proposal_cancelled";
 pub const ROLE_MIGRATED: &str = "role_migrated";
+/// Emitted when a `propose_role_transfer` call overwrites a still-pending
+/// proposal for the same role.  Lets indexers reconcile the superseded
+/// candidate without ambiguity.
+pub const ROLE_PROPOSAL_OVERWRITTEN: &str = "role_proposal_overwritten";
 // Royalty settlement snapshot event (Issue #270)
 pub const ROYALTY_SETTLEMENT: &str = "royalty_settlement";
 // Auction escrow recovery events (Issue #271)
@@ -880,6 +884,8 @@ pub struct RoleTransferredEvent {
     pub role: crate::types::RoleType,
     pub old_authority: Address,
     pub new_authority: Address,
+    /// Ledger sequence at which the transfer was accepted.
+    pub ledger_sequence: u32,
 }
 impl RoleTransferredEvent {
     #[allow(deprecated)]
@@ -897,12 +903,38 @@ pub struct RoleProposalCancelledEvent {
     pub role: crate::types::RoleType,
     pub current_authority: Address,
     pub cancelled_candidate: Address,
+    /// Ledger sequence at which the cancellation occurred.
+    pub ledger_sequence: u32,
 }
 impl RoleProposalCancelledEvent {
     #[allow(deprecated)]
     pub fn publish(self, env: &Env) {
         env.events()
             .publish((soroban_sdk::Symbol::new(env, ROLE_PROPOSAL_CANCELLED),), self);
+    }
+}
+
+/// Emitted when a second `propose_role_transfer` call for the same role
+/// overwrites a still-pending proposal. Carries both the superseded candidate
+/// and the new candidate so indexers can close the old proposal unambiguously.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoleProposalOverwrittenEvent {
+    pub role: crate::types::RoleType,
+    pub current_authority: Address,
+    /// The candidate whose proposal is being replaced.
+    pub old_candidate: Address,
+    pub old_expires_at: u64,
+    /// The new candidate being proposed.
+    pub new_candidate: Address,
+    pub new_expires_at: u64,
+    pub ledger_sequence: u32,
+}
+impl RoleProposalOverwrittenEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, ROLE_PROPOSAL_OVERWRITTEN),), self);
     }
 }
 
@@ -983,11 +1015,13 @@ pub fn emit_role_accepted(
     role: crate::types::RoleType,
     old_authority: Address,
     new_authority: Address,
+    ledger_sequence: u32,
 ) {
     RoleTransferredEvent {
         role,
         old_authority,
         new_authority,
+        ledger_sequence,
     }
     .publish(env);
 }
@@ -999,11 +1033,35 @@ pub fn emit_role_proposal_cancelled(
     role: crate::types::RoleType,
     current_authority: Address,
     cancelled_candidate: Address,
+    ledger_sequence: u32,
 ) {
     RoleProposalCancelledEvent {
         role,
         current_authority,
         cancelled_candidate,
+        ledger_sequence,
+    }
+    .publish(env);
+}
+
+/// Emit `role_proposal_overwritten` when a new proposal replaces a pending one.
+pub fn emit_role_proposal_overwritten(
+    env: &Env,
+    role: crate::types::RoleType,
+    current_authority: Address,
+    old_candidate: Address,
+    old_expires_at: u64,
+    new_candidate: Address,
+    new_expires_at: u64,
+) {
+    RoleProposalOverwrittenEvent {
+        role,
+        current_authority,
+        old_candidate,
+        old_expires_at,
+        new_candidate,
+        new_expires_at,
+        ledger_sequence: env.ledger().sequence(),
     }
     .publish(env);
 }
