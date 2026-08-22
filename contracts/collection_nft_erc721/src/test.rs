@@ -1100,20 +1100,20 @@ fn mint_succeeds_after_unpause() {
 }
 
 #[test]
-fn transfer_unaffected_when_paused() {
+fn transfer_blocked_when_paused() {
     let (env, client, _, _) = setup();
     let alice = Address::generate(&env);
     let bob = Address::generate(&env);
-    // Mint before pausing
     let id = client.mint(&alice, &String::from_str(&env, "uri"));
     client.pause();
-    // Transfer must still work while paused
-    client.transfer(&alice, &bob, &id);
-    assert_eq!(client.owner_of(&id), bob);
+    assert_eq!(
+        client.try_transfer(&alice, &bob, &id),
+        Err(Ok(Error::CollectionPaused))
+    );
 }
 
 #[test]
-fn transfer_from_unaffected_when_paused() {
+fn transfer_from_blocked_when_paused() {
     let (env, client, _, _) = setup();
     let alice = Address::generate(&env);
     let bob = Address::generate(&env);
@@ -1121,20 +1121,23 @@ fn transfer_from_unaffected_when_paused() {
     let id = client.mint(&alice, &String::from_str(&env, "uri"));
     client.approve(&alice, &spender, &id, &None::<u32>);
     client.pause();
-    client.transfer_from(&spender, &alice, &bob, &id);
-    assert_eq!(client.owner_of(&id), bob);
+    assert_eq!(
+        client.try_transfer_from(&spender, &alice, &bob, &id),
+        Err(Ok(Error::CollectionPaused))
+    );
 }
 
 #[test]
-fn burn_unaffected_when_paused() {
+fn burn_blocked_when_paused() {
     let (env, client, _, _) = setup();
     let alice = Address::generate(&env);
     let id = client.mint(&alice, &String::from_str(&env, "uri"));
     client.approve(&alice, &alice, &id, &None::<u32>);
     client.pause();
-    client.burn(&alice, &id);
-    let result = client.try_owner_of(&id);
-    assert_eq!(result, Err(Ok(Error::TokenNotFound)));
+    assert_eq!(
+        client.try_burn(&alice, &id),
+        Err(Ok(Error::CollectionPaused))
+    );
 }
 
 #[test]

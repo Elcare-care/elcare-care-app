@@ -100,8 +100,6 @@ pub enum DataKey {
     // ── Versioned migration registry ─────────────────────────────────────
     /// Completion marker: present when migration to `version` is done.
     MigrationDone(String),
-    /// Resumable progress cursor during an in-flight migration.
-    MigrationCursor(String),
     /// Version string last written to on-chain storage by `migrate()`.
     ContractVersion,
 }
@@ -355,14 +353,15 @@ impl NormalNFT721 {
 
     // ── Transfers ─────────────────────────────────────────────────────────
 
-    /// Owner transfers their token.
+    /// Owner transfers their token.  Blocked while paused.
     pub fn transfer(env: Env, from: Address, to: Address, token_id: u64) -> Result<(), Error> {
         Self::extend_instance_ttl(&env);
         from.require_auth();
+        Self::require_not_paused(&env)?;
         Self::_transfer(&env, &from, &to, token_id)
     }
 
-    /// Approved spender (or operator) transfers on behalf of owner.
+    /// Approved spender (or operator) transfers on behalf of owner.  Blocked while paused.
     pub fn transfer_from(
         env: Env,
         spender: Address,
@@ -372,6 +371,7 @@ impl NormalNFT721 {
     ) -> Result<(), Error> {
         Self::extend_instance_ttl(&env);
         spender.require_auth();
+        Self::require_not_paused(&env)?;
         Self::_check_approved(&env, &spender, &from, token_id)?;
         // clear single-token approval + its expiry on transfer
         env.storage()
@@ -542,9 +542,11 @@ impl NormalNFT721 {
 
     // ── Burn ──────────────────────────────────────────────────────────────
 
+    /// Blocked while paused.
     pub fn burn(env: Env, spender: Address, token_id: u64) -> Result<(), Error> {
         Self::extend_instance_ttl(&env);
         spender.require_auth();
+        Self::require_not_paused(&env)?;
         let owner: Address = env
             .storage()
             .persistent()
@@ -606,6 +608,21 @@ impl NormalNFT721 {
         // Verify the token exists first.
         if !env.storage().persistent().has(&DataKey::Owner(token_id)) {
             return Err(Error::TokenNotFound);
+        }
+        // Frozen tokens always return their immutable snapshotted URI — a
+        // subsequent `set_base_uri` call cannot retroactively alter metadata
+        // that has been permanently frozen.
+        if env
+            .storage()
+            .persistent()
+            .get::<DataKey, bool>(&DataKey::TokenFrozen(token_id))
+            .unwrap_or(false)
+        {
+            return env
+                .storage()
+                .persistent()
+                .get(&DataKey::TokenUri(token_id))
+                .ok_or(Error::TokenNotFound);
         }
         // If a base URI is set, return base_uri + token_id.
         if let Some(base) = env
@@ -940,7 +957,37 @@ impl NormalNFT721 {
         {
             return Err(Error::AlreadyFrozen);
         }
-        
+
+        // Snapshot the current effective URI into per-token storage before
+        // freezing so the frozen URI remains immutable even if BaseUri later
+        // changes.  Only needed when the per-token slot is absent (i.e. the
+        // token was minted under a base-URI regime).
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::TokenUri(token_id))
+        {
+            if let Some(base) = env
+                .storage()
+                .instance()
+                .get::<DataKey, String>(&DataKey::BaseUri)
+            {
+                let id_str = u64_to_string(&env, token_id);
+                let mut combined: Bytes = base.into();
+                let id_bytes: Bytes = id_str.into();
+                combined.append(&id_bytes);
+                let uri = String::from(&combined);
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::TokenUri(token_id), &uri);
+                env.storage().persistent().extend_ttl(
+                    &DataKey::TokenUri(token_id),
+                    TTL_THRESHOLD,
+                    TTL_BUMP,
+                );
+            }
+        }
+
         env.storage()
             .persistent()
             .set(&DataKey::TokenFrozen(token_id), &true);
@@ -1055,6 +1102,18 @@ impl NormalNFT721 {
             return Err(Error::AlreadyMigrated);
         }
 
+        // Reject version jumps: if the instance already records a *different*
+        // version, the operator skipped a migration step.
+        if let Some(current) = env
+            .storage()
+            .instance()
+            .get::<DataKey, String>(&DataKey::ContractVersion)
+        {
+            if current != target {
+                return Err(Error::UnsupportedMigration);
+            }
+        }
+
         // ── v1.0.0 migration body ─────────────────────────────────────────
         // Nothing to migrate for the initial version.  Future versions insert
         // data-backfill logic here before recording the marker.
@@ -1094,6 +1153,18 @@ impl NormalNFT721 {
             .ok_or(Error::NotInitialized)?;
         creator.require_auth();
         Ok(creator)
+    }
+
+    fn require_not_paused(env: &Env) -> Result<(), Error> {
+        if env
+            .storage()
+            .instance()
+            .get::<DataKey, bool>(&DataKey::Paused)
+            .unwrap_or(false)
+        {
+            return Err(Error::CollectionPaused);
+        }
+        Ok(())
     }
 
     fn _do_mint(env: &Env, to: &Address, token_id: u64, uri: &String) {

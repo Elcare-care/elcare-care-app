@@ -397,7 +397,7 @@ fn transfer_from_blocked_when_paused() {
     let bob = Address::generate(&env);
     let op = Address::generate(&env);
     let tid = c.mint_new(&alice, &10u128, &String::from_str(&env, "u"));
-    c.set_approval_for_all(&alice, &op, &true);
+    c.set_approval_for_all(&alice, &op, &true, &None::<u32>);
     c.pause();
     assert_eq!(c.try_transfer_from(&op, &alice, &bob, &tid, &1u128), Err(Ok(Error::CollectionPaused)));
 }
@@ -1078,9 +1078,9 @@ fn set_approval_for_all_and_is_approved_for_all() {
     let owner = Address::generate(&env);
     let op = Address::generate(&env);
     assert!(!c.is_approved_for_all(&owner, &op));
-    c.set_approval_for_all(&owner, &op, &true);
+    c.set_approval_for_all(&owner, &op, &true, &None::<u32>);
     assert!(c.is_approved_for_all(&owner, &op));
-    c.set_approval_for_all(&owner, &op, &false);
+    c.set_approval_for_all(&owner, &op, &false, &None::<u32>);
     assert!(!c.is_approved_for_all(&owner, &op));
 }
 
@@ -1091,7 +1091,7 @@ fn transfer_from_by_operator_succeeds() {
     let bob = Address::generate(&env);
     let op = Address::generate(&env);
     let id = c.mint_new(&alice, &10u128, &String::from_str(&env, "uri"));
-    c.set_approval_for_all(&alice, &op, &true);
+    c.set_approval_for_all(&alice, &op, &true, &None::<u32>);
     c.transfer_from(&op, &alice, &bob, &id, &5u128);
     assert_eq!(c.balance_of(&bob, &id), 5u128);
     assert_eq!(c.balance_of(&alice, &id), 5u128);
@@ -1113,7 +1113,7 @@ fn burn_by_operator_succeeds() {
     let alice = Address::generate(&env);
     let op = Address::generate(&env);
     let id = c.mint_new(&alice, &10u128, &String::from_str(&env, "uri"));
-    c.set_approval_for_all(&alice, &op, &true);
+    c.set_approval_for_all(&alice, &op, &true, &None::<u32>);
     c.burn(&op, &alice, &id, &3u128);
     assert_eq!(c.balance_of(&alice, &id), 7u128);
 }

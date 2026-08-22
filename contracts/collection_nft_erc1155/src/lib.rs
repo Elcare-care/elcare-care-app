@@ -68,6 +68,8 @@ pub enum Error {
     BatchTooLarge = 19,
     /// Token does not exist.
     TokenNotFound = 20,
+    /// Approval has expired.
+    ApprovalExpired = 21,
 }
 
 // ─── Storage Keys ─────────────────────────────────────────────────────────────
@@ -96,6 +98,8 @@ pub enum DataKey {
     // Persistent storage
     Balance(Address, u64),            // (account, token_id) → u128
     ApprovedForAll(Address, Address), // (owner, operator) → bool
+    /// Optional expiry (ledger sequence) for an operator-level approval.
+    ApprovedForAllExpiry(Address, Address),
     TokenUri(u64),
     TotalSupply(u64), // per token_id
     /// Per-token maximum supply cap. 0 means no cap.
@@ -108,7 +112,6 @@ pub enum DataKey {
     TokenRoyaltyBps(u64),
     // ── Versioned migration registry ─────────────────────────────────────
     MigrationDone(String),
-    MigrationCursor(String),
     ContractVersion,
 }
 
@@ -385,6 +388,35 @@ impl NormalNFT1155 {
             return Err(Error::AlreadyFrozen);
         }
 
+        // Snapshot the current effective URI into per-token storage before
+        // freezing so it remains immutable even if BaseUri later changes.
+        // Only needed when no per-token URI slot exists (base-URI regime).
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::TokenUri(token_id))
+        {
+            if let Some(base) = env
+                .storage()
+                .instance()
+                .get::<DataKey, String>(&DataKey::BaseUri)
+            {
+                let id_str = u64_to_string(&env, token_id);
+                let mut combined: Bytes = base.into();
+                let id_bytes: Bytes = id_str.into();
+                combined.append(&id_bytes);
+                let uri = String::from(&combined);
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::TokenUri(token_id), &uri);
+                env.storage().persistent().extend_ttl(
+                    &DataKey::TokenUri(token_id),
+                    TTL_THRESHOLD,
+                    TTL_BUMP,
+                );
+            }
+        }
+
         env.storage()
             .persistent()
             .set(&DataKey::TokenFrozen(token_id), &true);
@@ -404,7 +436,7 @@ impl NormalNFT1155 {
     pub fn set_token_uri(env: Env, token_id: u64, uri: String) -> Result<(), Error> {
         Self::extend_instance_ttl(&env);
         let creator = Self::only_creator(&env)?;
-        
+
         // Check collection-level freeze
         if env
             .storage()
@@ -846,14 +878,40 @@ impl NormalNFT1155 {
 
     // ── Approvals ─────────────────────────────────────────────────────────
 
-    pub fn set_approval_for_all(env: Env, owner: Address, operator: Address, approved: bool) {
+    pub fn set_approval_for_all(
+        env: Env,
+        owner: Address,
+        operator: Address,
+        approved: bool,
+        expires_at: Option<u32>,
+    ) -> Result<(), Error> {
         Self::extend_instance_ttl(&env);
         owner.require_auth();
+
+        // Reject grants with an expiry already in the past.
+        if let Some(exp) = expires_at {
+            if env.ledger().sequence() >= exp {
+                return Err(Error::ApprovalExpired);
+            }
+        }
+
         let key = DataKey::ApprovedForAll(owner.clone(), operator.clone());
         env.storage().persistent().set(&key, &approved);
         env.storage().persistent().extend_ttl(&key, 50_000, 100_000);
+
+        let expiry_key = DataKey::ApprovedForAllExpiry(owner.clone(), operator.clone());
+        if let Some(exp) = expires_at {
+            env.storage().persistent().set(&expiry_key, &exp);
+            env.storage()
+                .persistent()
+                .extend_ttl(&expiry_key, TTL_THRESHOLD, TTL_BUMP);
+        } else {
+            env.storage().persistent().remove(&expiry_key);
+        }
+
         env.events()
             .publish((symbol_short!("appr_all"), owner), (operator, approved));
+        Ok(())
     }
 
     // ── Burn ──────────────────────────────────────────────────────────────
@@ -951,6 +1009,21 @@ impl NormalNFT1155 {
     /// 1. If a base URI is set, returns `base_uri + token_id` (decimal string).
     /// 2. Otherwise returns the per-token URI stored at mint time.
     pub fn uri(env: Env, token_id: u64) -> String {
+        // Frozen tokens always return their immutable snapshotted URI — a
+        // subsequent `set_base_uri` call cannot retroactively alter metadata
+        // that has been permanently frozen.
+        if env
+            .storage()
+            .persistent()
+            .get::<DataKey, bool>(&DataKey::TokenFrozen(token_id))
+            .unwrap_or(false)
+        {
+            return env
+                .storage()
+                .persistent()
+                .get(&DataKey::TokenUri(token_id))
+                .unwrap();
+        }
         if let Some(base) = env
             .storage()
             .instance()
@@ -1041,6 +1114,18 @@ impl NormalNFT1155 {
             .unwrap_or(false)
         {
             return Err(Error::AlreadyMigrated);
+        }
+
+        // Reject version jumps: if the instance already records a different
+        // version, the operator skipped a migration step.
+        if let Some(current) = env
+            .storage()
+            .instance()
+            .get::<DataKey, String>(&DataKey::ContractVersion)
+        {
+            if current != target {
+                return Err(Error::UnsupportedMigration);
+            }
         }
 
         // v1.0.0 migration body: nothing to migrate for the initial version.
@@ -1201,10 +1286,25 @@ impl NormalNFT1155 {
     }
 
     fn _is_approved_for_all(env: &Env, operator: &Address, owner: &Address) -> bool {
-        env.storage()
+        let approved: bool = env
+            .storage()
             .persistent()
             .get(&DataKey::ApprovedForAll(owner.clone(), operator.clone()))
-            .unwrap_or(false)
+            .unwrap_or(false);
+        if !approved {
+            return false;
+        }
+        // If an expiry is recorded, check that it has not yet been reached.
+        let expired = env
+            .storage()
+            .persistent()
+            .get::<DataKey, u32>(&DataKey::ApprovedForAllExpiry(
+                owner.clone(),
+                operator.clone(),
+            ))
+            .map(|exp| env.ledger().sequence() >= exp)
+            .unwrap_or(false);
+        !expired
     }
 
     fn _check_supply_cap(env: &Env, token_id: u64, amount: u128) -> Result<(), Error> {

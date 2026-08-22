@@ -86,6 +86,8 @@ pub enum Error {
     DuplicateVoucherInBatch = 24,
     /// Royalty or fee basis points exceed 100 % (10 000 bps).
     InvalidBps = 25,
+    /// Approval has expired.
+    ApprovalExpired = 26,
 }
 
 // ─── Data types ───────────────────────────────────────────────────────────────
@@ -130,6 +132,8 @@ pub enum DataKey {
     PlatformFeeBps,
     Balance(Address, u64),
     ApprovedForAll(Address, Address),
+    /// Optional expiry (ledger sequence) for an operator-level approval.
+    ApprovedForAllExpiry(Address, Address),
     TokenUri(u64),
     TotalSupply(u64),
     MintedPerBuyer(Address, u64),
@@ -756,6 +760,18 @@ impl LazyMint1155 {
             return Err(Error::AlreadyMigrated);
         }
 
+        // Reject version jumps: if the instance already records a different
+        // version, the operator skipped a migration step.
+        if let Some(current) = env
+            .storage()
+            .instance()
+            .get::<DataKey, String>(&DataKey::ContractVersion)
+        {
+            if current != target {
+                return Err(Error::UnsupportedMigration);
+            }
+        }
+
         // v1.0.0 migration body: nothing to migrate for the initial version.
         // EditionMaxSupply, Balance, TotalSupply, RedeemedVoucher, and
         // RevokedVoucher entries are already in persistent storage and remain
@@ -839,16 +855,37 @@ impl LazyMint1155 {
 
     // ── Approvals ─────────────────────────────────────────────────────────
 
-    pub fn set_approval_for_all(env: Env, owner: Address, operator: Address, approved: bool) {
+    pub fn set_approval_for_all(
+        env: Env,
+        owner: Address,
+        operator: Address,
+        approved: bool,
+        expires_at: Option<u32>,
+    ) -> Result<(), Error> {
         Self::extend_instance_ttl(&env);
         owner.require_auth();
+        if let Some(exp) = expires_at {
+            if env.ledger().sequence() >= exp {
+                return Err(Error::ApprovalExpired);
+            }
+        }
         let key = DataKey::ApprovedForAll(owner.clone(), operator.clone());
         env.storage().persistent().set(&key, &approved);
         env.storage()
             .persistent()
             .extend_ttl(&key, TTL_THRESHOLD, TTL_BUMP);
+        let expiry_key = DataKey::ApprovedForAllExpiry(owner.clone(), operator.clone());
+        if let Some(exp) = expires_at {
+            env.storage().persistent().set(&expiry_key, &exp);
+            env.storage()
+                .persistent()
+                .extend_ttl(&expiry_key, TTL_THRESHOLD, TTL_BUMP);
+        } else {
+            env.storage().persistent().remove(&expiry_key);
+        }
         env.events()
             .publish((symbol_short!("appr_all"), owner), (operator, approved));
+        Ok(())
     }
 
     // ── Burn ──────────────────────────────────────────────────────────────
@@ -1043,6 +1080,9 @@ impl LazyMint1155 {
     pub fn register_edition(env: Env, token_id: u64, max_supply: u128) -> Result<(), Error> {
         Self::extend_instance_ttl(&env);
         Self::only_creator(&env)?;
+        if max_supply == 0 {
+            return Err(Error::ZeroAmount);
+        }
         let key = DataKey::EditionMaxSupply(token_id);
         if env.storage().persistent().has(&key) {
             return Err(Error::EditionAlreadyRegistered);
@@ -1197,10 +1237,24 @@ impl LazyMint1155 {
     }
 
     fn _is_approved_for_all(env: &Env, operator: &Address, owner: &Address) -> bool {
-        env.storage()
+        let approved: bool = env
+            .storage()
             .persistent()
             .get(&DataKey::ApprovedForAll(owner.clone(), operator.clone()))
-            .unwrap_or(false)
+            .unwrap_or(false);
+        if !approved {
+            return false;
+        }
+        let expired = env
+            .storage()
+            .persistent()
+            .get::<DataKey, u32>(&DataKey::ApprovedForAllExpiry(
+                owner.clone(),
+                operator.clone(),
+            ))
+            .map(|exp| env.ledger().sequence() >= exp)
+            .unwrap_or(false);
+        !expired
     }
 }
 
