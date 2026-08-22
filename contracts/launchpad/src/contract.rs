@@ -94,6 +94,7 @@ mod iface {
             royalty_receiver: Address,
             platform_fee_receiver: Address,
             platform_fee_bps: u32,
+            network_passphrase: String,
         );
         fn upgrade(env: Env, new_wasm_hash: BytesN<32>);
     }
@@ -110,6 +111,7 @@ mod iface {
             royalty_receiver: Address,
             platform_fee_receiver: Address,
             platform_fee_bps: u32,
+            network_passphrase: String,
         );
         fn upgrade(env: Env, new_wasm_hash: BytesN<32>);
     }
@@ -636,6 +638,7 @@ impl Launchpad {
         royalty_receiver: Address,
         platform_fee_bps: u32,
         salt: BytesN<32>,
+        network_passphrase: String,
     ) -> Result<Address, Error> {
         storage::extend_instance_ttl(&env);
         creator.require_auth();
@@ -674,6 +677,7 @@ impl Launchpad {
             &royalty_receiver,
             &platform_fee_receiver,
             &platform_fee_bps,
+            &network_passphrase,
         );
 
         storage::mark_salt_used(&env, &secure_salt);
@@ -744,6 +748,7 @@ impl Launchpad {
         royalty_receiver: Address,
         platform_fee_bps: u32,
         salt: BytesN<32>,
+        network_passphrase: String,
     ) -> Result<Address, Error> {
         storage::extend_instance_ttl(&env);
         creator.require_auth();
@@ -778,6 +783,7 @@ impl Launchpad {
             &royalty_receiver,
             &platform_fee_receiver,
             &platform_fee_bps,
+            &network_passphrase,
         );
 
         storage::mark_salt_used(&env, &secure_salt);
@@ -1028,8 +1034,4 @@ impl Launchpad {
         storage::wasm_version(&env)
     }
 
-    /// Semantic version string for this contract.
-    pub fn version(env: Env) -> soroban_sdk::String {
-        soroban_sdk::String::from_str(&env, CONTRACT_VERSION)
-    }
 }

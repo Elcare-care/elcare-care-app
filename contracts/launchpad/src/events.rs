@@ -147,6 +147,42 @@ pub fn publish_wasm_hashes_set(
     );
 }
 
+/// Emitted when the admin updates the WASM hash for a specific collection kind.
+///
+/// Topics: ("wasm_upd", kind_tag)
+/// Data:   (old_wasm: BytesN<32>, new_wasm: BytesN<32>)
+#[allow(deprecated)]
+pub fn publish_collection_wasm_updated(
+    env: &Env,
+    kind: &crate::types::CollectionKind,
+    old_wasm: &BytesN<32>,
+    new_wasm: &BytesN<32>,
+) {
+    use soroban_sdk::IntoVal;
+    let tag: soroban_sdk::Val = kind.clone().into_val(env);
+    env.events().publish(
+        (symbol_short!("wasm_upd"), tag),
+        (old_wasm.clone(), new_wasm.clone()),
+    );
+}
+
+/// Emitted when the admin upgrades a deployed collection to a new WASM hash.
+///
+/// Topics: ("col_upg", collection: Address)
+/// Data:   (from_wasm: BytesN<32>, to_wasm: BytesN<32>)
+#[allow(deprecated)]
+pub fn publish_collection_upgraded(
+    env: &Env,
+    collection: &Address,
+    from_wasm: &BytesN<32>,
+    to_wasm: &BytesN<32>,
+) {
+    env.events().publish(
+        (symbol_short!("col_upg"), collection.clone()),
+        (from_wasm.clone(), to_wasm.clone()),
+    );
+}
+
 /// Emitted when a versioned migration completes successfully.
 ///
 /// Topics: ("migrated", version: String)
