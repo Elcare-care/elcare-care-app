@@ -1503,7 +1503,7 @@ mod migration {
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #14)")]
+    #[should_panic(expected = "Contract, #14")]
     fn double_migrate_reverts_with_already_migrated() {
         let (_env, client, _contract_id, _creator) = setup();
 
@@ -1518,13 +1518,19 @@ mod migration {
         client.migrate();
 
         let events = env.events().all();
-        use soroban_sdk::xdr::{ContractEventBody, ScVal};
         let found = events.events().iter().any(|e| {
+            use soroban_sdk::xdr::{ContractEventBody, ScVal};
             if let ContractEventBody::V0(body) = &e.body {
-                body.topics.iter().any(|t| matches!(t,
-                    ScVal::Symbol(s) if core::str::from_utf8(s.0.as_slice()).unwrap_or("") == "migrated"
-                ))
-            } else { false }
+                body.topics.iter().any(|t| {
+                    if let ScVal::Symbol(s) = t {
+                        core::str::from_utf8(s.0.as_slice()).unwrap_or("") == "migrated"
+                    } else {
+                        false
+                    }
+                })
+            } else {
+                false
+            }
         });
         assert!(found, "expected 'migrated' event");
     }

@@ -42,7 +42,7 @@ const TTL_THRESHOLD: u32 = 50_000;
 const TTL_BUMP: u32 = 100_000;
 /// Maximum number of vouchers accepted by a single redeem_batch call (#274).
 const MAX_BATCH_SIZE: u32 = 100;
-/// Maximum URI length in bytes (#276).
+/// Maximum allowed byte length for a token URI.
 const MAX_URI_LEN: u32 = 2048;
 
 // ─── Errors ──────────────────────────────────────────────────────────────────
@@ -71,17 +71,17 @@ pub enum Error {
     AlreadyMigrated = 17,
     /// Unsupported version jump.
     UnsupportedMigration = 18,
-    /// Empty URI provided (#276).
+    /// redeem/check_voucher called with an empty URI.
     EmptyUri = 19,
-    /// URI exceeds maximum length (#276).
+    /// redeem/check_voucher called with a URI exceeding MAX_URI_LEN bytes.
     UriTooLong = 20,
-    /// Zero amount provided.
+    /// redeem called with amount == 0.
     ZeroAmount = 21,
-    /// Empty batch provided (#274).
+    /// redeem_batch called with an empty items list.
     EmptyBatch = 22,
-    /// Batch exceeds maximum size (#274).
+    /// redeem_batch called with more items than MAX_BATCH_SIZE.
     BatchTooLarge = 23,
-    /// Duplicate voucher nonce within a single batch (#274).
+    /// redeem_batch contains two items with the same voucher nonce.
     DuplicateVoucherInBatch = 24,
 }
 
@@ -141,13 +141,10 @@ pub enum DataKey {
     /// Network passphrase bound at initialization for cross-network domain
     /// separation (#273).
     NetworkPassphrase, // String
-    // ── Versioned migration registry ─────────────────────────────────────
-    /// Completion marker: present when migration to `version` is done.
-    MigrationDone(String),
-    /// Resumable progress cursor during an in-flight migration.
-    MigrationCursor(String),
-    /// Version string last written to on-chain storage by `migrate()`.
+    /// On-chain version string written by migrate().
     ContractVersion,
+    /// Migration completion marker (version string → bool).
+    MigrationDone(soroban_sdk::String),
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -725,8 +722,8 @@ impl LazyMint1155 {
 
     // ── Versioning & Migration ─────────────────────────────────────────────
 
-    pub fn version(env: Env) -> String {
-        String::from_str(&env, "1.0.0")
+    pub fn version(env: Env) -> soroban_sdk::String {
+        soroban_sdk::String::from_str(&env, "1.0.0")
     }
 
     pub fn contract_version(env: Env) -> Option<String> {

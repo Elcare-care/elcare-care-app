@@ -439,7 +439,7 @@ impl NormalNFT1155 {
         );
         
         env.events().publish(
-            (symbol_short!("tok_meta"), creator),
+            (symbol_short!("meta_upd"), creator),
             (token_id, old_uri, uri),
         );
         Ok(())
@@ -1014,8 +1014,8 @@ impl NormalNFT1155 {
 
     // ── Versioning & Migration ─────────────────────────────────────────────
 
-    pub fn version(env: Env) -> String {
-        String::from_str(&env, "1.0.0")
+    pub fn version(env: Env) -> soroban_sdk::String {
+        soroban_sdk::String::from_str(&env, "1.0.0")
     }
 
     pub fn contract_version(env: Env) -> Option<String> {

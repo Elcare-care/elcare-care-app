@@ -34,7 +34,7 @@ fn setup(fee_bps: u32) -> (Env, LazyMint1155Client<'static>, Address, Address) {
         &Address::generate(&env),
         &fee_receiver,
         &fee_bps,
-        &String::from_str(&env, "Test SDF Network ; September 2015"),
+        &String::from_str(&env, "Test Network; September 2015"),
     );
     (env, client, creator, fee_receiver)
 }
@@ -115,7 +115,7 @@ fn digest_byte_layout_is_stable() {
         &Address::generate(&env),
         &Address::generate(&env),
         &0u32,
-        &String::from_str(&env, "Test SDF Network ; September 2015"),
+        &String::from_str(&env, "Test Network; September 2015"),
     );
     let currency = Address::generate(&env);
     let v = MintVoucher1155 {
@@ -726,13 +726,18 @@ fn replay_check_before_sig_verification() {
             .set(&DataKey::RedeemedVoucher(nonce), &true);
     });
 
-    // Attempting to redeem with a pre-consumed nonce must return VoucherAlreadyRedeemed
-    // before sig verification is reached.
+    // Replay check fires before signature verification — redeemed nonce
+    // must be rejected with VoucherAlreadyRedeemed even with a junk signature.
     let buyer = Address::generate(&env);
     let v = make_voucher(&env, token_id, nonce);
-    let bad_sig = BytesN::from_array(&env, &[0u8; 64]);
-    let res = client.try_redeem(&buyer, &v, &1u128, &bad_sig, &empty_proof(&env));
-    assert_eq!(res, Err(Ok(Error::VoucherAlreadyRedeemed)));
+    let result = client.try_redeem(
+        &buyer,
+        &v,
+        &1u128,
+        &BytesN::from_array(&env, &[0u8; 64]),
+        &empty_proof(&env),
+    );
+    assert_eq!(result, Err(Ok(Error::VoucherAlreadyRedeemed)));
 }
 
 // ─── Issue #39 — Voucher nonce / replay protection tests ─────────────────────
@@ -865,7 +870,7 @@ mod migration {
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #17)")]
+    #[should_panic(expected = "Contract, #17")]
     fn double_migrate_reverts() {
         let (_env, client, _creator, _fee_receiver) = setup(0);
         client.migrate();
@@ -878,13 +883,19 @@ mod migration {
         client.migrate();
 
         let events = env.events().all();
-        use soroban_sdk::xdr::{ContractEventBody, ScVal};
         let found = events.events().iter().any(|e| {
+            use soroban_sdk::xdr::{ContractEventBody, ScVal};
             if let ContractEventBody::V0(body) = &e.body {
-                body.topics.iter().any(|t| matches!(t,
-                    ScVal::Symbol(s) if core::str::from_utf8(s.0.as_slice()).unwrap_or("") == "migrated"
-                ))
-            } else { false }
+                body.topics.iter().any(|t| {
+                    if let ScVal::Symbol(s) = t {
+                        core::str::from_utf8(s.0.as_slice()).unwrap_or("") == "migrated"
+                    } else {
+                        false
+                    }
+                })
+            } else {
+                false
+            }
         });
         assert!(found, "expected 'migrated' event");
     }
@@ -902,14 +913,13 @@ mod migration {
     #[test]
     fn redeemed_voucher_readable_after_migrate() {
         let (env, client, _creator, _fee_receiver) = setup(0);
-        let contract_id = env.register(crate::LazyMint1155, ());
 
         // Register an edition and redeem a voucher pre-migration
         client.register_edition(&0u64, &500u128);
         client.set_public_phase();
 
         let voucher = make_voucher(&env, 0u64, 1u64);
-        let sig = sign_voucher(&env, &contract_id, &voucher);
+        let sig = sign_voucher(&env, &client.address, &voucher);
         let buyer = Address::generate(&env);
 
         client.redeem(&buyer, &voucher, &1u128, &sig, &empty_proof(&env));
@@ -924,13 +934,12 @@ mod migration {
     #[test]
     fn balance_readable_after_migrate() {
         let (env, client, _creator, _fee_receiver) = setup(0);
-        let contract_id = env.register(crate::LazyMint1155, ());
 
         client.register_edition(&0u64, &500u128);
         client.set_public_phase();
 
         let voucher = make_voucher(&env, 0u64, 10u64);
-        let sig = sign_voucher(&env, &contract_id, &voucher);
+        let sig = sign_voucher(&env, &client.address, &voucher);
         let buyer = Address::generate(&env);
 
         client.redeem(&buyer, &voucher, &5u128, &sig, &empty_proof(&env));

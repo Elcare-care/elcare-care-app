@@ -69,16 +69,12 @@ pub enum Error {
     AlreadyMigrated = 14,
     /// Unsupported version jump.
     UnsupportedMigration = 15,
-    /// Empty URI provided (#276).
-    EmptyUri = 16,
-    /// URI exceeds maximum length (#276).
-    UriTooLong = 17,
-    /// Empty batch provided (#274).
-    EmptyBatch = 18,
-    /// Batch exceeds maximum size (#274).
-    BatchTooLarge = 19,
-    /// Duplicate voucher token_id within a single batch (#274).
-    DuplicateVoucherInBatch = 20,
+    /// redeem_batch called with an empty items list.
+    EmptyBatch = 16,
+    /// redeem_batch called with more items than MAX_BATCH_SIZE.
+    BatchTooLarge = 17,
+    /// redeem_batch contains two items with the same voucher token_id.
+    DuplicateVoucherInBatch = 18,
 }
 
 // ─── Data types ───────────────────────────────────────────────────────────────
@@ -150,13 +146,10 @@ pub enum DataKey {
     /// Network passphrase bound at initialization.
     /// Included in the signed digest to prevent cross-network replay (#273).
     NetworkPassphrase,   // String
-    // ── Versioned migration registry ─────────────────────────────────────
-    /// Completion marker: present when migration to `version` is done.
-    MigrationDone(String),
-    /// Resumable progress cursor during an in-flight migration.
-    MigrationCursor(String),
-    /// Version string last written to on-chain storage by `migrate()`.
+    /// On-chain version string written by migrate().
     ContractVersion,
+    /// Migration completion marker (version string → bool).
+    MigrationDone(soroban_sdk::String),
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -930,8 +923,8 @@ impl LazyMint721 {
 
     // ── Versioning & Migration ─────────────────────────────────────────────
 
-    pub fn version(env: Env) -> String {
-        String::from_str(&env, "1.0.0")
+    pub fn version(env: Env) -> soroban_sdk::String {
+        soroban_sdk::String::from_str(&env, "1.0.0")
     }
 
     pub fn contract_version(env: Env) -> Option<String> {

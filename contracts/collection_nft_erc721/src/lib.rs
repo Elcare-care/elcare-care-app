@@ -53,13 +53,13 @@ pub enum Error {
     AlreadyMigrated = 14,
     /// Unsupported version jump — only sequential upgrades are permitted.
     UnsupportedMigration = 15,
-    /// Empty URI provided (#276).
+    /// Empty URI provided.
     EmptyUri = 16,
-    /// URI exceeds maximum length (#276).
+    /// URI exceeds maximum length.
     UriTooLong = 17,
-    /// Empty batch provided (#274).
+    /// Empty batch provided.
     EmptyBatch = 18,
-    /// Batch exceeds maximum size (#274).
+    /// Batch exceeds maximum size.
     BatchTooLarge = 19,
 }
 
@@ -992,7 +992,7 @@ impl NormalNFT721 {
         );
         
         env.events().publish(
-            (symbol_short!("tok_meta"), creator),
+            (symbol_short!("meta_upd"), creator),
             (token_id, old_uri, uri),
         );
         Ok(())
@@ -1014,8 +1014,8 @@ impl NormalNFT721 {
     // ── Versioning & Migration ─────────────────────────────────────────────
 
     /// Semantic version compiled into this WASM.
-    pub fn version(env: Env) -> String {
-        String::from_str(&env, "1.0.0")
+    pub fn version(env: Env) -> soroban_sdk::String {
+        soroban_sdk::String::from_str(&env, "1.0.0")
     }
 
     /// On-chain version string last written by `migrate()`, or `None` before
