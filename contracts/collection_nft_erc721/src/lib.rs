@@ -992,7 +992,7 @@ impl NormalNFT721 {
         );
         
         env.events().publish(
-            (symbol_short!("token_meta_upd"), creator),
+            (symbol_short!("tok_meta"), creator),
             (token_id, old_uri, uri),
         );
         Ok(())
