@@ -865,7 +865,7 @@ mod migration {
     }
 
     #[test]
-    #[should_panic(expected = "AlreadyMigrated")]
+    #[should_panic(expected = "Error(Contract, #17)")]
     fn double_migrate_reverts() {
         let (_env, client, _creator, _fee_receiver) = setup(0);
         client.migrate();

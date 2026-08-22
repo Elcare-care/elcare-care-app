@@ -1198,7 +1198,7 @@ mod migration {
     }
 
     #[test]
-    #[should_panic(expected = "AlreadyMigrated")]
+    #[should_panic(expected = "Error(Contract, #13)")]
     fn double_migrate_reverts() {
         let (_, c, _, _) = setup();
         c.migrate();

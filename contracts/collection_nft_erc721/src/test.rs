@@ -1503,7 +1503,7 @@ mod migration {
     }
 
     #[test]
-    #[should_panic(expected = "AlreadyMigrated")]
+    #[should_panic(expected = "Error(Contract, #14)")]
     fn double_migrate_reverts_with_already_migrated() {
         let (_env, client, _contract_id, _creator) = setup();
 
