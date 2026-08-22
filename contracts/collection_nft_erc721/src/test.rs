@@ -1100,20 +1100,18 @@ fn mint_succeeds_after_unpause() {
 }
 
 #[test]
-fn transfer_unaffected_when_paused() {
+fn transfer_blocked_when_paused() {
     let (env, client, _, _) = setup();
     let alice = Address::generate(&env);
     let bob = Address::generate(&env);
-    // Mint before pausing
     let id = client.mint(&alice, &String::from_str(&env, "uri"));
     client.pause();
-    // Transfer must still work while paused
-    client.transfer(&alice, &bob, &id);
-    assert_eq!(client.owner_of(&id), bob);
+    let result = client.try_transfer(&alice, &bob, &id);
+    assert_eq!(result, Err(Ok(Error::CollectionPaused)));
 }
 
 #[test]
-fn transfer_from_unaffected_when_paused() {
+fn transfer_from_blocked_when_paused() {
     let (env, client, _, _) = setup();
     let alice = Address::generate(&env);
     let bob = Address::generate(&env);
@@ -1121,20 +1119,19 @@ fn transfer_from_unaffected_when_paused() {
     let id = client.mint(&alice, &String::from_str(&env, "uri"));
     client.approve(&alice, &spender, &id, &None::<u32>);
     client.pause();
-    client.transfer_from(&spender, &alice, &bob, &id);
-    assert_eq!(client.owner_of(&id), bob);
+    let result = client.try_transfer_from(&spender, &alice, &bob, &id);
+    assert_eq!(result, Err(Ok(Error::CollectionPaused)));
 }
 
 #[test]
-fn burn_unaffected_when_paused() {
+fn burn_blocked_when_paused() {
     let (env, client, _, _) = setup();
     let alice = Address::generate(&env);
     let id = client.mint(&alice, &String::from_str(&env, "uri"));
     client.approve(&alice, &alice, &id, &None::<u32>);
     client.pause();
-    client.burn(&alice, &id);
-    let result = client.try_owner_of(&id);
-    assert_eq!(result, Err(Ok(Error::TokenNotFound)));
+    let result = client.try_burn(&alice, &id);
+    assert_eq!(result, Err(Ok(Error::CollectionPaused)));
 }
 
 #[test]
@@ -1573,4 +1570,65 @@ mod migration {
 
         assert_eq!(client.get_approved(&token_id), Some(bob));
     }
+}
+
+// ── Security hardening regression tests (issue #6) ───────────────────────────
+
+#[test]
+fn initialize_invalid_royalty_bps_fails() {
+    let env = Env::default();
+    env.ledger().with_mut(|li| li.sequence_number = 1);
+    env.mock_all_auths();
+    let contract_id = env.register(NormalNFT721, ());
+    let client = NormalNFT721Client::new(&env, &contract_id);
+    let creator = Address::generate(&env);
+    let royalty_receiver = Address::generate(&env);
+    let result = client.try_initialize(
+        &creator,
+        &String::from_str(&env, "Test"),
+        &String::from_str(&env, "TST"),
+        &100u64,
+        &10_001u32,
+        &royalty_receiver,
+    );
+    assert_eq!(result, Err(Ok(Error::InvalidBps)));
+}
+
+#[test]
+fn update_royalty_exceeds_max_bps_returns_invalid_bps() {
+    let (env, client, _, _) = setup();
+    let receiver = Address::generate(&env);
+    let result = client.try_update_royalty(&receiver, &10_001u32);
+    assert_eq!(result, Err(Ok(Error::InvalidBps)));
+}
+
+#[test]
+fn set_token_royalty_on_nonexistent_token_fails() {
+    let (env, client, _, _) = setup();
+    let receiver = Address::generate(&env);
+    let result = client.try_set_token_royalty(&9999u64, &receiver, &500u32);
+    assert_eq!(result, Err(Ok(Error::TokenNotFound)));
+}
+
+#[test]
+fn burn_clears_per_token_royalty_override() {
+    let (env, client, _, _) = setup();
+    let alice = Address::generate(&env);
+    let royalty_receiver = Address::generate(&env);
+    let id = client.mint(&alice, &String::from_str(&env, "uri"));
+    client.set_token_royalty(&id, &royalty_receiver, &500u32);
+    let (rec, _amount) = client.royalty_info_for(&id, &1000i128);
+    assert_eq!(rec, royalty_receiver);
+    client.approve(&alice, &alice, &id, &None::<u32>);
+    client.burn(&alice, &id);
+    // After burn the token is gone — royalty_info_for must return TokenNotFound.
+    let result = client.try_royalty_info_for(&id, &1000i128);
+    assert_eq!(result, Err(Ok(Error::TokenNotFound)));
+}
+
+#[test]
+fn royalty_info_for_nonexistent_token_fails() {
+    let (_, client, _, _) = setup();
+    let result = client.try_royalty_info_for(&9999u64, &1000i128);
+    assert_eq!(result, Err(Ok(Error::TokenNotFound)));
 }

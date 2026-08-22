@@ -397,7 +397,7 @@ fn transfer_from_blocked_when_paused() {
     let bob = Address::generate(&env);
     let op = Address::generate(&env);
     let tid = c.mint_new(&alice, &10u128, &String::from_str(&env, "u"));
-    c.set_approval_for_all(&alice, &op, &true);
+    c.set_approval_for_all(&alice, &op, &true, &None::<u32>);
     c.pause();
     assert_eq!(c.try_transfer_from(&op, &alice, &bob, &tid, &1u128), Err(Ok(Error::CollectionPaused)));
 }
@@ -1078,9 +1078,9 @@ fn set_approval_for_all_and_is_approved_for_all() {
     let owner = Address::generate(&env);
     let op = Address::generate(&env);
     assert!(!c.is_approved_for_all(&owner, &op));
-    c.set_approval_for_all(&owner, &op, &true);
+    c.set_approval_for_all(&owner, &op, &true, &None::<u32>);
     assert!(c.is_approved_for_all(&owner, &op));
-    c.set_approval_for_all(&owner, &op, &false);
+    c.set_approval_for_all(&owner, &op, &false, &None::<u32>);
     assert!(!c.is_approved_for_all(&owner, &op));
 }
 
@@ -1091,7 +1091,7 @@ fn transfer_from_by_operator_succeeds() {
     let bob = Address::generate(&env);
     let op = Address::generate(&env);
     let id = c.mint_new(&alice, &10u128, &String::from_str(&env, "uri"));
-    c.set_approval_for_all(&alice, &op, &true);
+    c.set_approval_for_all(&alice, &op, &true, &None::<u32>);
     c.transfer_from(&op, &alice, &bob, &id, &5u128);
     assert_eq!(c.balance_of(&bob, &id), 5u128);
     assert_eq!(c.balance_of(&alice, &id), 5u128);
@@ -1113,7 +1113,7 @@ fn burn_by_operator_succeeds() {
     let alice = Address::generate(&env);
     let op = Address::generate(&env);
     let id = c.mint_new(&alice, &10u128, &String::from_str(&env, "uri"));
-    c.set_approval_for_all(&alice, &op, &true);
+    c.set_approval_for_all(&alice, &op, &true, &None::<u32>);
     c.burn(&op, &alice, &id, &3u128);
     assert_eq!(c.balance_of(&alice, &id), 7u128);
 }
@@ -1268,4 +1268,86 @@ mod migration {
         c.migrate();
         assert!(c.is_metadata_frozen());
     }
+}
+
+// ── Security hardening regression tests (issue #6) ───────────────────────────
+
+#[test]
+fn initialize_invalid_royalty_bps_fails_1155() {
+    let env = Env::default();
+    env.ledger().with_mut(|li| li.sequence_number = 1);
+    env.mock_all_auths();
+    let contract_id = env.register(NormalNFT1155, ());
+    let c = NormalNFT1155Client::new(&env, &contract_id);
+    let creator = Address::generate(&env);
+    let royalty_receiver = Address::generate(&env);
+    let result = c.try_initialize(
+        &creator,
+        &String::from_str(&env, "Name"),
+        &10_001u32,
+        &royalty_receiver,
+    );
+    assert_eq!(result, Err(Ok(Error::InvalidBps)));
+}
+
+#[test]
+fn update_royalty_exceeds_max_bps_1155() {
+    let (env, c, _, _) = setup();
+    let receiver = Address::generate(&env);
+    let result = c.try_update_royalty(&receiver, &10_001u32);
+    assert_eq!(result, Err(Ok(Error::InvalidBps)));
+}
+
+#[test]
+fn set_approval_for_all_with_expiry_valid_before_deadline() {
+    let (env, c, _, _) = setup();
+    let owner = Address::generate(&env);
+    let op = Address::generate(&env);
+    // Current ledger sequence is 1 (set in setup); expiry at 100 is in the future.
+    c.set_approval_for_all(&owner, &op, &true, &Some(100u32));
+    assert!(c.is_approved_for_all(&owner, &op));
+}
+
+#[test]
+fn set_approval_for_all_with_expiry_invalid_after_deadline() {
+    let (env, c, _, _) = setup();
+    let owner = Address::generate(&env);
+    let op = Address::generate(&env);
+    c.set_approval_for_all(&owner, &op, &true, &Some(100u32));
+    // Advance ledger past expiry.
+    env.ledger().with_mut(|li| li.sequence_number = 200);
+    assert!(!c.is_approved_for_all(&owner, &op));
+}
+
+#[test]
+fn set_approval_for_all_with_past_expiry_rejected() {
+    let (env, c, _, _) = setup();
+    let owner = Address::generate(&env);
+    let op = Address::generate(&env);
+    // Ledger is at sequence 1; expiry at 1 is already reached.
+    let result = c.try_set_approval_for_all(&owner, &op, &true, &Some(1u32));
+    assert_eq!(result, Err(Ok(Error::ApprovalExpired)));
+}
+
+#[test]
+fn batch_transfer_empty_fails() {
+    let (env, c, _, _) = setup();
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    let result = c.try_batch_transfer(&alice, &alice, &bob, &Vec::new(&env), &Vec::new(&env));
+    assert_eq!(result, Err(Ok(Error::EmptyBatch)));
+}
+
+#[test]
+fn batch_transfer_zero_amount_fails() {
+    let (env, c, _, _) = setup();
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    let id = c.mint_new(&alice, &10u128, &String::from_str(&env, "uri"));
+    let mut ids = Vec::new(&env);
+    ids.push_back(id);
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(0u128);
+    let result = c.try_batch_transfer(&alice, &alice, &bob, &ids, &amounts);
+    assert_eq!(result, Err(Ok(Error::ZeroAmount)));
 }
