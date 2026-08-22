@@ -163,6 +163,9 @@ impl NormalNFT721 {
         if env.storage().instance().has(&DataKey::Initialized) {
             return Err(Error::AlreadyInitialized);
         }
+        if royalty_bps > MAX_BPS {
+            return Err(Error::InvalidBps);
+        }
 
         env.storage().instance().set(&DataKey::Initialized, &true);
         env.storage().instance().set(&DataKey::Creator, &creator);
@@ -352,14 +355,22 @@ impl NormalNFT721 {
 
     // ── Transfers ─────────────────────────────────────────────────────────
 
-    /// Owner transfers their token.
+    /// Owner transfers their token.  Blocked while collection is paused.
     pub fn transfer(env: Env, from: Address, to: Address, token_id: u64) -> Result<(), Error> {
         Self::extend_instance_ttl(&env);
         from.require_auth();
+        if env
+            .storage()
+            .instance()
+            .get::<DataKey, bool>(&DataKey::Paused)
+            .unwrap_or(false)
+        {
+            return Err(Error::CollectionPaused);
+        }
         Self::_transfer(&env, &from, &to, token_id)
     }
 
-    /// Approved spender (or operator) transfers on behalf of owner.
+    /// Approved spender (or operator) transfers on behalf of owner.  Blocked while paused.
     pub fn transfer_from(
         env: Env,
         spender: Address,
@@ -369,6 +380,14 @@ impl NormalNFT721 {
     ) -> Result<(), Error> {
         Self::extend_instance_ttl(&env);
         spender.require_auth();
+        if env
+            .storage()
+            .instance()
+            .get::<DataKey, bool>(&DataKey::Paused)
+            .unwrap_or(false)
+        {
+            return Err(Error::CollectionPaused);
+        }
         Self::_check_approved(&env, &spender, &from, token_id)?;
         // clear single-token approval + its expiry on transfer
         env.storage()
@@ -539,9 +558,19 @@ impl NormalNFT721 {
 
     // ── Burn ──────────────────────────────────────────────────────────────
 
+    /// Burn a token. Blocked while collection is paused. Also clears any
+    /// per-token royalty override so stale entries cannot accumulate.
     pub fn burn(env: Env, spender: Address, token_id: u64) -> Result<(), Error> {
         Self::extend_instance_ttl(&env);
         spender.require_auth();
+        if env
+            .storage()
+            .instance()
+            .get::<DataKey, bool>(&DataKey::Paused)
+            .unwrap_or(false)
+        {
+            return Err(Error::CollectionPaused);
+        }
         let owner: Address = env
             .storage()
             .persistent()
@@ -575,6 +604,14 @@ impl NormalNFT721 {
         env.storage()
             .persistent()
             .remove(&DataKey::ApprovedExpiry(token_id));
+        // Clear per-token royalty overrides so they cannot be read back as
+        // stale data after the token ceases to exist.
+        env.storage()
+            .persistent()
+            .remove(&DataKey::TokenRoyaltyReceiver(token_id));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::TokenRoyaltyBps(token_id));
 
         let supply: u64 = env
             .storage()
@@ -673,13 +710,17 @@ impl NormalNFT721 {
 
     /// EIP-2981-style royalty query: returns (recipient, royalty_amount) for a
     /// given token and sale price.  Per-token overrides take priority over the
-    /// collection default.  Royalty amount = sale_price * bps / 10_000 using
-    /// checked arithmetic (returns 0 amount when sale_price is 0).
+    /// collection default.  Returns `TokenNotFound` if the token does not exist.
+    /// Royalty amount = sale_price * bps / 10_000 using checked arithmetic.
     pub fn royalty_info_for(
         env: Env,
         token_id: u64,
         sale_price: i128,
     ) -> Result<(Address, i128), Error> {
+        // Reject queries for non-existent (never minted or already burnt) tokens.
+        if !env.storage().persistent().has(&DataKey::Owner(token_id)) {
+            return Err(Error::TokenNotFound);
+        }
         // Resolve recipient and bps — per-token override wins if present.
         let (receiver, bps) = if env
             .storage()
@@ -775,6 +816,9 @@ impl NormalNFT721 {
     pub fn update_royalty(env: Env, receiver: Address, bps: u32) -> Result<(), Error> {
         Self::extend_instance_ttl(&env);
         Self::only_creator(&env)?;
+        if bps > MAX_BPS {
+            return Err(Error::InvalidBps);
+        }
         env.storage()
             .instance()
             .set(&DataKey::RoyaltyReceiver, &receiver);
@@ -799,7 +843,7 @@ impl NormalNFT721 {
 
     /// Set a per-token royalty override with bps validation.
     /// When set, `royalty_info_for(token_id, ..)` uses this instead of the default.
-    /// Callable only by creator.
+    /// Callable only by creator.  The token must exist.
     pub fn set_token_royalty(
         env: Env,
         token_id: u64,
@@ -810,6 +854,9 @@ impl NormalNFT721 {
         Self::only_creator(&env)?;
         if bps > MAX_BPS {
             return Err(Error::InvalidBps);
+        }
+        if !env.storage().persistent().has(&DataKey::Owner(token_id)) {
+            return Err(Error::TokenNotFound);
         }
         env.storage()
             .persistent()

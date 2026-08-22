@@ -44,6 +44,7 @@ const TTL_BUMP: u32 = 100_000;
 const MAX_BATCH_SIZE: u32 = 100;
 /// Maximum allowed byte length for a token URI.
 const MAX_URI_LEN: u32 = 2048;
+const MAX_BPS: u32 = 10_000;
 
 // ─── Errors ──────────────────────────────────────────────────────────────────
 
@@ -83,6 +84,10 @@ pub enum Error {
     BatchTooLarge = 23,
     /// redeem_batch contains two items with the same voucher nonce.
     DuplicateVoucherInBatch = 24,
+    /// set_approval_for_all called with an already-past `expires_at`.
+    ApprovalExpired = 25,
+    /// Royalty BPS exceeds 10 000 (100 %).
+    InvalidBps = 26,
 }
 
 // ─── Data types ───────────────────────────────────────────────────────────────
@@ -127,6 +132,7 @@ pub enum DataKey {
     PlatformFeeBps,
     Balance(Address, u64),
     ApprovedForAll(Address, Address),
+    ApprovedForAllExpiry(Address, Address), // (owner, operator) → u32 ledger sequence
     TokenUri(u64),
     TotalSupply(u64),
     MintedPerBuyer(Address, u64),
@@ -811,8 +817,16 @@ impl LazyMint1155 {
         if spender != from && !Self::_is_approved_for_all(&env, &spender, &from) {
             return Err(Error::NotApproved);
         }
+        if token_ids.is_empty() {
+            return Err(Error::EmptyBatch);
+        }
         if token_ids.len() != amounts.len() {
             return Err(Error::LengthMismatch);
+        }
+        for i in 0..amounts.len() {
+            if amounts.get(i).unwrap() == 0 {
+                return Err(Error::ZeroAmount);
+            }
         }
         env.events().publish(
             (
@@ -831,16 +845,47 @@ impl LazyMint1155 {
 
     // ── Approvals ─────────────────────────────────────────────────────────
 
-    pub fn set_approval_for_all(env: Env, owner: Address, operator: Address, approved: bool) {
+    pub fn set_approval_for_all(
+        env: Env,
+        owner: Address,
+        operator: Address,
+        approved: bool,
+        expires_at: Option<u32>,
+    ) -> Result<(), Error> {
         Self::extend_instance_ttl(&env);
         owner.require_auth();
+
+        if approved {
+            if let Some(exp) = expires_at {
+                if env.ledger().sequence() >= exp {
+                    return Err(Error::ApprovalExpired);
+                }
+            }
+        }
+
         let key = DataKey::ApprovedForAll(owner.clone(), operator.clone());
+        let expiry_key = DataKey::ApprovedForAllExpiry(owner.clone(), operator.clone());
+
         env.storage().persistent().set(&key, &approved);
         env.storage()
             .persistent()
             .extend_ttl(&key, TTL_THRESHOLD, TTL_BUMP);
+
+        match (approved, expires_at) {
+            (true, Some(exp)) => {
+                env.storage().persistent().set(&expiry_key, &exp);
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&expiry_key, TTL_THRESHOLD, TTL_BUMP);
+            }
+            _ => {
+                env.storage().persistent().remove(&expiry_key);
+            }
+        }
+
         env.events()
             .publish((symbol_short!("appr_all"), owner), (operator, approved));
+        Ok(())
     }
 
     // ── Burn ──────────────────────────────────────────────────────────────
@@ -1020,6 +1065,9 @@ impl LazyMint1155 {
     pub fn update_royalty(env: Env, receiver: Address, bps: u32) -> Result<(), Error> {
         Self::extend_instance_ttl(&env);
         Self::only_creator(&env)?;
+        if bps > MAX_BPS {
+            return Err(Error::InvalidBps);
+        }
         env.storage()
             .instance()
             .set(&DataKey::RoyaltyReceiver, &receiver);
@@ -1186,10 +1234,27 @@ impl LazyMint1155 {
     }
 
     fn _is_approved_for_all(env: &Env, operator: &Address, owner: &Address) -> bool {
-        env.storage()
+        let approved: bool = env
+            .storage()
             .persistent()
             .get(&DataKey::ApprovedForAll(owner.clone(), operator.clone()))
-            .unwrap_or(false)
+            .unwrap_or(false);
+        if !approved {
+            return false;
+        }
+        if let Some(exp) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, u32>(&DataKey::ApprovedForAllExpiry(
+                owner.clone(),
+                operator.clone(),
+            ))
+        {
+            if env.ledger().sequence() >= exp {
+                return false;
+            }
+        }
+        true
     }
 }
 

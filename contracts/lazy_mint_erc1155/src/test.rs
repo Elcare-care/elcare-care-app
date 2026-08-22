@@ -963,3 +963,56 @@ mod migration {
         assert!(client.is_voucher_revoked(&88u64));
     }
 }
+
+// ── Security hardening regression tests (issue #6) ───────────────────────────
+
+#[test]
+fn set_approval_for_all_expiry_respected_lazy1155() {
+    let (env, client, _, _) = setup(0);
+    let owner = Address::generate(&env);
+    let op = Address::generate(&env);
+    client.set_approval_for_all(&owner, &op, &true, &Some(100u32));
+    assert!(client.is_approved_for_all(&owner, &op));
+    env.ledger().with_mut(|li| li.sequence_number = 200);
+    assert!(!client.is_approved_for_all(&owner, &op));
+}
+
+#[test]
+fn set_approval_for_all_past_expiry_rejected_lazy1155() {
+    let (env, client, _, _) = setup(0);
+    let owner = Address::generate(&env);
+    let op = Address::generate(&env);
+    // Ledger sequence starts at 1; expiry at 1 is already reached.
+    let result = client.try_set_approval_for_all(&owner, &op, &true, &Some(1u32));
+    assert_eq!(result, Err(Ok(Error::ApprovalExpired)));
+}
+
+#[test]
+fn update_royalty_exceeds_max_bps_lazy1155() {
+    let (env, client, _, _) = setup(0);
+    let receiver = Address::generate(&env);
+    let result = client.try_update_royalty(&receiver, &10_001u32);
+    assert_eq!(result, Err(Ok(Error::InvalidBps)));
+}
+
+#[test]
+fn batch_transfer_empty_fails_lazy1155() {
+    let (env, client, _, _) = setup(0);
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    let result = client.try_batch_transfer(&alice, &alice, &bob, &Vec::new(&env), &Vec::new(&env));
+    assert_eq!(result, Err(Ok(Error::EmptyBatch)));
+}
+
+#[test]
+fn batch_transfer_zero_amount_fails_lazy1155() {
+    let (env, client, _, _) = setup(0);
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    let mut ids: Vec<u64> = Vec::new(&env);
+    ids.push_back(0u64);
+    let mut amounts: Vec<u128> = Vec::new(&env);
+    amounts.push_back(0u128);
+    let result = client.try_batch_transfer(&alice, &alice, &bob, &ids, &amounts);
+    assert_eq!(result, Err(Ok(Error::ZeroAmount)));
+}
