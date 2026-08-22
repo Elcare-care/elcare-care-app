@@ -2344,7 +2344,7 @@ fn preflight_normal_721_predicts_the_deployed_address() {
         &salt,
     );
     assert_eq!(preflight_after.predicted_address, deployed);
-    assert!(preflight_after.errors.contains(&Error::DuplicateSalt));
+    assert!(preflight_after.errors.contains(&(Error::DuplicateSalt as u32)));
 
     assert_eq!(
         client.try_deploy_normal_721(
@@ -2386,12 +2386,12 @@ fn preflight_normal_721_reports_every_error_deploy_would_raise() {
         &salt,
     );
 
-    assert!(preflight.errors.contains(&Error::ContractPaused));
-    assert!(preflight.errors.contains(&Error::EmptyName));
-    assert!(preflight.errors.contains(&Error::EmptySymbol));
-    assert!(preflight.errors.contains(&Error::InvalidMaxSupply));
-    assert!(preflight.errors.contains(&Error::InvalidRoyaltyBps));
-    assert!(preflight.errors.contains(&Error::InvalidFeeBps));
+    assert!(preflight.errors.contains(&(Error::ContractPaused as u32)));
+    assert!(preflight.errors.contains(&(Error::EmptyName as u32)));
+    assert!(preflight.errors.contains(&(Error::EmptySymbol as u32)));
+    assert!(preflight.errors.contains(&(Error::InvalidMaxSupply as u32)));
+    assert!(preflight.errors.contains(&(Error::InvalidRoyaltyBps as u32)));
+    assert!(preflight.errors.contains(&(Error::InvalidFeeBps as u32)));
 
     // The real deploy call rejects on the first violation it checks
     // (contract-paused) — proving preflight is a superset, never blind to a
@@ -2434,7 +2434,7 @@ fn preflight_flags_insufficient_balance_for_the_flat_fee() {
         &salt,
     );
 
-    assert!(preflight.errors.contains(&Error::InsufficientFee));
+    assert!(preflight.errors.contains(&(Error::InsufficientFee as u32)));
     assert_eq!(preflight.required_fee, 1_000i128);
 
     // The real deploy call fails too — it attempts the token transfer, which

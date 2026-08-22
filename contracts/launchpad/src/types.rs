@@ -93,7 +93,8 @@ pub struct PreflightResult {
     /// Every validation failure that the matching `deploy_*` call would
     /// raise given identical inputs. Empty means the deployment is expected
     /// to succeed.
-    pub errors: Vec<Error>,
+    /// Error codes are the u32 discriminants of the `Error` enum.
+    pub errors: Vec<u32>,
 }
 
 #[contracttype]

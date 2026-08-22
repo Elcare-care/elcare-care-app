@@ -366,6 +366,15 @@ fn revoke_vouchers_batch_all_or_nothing() {
 // SECTION 4 — Merkle allowlist (721)
 // ═══════════════════════════════════════════════════════════════════════════════
 
+#[test]
+fn allowlist_outsider_wrong_proof_returns_invalid_merkle_proof() {
+    let (env, client, creator) = setup_test();
+    default_init(&env, &client, &creator);
+
+    let buyer = Address::generate(&env);
+    let outsider = Address::generate(&env);
+    let (_root, _proof_buyer, proof_b) = two_leaf_tree(&env, &buyer, &outsider);
+
     // outsider tries to use addr_b's proof — doesn't match outsider's leaf
     let voucher = make_voucher(&env, 14);
     let result = client.try_redeem(
@@ -389,6 +398,14 @@ fn allowlist_valid_proof_passes_gate() {
     let res = client.redeem(&buyer, &v, &sig, &proof_buyer);
     assert_eq!(res, 1u64);
 }
+
+#[test]
+fn allowlist_valid_proof_bad_sig_errors_not_allowlist() {
+    let (env, client, _creator, _fee) = setup(0);
+    client.set_public_phase();
+    let buyer = Address::generate(&env);
+    let (root, proof_buyer, _) = two_leaf_tree(&env, &buyer, &Address::generate(&env));
+    client.set_merkle_root(&root);
 
     let voucher = make_voucher(&env, 20);
     let result = client.try_redeem(
@@ -858,15 +875,13 @@ mod migration {
         client.migrate();
 
         let events = env.events().all();
-        let found = events.iter().any(|(_, topics, _)| {
-            topics
-                .get(0)
-                .map(|v| {
-                    soroban_sdk::Symbol::try_from_val(&env, &v)
-                        .map(|s| s == soroban_sdk::symbol_short!("migrated"))
-                        .unwrap_or(false)
-                })
-                .unwrap_or(false)
+        use soroban_sdk::xdr::{ContractEventBody, ScVal};
+        let found = events.events().iter().any(|e| {
+            if let ContractEventBody::V0(body) = &e.body {
+                body.topics.iter().any(|t| matches!(t,
+                    ScVal::Symbol(s) if core::str::from_utf8(s.0.as_slice()).unwrap_or("") == "migrated"
+                ))
+            } else { false }
         });
         assert!(found, "expected 'migrated' event");
     }

@@ -874,15 +874,13 @@ mod migration {
         client.migrate();
 
         let events = env.events().all();
-        let found = events.iter().any(|(_, topics, _)| {
-            topics
-                .get(0)
-                .map(|v| {
-                    soroban_sdk::Symbol::try_from_val(&env, &v)
-                        .map(|s| s == soroban_sdk::symbol_short!("migrated"))
-                        .unwrap_or(false)
-                })
-                .unwrap_or(false)
+        use soroban_sdk::xdr::{ContractEventBody, ScVal};
+        let found = events.events().iter().any(|e| {
+            if let ContractEventBody::V0(body) = &e.body {
+                body.topics.iter().any(|t| matches!(t,
+                    ScVal::Symbol(s) if core::str::from_utf8(s.0.as_slice()).unwrap_or("") == "migrated"
+                ))
+            } else { false }
         });
         assert!(found, "expected 'migrated' event");
     }
