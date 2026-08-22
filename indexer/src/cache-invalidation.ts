@@ -34,7 +34,7 @@
  *     → invalidateWalletActivity(recipient) (called per recipient)
  */
 
-import { invalidateKey, invalidatePattern } from './redis.js';
+import redis, { invalidateKey, invalidatePattern } from './redis.js';
 import { logger } from './logger.js';
 import {
   cacheInvalidationsTotal,

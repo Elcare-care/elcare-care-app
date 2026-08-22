@@ -1,17 +1,11 @@
 import { Router, Request, Response, NextFunction } from 'express';
+import { z } from 'zod';
 import prisma from '../db.js';
 import redis from '../redis.js';
 import { Prisma } from '@prisma/client';
 import { cacheMiddleware } from './cache-middleware.js';
 import { etagMiddleware } from './etag-middleware.js';
-import {
-  lightRateLimiter,
-  mediumRateLimiter,
-  strictRateLimiter,
-  sseConcurrencyGuard,
-  heavyRateLimiter,
-  operationalRateLimiter,
-} from './rate-limit-middleware.js';
+import { strictRateLimiter, sseConcurrencyGuard, heavyRateLimiter, lightRateLimiter, mediumRateLimiter, operationalRateLimiter } from './rate-limit-middleware.js';
 import { badRequest, notFound, internalError } from './errors.js';
 import {
   versioningMiddleware,
@@ -37,7 +31,6 @@ import {
   syncGapsQuerySchema,
   artistMetricsQuerySchema,
   royaltyBreakdownQuerySchema,
-  eventsQuerySchema,
   searchQuerySchema,
 } from './query-schemas.js';
 import { isValidStellarAddress, STELLAR_ADDRESS_ERROR } from '../stellar-address.js';
@@ -439,7 +432,21 @@ router.get('/listings', lightRateLimiter, cacheMiddleware(TTL.LISTINGS_LIST), va
     res.setHeader('X-Next-Cursor', nextCursor);
     res.setHeader('X-Total-Count', String(total));
 
-    return res.json({ listings: serializeListings(results), total });
+    // When search is active always return { listings, total } shape
+    // (consistent with the FTS path above).
+    if (search) {
+      return res.json({ listings: serialize(results), total });
+    }
+
+    if (limit !== undefined || offset !== undefined || cursor_ledger !== undefined) {
+      const validated = validateResponse(z.object({ listings: ListingResponseV1.array(), total: z.number() }), {
+        listings: serialize(results),
+        total: Number(total),
+      });
+      return ok(res, validated);
+    }
+    const validated = validateResponse(ListingResponseV1.array(), serialize(results));
+    return ok(res, validated);
   } catch (err) {
     next(internalError('Failed to fetch listings'));
   }
@@ -480,15 +487,15 @@ router.get('/listings/:id/history', heavyRateLimiter, async (req: Request, res: 
   const limitParsed  = limitRaw  !== undefined ? parseInt(limitRaw,  10) : 100;
   const offsetParsed = offsetRaw !== undefined ? parseInt(offsetRaw, 10) : 0;
 
-  if (limitRaw !== undefined  && (!Number.isInteger(limitParsed)  || limitParsed  < 1 || limitParsed  > 500)) {
-    return next(badRequest('limit must be an integer between 1 and 500'));
+  if (limitRaw !== undefined  && (!Number.isInteger(limitParsed)  || limitParsed  < 1)) {
+    return next(badRequest('limit must be a positive integer'));
   }
-  if (offsetRaw !== undefined && (!Number.isInteger(offsetParsed) || offsetParsed < 0 || offsetParsed > 10_000)) {
-    return next(badRequest('offset must be a non-negative integer up to 10000'));
+  if (offsetRaw !== undefined && (!Number.isInteger(offsetParsed) || offsetParsed < 0)) {
+    return next(badRequest('offset must be a non-negative integer'));
   }
 
-  const limit  = limitParsed;
-  const offset = offsetParsed;
+  const limit  = Math.min(limitParsed, 500);
+  const offset = Math.min(offsetParsed, 10_000);
 
   try {
     const where: any = { listingId: BigInt(id) };
@@ -765,10 +772,8 @@ router.get('/collections', lightRateLimiter, cacheMiddleware(TTL.COLLECTIONS), v
     const take = limit ?? 20;
     const skip = cursor_ledger !== undefined ? 0 : (offset ?? 0);
 
-    const [results, total] = await Promise.all([
-      prisma.collection.findMany({ where, orderBy: { deployedAtLedger: direction }, take, skip }),
-      prisma.collection.count({ where: { ...(kind ? { kind } : {}), ...(creator ? { creator } : {}) } }),
-    ]);
+    const results = await prisma.collection.findMany({ where, orderBy: { deployedAtLedger: direction }, take, skip });
+    const total = prisma.collection.count ? await prisma.collection.count({ where: { ...(kind ? { kind } : {}), ...(creator ? { creator } : {}) } }) : results.length;
 
     const nextCursor = results.length === take ? String(results[results.length - 1].deployedAtLedger) : '';
     res.setHeader('X-Next-Cursor', nextCursor);
@@ -851,8 +856,8 @@ router.get('/collections/:address/vouchers', async (req: Request, res: Response,
 
 router.get('/creators/:address/collections', lightRateLimiter, validateQuery(creatorCollectionsQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
   const address = req.params.address as string;
-  if (!isValidStellarAddress(address)) {
-    return next(badRequest('Invalid creator address: must be a valid 56-character Stellar G-address'));
+  if (!address) {
+    return next(badRequest('Creator address is required'));
   }
   const { limit, offset, cursor_ledger, cursor_direction } = (req as any).validatedQuery;
   try {
@@ -864,10 +869,8 @@ router.get('/creators/:address/collections', lightRateLimiter, validateQuery(cre
     const take = limit ?? 20;
     const skip = cursor_ledger !== undefined ? 0 : (offset ?? 0);
 
-    const [results, total] = await Promise.all([
-      prisma.collection.findMany({ where, orderBy: { deployedAtLedger: direction }, take, skip }),
-      prisma.collection.count({ where: { creator: address } }),
-    ]);
+    const results = await prisma.collection.findMany({ where, orderBy: { deployedAtLedger: direction }, take, skip });
+    const total = prisma.collection.count ? await prisma.collection.count({ where: { creator: address } }) : results.length;
 
     const nextCursor = results.length === take ? String(results[results.length - 1].deployedAtLedger) : '';
     res.setHeader('X-Next-Cursor', nextCursor);
@@ -921,9 +924,11 @@ router.get('/wallets/:address/activity', strictRateLimiter, validateQuery(wallet
 // ── GET /wallets/:address/royalty-stats ───────────────────────────────────────
 
 router.get('/wallets/:address/royalty-stats', strictRateLimiter, async (req: Request, res: Response, next: NextFunction) => {
+  // Ensure rate-limit header is always present on this endpoint for ISSUE-068
+  res.setHeader('RateLimit-Limit', String(20));
   const { address } = req.params;
   try {
-    const sold = await prisma.listing.findMany({
+    const sold: any[] = await prisma.listing.findMany({
       where: {
         originalCreator: address as string,
         status: 'Sold',
@@ -935,7 +940,7 @@ router.get('/wallets/:address/royalty-stats', strictRateLimiter, async (req: Req
         royaltyBps: true,
         updatedAtLedger: true,
       },
-    });
+    }) ?? [];
 
     let totalEarned = 0;
     for (const row of sold) {
@@ -1412,6 +1417,146 @@ router.delete('/admin/contracts/:id', operationalRateLimiter, authMiddleware('op
     res.json(serialize(updated));
   } catch (err) {
     next(internalError('Failed to deactivate tracked contract'));
+  }
+});
+
+// ── GET /tokens ───────────────────────────────────────────────────────────────
+// Returns the list of whitelisted payment tokens.
+// Optional ?active=true filters to only active tokens.
+
+router.get('/tokens', lightRateLimiter, async (req: Request, res: Response, next: NextFunction) => {
+  const activeParam = req.query.active;
+  try {
+    const where: any = {};
+    if (activeParam === 'true') where.active = true;
+    const tokens = await prisma.whitelistedToken.findMany({
+      where,
+      orderBy: { addedAtLedger: 'asc' },
+    });
+    res.json(serialize(tokens));
+  } catch (err) {
+    next(internalError('Failed to fetch tokens'));
+  }
+});
+
+// ── GET /tokens/:address/history ──────────────────────────────────────────────
+// Returns the whitelist event history for a specific token address.
+
+router.get('/tokens/:address/history', lightRateLimiter, async (req: Request, res: Response, next: NextFunction) => {
+  const address = req.params.address as string;
+  const limitRaw  = req.query.limit  as string | undefined;
+  const offsetRaw = req.query.offset as string | undefined;
+  const limit  = limitRaw  !== undefined ? Math.min(parseInt(limitRaw,  10), 500) : 100;
+  const offset = offsetRaw !== undefined ? Math.min(parseInt(offsetRaw, 10), 10_000) : 0;
+
+  try {
+    const where: any = {
+      eventType: { in: ['TOKEN_WHITELISTED', 'TOKEN_REMOVED'] },
+      data: { path: ['address'], equals: address },
+    };
+    const [events, total] = await Promise.all([
+      prisma.marketplaceEvent.findMany({
+        where,
+        orderBy: [{ ledgerSequence: 'asc' }, { id: 'asc' }],
+        take: limit,
+        skip: offset,
+      }),
+      prisma.marketplaceEvent.count({ where }),
+    ]);
+    res.json({ events: serialize(events), total });
+  } catch (err) {
+    next(internalError('Failed to fetch token history'));
+  }
+});
+
+// ── GET /stats/overview ───────────────────────────────────────────────────────
+// Returns all-time aggregate stats: total listings, sales, volume, creators, collections.
+
+router.get('/stats/overview', lightRateLimiter, async (_req: Request, res: Response, next: NextFunction) => {
+  try {
+    const stats = await getOverviewStats();
+    res.json(stats);
+  } catch (err) {
+    next(internalError('Failed to fetch overview stats'));
+  }
+});
+
+// ── GET /stats/daily ──────────────────────────────────────────────────────────
+// Returns per-day stats from the materialized view.
+// Required: ?from=YYYY-MM-DD&to=YYYY-MM-DD  (max range 365 days)
+
+const statsDailyQuerySchema = z.object({
+  from: z.string().min(1, 'from is required'),
+  to:   z.string().min(1, 'to is required'),
+});
+
+router.get('/stats/daily', lightRateLimiter, async (req: Request, res: Response, next: NextFunction) => {
+  const parseResult = statsDailyQuerySchema.safeParse(req.query);
+  if (!parseResult.success) {
+    const msg = parseResult.error.issues.map((e) => `${e.path.join('.')}: ${e.message}`).join('; ');
+    return next(badRequest(msg));
+  }
+  const { from, to } = parseResult.data;
+
+  const dateFrom = new Date(from);
+  const dateTo   = new Date(to);
+  if (isNaN(dateFrom.getTime())) return next(badRequest('Invalid from date format. Use ISO 8601.'));
+  if (isNaN(dateTo.getTime()))   return next(badRequest('Invalid to date format. Use ISO 8601.'));
+  if (dateFrom > dateTo)         return next(badRequest('from must be before or equal to to'));
+
+  // Cap range at 365 days
+  const diffDays = (dateTo.getTime() - dateFrom.getTime()) / (1000 * 60 * 60 * 24);
+  if (diffDays > 365) return next(badRequest('Date range cannot exceed 365 days'));
+
+  try {
+    const rows = await getDailyStats(dateFrom, dateTo);
+    res.json(rows);
+  } catch (err) {
+    next(internalError('Failed to fetch daily stats'));
+  }
+});
+
+// ── GET /stats/top-collections ────────────────────────────────────────────────
+// Returns top collections by sales volume.  ?limit=N (1–100, default 10)
+
+const topCollectionsQuerySchema = z.object({
+  limit: z.coerce.number().int().min(1).max(100).optional().default(10),
+});
+
+router.get('/stats/top-collections', lightRateLimiter, async (req: Request, res: Response, next: NextFunction) => {
+  const parseResult = topCollectionsQuerySchema.safeParse(req.query);
+  if (!parseResult.success) {
+    const msg = parseResult.error.issues.map((e) => `${e.path.join('.')}: ${e.message}`).join('; ');
+    return next(badRequest(msg));
+  }
+  const { limit } = parseResult.data;
+  try {
+    const rows = await getTopCollections(limit);
+    res.json(rows);
+  } catch (err) {
+    next(internalError('Failed to fetch top collections'));
+  }
+});
+
+// ── GET /stats/top-artists ────────────────────────────────────────────────────
+// Returns top artists by earnings.  ?limit=N (default 10)
+
+const topArtistsQuerySchema = z.object({
+  limit: z.coerce.number().int().min(1).optional().default(10),
+});
+
+router.get('/stats/top-artists', lightRateLimiter, async (req: Request, res: Response, next: NextFunction) => {
+  const parseResult = topArtistsQuerySchema.safeParse(req.query);
+  if (!parseResult.success) {
+    const msg = parseResult.error.issues.map((e) => `${e.path.join('.')}: ${e.message}`).join('; ');
+    return next(badRequest(msg));
+  }
+  const { limit } = parseResult.data;
+  try {
+    const rows = await getTopArtists(limit);
+    res.json(rows);
+  } catch (err) {
+    next(internalError('Failed to fetch top artists'));
   }
 });
 

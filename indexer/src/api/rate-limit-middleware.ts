@@ -36,7 +36,7 @@ function getRateLimitKey(req: Request): string {
   if (typeof queryWallet === 'string' && queryWallet.length > 0) {
     return `wallet:${queryWallet}`;
   }
-  // Use the library's IPv6-aware helper for IP-based keys
+  // Use ipKeyGenerator for correct IPv6 normalisation
   return `ip:${ipKeyGenerator(req)}`;
 }
 
@@ -48,7 +48,7 @@ function baseOptions(cost: ResourceCost, message?: string) {
     windowMs: limits.windowMs,
     max: limits.max,
     keyGenerator: getRateLimitKey,
-    standardHeaders: true,   // emit RateLimit-* headers (draft-6 style)
+    standardHeaders: 'draft-6' as const,
     legacyHeaders: false,
     message: {
       error: message || 'Rate limit exceeded',
@@ -73,7 +73,7 @@ export const globalRateLimiter = rateLimit({
   windowMs: 60_000,
   max: GLOBAL_LIMIT,
   keyGenerator: getRateLimitKey,
-  standardHeaders: true,
+  standardHeaders: 'draft-6' as const,
   legacyHeaders: false,
   message: {
     error: 'Too many requests, please try again later.',

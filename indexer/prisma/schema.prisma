@@ -77,6 +77,13 @@ model Listing {
   createdAt       DateTime      @default(now())
   updatedAt       DateTime      @updatedAt
 
+  // ── Royalty fields ─────────────────────────────────────────────────────────
+  /// Address of the original creator — used to attribute secondary royalties
+  /// after ownership has transferred.
+  originalCreator String?
+  /// Collection-level royalty in basis points (0–10 000).
+  royaltyBps      Int           @default(0)
+
   // ── Full-text search fields (populated from IPFS metadata after indexing) ──
   // Populated asynchronously after a LISTING_CREATED event is processed.
   // Null until IPFS metadata has been fetched and stored.
@@ -96,6 +103,7 @@ model Listing {
   @@index([artist, updatedAtLedger])
   @@index([collection])
   @@index([collection, status])
+  @@index([originalCreator])
   // GIN index created via raw SQL in the migration (Prisma cannot express it).
   // CREATE INDEX "Listing_searchVector_idx" ON "Listing" USING gin("searchVector");
 }
@@ -237,6 +245,64 @@ model Collection {
   @@index([creator])
   @@index([creator, deployedAtLedger])
   @@index([kind, deployedAtLedger])
+}
+
+// ── Lazy-mint voucher registry ────────────────────────────────────────────────
+//
+// Tracks voucher issuance, redemption, and revocation for lazy-mint collections.
+// Indexed per collection so the API can serve filtered voucher lists with pagination.
+
+model Voucher {
+  id              Int      @id @default(autoincrement())
+  collection      String   // collection contract address
+  nonce           BigInt   // unique per-voucher nonce (replay-protection key)
+  tokenId         BigInt?  // target token id (may be null until redeemed)
+  status          String   @default("Issued") // Issued | Redeemed | Revoked | Expired
+  redeemer        String?  // address that redeemed (null if not yet redeemed)
+  createdAtLedger Int
+  updatedAtLedger Int      @default(0)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@unique([collection, nonce])
+  @@index([collection])
+  @@index([collection, status])
+  @@index([createdAtLedger])
+}
+
+// ── IPFS metadata cache ───────────────────────────────────────────────────────
+//
+// Content-addressed metadata cache keyed by IPFS CID.  Populated by the
+// background IpfsQueue worker once content is fetched from a gateway.
+// Prisma cannot express the raw JSON `raw` field as anything other than Json,
+// so callers must cast it to `Record<string, unknown>` when reading artist info.
+
+model IpfsMetadata {
+  cid         String   @id
+  title       String?
+  description String?
+  imageUrl    String?
+  attributes  Json?
+  fetchedAt   DateTime @default(now())
+  raw         Json
+}
+
+// ── IPFS fetch queue ──────────────────────────────────────────────────────────
+//
+// Durable background job queue for fetching and caching IPFS content.
+// Workers poll for Pending/Failed entries with nextRetryAt <= now().
+
+model IpfsQueue {
+  id          Int       @id @default(autoincrement())
+  cid         String
+  attempts    Int       @default(0)
+  nextRetryAt DateTime?
+  status      String    @default("pending")
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([status, nextRetryAt])
+  @@index([cid])
 }
 
 // ── Backfill subsystem ───────────────────────────────────────────────────────

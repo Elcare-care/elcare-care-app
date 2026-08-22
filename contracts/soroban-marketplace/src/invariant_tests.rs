@@ -16,16 +16,15 @@
 /// Failing seeds are printed so any sequence can be reproduced with:
 ///   `cargo test -- invariant --nocapture 2>&1 | grep SEED`
 ///
-#[cfg(test)]
-mod invariant_tests {
-    use super::test::*;
-    use crate::types::{AuctionStatus, ListingStatus, MarketplaceError, OfferStatus};
-    use soroban_sdk::{
-        symbol_short,
-        testutils::{Address as _, Ledger},
-        token::{StellarAssetClient, TokenClient},
-        vec, Address, Env,
-    };
+use crate::test::{mock_nft, MockNftClient, valid_recipients};
+use crate::{MarketplaceContract, MarketplaceContractClient};
+use crate::types::{AuctionStatus, ListingStatus, MarketplaceError, OfferStatus};
+use soroban_sdk::{
+    symbol_short,
+    testutils::{Address as _, Ledger},
+    token::{StellarAssetClient, TokenClient},
+    vec, Address, Env,
+};
 
     // ── Deterministic LCG used as a seedable RNG ─────────────────────────
     // Allows any failing sequence to be reproduced by re-running with the
@@ -112,7 +111,7 @@ mod invariant_tests {
         let collection_id = env.register(mock_nft::MockNft, ());
         MockNftClient::new(&env, &collection_id).set_owner(&1u64, &artist);
         client.set_admin(&artist);
-        client.add_token_to_whitelist(&payment_token);
+        client.add_token_to_whitelist(&artist, &payment_token);
         (env, client, artist, buyer, payment_token, contract_id, collection_id)
     }
 
@@ -126,7 +125,7 @@ mod invariant_tests {
     ) -> u64 {
         client.create_listing(
             artist, &price, &symbol_short!("XLM"),
-            token, collection, &1u64,
+            token, collection, &1u64, &1u64,
             &valid_recipients(env, artist),
             &None::<u64>,
         )
@@ -255,12 +254,7 @@ mod invariant_tests {
     #[test]
     fn inv_listing_random_sequence() {
         for seed in [1u64, 42, 999, 12345, 0xdeadbeef] {
-            let result = std::panic::catch_unwind(|| {
-                run_listing_sequence(seed);
-            });
-            if result.is_err() {
-                panic!("SEED {} caused a listing invariant failure", seed);
-            }
+            run_listing_sequence(seed);
         }
     }
 
@@ -497,12 +491,7 @@ mod invariant_tests {
     #[test]
     fn inv_offer_random_sequence() {
         for seed in [7u64, 31, 101, 7777, 0xcafebabe] {
-            let result = std::panic::catch_unwind(|| {
-                run_offer_sequence(seed);
-            });
-            if result.is_err() {
-                panic!("SEED {} caused an offer invariant failure", seed);
-            }
+            run_offer_sequence(seed);
         }
     }
 
@@ -600,15 +589,14 @@ mod invariant_tests {
         let col = env.register(mock_nft::MockNft, ());
         MockNftClient::new(&env, &col).set_owner(&1u64, &creator);
         client.set_admin(&creator);
-        client.add_token_to_whitelist(&token);
+        client.add_token_to_whitelist(&creator, &token);
 
         env.ledger().with_mut(|li| li.timestamp = 1_000_000);
         let duration = 7_200u64; // 2 h > MIN_AUCTION_DURATION (1 h)
         let auction_id = client.create_auction(
-            &creator, &1_000_000_i128, &symbol_short!("XLM"),
-            &token, &col, &1u64,
+            &creator, &token, &col, &1u64,
+            &1_000_000_i128, &duration,
             &valid_recipients(&env, &creator),
-            &duration, &None::<u64>,
         );
         (env, client, creator, bidder, token, contract_id, col, auction_id)
     }
@@ -776,12 +764,7 @@ mod invariant_tests {
     #[test]
     fn inv_auction_random_sequence() {
         for seed in [2u64, 17, 256, 9999, 0xbaadf00d] {
-            let result = std::panic::catch_unwind(|| {
-                run_auction_sequence(seed);
-            });
-            if result.is_err() {
-                panic!("SEED {} caused an auction invariant failure", seed);
-            }
+            run_auction_sequence(seed);
         }
     }
 
@@ -852,4 +835,3 @@ mod invariant_tests {
         }
     }
 
-} // end mod invariant_tests

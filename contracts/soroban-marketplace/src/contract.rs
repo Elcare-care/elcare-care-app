@@ -8,6 +8,7 @@ use crate::events::*;
 use crate::{
     escrow,
     storage::{
+        acquire_auction_lock, acquire_listing_lock,
         active_listings_len, add_artist_auction_id,
         add_artist_listing_id, add_listing_offer_id, add_offerer_offer_id, add_pending_offer,
         add_to_active_listings, append_bid_record, bump_instance_ttl, clear_artist_cancel_cursor,
@@ -16,11 +17,13 @@ use crate::{
         get_artist_cancel_cursor, get_artist_listing_ids, get_auction_count,
         get_auction_extension_trigger_storage, get_auction_extension_window_storage,
         get_auction_max_extensions_storage,
-        get_bid_history_cap_storage, get_listing_count, get_max_price_storage,
-        get_migration_progress, get_min_price_storage, get_pending_admin_storage,
+        get_bid_history_cap_storage, get_collection_fee_bps_storage, get_listing_count,
+        get_max_price_storage, get_migration_progress, get_migration_status_storage,
+        get_min_price_storage, get_pending_admin_storage,
+        get_pending_role_storage, get_role_storage, get_ttl_sweep_progress,
         increment_auction_count, increment_listing_count, increment_offer_count,
-        index_append, index_len,
-        is_artist_revoked_storage, is_migration_done, load_auction, load_auction_bids,
+        index_append, index_contains, index_get, index_len, index_page_count,
+        is_artist_revoked_storage, is_bidder_blocked, is_migration_done, load_auction, load_auction_bids,
         load_listing, load_listing_offers, load_offer, load_offerer_offers,
         load_pending_offer_ids, pending_offer_count, release_auction_lock,
         release_listing_lock, remove_artist_revocation_storage, remove_from_active_listings,
@@ -28,13 +31,18 @@ use crate::{
         set_artist_cancel_cursor, set_artist_revocation_storage,
         set_auction_extension_trigger_storage,
         set_auction_extension_window_storage, set_auction_max_extensions_storage,
-        set_bid_history_cap_storage, set_max_price_storage, set_migration_done,
-        set_migration_progress, set_min_price_storage, set_pending_admin_storage,
-        take_legacy_index_vec, DataKey, IndexId, PendingAdminProposal, MAX_BID_HISTORY_CAP,
+        set_bid_history_cap_storage, set_collection_fee_bps_storage, set_max_price_storage,
+        set_migration_done, set_migration_progress, set_migration_stuck, clear_migration_stuck,
+        set_min_price_storage,
+        set_pending_admin_storage, set_pending_role_storage, set_role_storage,
+        set_ttl_sweep_progress, clear_collection_fee_bps_storage, clear_pending_role_storage,
+        take_legacy_index_vec, DataKey, IndexId, MigrationStatus, PendingAdminProposal,
+        PendingRoleProposal, MAX_BID_HISTORY_CAP,
     },
     types::{
         Auction, AuctionStatus, BatchCreateListingInput, BatchUpdateListingInput, BidRecord,
         CancelReason, Listing, ListingStatus, MarketplaceError, Offer, OfferStatus, Recipient,
+        RoleType,
     },
 };
 
@@ -128,7 +136,7 @@ const MIN_AUCTION_DURATION: u64 = 3_600; // 1 hour
 /// even with anti-sniping extensions. This prevents adversarial bidders from
 /// indefinitely extending an auction by placing small qualifying bids just before
 /// each deadline.
-const MAX_TOTAL_AUCTION_DURATION: u64 = 2_592_000; // 30 days
+pub(crate) const MAX_TOTAL_AUCTION_DURATION: u64 = 2_592_000; // 30 days
 
 /// Maximum number of listing ids accepted by one `cancel_listings` batch.
 const MAX_BATCH_CANCEL: u32 = 10;
@@ -147,6 +155,12 @@ const MAX_OFFERS_PER_LISTING: u32 = 50;
 /// (Issue #199).  Bounds the per-auction `AuctionBlockedBidders` entry so the
 /// `place_bid` membership scan and the storage footprint stay small.
 const MAX_BLOCKED_BIDDERS: u32 = 50;
+
+/// Maximum listings+auctions the `revoke_artist` cascade processes in one call
+/// (Issue #214). Keeps the per-invocation compute footprint bounded for artists
+/// with many active records; `RevocationIncompleteEvent` is emitted when items
+/// remain so the caller knows to call again.
+const REVOCATION_CLEANUP_CAP: u32 = 100;
 
 #[contract]
 pub struct MarketplaceContract;
@@ -378,6 +392,88 @@ impl MarketplaceContract {
         soroban_sdk::String::from_str(&env, CONTRACT_VERSION)
     }
 
+    /// Operator-facing view: return the current migration state for the running
+    /// contract version so maintainers can determine whether a migration is
+    /// pending, in-progress (interrupted mid-step), completed, or has never
+    /// been started.
+    ///
+    /// Interpretation:
+    /// * `is_done = true`         — migration completed successfully.
+    /// * `is_in_progress = true`  — a cursor exists; `migrate_step` was called
+    ///                              but did not drain all phases. Call
+    ///                              `migrate_step` again to continue.
+    /// * both `false`             — migration has never been started for this
+    ///                              version (or a fresh deploy before any
+    ///                              migration exists).
+    pub fn get_migration_status(env: Env) -> MigrationStatus {
+        let version = soroban_sdk::String::from_str(&env, CONTRACT_VERSION);
+        get_migration_status_storage(&env, &version)
+    }
+
+    /// Operator-facing bounded consistency check for the post-migration storage
+    /// state.  Returns `true` when all sampled invariants hold; `false` (and
+    /// `TtlAnomalyEvent`s) when drift is detected.
+    ///
+    /// Checks (all bounded by `max_items` so a single call is always safe):
+    ///   1. The `ActiveListings` index count equals the number of Active listings
+    ///      found in a sequential scan of `[cursor, cursor + max_items)`.
+    ///   2. No terminal listing in that range has a stale `ActiveListingPos` key.
+    ///   3. Each Active listing in the range has an `ActiveListingPos` key.
+    ///
+    /// The check is STATELESS — it does not modify any storage key and does not
+    /// require the migration to be complete.  Call without a migration running to
+    /// verify the live index; call after migration to confirm the postcondition.
+    ///
+    /// Returns `true` when every sampled record is consistent.
+    pub fn validate_migration_consistency(
+        env: Env,
+        operator: Address,
+        cursor: u64,
+        max_items: u32,
+    ) -> bool {
+        bump_instance_ttl(&env);
+        // Read-only operation; ProtocolConfig role is sufficient since this is
+        // a diagnostic view, not a state-changing operation.
+        Self::require_role(&env, &operator, RoleType::ProtocolConfig);
+
+        let budget = max_items.min(MAX_MAINTENANCE_ITEMS);
+        let listing_count = get_listing_count(&env);
+        let mut consistent = true;
+
+        let end = (cursor + budget as u64).min(listing_count);
+        for i in cursor..end {
+            let listing_id = i + 1;
+            let pos_key = DataKey::ActiveListingPos(listing_id);
+            match load_listing(&env, listing_id) {
+                Some(l) if l.status == ListingStatus::Active => {
+                    if !env.storage().persistent().has(&pos_key) {
+                        TtlAnomalyEvent {
+                            subject: Symbol::new(&env, "active_pos_miss"),
+                            id: listing_id,
+                            ledger_sequence: env.ledger().sequence(),
+                        }
+                        .publish(&env);
+                        consistent = false;
+                    }
+                }
+                Some(_) => {
+                    // Terminal listing — must NOT have a stale pos key.
+                    if env.storage().persistent().has(&pos_key) {
+                        TtlAnomalyEvent {
+                            subject: Symbol::new(&env, "term_in_active"),
+                            id: listing_id,
+                            ledger_sequence: env.ledger().sequence(),
+                        }
+                        .publish(&env);
+                        consistent = false;
+                    }
+                }
+                None => {}
+            }
+        }
+        consistent
+    }
+
     /// Admin-guarded, idempotent storage migration entry point.
     ///
     /// # Idempotency
@@ -447,6 +543,9 @@ impl MarketplaceContract {
     ///   2. per offer:   migrate the offerer's legacy offer index.
     ///   3. move the legacy ActiveListings vector into pages + position keys.
     ///
+    /// At each phase boundary a `MigrationPhaseCompletedEvent` is emitted
+    /// carrying the record count so operators can verify no entries were lost.
+    ///
     /// Returns the number of units remaining; records the completion marker
     /// (and drops the cursor) when everything has been processed.
     fn run_migration(env: &Env, version: &soroban_sdk::String, mut budget: u32) -> u64 {
@@ -459,6 +558,15 @@ impl MarketplaceContract {
             match p.phase {
                 0 => {
                     if p.cursor >= listing_count {
+                        // Phase 0 complete: assert that every listing id now has a
+                        // paged ArtistListings entry (postcondition check).
+                        Self::assert_phase0_postconditions(env, listing_count);
+                        MigrationPhaseCompletedEvent {
+                            version: version.clone(),
+                            phase: 0,
+                            records_processed: listing_count,
+                            ledger_sequence: env.ledger().sequence(),
+                        }.publish(env);
                         p.phase = 1;
                         p.cursor = 0;
                         continue;
@@ -470,6 +578,15 @@ impl MarketplaceContract {
                 }
                 1 => {
                     if p.cursor >= auction_count {
+                        // Phase 1 complete: assert that every auction's creator
+                        // has a non-empty paged ArtistAuctions index.
+                        Self::assert_phase1_postconditions(env, auction_count);
+                        MigrationPhaseCompletedEvent {
+                            version: version.clone(),
+                            phase: 1,
+                            records_processed: auction_count,
+                            ledger_sequence: env.ledger().sequence(),
+                        }.publish(env);
                         p.phase = 2;
                         p.cursor = 0;
                         continue;
@@ -487,6 +604,15 @@ impl MarketplaceContract {
                 }
                 2 => {
                     if p.cursor >= offer_count {
+                        // Phase 2 complete: assert that every offer's offerer
+                        // has a non-empty paged OffererOffers index.
+                        Self::assert_phase2_postconditions(env, offer_count);
+                        MigrationPhaseCompletedEvent {
+                            version: version.clone(),
+                            phase: 2,
+                            records_processed: offer_count,
+                            ledger_sequence: env.ledger().sequence(),
+                        }.publish(env);
                         p.phase = 3;
                         p.cursor = 0;
                         continue;
@@ -505,11 +631,29 @@ impl MarketplaceContract {
                 3 => {
                     // The legacy active index is a single entry; reading it is
                     // the same cost the old code paid on every removal.
-                    if let Some(ids) = take_legacy_index_vec(env, &DataKey::ActiveListings) {
+                    let legacy_count = if let Some(ids) = take_legacy_index_vec(env, &DataKey::ActiveListings) {
+                        let n = ids.len() as u64;
                         for listing_id in ids.iter() {
-                            add_to_active_listings(env, listing_id);
+                            // Only move active listings — guard against stale entries.
+                            if let Some(ref l) = load_listing(env, listing_id) {
+                                if l.status == ListingStatus::Active {
+                                    add_to_active_listings(env, listing_id);
+                                }
+                            }
                         }
-                    }
+                        n
+                    } else {
+                        0
+                    };
+                    // Phase 3 postcondition: assert ActiveListings paged count
+                    // covers all currently-Active listings.
+                    Self::assert_phase3_postconditions(env, listing_count);
+                    MigrationPhaseCompletedEvent {
+                        version: version.clone(),
+                        phase: 3,
+                        records_processed: legacy_count,
+                        ledger_sequence: env.ledger().sequence(),
+                    }.publish(env);
                     p.phase = 4;
                     budget -= 1;
                 }
@@ -527,14 +671,191 @@ impl MarketplaceContract {
 
         if remaining == 0 {
             clear_migration_progress(env, version);
+            clear_migration_stuck(env, version);
             set_migration_done(env, version);
         } else {
             set_migration_progress(env, version, &p);
+            // Mark that this migration has been interrupted at least once so
+            // get_migration_status can distinguish "never started" from
+            // "started but not yet finished".
+            set_migration_stuck(env, version);
         }
         remaining
     }
 
+    /// Phase-0 postcondition: for every listing that exists:
+    /// (a) the ArtistListings paged index for that artist is non-empty,
+    /// (b) the specific `listing_id` is present in that paged index,
+    /// (c) every id in `ListingPendingOffers` references a truly-Pending offer,
+    /// (d) every pending offer id is also in the `ListingOffers` paged index.
+    /// Emits `TtlAnomalyEvent` for each violation rather than panicking, so the
+    /// migration can complete and operators can see the full anomaly set.
+    fn assert_phase0_postconditions(env: &Env, listing_count: u64) {
+        for i in 0..listing_count {
+            let listing_id = i + 1;
+            if let Some(listing) = load_listing(env, listing_id) {
+                let artist_idx = IndexId::ArtistListings(listing.artist.clone());
+                if index_len(env, &artist_idx) == 0 {
+                    TtlAnomalyEvent {
+                        subject: Symbol::new(env, "artist_idx"),
+                        id: listing_id,
+                        ledger_sequence: env.ledger().sequence(),
+                    }.publish(env);
+                } else if !index_contains(env, &artist_idx, listing_id) {
+                    // Index is non-empty but this specific listing_id is absent —
+                    // a more precise signal that the entry was silently dropped.
+                    TtlAnomalyEvent {
+                        subject: Symbol::new(env, "artist_idx_miss"),
+                        id: listing_id,
+                        ledger_sequence: env.ledger().sequence(),
+                    }.publish(env);
+                }
+                // Pending-offer alias correctness: every id in ListingPendingOffers
+                // must point to an offer that is actually in Pending state, and
+                // must also appear in the ListingOffers paged history index.
+                let offers_idx = IndexId::ListingOffers(listing_id);
+                for offer_id in load_pending_offer_ids(env, listing_id).iter() {
+                    let alias_ok = load_offer(env, offer_id)
+                        .map(|o| o.status == OfferStatus::Pending)
+                        .unwrap_or(false);
+                    if !alias_ok {
+                        TtlAnomalyEvent {
+                            subject: Symbol::new(env, "pending_alias"),
+                            id: offer_id,
+                            ledger_sequence: env.ledger().sequence(),
+                        }.publish(env);
+                    }
+                    if !index_contains(env, &offers_idx, offer_id) {
+                        TtlAnomalyEvent {
+                            subject: Symbol::new(env, "offer_idx_miss"),
+                            id: offer_id,
+                            ledger_sequence: env.ledger().sequence(),
+                        }.publish(env);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Phase-1 postcondition: for every auction that exists:
+    /// (a) the ArtistAuctions paged index for that creator is non-empty,
+    /// (b) the specific `auction_id` is present in that paged index.
+    /// Emits `TtlAnomalyEvent` for each violation.
+    fn assert_phase1_postconditions(env: &Env, auction_count: u64) {
+        for i in 0..auction_count {
+            let auction_id = i + 1;
+            if let Some(auction) = load_auction(env, auction_id) {
+                let idx = IndexId::ArtistAuctions(auction.creator.clone());
+                if index_len(env, &idx) == 0 {
+                    TtlAnomalyEvent {
+                        subject: Symbol::new(env, "auction_idx"),
+                        id: auction_id,
+                        ledger_sequence: env.ledger().sequence(),
+                    }.publish(env);
+                } else if !index_contains(env, &idx, auction_id) {
+                    TtlAnomalyEvent {
+                        subject: Symbol::new(env, "auction_idx_miss"),
+                        id: auction_id,
+                        ledger_sequence: env.ledger().sequence(),
+                    }.publish(env);
+                }
+            }
+        }
+    }
+
+    /// Phase-2 postcondition: for every offer that exists:
+    /// (a) the OffererOffers paged index for that offerer is non-empty,
+    /// (b) the specific `offer_id` is present in that paged index.
+    /// Emits `TtlAnomalyEvent` for each violation.
+    fn assert_phase2_postconditions(env: &Env, offer_count: u64) {
+        for i in 0..offer_count {
+            let offer_id = i + 1;
+            if let Some(offer) = load_offer(env, offer_id) {
+                let idx = IndexId::OffererOffers(offer.offerer.clone());
+                if index_len(env, &idx) == 0 {
+                    TtlAnomalyEvent {
+                        subject: Symbol::new(env, "offerer_idx"),
+                        id: offer_id,
+                        ledger_sequence: env.ledger().sequence(),
+                    }.publish(env);
+                } else if !index_contains(env, &idx, offer_id) {
+                    TtlAnomalyEvent {
+                        subject: Symbol::new(env, "offerer_idx_miss"),
+                        id: offer_id,
+                        ledger_sequence: env.ledger().sequence(),
+                    }.publish(env);
+                }
+            }
+        }
+    }
+
+    /// Phase-3 postcondition checks for `ActiveListings` consistency:
+    /// (a) the paged index count equals the number of Active listings in storage,
+    /// (b) every Active listing has an `ActiveListingPos` key (is reachable),
+    /// (c) no terminal (Sold/Cancelled) listing has a stale `ActiveListingPos` key,
+    /// (d) the number of allocated index pages matches `ceil(len / PAGE_SIZE)`.
+    /// Emits `TtlAnomalyEvent` for each violation.
+    fn assert_phase3_postconditions(env: &Env, listing_count: u64) {
+        let mut active_in_storage: u32 = 0;
+        for i in 0..listing_count {
+            let listing_id = i + 1;
+            let pos_key = DataKey::ActiveListingPos(listing_id);
+            if let Some(l) = load_listing(env, listing_id) {
+                if l.status == ListingStatus::Active {
+                    active_in_storage += 1;
+                    // Active listing must have a position key (i.e., be reachable).
+                    if !env.storage().persistent().has(&pos_key) {
+                        TtlAnomalyEvent {
+                            subject: Symbol::new(env, "active_pos_miss"),
+                            id: listing_id,
+                            ledger_sequence: env.ledger().sequence(),
+                        }.publish(env);
+                    }
+                } else {
+                    // Terminal listing must NOT have a stale position key.
+                    if env.storage().persistent().has(&pos_key) {
+                        TtlAnomalyEvent {
+                            subject: Symbol::new(env, "term_in_active"),
+                            id: listing_id,
+                            ledger_sequence: env.ledger().sequence(),
+                        }.publish(env);
+                    }
+                }
+            }
+        }
+        let active_in_index = crate::storage::active_listings_len(env);
+        if active_in_index != active_in_storage {
+            TtlAnomalyEvent {
+                subject: Symbol::new(env, "active_idx"),
+                id: active_in_index as u64,
+                ledger_sequence: env.ledger().sequence(),
+            }.publish(env);
+        }
+        // Page count must be consistent with the stored length.
+        let expected_pages = if active_in_index == 0 {
+            0
+        } else {
+            (active_in_index + crate::storage::INDEX_PAGE_SIZE - 1)
+                / crate::storage::INDEX_PAGE_SIZE
+        };
+        let actual_pages = index_page_count(env, &IndexId::ActiveListings);
+        if actual_pages != expected_pages {
+            TtlAnomalyEvent {
+                subject: Symbol::new(env, "page_count"),
+                id: actual_pages as u64,
+                ledger_sequence: env.ledger().sequence(),
+            }.publish(env);
+        }
+    }
+
     /// Phase-0 unit: migrate everything hanging off one listing.
+    ///
+    /// Idempotency invariant: calling this function twice for the same listing
+    /// is safe — `take_legacy_index_vec` consumes and deletes the legacy key on
+    /// first call so the second call is a no-op.  The pending-offer alias is
+    /// rebuilt from the surviving legacy offer list with an explicit guard that
+    /// skips any offer_id already present in `ListingPendingOffers`, preventing
+    /// duplication when post-upgrade offer operations ran before migration.
     fn migrate_listing_unit(env: &Env, listing_id: u64) {
         let listing = match load_listing(env, listing_id) {
             Some(l) => l,
@@ -548,11 +869,20 @@ impl MarketplaceContract {
             &IndexId::ArtistListings(listing.artist.clone()),
         );
         // Per-listing offer history + pending-offer set rebuild.
+        // Guard: snapshot existing pending ids before the loop so we can skip
+        // offers already registered (post-upgrade offers written before migration).
         if let Some(offer_ids) = take_legacy_index_vec(env, &DataKey::ListingOffers(listing_id)) {
+            let existing_pending = load_pending_offer_ids(env, listing_id);
             for offer_id in offer_ids.iter() {
-                index_append(env, &IndexId::ListingOffers(listing_id), offer_id);
+                // Idempotency: only append to the ListingOffers paged index if
+                // this offer_id isn't already there (same guard as migrate_legacy_index).
+                if !index_contains(env, &IndexId::ListingOffers(listing_id), offer_id) {
+                    index_append(env, &IndexId::ListingOffers(listing_id), offer_id);
+                }
                 if let Some(offer) = load_offer(env, offer_id) {
-                    if offer.status == OfferStatus::Pending {
+                    if offer.status == OfferStatus::Pending
+                        && !existing_pending.contains(&offer_id)
+                    {
                         add_pending_offer(env, listing_id, offer_id);
                     }
                 }
@@ -562,10 +892,18 @@ impl MarketplaceContract {
 
     /// Move one legacy monolithic `Vec<u64>` entry into the paged index,
     /// deleting the legacy key.  No-op when the legacy key is absent.
+    ///
+    /// Idempotency guard: if the paged index already contains a value (written
+    /// by post-upgrade contract calls that ran between the WASM upgrade and the
+    /// migration invocation), it is skipped so no duplicate is introduced.
+    /// This keeps the migration safe even when the contract is not paused during
+    /// upgrade, at the cost of an O(n) membership scan per legacy entry.
     fn migrate_legacy_index(env: &Env, legacy: &DataKey, idx: &IndexId) {
         if let Some(ids) = take_legacy_index_vec(env, legacy) {
             for value in ids.iter() {
-                index_append(env, idx, value);
+                if !index_contains(env, idx, value) {
+                    index_append(env, idx, value);
+                }
             }
         }
     }
@@ -849,152 +1187,22 @@ impl MarketplaceContract {
 
     // ── Artist Moderation ────────────────────────────────────
 
-    /// Revoke an artist and immediately begin cascading cleanup.
+    /// Mark an artist as revoked (CollectionAdmin only).
     ///
-    /// On the first call (or after a reinstate → re-revoke cycle) the function:
-    ///   1. Marks the artist as revoked in storage.
-    ///   2. Iterates up to `REVOCATION_CLEANUP_CAP` active listings owned by
-    ///      the artist, cancelling each (offer refunds + escrow return).
-    ///   3. Continues iterating into the artist's auctions (within the same
-    ///      budget), cancelling each and refunding the current highest bidder.
-    ///   4. Emits `ArtistRevokedEvent` and, when items remain, a
-    ///      `RevocationIncompleteEvent` so the caller knows to invoke again.
-    ///
-    /// Subsequent calls advance the cursor until all items are processed.
-    /// The function is idempotent: calling it on an already-revoked artist with
-    /// no remaining items is a no-op.
-    pub fn revoke_artist(env: Env, artist: Address) {
+    /// Only marks the artist as revoked and emits `ArtistRevokedEvent`.
+    /// Use `cancel_artist_listings` afterward to batch-cancel their active items.
+    pub fn revoke_artist(env: Env, caller: Address, artist: Address) {
         bump_instance_ttl(&env);
-        Self::require_role_auth(&env, RoleType::CollectionAdmin);
+        Self::require_role(&env, &caller, RoleType::CollectionAdmin);
         set_artist_revocation_storage(&env, &artist);
 
-        // Emit the revocation event using the typed struct (not the raw address).
-        ArtistRevokedEvent { artist: artist.clone() }.publish(&env);
-
-        // ── Cascade: cancel listings ─────────────────────────────────────────
-        let admin = {
-            let key = crate::storage::DataKey::Admin;
-            env.storage().persistent()
-                .get::<_, Address>(&key)
-                .expect("admin not set")
-        };
-
-        let listing_idx = IndexId::ArtistListings(artist.clone());
-        let listing_total = index_len(&env, &listing_idx);
-        let mut cursor = crate::storage::get_artist_cancel_cursor(&env, &artist);
-        let mut budget = REVOCATION_CLEANUP_CAP;
-
-        // Phase 1 — listings
-        while cursor < listing_total && budget > 0 {
-            let listing_id = crate::storage::index_get(&env, &listing_idx, cursor).unwrap();
-            cursor += 1;
-            budget -= 1;
-            if let Some(mut listing) = load_listing(&env, listing_id) {
-                if listing.status == ListingStatus::Active {
-                    // Refund all pending offers
-                    for offer_id in load_pending_offer_ids(&env, listing_id).iter() {
-                        if let Some(mut offer) = load_offer(&env, offer_id) {
-                            if offer.status == OfferStatus::Pending {
-                                offer.status = OfferStatus::Rejected;
-                                save_offer(&env, &offer);
-                                TokenClient::new(&env, &offer.token).transfer(
-                                    &env.current_contract_address(),
-                                    &offer.offerer,
-                                    &offer.amount,
-                                );
-                            }
-                        }
-                    }
-                    clear_pending_offers(&env, listing_id);
-                    listing.status = ListingStatus::Cancelled;
-                    save_listing(&env, &listing);
-                    remove_from_active_listings(&env, listing_id);
-                    ListingCancelledEvent {
-                        listing_id,
-                        cancelled_by: admin.clone(),
-                        reason: CancelReason::AdminRevoked,
-                        ledger_sequence: env.ledger().sequence(),
-                    }.publish(&env);
-                    if listing.quantity > 1 {
-                        escrow::release_nft_with_quantity(
-                            &env, &listing.collection, listing.token_id,
-                            listing.quantity, &listing.artist, env.ledger().sequence(), listing_id,
-                        );
-                    } else {
-                        escrow::release_nft(
-                            &env, &listing.collection, listing.token_id,
-                            &listing.artist, env.ledger().sequence(), listing_id,
-                        );
-                    }
-                }
-            }
-        }
-        set_artist_cancel_cursor(&env, &artist, cursor);
-
-        // Phase 2 — auctions (within remaining budget)
-        let auction_idx = IndexId::ArtistAuctions(artist.clone());
-        let auction_total = index_len(&env, &auction_idx);
-        let mut auction_cursor = crate::storage::get_artist_auction_cancel_cursor(&env, &artist);
-
-        while auction_cursor < auction_total && budget > 0 {
-            let auction_id = crate::storage::index_get(&env, &auction_idx, auction_cursor).unwrap();
-            auction_cursor += 1;
-            budget -= 1;
-            if let Some(mut auction) = load_auction(&env, auction_id) {
-                if auction.status == AuctionStatus::Active {
-                    // Refund current highest bidder if any
-                    if let Some(ref bidder) = auction.highest_bidder.clone() {
-                        let refund = auction.highest_bid;
-                        if refund > 0 {
-                            TokenClient::new(&env, &auction.token).transfer(
-                                &env.current_contract_address(),
-                                bidder,
-                                &refund,
-                            );
-                            AuctionBidRefundedEvent {
-                                auction_id,
-                                bidder: bidder.clone(),
-                                amount: refund,
-                                token: auction.token.clone(),
-                                reason: Symbol::new(&env, "admin_revoke"),
-                                ledger_sequence: env.ledger().sequence(),
-                            }.publish(&env);
-                        }
-                    }
-                    auction.status = AuctionStatus::Cancelled;
-                    save_auction(&env, &auction);
-                    AuctionCancelledEvent {
-                        auction_id,
-                        cancelled_by: admin.clone(),
-                        reason: Symbol::new(&env, "admin_revoke"),
-                    }.publish(&env);
-                    escrow::release_nft(
-                        &env, &auction.collection, auction.token_id,
-                        &auction.creator, env.ledger().sequence(), auction_id,
-                    );
-                }
-            }
-        }
-        crate::storage::set_artist_auction_cancel_cursor(&env, &artist, auction_cursor);
-
-        // ── Emit incomplete signal if items remain ───────────────────────────
-        let listings_remaining = listing_total.saturating_sub(cursor) as u64;
-        let auctions_remaining = auction_total.saturating_sub(auction_cursor) as u64;
-        let total_remaining = listings_remaining + auctions_remaining;
-        if total_remaining > 0 {
-            RevocationIncompleteEvent {
-                artist: artist.clone(),
-                remaining: total_remaining,
-                ledger_sequence: env.ledger().sequence(),
-            }.publish(&env);
-        }
+        ArtistRevokedEvent { artist }.publish(&env);
     }
 
-    pub fn reinstate_artist(env: Env, artist: Address) {
+    pub fn reinstate_artist(env: Env, caller: Address, artist: Address) {
         bump_instance_ttl(&env);
-        Self::require_role_auth(&env, RoleType::CollectionAdmin);
+        Self::require_role(&env, &caller, RoleType::CollectionAdmin);
         remove_artist_revocation_storage(&env, &artist);
-        // Clear any in-progress revocation cursors on reinstatement
         crate::storage::clear_artist_cancel_cursor(&env, &artist);
         crate::storage::clear_artist_auction_cancel_cursor(&env, &artist);
         ArtistReinstatedEvent { artist }.publish(&env);
@@ -1103,11 +1311,19 @@ impl MarketplaceContract {
             panic_with_error!(&env, MarketplaceError::BatchTooLarge);
         }
 
+        let mut cancelled: u32 = 0;
         for listing_id in listing_ids.iter() {
+            // Skip listings that are not active (idempotent batch cancel).
+            if let Some(l) = load_listing(&env, listing_id) {
+                if l.status != ListingStatus::Active {
+                    continue;
+                }
+            }
             Self::cancel_listing_inner(&env, &owner, listing_id);
+            cancelled += 1;
         }
 
-        listing_ids.len()
+        cancelled
     }
 
     // ── Bounded storage maintenance (Issue #280) ─────────────
@@ -1281,6 +1497,19 @@ impl MarketplaceContract {
             budget -= 1;
             let key = DataKey::ListingLock(listing_id);
             if env.storage().temporary().has(&key) {
+                // Emit an anomaly when a lock is found for an Active listing —
+                // under Soroban's sequential model a lock persisting between
+                // transactions indicates the acquiring call did not release it
+                // (a bug), so we surface the drift before clearing.
+                if let Some(l) = load_listing(&env, listing_id) {
+                    if l.status == ListingStatus::Active {
+                        TtlAnomalyEvent {
+                            subject: Symbol::new(&env, "active_lock"),
+                            id: listing_id,
+                            ledger_sequence: env.ledger().sequence(),
+                        }.publish(&env);
+                    }
+                }
                 release_listing_lock(&env, listing_id);
                 cleared += 1;
             }
@@ -1292,6 +1521,16 @@ impl MarketplaceContract {
             budget -= 1;
             let key = DataKey::AuctionLock(auction_id);
             if env.storage().temporary().has(&key) {
+                // Same anomaly signal for Active auction locks.
+                if let Some(a) = load_auction(&env, auction_id) {
+                    if a.status == AuctionStatus::Active {
+                        TtlAnomalyEvent {
+                            subject: Symbol::new(&env, "active_lock"),
+                            id: auction_id,
+                            ledger_sequence: env.ledger().sequence(),
+                        }.publish(&env);
+                    }
+                }
                 release_auction_lock(&env, auction_id);
                 cleared += 1;
             }
@@ -1388,7 +1627,7 @@ impl MarketplaceContract {
                     active: true,
                 };
                 crate::storage::set_token_whitelist_entry(&env, &token, &updated);
-                crate::events::emit_token_whitelisted(&env, &token, &env.invoker());
+                crate::events::emit_token_whitelisted(&env, &token, &admin);
                 return;
             }
         }
@@ -1397,17 +1636,17 @@ impl MarketplaceContract {
         let now = env.ledger().timestamp();
         let entry = crate::storage::TokenWhitelistEntry {
             added_at: now,
-            added_by: env.invoker(),
+            added_by: admin.clone(),
             active: true,
         };
         crate::storage::set_token_whitelist_entry(&env, &token, &entry);
         crate::storage::add_token_to_whitelist_index(&env, &token);
-        crate::events::emit_token_whitelisted(&env, &token, &env.invoker());
+        crate::events::emit_token_whitelisted(&env, &token, &admin);
     }
 
-    pub fn remove_token_from_whitelist(env: Env, token: Address) {
+    pub fn remove_token_from_whitelist(env: Env, caller: Address, token: Address) {
         bump_instance_ttl(&env);
-        Self::require_role_auth(&env, RoleType::ProtocolConfig);
+        Self::require_role(&env, &caller, RoleType::ProtocolConfig);
 
         // Check if token exists in registry
         let existing = crate::storage::get_token_whitelist_entry(&env, &token);
@@ -1419,7 +1658,7 @@ impl MarketplaceContract {
             // Soft delete: set active to false, preserve history
             entry.active = false;
             crate::storage::set_token_whitelist_entry(&env, &token, &entry);
-            crate::events::emit_token_removed(&env, &token, &env.invoker());
+            crate::events::emit_token_removed(&env, &token, &caller);
         }
         // If token was never whitelisted, do nothing (no-op)
     }
@@ -1584,19 +1823,24 @@ impl MarketplaceContract {
             panic_with_error!(&env, MarketplaceError::ContractPaused);
         }
         if listing.status == ListingStatus::Sold {
+            release_listing_lock(&env, listing_id);
             panic_with_error!(&env, MarketplaceError::ListingSold);
         }
         if listing.status == ListingStatus::Cancelled {
+            release_listing_lock(&env, listing_id);
             panic_with_error!(&env, MarketplaceError::ListingCancelled);
         }
         if listing.status != ListingStatus::Active {
+            release_listing_lock(&env, listing_id);
             panic_with_error!(&env, MarketplaceError::ListingNotActive);
         }
         if listing.artist == buyer {
+            release_listing_lock(&env, listing_id);
             panic_with_error!(&env, MarketplaceError::SelfPurchaseNotAllowed);
         }
         if let Some(ref o) = listing.owner {
             if *o == buyer {
+                release_listing_lock(&env, listing_id);
                 panic_with_error!(&env, MarketplaceError::SelfPurchaseNotAllowed);
             }
         }
@@ -1635,10 +1879,12 @@ impl MarketplaceContract {
                     escrow::release_nft(&env, &listing.collection, listing.token_id,
                         &listing.artist, env.ledger().sequence(), listing_id);
                 }
+                release_listing_lock(&env, listing_id);
                 return false;
             }
         }
         if !Self::is_token_whitelisted(&env, &listing.token) {
+            release_listing_lock(&env, listing_id);
             panic_with_error!(&env, MarketplaceError::TokenNotWhitelisted);
         }
         // Effects
@@ -1722,7 +1968,7 @@ impl MarketplaceContract {
                 &p_amounts.get(i).unwrap(),
             );
         }
-        // _guard dropped here — releases listing lock automatically.
+        release_listing_lock(&env, listing_id);
         true
     }
 
@@ -2537,6 +2783,7 @@ impl MarketplaceContract {
             collection: listing.collection.clone(),
             token_id: listing.token_id,
             ledger_sequence: env.ledger().sequence(),
+            schema_version: 1,
         }.publish(env);
 
         escrow::escrow_nft(env, artist, &listing.collection, listing.token_id, true, listing_id);
@@ -2731,6 +2978,22 @@ impl MarketplaceContract {
         crate::storage::is_token_whitelisted(env, token)
     }
 
+    /// Lightweight on-chain sanity check for a payment token address:
+    /// rejects the marketplace contract itself or (when `collection` is given)
+    /// the NFT collection address.  Decimal/asset-identity policy for the token
+    /// lives in the off-chain token registry — this is a cheap, on-chain-only
+    /// boundary guard. (Issue #282)
+    fn validate_token_asset(env: &Env, token: &Address, collection: Option<&Address>) {
+        if *token == env.current_contract_address() {
+            panic_with_error!(env, MarketplaceError::TokenNotWhitelisted);
+        }
+        if let Some(col) = collection {
+            if token == col {
+                panic_with_error!(env, MarketplaceError::TokenNotWhitelisted);
+            }
+        }
+    }
+
     // ── IPFS CID validation (Issue #206) ─────────────────────────────────────
     //
     // Accepts two canonical CID formats:
@@ -2751,9 +3014,8 @@ impl MarketplaceContract {
             return false;
         }
 
-        // Collect bytes for indexed access (soroban String = UTF-8; CIDs are ASCII).
-        let mut bytes = soroban_sdk::Bytes::new(cid.env());
-        cid.iter().for_each(|b| bytes.push_back(b));
+        // soroban_sdk::String has no iter(); convert to Bytes for indexed access.
+        let bytes = cid.to_bytes();
 
         let first  = bytes.get(0).unwrap_or(0) as char;
         let second = bytes.get(1).unwrap_or(0) as char;
@@ -2800,7 +3062,7 @@ impl MarketplaceContract {
     ///
     /// Callers can pre-validate CIDs returned by IPFS pinning services before
     /// including them in `create_listing` or `create_auction` invocations.
-    pub fn check_cid_valid(env: Env, cid: soroban_sdk::String) -> bool {
+    pub fn check_cid_valid(_env: Env, cid: soroban_sdk::String) -> bool {
         Self::validate_cid(&cid)
     }
 
@@ -2815,8 +3077,8 @@ impl MarketplaceContract {
     /// * `recipients` must be non-empty (caller responsibility to guard with `InvalidSplit`).
     /// * Each recipient's `percentage` must be > 0 (ZeroRecipientBps).
     /// * No duplicate addresses in the recipient list (DuplicateRecipient).
-    /// * `sum(r.percentage) + protocol_fee_bps <= 10_000`
-    fn validate_recipients(env: &Env, recipients: &Vec<Recipient>, protocol_fee_bps: u32) {
+    /// * `sum(r.percentage) <= 10_000` (recipients share of remaining after fee)
+    fn validate_recipients(env: &Env, recipients: &Vec<Recipient>, _protocol_fee_bps: u32) {
         let len = recipients.len();
         let mut total_bps: u32 = 0;
         for i in 0..len {
@@ -2834,9 +3096,7 @@ impl MarketplaceContract {
             total_bps = total_bps.checked_add(r.percentage)
                 .unwrap_or_else(|| panic_with_error!(env, MarketplaceError::RoyaltyExceedsLimit));
         }
-        let combined = total_bps.checked_add(protocol_fee_bps)
-            .unwrap_or_else(|| panic_with_error!(env, MarketplaceError::RoyaltyExceedsLimit));
-        if combined > 10_000 { panic_with_error!(env, MarketplaceError::RoyaltyExceedsLimit); }
+        if total_bps > 10_000 { panic_with_error!(env, MarketplaceError::RoyaltyExceedsLimit); }
     }
 
     /// Returns `(protocol_fee_collected, per-recipient payouts)`. The payout
@@ -2855,7 +3115,6 @@ impl MarketplaceContract {
             token.transfer(buyer, &env.current_contract_address(), &amount);
         }
         let mut payouts: Vec<RecipientPayout> = Vec::new(env);
-        let mut payout = amount;
         let royalty_info: (Address, u32) = env.invoke_contract(
             collection_addr,
             &soroban_sdk::Symbol::new(env, "royalty_info"),
@@ -2897,21 +3156,9 @@ impl MarketplaceContract {
                 fee_collected = dist.fee;
             }
         }
-        let len = recipients.len();
-        let mut ds = 0i128;
-        for i in 0..len {
-            let r = recipients.get(i).unwrap();
-            let amt = if i == len - 1 {
-                payout - ds
-            } else {
-                payout.checked_mul(r.percentage as i128)
-                    .unwrap_or_else(|| panic_with_error!(env, MarketplaceError::ArithmeticOverflow))
-                    .checked_div(10_000)
-                    .unwrap_or_else(|| panic_with_error!(env, MarketplaceError::ArithmeticOverflow))
-            };
-            token.transfer(&env.current_contract_address(), &r.address, &amt);
-            payouts.push_back(RecipientPayout { address: r.address, amount: amt });
-            ds += amt;
+        for entry in dist.iter_payouts() {
+            token.transfer(&env.current_contract_address(), &entry.address, &entry.amount);
+            payouts.push_back(RecipientPayout { address: entry.address.clone(), amount: entry.amount });
         }
         (fee_collected, payouts)
     }

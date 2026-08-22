@@ -17,6 +17,9 @@ mod test;
 #[cfg(test)]
 mod invariant_tests;
 
+#[cfg(test)]
+mod migration_tests;
+
 pub use contract::MarketplaceContract;
 pub use types::{
     BidRecord, CancelReason, Listing, ListingStatus, MarketplaceError, Offer, OfferStatus,
