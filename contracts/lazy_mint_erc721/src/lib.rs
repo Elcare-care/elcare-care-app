@@ -67,6 +67,12 @@ pub enum Error {
     AlreadyMigrated = 14,
     /// Unsupported version jump.
     UnsupportedMigration = 15,
+    /// redeem_batch called with an empty items list.
+    EmptyBatch = 16,
+    /// redeem_batch called with more items than MAX_BATCH_SIZE.
+    BatchTooLarge = 17,
+    /// redeem_batch contains two items with the same voucher token_id.
+    DuplicateVoucherInBatch = 18,
 }
 
 // ─── Data types ───────────────────────────────────────────────────────────────
@@ -138,6 +144,10 @@ pub enum DataKey {
     /// Network passphrase bound at initialization.
     /// Included in the signed digest to prevent cross-network replay (#273).
     NetworkPassphrase,   // String
+    /// On-chain version string written by migrate().
+    ContractVersion,
+    /// Migration completion marker (version string → bool).
+    MigrationDone(soroban_sdk::String),
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -394,7 +404,7 @@ impl LazyMint721 {
         env.storage()
             .instance()
             .set(&DataKey::CurrentWasmHash, &new_wasm_hash);
-        env.deployer().update_current_contract_wasm(&new_wasm_hash);
+        env.deployer().update_current_contract_wasm(new_wasm_hash.clone());
         env.events().publish(
             (symbol_short!("upgraded"),),
             (old_wasm_hash, new_wasm_hash),
@@ -903,8 +913,8 @@ impl LazyMint721 {
 
     // ── Versioning & Migration ─────────────────────────────────────────────
 
-    pub fn version(_env: Env) -> &'static str {
-        "1.0.0"
+    pub fn version(env: Env) -> soroban_sdk::String {
+        soroban_sdk::String::from_str(&env, "1.0.0")
     }
 
     pub fn contract_version(env: Env) -> Option<String> {

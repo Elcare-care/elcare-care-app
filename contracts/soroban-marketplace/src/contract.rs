@@ -294,8 +294,14 @@ impl MarketplaceContract {
     }
 
     /// Step 1 of the two-step role rotation: the current holder of `role`
-    /// proposes a candidate. Mirrors `transfer_admin`'s TTL/overwrite
-    /// semantics — a second call overwrites any still-pending proposal.
+    /// proposes a candidate. A second call overwrites any still-pending proposal
+    /// and emits `role_proposal_overwritten` so indexers can close the old one.
+    ///
+    /// Rejects with:
+    /// - `Unauthorized`          — caller is not the current role holder.
+    /// - `RoleTransferToSelf`    — candidate is already the current holder.
+    /// - `RoleTransferToContract`— candidate is the contract's own address
+    ///                             (irrecoverable governance state).
     pub fn propose_role_transfer(
         env: Env,
         current_authority: Address,
@@ -308,16 +314,39 @@ impl MarketplaceContract {
         if current_authority != stored {
             panic_with_error!(&env, MarketplaceError::Unauthorized);
         }
-        let expires_at = env.ledger().timestamp() + ADMIN_PROPOSAL_TTL;
+        // Guard: no-op transfers pollute the pending slot without advancing
+        // governance — reject them explicitly.
+        if candidate == current_authority {
+            panic_with_error!(&env, MarketplaceError::RoleTransferToSelf);
+        }
+        // Guard: the contract address cannot hold a role because no external
+        // key can produce a valid Soroban auth signature for it.
+        if candidate == env.current_contract_address() {
+            panic_with_error!(&env, MarketplaceError::RoleTransferToContract);
+        }
+        // Overwrite detection: if a proposal already exists, emit an overwrite
+        // event so the indexer can mark the superseded candidate as cancelled.
+        let new_expires_at = env.ledger().timestamp() + ADMIN_PROPOSAL_TTL;
+        if let Some(existing) = get_pending_role_storage(&env, &role) {
+            emit_role_proposal_overwritten(
+                &env,
+                role.clone(),
+                current_authority.clone(),
+                existing.candidate,
+                existing.expires_at,
+                candidate.clone(),
+                new_expires_at,
+            );
+        }
         set_pending_role_storage(
             &env,
             &role,
             &PendingRoleProposal {
                 candidate: candidate.clone(),
-                expires_at,
+                expires_at: new_expires_at,
             },
         );
-        emit_role_proposed(&env, role, current_authority, candidate, expires_at);
+        emit_role_proposed(&env, role, current_authority, candidate, new_expires_at);
     }
 
     /// Step 2: the proposed candidate accepts and becomes the explicit
@@ -339,7 +368,7 @@ impl MarketplaceContract {
         let old_authority = Self::get_role(env.clone(), role.clone());
         set_role_storage(&env, &role, &candidate);
         clear_pending_role_storage(&env, &role);
-        emit_role_accepted(&env, role, old_authority, candidate);
+        emit_role_accepted(&env, role, old_authority, candidate, env.ledger().sequence());
     }
 
     /// Cancel a still-pending role-transfer proposal. Callable only by the
@@ -355,7 +384,13 @@ impl MarketplaceContract {
         let pending = get_pending_role_storage(&env, &role)
             .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::NoRoleProposalPending));
         clear_pending_role_storage(&env, &role);
-        emit_role_proposal_cancelled(&env, role, current_authority, pending.candidate);
+        emit_role_proposal_cancelled(
+            &env,
+            role,
+            current_authority,
+            pending.candidate,
+            env.ledger().sequence(),
+        );
     }
 
     /// Migration path for existing single-admin deployments (Issue #267):

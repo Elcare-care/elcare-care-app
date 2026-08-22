@@ -144,6 +144,15 @@ pub enum MarketplaceError {
     /// `accept_role_transfer` was called after the pending role proposal's
     /// `expires_at` ledger timestamp has passed. The proposal must be re-issued.
     RoleProposalExpired = 53,
+    /// `propose_role_transfer` was called with `candidate == current_authority`.
+    /// Transferring a role to its own current holder is a no-op and is rejected
+    /// so that the pending-proposal slot is not polluted with a dead proposal.
+    RoleTransferToSelf = 54,
+    /// `propose_role_transfer` was called with `candidate` equal to this
+    /// contract's own address. Assigning the contract as a role holder would
+    /// create an irrecoverable governance state (no key can sign for a contract
+    /// address in the normal Soroban auth model).
+    RoleTransferToContract = 55,
 }
 
 #[contracttype]
