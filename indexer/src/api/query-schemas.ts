@@ -151,18 +151,11 @@ export const searchQuerySchema = z.object({
    * Defaults to all: listings, auctions, collections.
    */
   types: z
-    .union([
-      z.string().transform((s) => s.split(',').map((t) => t.trim())),
-      z.array(z.string()),
-    ])
+    .string()
     .optional()
     .default('listings,auctions,collections')
-    .transform((v) =>
-      (typeof v === 'string' ? v.split(',').map((t) => t.trim()) : v).filter(Boolean)
-    )
-    .pipe(
-      z.array(z.enum(['listings', 'auctions', 'collections'])).min(1)
-    ),
+    .transform((v) => v.split(',').map((t) => t.trim()).filter(Boolean))
+    .pipe(z.array(z.enum(['listings', 'auctions', 'collections'])).min(1)),
   /** Max results per entity type (1–50). */
   limit: positiveInt(50).optional().default(10),
 });

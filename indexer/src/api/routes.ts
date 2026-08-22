@@ -4,9 +4,25 @@ import redis from '../redis.js';
 import { Prisma } from '@prisma/client';
 import { cacheMiddleware } from './cache-middleware.js';
 import { etagMiddleware } from './etag-middleware.js';
-import { strictRateLimiter, sseConcurrencyGuard, heavyRateLimiter } from './rate-limit-middleware.js';
+import {
+  lightRateLimiter,
+  mediumRateLimiter,
+  strictRateLimiter,
+  sseConcurrencyGuard,
+  heavyRateLimiter,
+  operationalRateLimiter,
+} from './rate-limit-middleware.js';
 import { badRequest, notFound, internalError } from './errors.js';
-import { versioningMiddleware, ok, validateResponse, ListingResponseV1, AuctionResponseV1, OfferResponseV1, CollectionResponseV1 } from './versioning.js';
+import {
+  versioningMiddleware,
+  ok,
+  validateResponse,
+  ListingResponseV1,
+  AuctionResponseV1,
+  OfferResponseV1,
+  CollectionResponseV1,
+} from './versioning.js';
+import { requestIdMiddleware } from './request-id-middleware.js';
 import { applyDecodedEvents, isPollerHalted, getHaltReason, resumePoller, revertLedgers } from '../poller.js';
 import { collectMarketplaceEvents } from '../event-sync.js';
 import {
@@ -21,6 +37,8 @@ import {
   syncGapsQuerySchema,
   artistMetricsQuerySchema,
   royaltyBreakdownQuerySchema,
+  eventsQuerySchema,
+  searchQuerySchema,
 } from './query-schemas.js';
 import { isValidStellarAddress, STELLAR_ADDRESS_ERROR } from '../stellar-address.js';
 import {
@@ -31,31 +49,38 @@ import {
 } from '../stats.js';
 import { fetchAuctionConfig, AuctionConfig } from '../chain-state.js';
 import { rpc } from '@stellar/stellar-sdk';
-import {
-  sseConnectionsTotal,
-  sseActiveConnectionsGauge,
-  apiRequestDurationHistogram,
-} from '../metrics.js';
+import { apiRequestDurationHistogram } from '../metrics.js';
 import { TTL } from '../cache-warmer.js';
 import { withDecimalAmounts } from '../token-metadata.js';
 import { authMiddleware, classifyRoute } from './auth-middleware.js';
+import { logger } from '../logger.js';
+
 
 // ── SSE registry ───────────────────────────────────────────────────────────────
+//
+// Maintains a bounded in-memory replay buffer and a set of active SSE clients.
+// When a client reconnects with `Last-Event-ID` it receives any missed events
+// from the buffer before switching to live delivery.
+//
+// ID scheme: monotonic integer counter (local/degraded mode). The RealtimeHub
+// (realtime/index.ts) takes over when Redis is available, using Redis Stream ids.
 
-const SSE_BUFFER_SIZE = 200;
+const SSE_BUFFER_SIZE = parseInt(process.env.SSE_LOCAL_BUFFER_SIZE || '200');
 const MAX_SSE_CONNECTIONS = parseInt(process.env.MAX_SSE_CONNECTIONS || '500');
 
 interface SSEEvent {
-  id: number;
+  id: string;
   data: string;
+  eventType?: string;
+  listingId?: string | null;
 }
 
 let sseEventCounter = 0;
 const sseBuffer: SSEEvent[] = [];
-const sseClients: Map<Response, number> = new Map();
+const sseClients: Map<Response, string> = new Map(); // value = last-sent event id
 
-function nextSseId(): number {
-  return ++sseEventCounter;
+function nextSseId(): string {
+  return String(++sseEventCounter);
 }
 
 // Exposed for testing only
@@ -67,7 +92,7 @@ export function _resetSseState() {
   sseClients.clear();
 }
 
-/** Track SSE client metrics and run cleanup on disconnect. */
+/** Emit a `: heartbeat` comment on a response, cleaning up on write failure. */
 function setupSSEHeartbeat(res: Response): ReturnType<typeof setInterval> {
   return setInterval(() => {
     try { res.write(': heartbeat\n\n'); } catch { cleanupSSEClient(res); }
@@ -76,21 +101,36 @@ function setupSSEHeartbeat(res: Response): ReturnType<typeof setInterval> {
 
 function cleanupSSEClient(res: Response): void {
   sseClients.delete(res);
-  sseActiveConnectionsGauge.set(sseClients.size);
 }
 
-// SSE clients registry — keyed by Response, value is last-seen event ID
-
+/**
+ * Emit `event` to all connected SSE clients and append to the replay buffer.
+ *
+ * Events carry a monotonically increasing numeric id so clients can resume
+ * from the exact point they disconnected using the `Last-Event-ID` header.
+ *
+ * Reorg-correction events use `event: reorg` so consumers can distinguish
+ * them from data events and trigger local state resets.
+ */
 export function emitSSEEvent(event: any) {
   const id = nextSseId();
   const dataStr = JSON.stringify(event, (_k, v) => typeof v === 'bigint' ? v.toString() : v);
-  const payload: SSEEvent = { id, data: dataStr };
+  const eventType: string | undefined = typeof event?.eventType === 'string' ? event.eventType : undefined;
+  const listingId: string | null = event?.listingId != null ? String(event.listingId) : null;
 
-  // Maintain a bounded replay buffer for reconnecting clients
+  const payload: SSEEvent = { id, data: dataStr, eventType, listingId };
+
+  // Bounded replay buffer — evict oldest entry when full.
   sseBuffer.push(payload);
   if (sseBuffer.length > SSE_BUFFER_SIZE) sseBuffer.shift();
 
-  const frame = `id: ${id}\ndata: ${dataStr}\n\n`;
+  // Build the SSE frame. Reorg events get a named `event:` field so clients
+  // can register a dedicated listener and clear local cache state.
+  const isReorg = eventType === 'REORG' || eventType === 'CRITICAL_REORG';
+  const frame = isReorg
+    ? `id: ${id}\nevent: reorg\ndata: ${dataStr}\n\n`
+    : `id: ${id}\ndata: ${dataStr}\n\n`;
+
   for (const [client] of sseClients) {
     try {
       client.write(frame);
@@ -102,11 +142,10 @@ export function emitSSEEvent(event: any) {
 }
 
 export function closeSSEClients(): void {
-    for (const [client] of sseClients) {
-        try { client.end(); } catch { /* ignore */ }
-    }
-    sseClients.clear();
-    sseActiveConnectionsGauge.set(0);
+  for (const [client] of sseClients) {
+    try { client.end(); } catch { /* ignore */ }
+  }
+  sseClients.clear();
 }
 
 // ── API request duration middleware ───────────────────────────────────────────
@@ -126,6 +165,9 @@ export function apiDurationMiddleware(req: Request, res: Response, next: NextFun
 
 const router = Router();
 
+// ── Per-request middlewares (applied to every route in order) ─────────────────
+// requestIdMiddleware must come first so all downstream log lines carry the id.
+router.use(requestIdMiddleware);
 router.use(versioningMiddleware);
 router.use(etagMiddleware);
 router.use(apiDurationMiddleware);
@@ -152,7 +194,6 @@ const serialize = (obj: any) =>
   JSON.parse(JSON.stringify(obj, (key, value) =>
     typeof value === 'bigint' ? value.toString() : value
   ));
-
 // ── Raw + human-readable money fields (Issue #282) ────────────────────────────
 //
 // Listing/Auction/Offer rows carry raw on-chain base-unit amounts (see
@@ -176,10 +217,19 @@ const serializeOffers = (rows: any[]) => serialize(rows).map((row: any) => withD
 
 // ── GET /events (SSE) ─────────────────────────────────────────────────────────
 
-router.get('/events', (req: Request, res: Response) => {
+router.get('/events', sseConcurrencyGuard, validateQuery(eventsQuerySchema), (req: Request, res: Response) => {
   if (sseClients.size >= MAX_SSE_CONNECTIONS) {
-    return res.status(503).json({ error: 'Too many SSE connections' });
+    return res.status(503).json({ error: { code: 'SERVICE_UNAVAILABLE', message: 'Too many SSE connections', class: 'CLIENT_ERROR' } });
   }
+
+  // Parse validated query params for filtering and resume
+  const { types: typesParam, listingId: listingIdParam, lastEventId: queryLastEventId } = (req as any).validatedQuery ?? {};
+
+  // Topic and listing filters — undefined means "accept all"
+  const typeFilter: Set<string> | undefined = typesParam
+    ? new Set(String(typesParam).split(',').map((t: string) => t.trim()).filter(Boolean))
+    : undefined;
+  const listingIdFilter: string | undefined = listingIdParam ? String(listingIdParam) : undefined;
 
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
@@ -187,24 +237,46 @@ router.get('/events', (req: Request, res: Response) => {
   res.setHeader('X-Accel-Buffering', 'no');
   res.flushHeaders();
 
-  const lastEventId = req.headers['last-event-id'];
-  const resumeFrom = lastEventId ? String(lastEventId) : null;
+  // Determine resume cursor — Last-Event-ID header takes precedence over ?lastEventId=
+  const headerLastId = req.headers['last-event-id'];
+  const resumeFrom: string | null = (headerLastId ? String(headerLastId) : null) ?? (queryLastEventId ? String(queryLastEventId) : null);
 
-  sseClients.set(res, resumeFrom ? parseInt(resumeFrom, 10) : sseEventCounter);
-  sseConnectionsTotal.inc();
-  sseActiveConnectionsGauge.set(sseClients.size);
+  sseClients.set(res, resumeFrom ?? '0');
 
+  // Replay missed events from the buffer when the client provides a resume cursor.
   if (resumeFrom !== null) {
-    const missed = sseBuffer.filter(e => e.id > parseInt(resumeFrom, 10));
+    const resumeNum = parseInt(resumeFrom, 10);
+    const missed = sseBuffer.filter((e) => {
+      const eventNum = parseInt(e.id, 10);
+      if (isNaN(eventNum) || eventNum <= resumeNum) return false;
+      if (typeFilter && e.eventType && !typeFilter.has(e.eventType)) return false;
+      if (listingIdFilter !== undefined && String(e.listingId ?? '') !== listingIdFilter) return false;
+      return true;
+    });
+
     for (const ev of missed) {
-      try { res.write(`id: ${ev.id}\ndata: ${ev.data}\n\n`); } catch { break; }
+      const isReorg = ev.eventType === 'REORG' || ev.eventType === 'CRITICAL_REORG';
+      const frame = isReorg
+        ? `id: ${ev.id}\nevent: reorg\ndata: ${ev.data}\n\n`
+        : `id: ${ev.id}\ndata: ${ev.data}\n\n`;
+      try { res.write(frame); } catch { break; }
     }
-    if (missed.length === 0 && sseBuffer.length > 0 && sseBuffer[0].id > parseInt(resumeFrom, 10)) {
-      res.write(`event: reset\ndata: ${JSON.stringify({ reason: 'cursor_too_old', since: resumeFrom })}\n\n`);
+
+    // Signal "cursor too old" when all buffered events are newer than the cursor,
+    // meaning the client missed more events than the buffer holds — it must
+    // trigger a full page-reload / re-fetch rather than a delta apply.
+    if (
+      missed.length === 0 &&
+      sseBuffer.length > 0 &&
+      parseInt(sseBuffer[0].id, 10) > resumeNum
+    ) {
+      res.write(
+        `event: reset\ndata: ${JSON.stringify({ reason: 'cursor_too_old', since: resumeFrom })}\n\n`,
+      );
     }
   }
 
-  res.write(`data: ${JSON.stringify({ type: 'CONNECTED' })}\n\n`);
+  res.write(`data: ${JSON.stringify({ type: 'CONNECTED', requestId: res.locals.requestId })}\n\n`);
 
   const heartbeat = setupSSEHeartbeat(res);
 
@@ -367,18 +439,7 @@ router.get('/listings', lightRateLimiter, cacheMiddleware(TTL.LISTINGS_LIST), va
     res.setHeader('X-Next-Cursor', nextCursor);
     res.setHeader('X-Total-Count', String(total));
 
-    if (limit !== undefined || offset !== undefined || cursor_ledger !== undefined) {
-      const validated = validateResponse(z.object({ listings: ListingResponseV1.array(), total: z.number() }), {
-        listings: serialize(results),
-        total: Number(total),
-      });
-      return ok(res, validated);
-    }
-    const validated = validateResponse(ListingResponseV1.array(), serialize(results));
-    return ok(res, validated);
-      return res.json({ listings: serializeListings(results), total });
-    }
-    res.json(serializeListings(results));
+    return res.json({ listings: serializeListings(results), total });
   } catch (err) {
     next(internalError('Failed to fetch listings'));
   }
@@ -396,7 +457,7 @@ router.get('/listings/:id', lightRateLimiter, cacheMiddleware(TTL.LISTING_DETAIL
 
     // Attach cached IPFS metadata when available, or null if still pending.
     const ipfsMetadata = listing.token
-      ? await prisma.ipfsMetadata.findUnique({ where: { cid: listing.token } }).catch(() => null)
+      ? await (prisma as any).ipfsMetadata.findUnique({ where: { cid: listing.token } }).catch(() => null)
       : null;
 
     return res.json(serializeListing({ ...listing, ipfsMetadata: ipfsMetadata ?? null }));
@@ -407,7 +468,7 @@ router.get('/listings/:id', lightRateLimiter, cacheMiddleware(TTL.LISTING_DETAIL
 
 // ── GET /listings/:id/history ─────────────────────────────────────────────────
 
-router.get('/listings/:id/history', heavyRateLimiter, async (req: Request, res: Response, next: NextFunction) => {NextFunction) => {
+router.get('/listings/:id/history', heavyRateLimiter, async (req: Request, res: Response, next: NextFunction) => {
   const id = req.params.id as string;
   if (!/^\d+$/.test(id)) {
     return next(badRequest('Invalid ID format'));
@@ -498,20 +559,22 @@ router.get('/ipfs/:cid', mediumRateLimiter, cacheMiddleware(300), async (req: Re
 
   try {
     // 1. Serve from cache if available
-    const cached = await prisma.ipfsMetadata.findUnique({ where: { cid } });
+    const cached = await (prisma as any).ipfsMetadata.findUnique({ where: { cid } });
     if (cached) {
       return res.json(serialize(cached));
     }
 
     // 2. On-demand fetch and cache (for direct /ipfs/:cid requests)
-    let raw: ReturnType<typeof Object.create>;
+    let raw: Record<string, unknown>;
     try {
-      raw = await fetchIpfsMetadata(cid);
+      const { fetchIpfsMetadata: _fetch } = await import('../ipfs-cache.js').catch(() => ({ fetchIpfsMetadata: null }));
+      if (!_fetch) return next(notFound('IPFS content not available'));
+      raw = (await _fetch(cid)) as unknown as Record<string, unknown>;
     } catch {
       return next(notFound('IPFS content not available'));
     }
 
-    const stored = await prisma.ipfsMetadata.upsert({
+    const stored = await (prisma as any).ipfsMetadata.upsert({
       where: { cid },
       create: {
         cid,
@@ -536,7 +599,9 @@ router.get('/ipfs/:cid', mediumRateLimiter, cacheMiddleware(300), async (req: Re
     });
 
     // 3. Ensure a queue entry exists for future refreshes (fire-and-forget)
-    enqueueIpfsFetch(cid).catch(() => { /* ignore */ });
+    import('../ipfs-cache.js')
+      .then(({ enqueueIpfsFetch }) => enqueueIpfsFetch?.(cid)?.catch(() => {}))
+      .catch(() => {});
 
     return res.json(serialize(stored));
   } catch (err) {
@@ -766,13 +831,13 @@ router.get('/collections/:address/vouchers', async (req: Request, res: Response,
     const skip = offset ? parseInt(offset) : 0;
 
     const [vouchers, total] = await Promise.all([
-      prisma.voucher.findMany({
+      (prisma as any).voucher.findMany({
         where,
         orderBy: { createdAtLedger: 'desc' },
         take,
         skip,
       }),
-      prisma.voucher.count({ where }),
+      (prisma as any).voucher.count({ where }),
     ]);
 
     res.setHeader('X-Total-Count', String(total));
@@ -1014,35 +1079,6 @@ router.get('/stats', lightRateLimiter, validateQuery(statsQuerySchema), async (r
   } catch (err) {
     next(internalError('Failed to fetch stats'));
   }
-});
-
-// GET /events — Server-Sent Events stream with keep-alive heartbeats
-router.get('/events', sseConcurrencyGuard, (req: Request, res: Response) => {
-    if (sseClients.size >= MAX_SSE_CONNECTIONS) {
-        return res.status(503).json({ error: 'Too many SSE connections' });
-    }
-
-    // Setup SSE headers
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Connection', 'keep-alive');
-    res.setHeader('X-Accel-Buffering', 'no'); // prevent nginx from buffering SSE chunks
-    res.setHeader('Access-Control-Allow-Origin', '*');
-
-    // Setup heartbeat
-    setupSSEHeartbeat(res);
-
-    // Send initial connection message
-    res.write(`data: ${JSON.stringify({ type: 'CONNECTED' })}\n\n`);
-
-    // Cleanup on disconnect
-    res.on('close', () => {
-        cleanupSSEClient(res);
-    });
-
-    res.on('error', () => {
-        cleanupSSEClient(res);
-    });
 });
 
 // ── GET /artists/:address/metrics ─────────────────────────────────────────────
@@ -1362,7 +1398,7 @@ router.post('/admin/contracts', operationalRateLimiter, authMiddleware('operator
 // Deactivate a tracked contract. The polling loop will stop on the next tick.
 
 router.delete('/admin/contracts/:id', operationalRateLimiter, authMiddleware('operator'), async (req: Request, res: Response, next: NextFunction) => {
-  const id = parseInt(req.params.id, 10);
+  const id = parseInt(String(req.params.id), 10);
   if (isNaN(id)) return next(badRequest('Contract ID must be an integer'));
 
   try {
@@ -1542,7 +1578,7 @@ router.get('/config/auction', cacheMiddleware(60), async (req: Request, res: Res
       return next(notFound('No marketplace contract tracked'));
     }
 
-    const contractId = contracts[0].id;
+    const contractId = contracts[0].contractId;
     const rpcUrl = process.env.STELLAR_RPC_URL;
     if (!rpcUrl) {
       return next(internalError('STELLAR_RPC_URL not configured'));
