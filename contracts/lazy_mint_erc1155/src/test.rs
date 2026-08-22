@@ -6,7 +6,7 @@ use crate::{
 };
 use ed25519_dalek::{Signer, SigningKey};
 use soroban_sdk::{
-    testutils::{Address as _, Ledger as _},
+    testutils::{Address as _, Events as _, Ledger as _},
     xdr::ToXdr,
     Address, Bytes, BytesN, Env, String, Vec,
 };
@@ -726,11 +726,13 @@ fn replay_check_before_sig_verification() {
             .set(&DataKey::RedeemedVoucher(nonce), &true);
     });
 
-    // Burn should succeed and write supply = 0, not amount (3).
-    client.burn(&buyer, &buyer, &token_id, &3u128);
-
-    // total_supply must be 0, not 3 (the old unwrap_or(amount) result).
-    assert_eq!(client.total_supply(&token_id), 0u128);
+    // Attempting to redeem with a pre-consumed nonce must return VoucherAlreadyRedeemed
+    // before sig verification is reached.
+    let buyer = Address::generate(&env);
+    let v = make_voucher(&env, token_id, nonce);
+    let bad_sig = BytesN::from_array(&env, &[0u8; 64]);
+    let res = client.try_redeem(&buyer, &v, &1u128, &bad_sig, &empty_proof(&env));
+    assert_eq!(res, Err(Ok(Error::VoucherAlreadyRedeemed)));
 }
 
 // ─── Issue #39 — Voucher nonce / replay protection tests ─────────────────────
