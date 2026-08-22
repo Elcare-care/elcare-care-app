@@ -1027,9 +1027,4 @@ impl Launchpad {
     pub fn wasm_version(env: Env) -> u32 {
         storage::wasm_version(&env)
     }
-
-    /// Semantic version string for this contract.
-    pub fn version(env: Env) -> soroban_sdk::String {
-        soroban_sdk::String::from_str(&env, CONTRACT_VERSION)
-    }
 }

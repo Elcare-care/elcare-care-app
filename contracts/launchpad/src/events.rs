@@ -158,3 +158,44 @@ pub fn publish_migration_completed(env: &Env, version: &soroban_sdk::String) {
         (),
     );
 }
+
+/// Emitted when the admin updates the WASM hash for a specific collection kind.
+///
+/// Topics: ("wasm_upd", kind_tag)
+/// Data:   (old_wasm: BytesN<32>, new_wasm: BytesN<32>)
+#[allow(deprecated)]
+pub fn publish_collection_wasm_updated(
+    env: &Env,
+    kind: &crate::types::CollectionKind,
+    old_wasm: &BytesN<32>,
+    new_wasm: &BytesN<32>,
+) {
+    use soroban_sdk::symbol_short;
+    let tag = match kind {
+        crate::types::CollectionKind::Normal721    => symbol_short!("n721"),
+        crate::types::CollectionKind::Normal1155   => symbol_short!("n1155"),
+        crate::types::CollectionKind::LazyMint721  => symbol_short!("l721"),
+        crate::types::CollectionKind::LazyMint1155 => symbol_short!("l1155"),
+    };
+    env.events().publish(
+        (symbol_short!("wasm_upd"), tag),
+        (old_wasm.clone(), new_wasm.clone()),
+    );
+}
+
+/// Emitted when the admin upgrades an existing deployed collection contract.
+///
+/// Topics: ("coll_upg", collection_address)
+/// Data:   (from_wasm: BytesN<32>, to_wasm: BytesN<32>)
+#[allow(deprecated)]
+pub fn publish_collection_upgraded(
+    env: &Env,
+    collection_address: &Address,
+    from_wasm: &BytesN<32>,
+    to_wasm: &BytesN<32>,
+) {
+    env.events().publish(
+        (symbol_short!("coll_upg"), collection_address.clone()),
+        (from_wasm.clone(), to_wasm.clone()),
+    );
+}
