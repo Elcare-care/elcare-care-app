@@ -28,6 +28,10 @@ pub enum Error {
     InvalidMaxSupply = 14,
     /// Creator's balance of `currency` is insufficient to cover the deploy fee (#277).
     InsufficientFee = 15,
+    /// migrate() called for a version that has already been migrated.
+    AlreadyMigrated = 16,
+    /// upgrade_collection() called with an address not in the registry.
+    CollectionNotFound = 17,
 }
 
 /// Which of the four collection types was deployed.
@@ -127,4 +131,10 @@ pub enum DataKey {
     /// `Admin` while absent so existing single-admin deployments are
     /// unaffected until an operator opts into a separate emergency signer.
     EmergencyPauser,
+    /// Persistent marker — set when a versioned migration completes.
+    MigrationDone(String),
+    /// Persistent resumable progress for a versioned migration.
+    MigrationCursor(String),
+    /// Instance-storage slot holding the version string last written by migrate().
+    ContractVersion,
 }
