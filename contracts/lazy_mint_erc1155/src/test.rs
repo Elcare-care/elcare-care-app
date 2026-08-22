@@ -34,6 +34,7 @@ fn setup(fee_bps: u32) -> (Env, LazyMint1155Client<'static>, Address, Address) {
         &Address::generate(&env),
         &fee_receiver,
         &fee_bps,
+        &String::from_str(&env, "Test SDF Network ; September 2015"),
     );
     (env, client, creator, fee_receiver)
 }
@@ -114,6 +115,7 @@ fn digest_byte_layout_is_stable() {
         &Address::generate(&env),
         &Address::generate(&env),
         &0u32,
+        &String::from_str(&env, "Test SDF Network ; September 2015"),
     );
     let currency = Address::generate(&env);
     let v = MintVoucher1155 {

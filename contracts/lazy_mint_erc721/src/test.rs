@@ -3,7 +3,7 @@
 use crate::{BatchVoucherItem, DataKey, Error, LazyMint721, LazyMint721Client, MintVoucher};
 use ed25519_dalek::{Signer, SigningKey};
 use soroban_sdk::{
-    testutils::{Address as _, Ledger as _},
+    testutils::{Address as _, Events as _, Ledger as _},
     xdr::ToXdr,
     Address, Bytes, BytesN, Env, String, Vec,
 };
@@ -33,6 +33,7 @@ fn setup(fee_bps: u32) -> (Env, LazyMint721Client<'static>, Address, Address) {
         &Address::generate(&env),
         &fee_receiver,
         &fee_bps,
+        &String::from_str(&env, "Test SDF Network ; September 2015"),
     );
     (env, client, creator, fee_receiver)
 }
@@ -44,6 +45,7 @@ fn empty_proof(env: &Env) -> Vec<BytesN<32>> {
 fn make_voucher(env: &Env, token_id: u64) -> MintVoucher {
     MintVoucher {
         token_id,
+        nonce: token_id, // use token_id as nonce for test uniqueness
         price: 0,
         currency: Address::generate(env),
         uri: String::from_str(env, "ipfs://test"),
@@ -107,6 +109,36 @@ fn two_leaf_tree(
     (root, pa, pb)
 }
 
+/// Minimal setup without fee — returns (env, client, creator).
+/// Used by tests that call `default_init` separately.
+fn setup_test() -> (Env, LazyMint721Client<'static>, Address) {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|li| li.sequence_number = 1);
+    let contract_id = env.register(LazyMint721, ());
+    let client = LazyMint721Client::new(&env, &contract_id);
+    let creator = Address::generate(&env);
+    (env, client, creator)
+}
+
+/// Initialize the contract in public phase with the test signing key.
+fn default_init(env: &Env, client: &LazyMint721Client, creator: &Address) {
+    let sk = creator_signing_key();
+    client.initialize(
+        creator,
+        &BytesN::from_array(env, &sk.verifying_key().to_bytes()),
+        &String::from_str(env, "TestNFT"),
+        &String::from_str(env, "TNFT"),
+        &1000u64,
+        &0u32,
+        &Address::generate(env),
+        &Address::generate(env),
+        &0u32,
+        &String::from_str(env, "Test SDF Network ; September 2015"),
+    );
+    client.set_public_phase();
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // SECTION 1 — Digest stability (pinned regression)
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -136,11 +168,13 @@ fn digest_byte_layout_is_stable() {
         &Address::generate(&env),
         &fee_receiver,
         &0u32,
+        &String::from_str(&env, "Test SDF Network ; September 2015"),
     );
     // Use a fixed currency address constructed deterministically.
     let currency = Address::generate(&env);
     let v = MintVoucher {
         token_id: 1u64,
+        nonce: 1u64,
         price: 500i128,
         currency: currency.clone(),
         uri: String::from_str(&env, "ipfs://stable"),
@@ -254,7 +288,7 @@ fn redeem_tampered_uri_fails_sig_check() {
     };
     let result = client.try_redeem(
         &buyer,
-        &modified_voucher,
+        &v_bad,
         &BytesN::from_array(&env, &[42u8; 64]),
         &empty_proof(&env),
     );
@@ -444,10 +478,10 @@ fn test_allowlist_single_leaf_tree_valid_proof() {
     let (root, _, proof_other) = two_leaf_tree(&env, &buyer, &other);
     client.set_merkle_root(&root);
 
-    // Proof for buyer: [leaf_b, leaf_c]
+    // Proof for buyer: use the other's leaf hash as the sibling proof element
+    let lb = leaf_hash(&env, &other);
     let mut proof_buyer = Vec::new(&env);
-    proof_buyer.push_back(leaf_b);
-    proof_buyer.push_back(leaf_c);
+    proof_buyer.push_back(lb);
 
     let voucher = make_voucher(&env, 21);
     let result = client.try_redeem(
@@ -583,6 +617,7 @@ fn test_set_merkle_root_non_creator_fails() {
         &royalty_receiver,
         &fee_receiver,
         &0u32,
+        &String::from_str(&env, "Test SDF Network ; September 2015"),
     );
 
     // Without mocked auth, the creator.require_auth() inside set_merkle_root will fail.
@@ -682,24 +717,12 @@ fn batch_one_bad_sig_reverts_all() {
         signature: BytesN::from_array(&env, &[0u8; 64]),
         merkle_proof: empty_proof(&env),
     };
-
-    let result = client.try_redeem(
-        &buyer,
-        &voucher,
-        &BytesN::from_array(&env, &[0u8; 64]),
-        &empty_proof(&env),
-    );
-    // VoucherExpired is checked first (step 1), Merkle is step 0 — but in our
-    // implementation Merkle (step 0) runs before expiry (step 1).
-    // Accept either NotAllowlisted (empty proof) or VoucherExpired depending
-    // on ordering — the important thing is it is NOT a successful mint.
+    let mut items = Vec::new(&env);
+    items.push_back(good);
+    items.push_back(bad);
+    let result = client.try_redeem_batch(&buyer, &items);
     assert!(result.is_err());
-    let err = result.unwrap_err();
-    assert!(
-        err == Ok(Error::NotAllowlisted)
-            || err == Ok(Error::VoucherExpired)
-            || err == Ok(Error::InvalidMerkleProof)
-    );
+    assert!(client.try_owner_of(&600u64).is_err());
 }
 
 #[test]
@@ -893,7 +916,7 @@ mod migration {
         // Redeem one voucher to create a UsedVoucher entry pre-migration
         let sk = creator_signing_key();
         let voucher = make_voucher(&env, 42u64);
-        let sig = sign_voucher(&env, &sk, &client, &voucher);
+        let sig = sign_voucher(&env, &client.address, &voucher);
         let buyer = Address::generate(&env);
 
         client.set_public_phase();
@@ -925,7 +948,7 @@ mod migration {
 
         let sk = creator_signing_key();
         let voucher = make_voucher(&env, 1u64);
-        let sig = sign_voucher(&env, &sk, &client, &voucher);
+        let sig = sign_voucher(&env, &client.address, &voucher);
         let buyer = Address::generate(&env);
 
         client.set_public_phase();
