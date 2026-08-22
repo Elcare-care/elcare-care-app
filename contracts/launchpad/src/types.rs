@@ -90,9 +90,9 @@ pub struct PreflightResult {
     /// The currency the required fee would be charged in.
     pub currency: Address,
     /// Every validation failure that the matching `deploy_*` call would
-    /// raise given identical inputs. Empty means the deployment is expected
-    /// to succeed.
-    pub errors: Vec<Error>,
+    /// raise given identical inputs, encoded as their `Error` discriminant
+    /// `u32` values.  Empty means the deployment is expected to succeed.
+    pub errors: Vec<u32>,
 }
 
 #[contracttype]
