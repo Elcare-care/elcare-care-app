@@ -195,7 +195,7 @@ impl NormalNFT1155 {
         env.storage()
             .instance()
             .set(&DataKey::CurrentWasmHash, &new_wasm_hash);
-        env.deployer().update_current_contract_wasm(&new_wasm_hash);
+        env.deployer().update_current_contract_wasm(new_wasm_hash.clone());
         env.events().publish(
             (symbol_short!("upgraded"),),
             (old_wasm_hash, new_wasm_hash),
@@ -1014,8 +1014,8 @@ impl NormalNFT1155 {
 
     // ── Versioning & Migration ─────────────────────────────────────────────
 
-    pub fn version(_env: Env) -> &'static str {
-        "1.0.0"
+    pub fn version(env: Env) -> String {
+        String::from_str(&env, "1.0.0")
     }
 
     pub fn contract_version(env: Env) -> Option<String> {

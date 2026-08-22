@@ -19,15 +19,9 @@ on:
   pull_request:
     branches: ["main", "master"]
     paths:
-      # Trigger on any contract source change
+      # Trigger on any contract source change, excluding test files and Cargo.lock
       - "contracts/**/src/**/*.rs"
       - "contracts/**/Cargo.toml"
-      # Exclude test files and Cargo.lock from triggering the gate
-      # (test-only changes do not require a threat model)
-    paths-ignore:
-      - "contracts/**/src/test.rs"
-      - "contracts/**/src/test/**"
-      - "Cargo.lock"
 
 jobs:
   threat-model-check:

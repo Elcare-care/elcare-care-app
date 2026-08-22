@@ -365,7 +365,7 @@ impl Launchpad {
         env.storage()
             .instance()
             .set(&DataKey::CurrentWasmHash, &new_wasm_hash);
-        env.deployer().update_current_contract_wasm(&new_wasm_hash);
+        env.deployer().update_current_contract_wasm(new_wasm_hash.clone());
         env.events().publish(
             (symbol_short!("upgraded"),),
             (old_wasm_hash, new_wasm_hash),

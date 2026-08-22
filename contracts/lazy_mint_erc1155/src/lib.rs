@@ -42,6 +42,8 @@ const TTL_THRESHOLD: u32 = 50_000;
 const TTL_BUMP: u32 = 100_000;
 /// Maximum number of vouchers accepted by a single redeem_batch call (#274).
 const MAX_BATCH_SIZE: u32 = 100;
+/// Maximum URI length in bytes (#276).
+const MAX_URI_LEN: u32 = 2048;
 
 // ─── Errors ──────────────────────────────────────────────────────────────────
 
@@ -69,6 +71,18 @@ pub enum Error {
     AlreadyMigrated = 17,
     /// Unsupported version jump.
     UnsupportedMigration = 18,
+    /// Empty URI provided (#276).
+    EmptyUri = 19,
+    /// URI exceeds maximum length (#276).
+    UriTooLong = 20,
+    /// Zero amount provided.
+    ZeroAmount = 21,
+    /// Empty batch provided (#274).
+    EmptyBatch = 22,
+    /// Batch exceeds maximum size (#274).
+    BatchTooLarge = 23,
+    /// Duplicate voucher nonce within a single batch (#274).
+    DuplicateVoucherInBatch = 24,
 }
 
 // ─── Data types ───────────────────────────────────────────────────────────────
@@ -127,6 +141,13 @@ pub enum DataKey {
     /// Network passphrase bound at initialization for cross-network domain
     /// separation (#273).
     NetworkPassphrase, // String
+    // ── Versioned migration registry ─────────────────────────────────────
+    /// Completion marker: present when migration to `version` is done.
+    MigrationDone(String),
+    /// Resumable progress cursor during an in-flight migration.
+    MigrationCursor(String),
+    /// Version string last written to on-chain storage by `migrate()`.
+    ContractVersion,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -430,7 +451,7 @@ impl LazyMint1155 {
         env.storage()
             .instance()
             .set(&DataKey::CurrentWasmHash, &new_wasm_hash);
-        env.deployer().update_current_contract_wasm(&new_wasm_hash);
+        env.deployer().update_current_contract_wasm(new_wasm_hash.clone());
         env.events().publish(
             (symbol_short!("upgraded"),),
             (old_wasm_hash, new_wasm_hash),
@@ -704,8 +725,8 @@ impl LazyMint1155 {
 
     // ── Versioning & Migration ─────────────────────────────────────────────
 
-    pub fn version(_env: Env) -> &'static str {
-        "1.0.0"
+    pub fn version(env: Env) -> String {
+        String::from_str(&env, "1.0.0")
     }
 
     pub fn contract_version(env: Env) -> Option<String> {

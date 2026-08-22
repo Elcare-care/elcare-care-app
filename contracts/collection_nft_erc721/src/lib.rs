@@ -27,6 +27,8 @@ const TTL_BUMP: u32 = 100_000;
 const MAX_BPS: u32 = 10_000; // 100% in basis points
 /// Maximum number of items accepted by any single batch call (#274).
 const MAX_BATCH_SIZE: u32 = 200;
+/// Maximum URI length in bytes (#276).
+const MAX_URI_LEN: u32 = 2048;
 
 // ─── Errors ──────────────────────────────────────────────────────────────────
 
@@ -51,6 +53,14 @@ pub enum Error {
     AlreadyMigrated = 14,
     /// Unsupported version jump — only sequential upgrades are permitted.
     UnsupportedMigration = 15,
+    /// Empty URI provided (#276).
+    EmptyUri = 16,
+    /// URI exceeds maximum length (#276).
+    UriTooLong = 17,
+    /// Empty batch provided (#274).
+    EmptyBatch = 18,
+    /// Batch exceeds maximum size (#274).
+    BatchTooLarge = 19,
 }
 
 // ─── Storage Keys ─────────────────────────────────────────────────────────────
@@ -1004,8 +1014,8 @@ impl NormalNFT721 {
     // ── Versioning & Migration ─────────────────────────────────────────────
 
     /// Semantic version compiled into this WASM.
-    pub fn version(_env: Env) -> &'static str {
-        "1.0.0"
+    pub fn version(env: Env) -> String {
+        String::from_str(&env, "1.0.0")
     }
 
     /// On-chain version string last written by `migrate()`, or `None` before
