@@ -40,8 +40,11 @@ use soroban_sdk::{
 
 const TTL_THRESHOLD: u32 = 50_000;
 const TTL_BUMP: u32 = 100_000;
+const MAX_BPS: u32 = 10_000;
 /// Maximum number of vouchers accepted by a single redeem_batch call (#274).
 const MAX_BATCH_SIZE: u32 = 100;
+/// Maximum URI length in bytes (#276).
+const MAX_URI_LEN: u32 = 2048;
 
 // ─── Errors ──────────────────────────────────────────────────────────────────
 
@@ -67,6 +70,14 @@ pub enum Error {
     AlreadyMigrated = 14,
     /// Unsupported version jump.
     UnsupportedMigration = 15,
+    /// Empty batch provided.
+    EmptyBatch = 16,
+    /// Batch exceeds maximum size.
+    BatchTooLarge = 17,
+    /// Duplicate voucher nonce within a single batch call.
+    DuplicateVoucherInBatch = 18,
+    /// Royalty or fee basis points exceed 100 % (10 000 bps).
+    InvalidBps = 19,
 }
 
 // ─── Data types ───────────────────────────────────────────────────────────────
@@ -138,6 +149,11 @@ pub enum DataKey {
     /// Network passphrase bound at initialization.
     /// Included in the signed digest to prevent cross-network replay (#273).
     NetworkPassphrase,   // String
+    // ── Versioned migration registry ──────────────────────────────────────
+    /// Persistent marker set to `true` once migration to `String` version completes.
+    MigrationDone(String),
+    /// Current on-chain contract version string.
+    ContractVersion,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -351,6 +367,9 @@ impl LazyMint721 {
         if env.storage().instance().has(&DataKey::Initialized) {
             return Err(Error::AlreadyInitialized);
         }
+        if royalty_bps > MAX_BPS {
+            return Err(Error::InvalidBps);
+        }
         env.storage().instance().set(&DataKey::Initialized, &true);
         env.storage().instance().set(&DataKey::Creator, &creator);
         env.storage().instance().set(&DataKey::CurrentWasmHash, &BytesN::from_array(&env, &[0u8; 32]));
@@ -386,6 +405,7 @@ impl LazyMint721 {
 
     pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
         Self::extend_instance_ttl(&env);
+        Self::only_creator(&env)?;
         let old_wasm_hash: BytesN<32> = env
             .storage()
             .instance()
@@ -394,7 +414,7 @@ impl LazyMint721 {
         env.storage()
             .instance()
             .set(&DataKey::CurrentWasmHash, &new_wasm_hash);
-        env.deployer().update_current_contract_wasm(&new_wasm_hash);
+        env.deployer().update_current_contract_wasm(new_wasm_hash.clone());
         env.events().publish(
             (symbol_short!("upgraded"),),
             (old_wasm_hash, new_wasm_hash),
@@ -860,6 +880,9 @@ impl LazyMint721 {
     pub fn update_royalty(env: Env, receiver: Address, bps: u32) -> Result<(), Error> {
         Self::extend_instance_ttl(&env);
         Self::only_creator(&env)?;
+        if bps > MAX_BPS {
+            return Err(Error::InvalidBps);
+        }
         env.storage()
             .instance()
             .set(&DataKey::RoyaltyReceiver, &receiver);
@@ -903,8 +926,8 @@ impl LazyMint721 {
 
     // ── Versioning & Migration ─────────────────────────────────────────────
 
-    pub fn version(_env: Env) -> &'static str {
-        "1.0.0"
+    pub fn version(env: Env) -> String {
+        String::from_str(&env, "1.0.0")
     }
 
     pub fn contract_version(env: Env) -> Option<String> {

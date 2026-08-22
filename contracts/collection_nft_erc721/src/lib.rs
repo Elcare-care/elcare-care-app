@@ -27,6 +27,8 @@ const TTL_BUMP: u32 = 100_000;
 const MAX_BPS: u32 = 10_000; // 100% in basis points
 /// Maximum number of items accepted by any single batch call (#274).
 const MAX_BATCH_SIZE: u32 = 200;
+/// Maximum URI length in bytes (#276).
+const MAX_URI_LEN: u32 = 2048;
 
 // ─── Errors ──────────────────────────────────────────────────────────────────
 
@@ -51,6 +53,14 @@ pub enum Error {
     AlreadyMigrated = 14,
     /// Unsupported version jump — only sequential upgrades are permitted.
     UnsupportedMigration = 15,
+    /// Empty URI provided.
+    EmptyUri = 16,
+    /// URI exceeds maximum length.
+    UriTooLong = 17,
+    /// Empty batch provided.
+    EmptyBatch = 18,
+    /// Batch exceeds maximum size.
+    BatchTooLarge = 19,
 }
 
 // ─── Storage Keys ─────────────────────────────────────────────────────────────
@@ -152,6 +162,9 @@ impl NormalNFT721 {
     ) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Initialized) {
             return Err(Error::AlreadyInitialized);
+        }
+        if royalty_bps > MAX_BPS {
+            return Err(Error::InvalidBps);
         }
 
         env.storage().instance().set(&DataKey::Initialized, &true);
@@ -765,6 +778,9 @@ impl NormalNFT721 {
     pub fn update_royalty(env: Env, receiver: Address, bps: u32) -> Result<(), Error> {
         Self::extend_instance_ttl(&env);
         Self::only_creator(&env)?;
+        if bps > MAX_BPS {
+            return Err(Error::InvalidBps);
+        }
         env.storage()
             .instance()
             .set(&DataKey::RoyaltyReceiver, &receiver);
@@ -982,7 +998,7 @@ impl NormalNFT721 {
         );
         
         env.events().publish(
-            (symbol_short!("token_meta_upd"), creator),
+            (symbol_short!("tok_mupd"), creator),
             (token_id, old_uri, uri),
         );
         Ok(())
@@ -1004,8 +1020,8 @@ impl NormalNFT721 {
     // ── Versioning & Migration ─────────────────────────────────────────────
 
     /// Semantic version compiled into this WASM.
-    pub fn version(_env: Env) -> &'static str {
-        "1.0.0"
+    pub fn version(env: Env) -> String {
+        String::from_str(&env, "1.0.0")
     }
 
     /// On-chain version string last written by `migrate()`, or `None` before

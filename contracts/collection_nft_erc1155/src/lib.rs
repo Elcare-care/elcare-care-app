@@ -166,6 +166,9 @@ impl NormalNFT1155 {
         if env.storage().instance().has(&DataKey::Initialized) {
             return Err(Error::AlreadyInitialized);
         }
+        if royalty_bps > MAX_BPS {
+            return Err(Error::InvalidBps);
+        }
         env.storage().instance().set(&DataKey::Initialized, &true);
         env.storage().instance().set(&DataKey::Creator, &creator);
         env.storage().instance().set(&DataKey::Name, &name);
@@ -195,7 +198,7 @@ impl NormalNFT1155 {
         env.storage()
             .instance()
             .set(&DataKey::CurrentWasmHash, &new_wasm_hash);
-        env.deployer().update_current_contract_wasm(&new_wasm_hash);
+        env.deployer().update_current_contract_wasm(new_wasm_hash.clone());
         env.events().publish(
             (symbol_short!("upgraded"),),
             (old_wasm_hash, new_wasm_hash),
@@ -439,7 +442,7 @@ impl NormalNFT1155 {
         );
         
         env.events().publish(
-            (symbol_short!("token_meta_upd"), creator),
+            (symbol_short!("tok_mupd"), creator),
             (token_id, old_uri, uri),
         );
         Ok(())
@@ -1014,8 +1017,8 @@ impl NormalNFT1155 {
 
     // ── Versioning & Migration ─────────────────────────────────────────────
 
-    pub fn version(_env: Env) -> &'static str {
-        "1.0.0"
+    pub fn version(env: Env) -> String {
+        String::from_str(&env, "1.0.0")
     }
 
     pub fn contract_version(env: Env) -> Option<String> {
@@ -1054,12 +1057,12 @@ impl NormalNFT1155 {
         Ok(())
     }
 
-    /// Legacy default-royalty setter. Alias for set_default_royalty without bps
-    /// validation (preserved for backward compatibility). New callers should use
-    /// `set_default_royalty` which validates bps ≤ MAX_BPS.
     pub fn update_royalty(env: Env, receiver: Address, bps: u32) -> Result<(), Error> {
         Self::extend_instance_ttl(&env);
         Self::only_creator(&env)?;
+        if bps > MAX_BPS {
+            return Err(Error::InvalidBps);
+        }
         env.storage()
             .instance()
             .set(&DataKey::RoyaltyReceiver, &receiver);

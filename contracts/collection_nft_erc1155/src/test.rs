@@ -1198,7 +1198,7 @@ mod migration {
     }
 
     #[test]
-    #[should_panic(expected = "AlreadyMigrated")]
+    #[should_panic(expected = "Error(Contract, #13)")]
     fn double_migrate_reverts() {
         let (_, c, _, _) = setup();
         c.migrate();
@@ -1209,13 +1209,19 @@ mod migration {
     fn migrate_emits_migrated_event() {
         let (env, c, _, _) = setup();
         c.migrate();
+        use soroban_sdk::xdr::{ContractEventBody, ScVal};
         let events = env.events().all();
-        let found = events.iter().any(|(_, topics, _)| {
-            topics.get(0).map(|v| {
-                soroban_sdk::Symbol::try_from_val(&env, &v)
-                    .map(|s| s == soroban_sdk::symbol_short!("migrated"))
-                    .unwrap_or(false)
-            }).unwrap_or(false)
+        let found = events.events().iter().any(|e| {
+            if let ContractEventBody::V0(body) = &e.body {
+                body.topics.iter().any(|t| match t {
+                    ScVal::Symbol(s) => {
+                        core::str::from_utf8(s.0.as_slice()).unwrap_or("") == "migrated"
+                    }
+                    _ => false,
+                })
+            } else {
+                false
+            }
         });
         assert!(found, "expected 'migrated' event");
     }
@@ -1261,4 +1267,80 @@ mod migration {
         c.migrate();
         assert!(c.is_metadata_frozen());
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Security hardening regressions (#6)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn initialize_royalty_bps_over_max_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(NormalNFT1155, ());
+    let client = NormalNFT1155Client::new(&env, &contract_id);
+    let creator = Address::generate(&env);
+    let royalty_receiver = Address::generate(&env);
+    let res = client.try_initialize(
+        &creator,
+        &String::from_str(&env, "Test"),
+        &10_001u32, // > MAX_BPS
+        &royalty_receiver,
+    );
+    assert_eq!(res, Err(Ok(Error::InvalidBps)));
+}
+
+#[test]
+fn update_royalty_over_max_fails() {
+    let (env, client, _, _) = setup();
+    let new_receiver = Address::generate(&env);
+    let res = client.try_update_royalty(&new_receiver, &10_001u32);
+    assert_eq!(res, Err(Ok(Error::InvalidBps)));
+}
+
+#[test]
+fn update_royalty_at_max_succeeds() {
+    let (env, client, _, _) = setup();
+    let new_receiver = Address::generate(&env);
+    assert!(client.try_update_royalty(&new_receiver, &10_000u32).is_ok());
+}
+
+#[test]
+fn metadata_frozen_blocks_set_base_uri() {
+    let (env, client, _, _) = setup();
+    client.freeze_metadata();
+    let res = client.try_set_base_uri(&String::from_str(&env, "https://new.example/"));
+    assert_eq!(res, Err(Ok(Error::MetadataFrozen)));
+}
+
+#[test]
+fn paused_collection_blocks_mint_new() {
+    let (env, client, _, _) = setup();
+    client.pause();
+    let alice = Address::generate(&env);
+    let res = client.try_mint_new(&alice, &5u128, &String::from_str(&env, "uri"));
+    assert_eq!(res, Err(Ok(Error::CollectionPaused)));
+}
+
+#[test]
+fn batch_mint_all_or_nothing_rejects_invalid_uri() {
+    let (env, client, _, _) = setup();
+    let alice = Address::generate(&env);
+    // Empty URI within a batch must cause EmptyUri, and no token should be minted
+    let supply_before = client.next_token_id();
+    let valid_uri = String::from_str(&env, "ipfs://valid");
+    let empty_uri = String::from_str(&env, "");
+    let mut token_ids = Vec::new(&env);
+    let mut amounts = Vec::new(&env);
+    let mut uris = Vec::new(&env);
+    token_ids.push_back(0u64);
+    token_ids.push_back(1u64);
+    amounts.push_back(1u128);
+    amounts.push_back(1u128);
+    uris.push_back(valid_uri);
+    uris.push_back(empty_uri);
+    let res = client.try_mint_batch(&alice, &token_ids, &amounts, &uris);
+    assert_eq!(res, Err(Ok(Error::EmptyUri)));
+    // All-or-nothing: no tokens were minted (next_token_id unchanged)
+    assert_eq!(client.next_token_id(), supply_before);
 }
