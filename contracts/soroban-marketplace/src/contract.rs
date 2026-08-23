@@ -38,6 +38,8 @@ use crate::{
         set_ttl_sweep_progress, clear_collection_fee_bps_storage, clear_pending_role_storage,
         take_legacy_index_vec, DataKey, IndexId, MigrationStatus, PendingAdminProposal,
         PendingRoleProposal, MAX_BID_HISTORY_CAP,
+        assert_token_policy_active, assert_price_policy, evaluate_token_policy,
+        TokenWhitelistPolicyResult,
     },
     types::{
         Auction, AuctionStatus, BatchCreateListingInput, BatchUpdateListingInput, BidRecord,
@@ -1681,6 +1683,21 @@ impl MarketplaceContract {
         crate::storage::get_token_whitelist_entry(&env, &token)
     }
 
+    /// View: return the complete policy snapshot for `token`.
+    ///
+    /// Returns a `TokenWhitelistPolicyResult` with the resolved lifecycle state
+    /// (`Active`, `Removed`, or `NeverAdded`), whether the token is currently
+    /// accepted, the full registry entry (when present), and the total number of
+    /// tokens ever registered.  Designed to be used by the indexer and admin
+    /// tooling to query policy state in a single call without re-implementing
+    /// the validation logic client-side.
+    ///
+    /// Specifically covers Issue #435 acceptance criterion: "Whitelist events
+    /// and registry state are stable and indexable by the off-chain system."
+    pub fn get_token_whitelist_policy(env: Env, token: Address) -> TokenWhitelistPolicyResult {
+        evaluate_token_policy(&env, &token)
+    }
+
     // ── create_listing ───────────────────────────────────────
     // CEI order:
     //   Checks  — auth, revocation, price, split, whitelist
@@ -1792,6 +1809,8 @@ impl MarketplaceContract {
         if new_price <= 0 { panic_with_error!(&env, MarketplaceError::InvalidPrice); }
         let price_upper_bound: i128 = i128::MAX / 10_000;
         if new_price > price_upper_bound { panic_with_error!(&env, MarketplaceError::InvalidPrice); }
+        // Policy engine: enforce configured price bounds at update time (Issue #435).
+        assert_price_policy(&env, new_price);
         let old_price = listing.price;
         listing.price = new_price;
         save_listing(&env, &listing);
@@ -1883,7 +1902,8 @@ impl MarketplaceContract {
                 return false;
             }
         }
-        if !Self::is_token_whitelisted(&env, &listing.token) {
+        // Policy engine: re-validate listing token at settlement time (Issue #435).
+        if !evaluate_token_policy(&env, &listing.token).is_accepted {
             release_listing_lock(&env, listing_id);
             panic_with_error!(&env, MarketplaceError::TokenNotWhitelisted);
         }
@@ -2040,9 +2060,8 @@ impl MarketplaceContract {
             panic_with_error!(&env, MarketplaceError::InvalidAuctionDuration);
         }
         Self::validate_token_asset(&env, &token, Some(&collection));
-        if !Self::is_token_whitelisted(&env, &token) {
-            panic_with_error!(&env, MarketplaceError::TokenNotWhitelisted);
-        }
+        // Policy engine gate (Issue #435).
+        assert_token_policy_active(&env, &token);
         // Snapshot protocol fee early so it can be used in recipient validation.
         let protocol_fee_bps = crate::storage::get_protocol_fee_bps_storage(&env).unwrap_or(0);
         // Validate recipients using the same rules as create_listing (#270).
@@ -2218,6 +2237,13 @@ impl MarketplaceContract {
         let winner = auction.highest_bidder.clone();
         let winning_bid = auction.highest_bid;
         let snapshotted_fee = auction.protocol_fee_bps;
+        // Policy engine: re-validate auction token at settlement time (Issue #435).
+        // Only block settlement when there is a winner — a no-bid finalization
+        // returns the NFT to the creator without any payment flow, so there is
+        // no stale token risk on that path.
+        if winner.is_some() {
+            assert_token_policy_active(&env, &auction.token);
+        }
         auction.status = if winner.is_some() { AuctionStatus::Finalized } else { AuctionStatus::Cancelled };
         save_auction(&env, &auction);
         AuctionFinalizedEvent {
@@ -2373,9 +2399,8 @@ impl MarketplaceContract {
         if listing.artist == offerer { panic_with_error!(&env, MarketplaceError::CannotOfferOwnListing); }
         if amount <= 0 { panic_with_error!(&env, MarketplaceError::InsufficientOfferAmount); }
         Self::validate_token_asset(&env, &token, Some(&listing.collection));
-        if !Self::is_token_whitelisted(&env, &token) {
-            panic_with_error!(&env, MarketplaceError::TokenNotWhitelisted);
-        }
+        // Policy engine gate (Issue #435).
+        assert_token_policy_active(&env, &token);
         // Enforce the active-offer cap so per-listing storage is bounded.
         // Only Pending offers count; terminal offers have freed their slot.
         // O(1): one read of the bounded pending-offer set — no scan over the
@@ -2499,6 +2524,10 @@ impl MarketplaceContract {
                 panic_with_error!(&env, MarketplaceError::ListingExpired);
             }
         }
+        // Policy engine: re-validate offer token at settlement time (Issue #435).
+        // The token may have been removed from the whitelist after the offer was
+        // created — we must block settlement with a stale token.
+        assert_token_policy_active(&env, &offer.token);
         // Effects
         let accepted_offerer = offer.offerer.clone();
         let accepted_amount = offer.amount;
@@ -2751,9 +2780,10 @@ impl MarketplaceContract {
 
         let protocol_fee_bps = crate::storage::get_protocol_fee_bps_storage(env).unwrap_or(0);
         Self::validate_recipients(env, &recipients, protocol_fee_bps);
-        if !Self::is_token_whitelisted(env, &token) {
-            panic_with_error!(env, MarketplaceError::TokenNotWhitelisted);
-        }
+        // Policy engine gate (Issue #435): rejects self-token, collection-token,
+        // and any token not currently active in the whitelist registry.
+        Self::validate_token_asset(env, &token, Some(&collection));
+        assert_token_policy_active(env, &token);
 
         let listing_id = increment_listing_count(env);
         let listing = Listing {
@@ -2807,9 +2837,11 @@ impl MarketplaceContract {
             panic_with_error!(env, MarketplaceError::Unauthorized);
         }
         if new_price <= 0 { panic_with_error!(env, MarketplaceError::InvalidPrice); }
-        if !Self::is_token_whitelisted(env, &new_token) {
-            panic_with_error!(env, MarketplaceError::Unauthorized);
-        }
+        // Policy engine: enforce price bounds at update time (Issue #435).
+        assert_price_policy(env, new_price);
+        // Policy engine: enforce token whitelist at update time (Issue #435).
+        Self::validate_token_asset(env, &new_token, Some(&listing.collection));
+        assert_token_policy_active(env, &new_token);
         let nrlen = new_recipients.len();
         if nrlen == 0 { panic_with_error!(env, MarketplaceError::InvalidSplit); }
         if nrlen > 4  { panic_with_error!(env, MarketplaceError::TooManyRecipients); }
@@ -2942,12 +2974,8 @@ impl MarketplaceContract {
     }
 
     fn require_price_in_bounds(env: &Env, price: i128) {
-        if let Some(min) = get_min_price_storage(env) {
-            if price < min { panic_with_error!(env, MarketplaceError::PriceOutOfBounds); }
-        }
-        if let Some(max) = get_max_price_storage(env) {
-            if price > max { panic_with_error!(env, MarketplaceError::PriceOutOfBounds); }
-        }
+        // Delegates to the policy engine (Issue #435).
+        assert_price_policy(env, price);
     }
 
     fn require_not_paused(env: &Env) {
@@ -2974,15 +3002,6 @@ impl MarketplaceContract {
         }
     }
 
-    fn is_token_whitelisted(env: &Env, token: &Address) -> bool {
-        crate::storage::is_token_whitelisted(env, token)
-    }
-
-    /// Lightweight on-chain sanity check for a payment token address:
-    /// rejects the marketplace contract itself or (when `collection` is given)
-    /// the NFT collection address.  Decimal/asset-identity policy for the token
-    /// lives in the off-chain token registry — this is a cheap, on-chain-only
-    /// boundary guard. (Issue #282)
     fn validate_token_asset(env: &Env, token: &Address, collection: Option<&Address>) {
         if *token == env.current_contract_address() {
             panic_with_error!(env, MarketplaceError::TokenNotWhitelisted);

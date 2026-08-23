@@ -1108,6 +1108,32 @@ impl CleanupSummaryEvent {
     }
 }
 
+// ── Token whitelist event emitters (Issue #435) ──────────────────────────────
+//
+// The event structs (`TokenWhitelistedEvent`, `TokenRemovedEvent`) were defined
+// above (Issue #208). These are the corresponding thin emitter helpers so
+// contract.rs can call `emit_token_whitelisted` / `emit_token_removed` without
+// constructing the struct at each call site.
+
+/// Emit `token_whitelisted` when a token is added to or reactivated in the
+/// registry.
+pub fn emit_token_whitelisted(env: &Env, token: &Address, added_by: &Address) {
+    TokenWhitelistedEvent {
+        token: token.clone(),
+        added_by: added_by.clone(),
+    }
+    .publish(env);
+}
+
+/// Emit `token_removed` when a token is soft-deleted from the registry.
+pub fn emit_token_removed(env: &Env, token: &Address, removed_by: &Address) {
+    TokenRemovedEvent {
+        token: token.clone(),
+        removed_by: removed_by.clone(),
+    }
+    .publish(env);
+}
+
 // ── Migration phase observability ─────────────────────────────────────────────
 
 /// Emitted when a migration phase transitions to the next, carrying postcondition
