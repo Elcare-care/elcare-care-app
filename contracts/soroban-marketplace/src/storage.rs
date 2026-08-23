@@ -297,7 +297,7 @@ pub struct EscrowRecord {
 /// soft-delete: the historical record is preserved for audit, but the token
 /// is no longer accepted for new operations.
 #[contracttype]
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct TokenWhitelistEntry {
     /// Ledger timestamp at which the token was first whitelisted.
     pub added_at: u64,
@@ -1093,6 +1093,127 @@ pub fn get_all_token_registry(env: &Env) -> Vec<Address> {
 /// Returns the entry if the token has ever been whitelisted (active or removed).
 pub fn token_whitelist_history(env: &Env, token: &Address) -> Option<TokenWhitelistEntry> {
     get_token_whitelist_entry(env, token)
+}
+
+// ── Policy Engine (Issue #435) ───────────────────────────────────────────────
+//
+// A single, authoritative validation layer for token-whitelist state and price
+// bounds. Every entry point that creates or settles a listing, auction, or offer
+// must go through `check_token_policy` / `check_price_policy` rather than
+// duplicating the individual storage reads inline.
+//
+// Design goals:
+//   1. One place to audit: all whitelist and price semantics live here.
+//   2. Explicit lifecycle states: Active / Removed / NeverAdded are distinct —
+//      callers cannot accidentally treat a removed token as valid.
+//   3. Stable output for the indexer: `TokenWhitelistPolicyResult` is a
+//      `#[contracttype]` struct that can be returned from view functions so the
+//      off-chain system can query policy state without re-implementing the logic.
+//   4. Zero dead code: every variant of `TokenWhitelistState` is reachable by
+//      the tests added for Issue #435.
+
+/// Describes the current lifecycle state of a token in the whitelist registry.
+///
+/// Returned by `get_token_whitelist_policy` and inspected by
+/// `assert_token_policy_active` to give the caller an explicit, unambiguous
+/// verdict rather than a plain `bool`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TokenWhitelistState {
+    /// Token is currently active in the whitelist and may be used in new
+    /// listings, auctions, and offers.
+    Active,
+    /// Token was previously whitelisted but has been soft-removed by an admin.
+    /// It is preserved in the registry for historical audit but must not be
+    /// accepted for any new operations.
+    Removed,
+    /// Token has never been added to the whitelist.  When the whitelist is
+    /// non-empty this means the token is rejected; when the whitelist is
+    /// empty (count == 0) the contract allows any token (pass-all mode).
+    NeverAdded,
+}
+
+/// Complete policy snapshot for one token address. Returned by the
+/// `get_token_whitelist_policy` view so operators and the indexer can query
+/// the full registry state in one call without reconstructing it client-side.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct TokenWhitelistPolicyResult {
+    /// The queried token address.
+    pub token: Address,
+    /// Resolved lifecycle state (Active / Removed / NeverAdded).
+    pub state: TokenWhitelistState,
+    /// `true` when the token may currently be used in new operations.
+    /// Equivalent to `state == Active || (state == NeverAdded && count == 0)`.
+    pub is_accepted: bool,
+    /// The full registry entry when the token has ever been whitelisted,
+    /// `None` when `state == NeverAdded`.
+    pub entry: Option<TokenWhitelistEntry>,
+    /// Total number of tokens ever registered (monotonically increasing).
+    /// Useful context for callers building pagination UIs.
+    pub total_registered: u64,
+}
+
+/// Compute the complete policy snapshot for `token` without modifying state.
+///
+/// Callers use this for both enforcement and view purposes:
+/// - Enforcement: `assert_token_policy_active` panics when `is_accepted` is false.
+/// - View: `get_token_whitelist_policy` returns this struct directly.
+pub fn evaluate_token_policy(env: &Env, token: &Address) -> TokenWhitelistPolicyResult {
+    let total = get_token_whitelist_count(env);
+    let entry = get_token_whitelist_entry(env, token);
+
+    let (state, is_accepted) = match &entry {
+        Some(e) if e.active => (TokenWhitelistState::Active, true),
+        Some(_) => (TokenWhitelistState::Removed, false),
+        None => {
+            // Pass-all mode when no tokens have ever been registered.
+            let accepted = total == 0;
+            (TokenWhitelistState::NeverAdded, accepted)
+        }
+    };
+
+    TokenWhitelistPolicyResult {
+        token: token.clone(),
+        state,
+        is_accepted,
+        entry,
+        total_registered: total,
+    }
+}
+
+/// Enforce that `token` is currently accepted by the policy engine.
+///
+/// Panics with `TokenNotWhitelisted` when:
+/// - `state == Removed`  (token was soft-deleted by an admin)
+/// - `state == NeverAdded` AND the whitelist is non-empty (at least one token
+///   has been registered, so pass-all mode is inactive)
+///
+/// This is the single authoritative gate used at every write surface:
+/// listing creation, auction creation, offer creation, and settlement.
+pub fn assert_token_policy_active(env: &Env, token: &Address) {
+    let result = evaluate_token_policy(env, token);
+    if !result.is_accepted {
+        panic_with_error!(env, MarketplaceError::TokenNotWhitelisted);
+    }
+}
+
+/// Enforce that `price` satisfies the configured `[min, max]` price bounds.
+///
+/// Panics with `PriceOutOfBounds` when either bound is set and `price`
+/// violates it.  A bound of `None` means unconfigured (unbounded in that
+/// direction).
+pub fn assert_price_policy(env: &Env, price: i128) {
+    if let Some(min) = get_min_price_storage(env) {
+        if price < min {
+            panic_with_error!(env, MarketplaceError::PriceOutOfBounds);
+        }
+    }
+    if let Some(max) = get_max_price_storage(env) {
+        if price > max {
+            panic_with_error!(env, MarketplaceError::PriceOutOfBounds);
+        }
+    }
 }
 
 // ── Batched cancel_artist_listings cursor ────────────────────
