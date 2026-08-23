@@ -1,4 +1,5 @@
 import { Request, Response, NextFunction } from 'express';
+import { logger } from '../logger.js';
 import { unauthorized, forbidden } from './errors.js';
 
 // ── Route classification ────────────────────────────────────────────────────────
@@ -36,7 +37,14 @@ export function resetAuthConfigCache(): void {
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
 function getClientIp(req: Request): string {
-  return (req.ip || req.socket.remoteAddress || 'unknown').toString();
+  // Respect X-Forwarded-For when the server is behind a trusted proxy (e.g.
+  // nginx, AWS ALB). Fall back through socket address to 'unknown'.
+  const forwarded = req.headers['x-forwarded-for'];
+  if (typeof forwarded === 'string') {
+    const first = forwarded.split(',')[0].trim();
+    if (first) return first;
+  }
+  return (req.ip || req.socket?.remoteAddress || 'unknown').toString();
 }
 
 function extractWallet(req: Request): string | undefined {
@@ -47,14 +55,32 @@ function extractWallet(req: Request): string | undefined {
   return undefined;
 }
 
-// ── Audit logger ───────────────────────────────────────────────────────────────
+// ── Correlation helper ─────────────────────────────────────────────────────────
 
-export function auditLog(req: Request, outcome: 'allowed' | 'denied', reason: string, policy: RoutePolicy): void {
-  const { logger } = require('../logger.js');
-  logger.info('[auth] audit', {
+function getRequestId(res: Response): string | undefined {
+  return (res.locals.requestId as string) || undefined;
+}
+
+// ── Audit logger ───────────────────────────────────────────────────────────────
+//
+// Every auth decision — allowed or denied — is emitted as a structured log line
+// with a stable `event` field so log aggregators can build dashboards from it
+// without parsing free-form strings. The `requestId` correlation key ties each
+// audit entry to the surrounding request/response log lines.
+
+export function auditLog(
+  req: Request,
+  res: Response,
+  outcome: 'allowed' | 'denied',
+  reason: string,
+  policy: RoutePolicy,
+): void {
+  logger.info('auth.decision', {
+    event: 'auth.decision',
     outcome,
     policy,
     reason,
+    requestId: getRequestId(res),
     ip: getClientIp(req),
     wallet: extractWallet(req),
     path: req.path,
@@ -73,8 +99,6 @@ export function authMiddleware(policy: RoutePolicy) {
       return next();
     }
 
-    const wallet = extractWallet(req);
-
     if (policy === 'authenticated') {
       // Authenticated routes accept any request; wallet is optional metadata.
       // No auth check needed — the route itself may use wallet for filtering.
@@ -85,16 +109,20 @@ export function authMiddleware(policy: RoutePolicy) {
       const provided = req.headers['x-operator-token'] ?? req.query.operator_token;
 
       if (!config.operatorToken) {
-        // No token configured — allow but log warning
-        logger.warn('[auth] operator endpoint accessed without OPERATOR_TOKEN configured', {
+        // No token configured — allow but emit a warning so operators know the
+        // endpoint is effectively unprotected.
+        logger.warn('auth.unconfigured', {
+          event: 'auth.unconfigured',
+          policy,
           path: req.path,
+          requestId: getRequestId(res),
           ip: getClientIp(req),
         });
         return next();
       }
 
       if (!provided || provided !== config.operatorToken) {
-        auditLog(req, 'denied', 'invalid_or_missing_token', policy);
+        auditLog(req, res, 'denied', 'invalid_or_missing_token', policy);
         return next(unauthorized('Invalid or missing operator token'));
       }
 
@@ -102,12 +130,12 @@ export function authMiddleware(policy: RoutePolicy) {
       if (config.allowlist.length > 0) {
         const clientIp = getClientIp(req);
         if (!config.allowlist.includes(clientIp)) {
-          auditLog(req, 'denied', 'ip_not_in_allowlist', policy);
+          auditLog(req, res, 'denied', 'ip_not_in_allowlist', policy);
           return next(forbidden('Operator access not allowed from this IP'));
         }
       }
 
-      auditLog(req, 'allowed', 'token_valid', policy);
+      auditLog(req, res, 'allowed', 'token_valid', policy);
       return next();
     }
 

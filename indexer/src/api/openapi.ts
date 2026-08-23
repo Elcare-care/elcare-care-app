@@ -538,12 +538,7 @@ registry.registerPath({
 
 // ── Generator ─────────────────────────────────────────────────────────────────
 
-/**
- * Build and return the complete OpenAPI 3.0 document.
- * Call once at startup; the result is stable and can be cached.
- */
-export function buildOpenApiDocument() {
-  // GET /health/details
+// GET /health/details
 registry.registerPath({
   method: 'get',
   path: '/health/details',
@@ -791,8 +786,8 @@ registry.registerPath({
   description: 'Returns the machine-readable API specification.',
   responses: {
     200: {
-      description: 'OpenAPI 3.0 JSON document',
-      content: { 'application/json': { schema: z.record(z.string(), z.unknown()) } },
+      description: 'OpenAPI 3.0 document',
+      content: { 'application/json': { schema: { type: 'object' } } },
     },
   },
 });
@@ -823,7 +818,9 @@ const securitySchemes = {
 const generator = new OpenApiGeneratorV3(registry.definitions);
 
 export function buildOpenApiDocument() {
-  return generator.generateDocument({
+  // Cast to `any` to accommodate the version difference between
+  // OpenAPIObjectConfig types across @asteasolutions/zod-to-openapi versions.
+  const doc = generator.generateDocument({
     openapi: '3.0.0',
     info: {
       title: 'ElcareHub Indexer API',
@@ -837,9 +834,12 @@ export function buildOpenApiDocument() {
       { url: 'http://localhost:4000', description: 'Local development' },
       { url: 'https://indexer.elcarehub.io', description: 'Production' },
     ],
-    components: {
-      securitySchemes,
-    },
-    security: [{ operatorToken: [] }],
-  });
+  } as any);
+
+  // Inject securitySchemes and global security into the generated document.
+  if (!doc.components) (doc as any).components = {};
+  (doc as any).components.securitySchemes = securitySchemes;
+  (doc as any).security = [{ operatorToken: [] }];
+
+  return doc;
 }

@@ -109,7 +109,8 @@ pub struct PreflightResult {
     /// Every validation failure that the matching `deploy_*` call would
     /// raise given identical inputs. Empty means the deployment is expected
     /// to succeed.
-    pub errors: Vec<Error>,
+    /// Error codes are the u32 discriminants of the `Error` enum.
+    pub errors: Vec<u32>,
 }
 
 #[contracttype]
@@ -154,4 +155,10 @@ pub enum DataKey {
     /// `Admin` while absent so existing single-admin deployments are
     /// unaffected until an operator opts into a separate emergency signer.
     EmergencyPauser,
+    /// Completion marker: present when migration to `version` is done.
+    MigrationDone(String),
+    /// Resumable progress cursor during an in-flight migration.
+    MigrationCursor(String),
+    /// Version string last written to on-chain storage by `migrate()`.
+    ContractVersion,
 }

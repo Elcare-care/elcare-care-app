@@ -1,5 +1,9 @@
 import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
 import { Request, Response, NextFunction } from 'express';
+import {
+  sseConnectionsTotal,
+  sseActiveConnectionsGauge,
+} from '../metrics.js';
 
 // ── Resource cost classes ──────────────────────────────────────────────────────
 //
@@ -87,14 +91,19 @@ export const strictRateLimiter = heavyRateLimiter;
 // ── SSE concurrency guard ──────────────────────────────────────────────────────
 //
 // Tracks active SSE connections per key (wallet or IP) and rejects new
-// connections when the per-key concurrency limit is reached.
+// connections when the per-key concurrency limit is reached. Operates
+// independently of the token-bucket rate limiter — this is a hard cap on
+// simultaneous long-lived connections, not a request rate.
+//
+// The guard emits SSE connection metrics so Grafana dashboards track
+// per-key usage alongside the global active connection count.
 
 const SSE_CONCURRENT_PER_KEY = parseInt(process.env.SSE_CONCURRENT_PER_KEY || '5');
 const sseConnectionCounts = new Map<string, number>();
 
 export function sseConcurrencyGuard(req: Request, res: Response, next: NextFunction): void {
   const key = getRateLimitKey(req);
-  const current = sseConnectionCounts.get(key) || 0;
+  const current = sseConnectionCounts.get(key) ?? 0;
 
   if (current >= SSE_CONCURRENT_PER_KEY) {
     res.setHeader('Retry-After', '30');
@@ -102,6 +111,7 @@ export function sseConcurrencyGuard(req: Request, res: Response, next: NextFunct
       error: {
         code: 'RATE_LIMIT_EXCEEDED',
         message: `SSE connection limit reached (${SSE_CONCURRENT_PER_KEY} concurrent per key). Retry later.`,
+        class: 'CLIENT_ERROR',
         details: { limit: SSE_CONCURRENT_PER_KEY, key },
       },
     });
@@ -109,21 +119,24 @@ export function sseConcurrencyGuard(req: Request, res: Response, next: NextFunct
   }
 
   sseConnectionCounts.set(key, current + 1);
-  sseActiveConnectionsGauge.set(sseConnectionCounts.get(key) || 0);
+  sseConnectionsTotal.inc();
 
   res.on('close', () => {
-    const updated = (sseConnectionCounts.get(key) || 1) - 1;
+    const updated = (sseConnectionCounts.get(key) ?? 1) - 1;
     if (updated <= 0) {
       sseConnectionCounts.delete(key);
     } else {
       sseConnectionCounts.set(key, updated);
     }
-    sseActiveConnectionsGauge.set(sseConnectionCounts.get(key) || 0);
   });
 
   next();
 }
 
-// ── Metrics integration ────────────────────────────────────────────────────────
+// Exposed for testing — lets tests reset per-key counters between runs.
+export function _resetSseConcurrencyState(): void {
+  sseConnectionCounts.clear();
+}
 
-export { sseConnectionsTotal, sseActiveConnectionsGauge } from '../metrics.js';
+export { sseConnectionsTotal, sseActiveConnectionsGauge };
+

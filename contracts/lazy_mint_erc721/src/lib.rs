@@ -241,6 +241,14 @@ impl LazyMint721 {
                 .publish((symbol_short!("expired"),), voucher.nonce);
             return Err(Error::VoucherExpired);
         }
+        // URI boundary validation (#276)
+        let uri_len = voucher.uri.len();
+        if uri_len == 0 {
+            return Err(Error::EmptyUri);
+        }
+        if uri_len > MAX_URI_LEN {
+            return Err(Error::UriTooLong);
+        }
         // Replay protection uses the voucher's nonce (not token_id) so the same
         // token can be covered by multiple vouchers with independent lifetimes.
         if env

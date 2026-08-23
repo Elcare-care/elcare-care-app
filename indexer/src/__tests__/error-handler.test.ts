@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect } from 'vitest';
 import express, { Request, Response, NextFunction } from 'express';
 import request from 'supertest';
 import { errorHandler, ApiError, badRequest, notFound, internalError, ErrorCode } from '../api/errors';
@@ -16,26 +16,26 @@ describe('error shape', () => {
     const app = buildApp((_req, _res, next) => next(badRequest('Param x is required')));
     const res = await request(app).get('/test');
     expect(res.status).toBe(400);
-    expect(res.body).toEqual({
-      error: { code: ErrorCode.BAD_REQUEST, message: 'Param x is required' },
-    });
+    expect(res.body.error.code).toBe(ErrorCode.BAD_REQUEST);
+    expect(res.body.error.message).toBe('Param x is required');
+    expect(res.body.error.class).toBe('CLIENT_ERROR');
   });
 
   it('404 — wraps notFound in standard envelope', async () => {
     const app = buildApp((_req, _res, next) => next(notFound('Resource not found')));
     const res = await request(app).get('/test');
     expect(res.status).toBe(404);
-    expect(res.body).toEqual({
-      error: { code: ErrorCode.NOT_FOUND, message: 'Resource not found' },
-    });
+    expect(res.body.error.code).toBe(ErrorCode.NOT_FOUND);
+    expect(res.body.error.message).toBe('Resource not found');
+    expect(res.body.error.class).toBe('CLIENT_ERROR');
   });
 
-  it('500 — wraps unknown error in standard envelope without leaking internals', async () => {
+  it('500 — wraps unknown error without leaking internals', async () => {
     const app = buildApp((_req, _res, next) => next(new Error('secret db password')));
     const res = await request(app).get('/test');
     expect(res.status).toBe(500);
     expect(res.body.error.code).toBe(ErrorCode.INTERNAL);
-    // Must not expose internal details
+    expect(res.body.error.class).toBe('SERVER_ERROR');
     expect(JSON.stringify(res.body)).not.toContain('secret db password');
     expect(JSON.stringify(res.body)).not.toContain('stack');
   });
@@ -44,9 +44,9 @@ describe('error shape', () => {
     const app = buildApp((_req, _res, next) => next(internalError('Failed to fetch data')));
     const res = await request(app).get('/test');
     expect(res.status).toBe(500);
-    expect(res.body).toEqual({
-      error: { code: ErrorCode.INTERNAL, message: 'Failed to fetch data' },
-    });
+    expect(res.body.error.code).toBe(ErrorCode.INTERNAL);
+    expect(res.body.error.message).toBe('Failed to fetch data');
+    expect(res.body.error.class).toBe('SERVER_ERROR');
   });
 
   it('ApiError preserves statusCode and code', () => {
@@ -56,7 +56,7 @@ describe('error shape', () => {
     expect(err.message).toBe('Unprocessable');
   });
 
-  it('all error responses share { error: { code, message } } shape', async () => {
+  it('all error responses share { error: { code, message, class } } shape', async () => {
     const cases: Array<[string, () => ApiError]> = [
       ['400', () => badRequest('bad')],
       ['404', () => notFound('not found')],
@@ -68,6 +68,7 @@ describe('error shape', () => {
       expect(res.body, `shape for ${label}`).toHaveProperty('error');
       expect(res.body.error, `error.code for ${label}`).toHaveProperty('code');
       expect(res.body.error, `error.message for ${label}`).toHaveProperty('message');
+      expect(res.body.error, `error.class for ${label}`).toHaveProperty('class');
     }
   });
 });
