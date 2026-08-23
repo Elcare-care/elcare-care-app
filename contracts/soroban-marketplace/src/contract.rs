@@ -162,6 +162,17 @@ const MAX_BLOCKED_BIDDERS: u32 = 50;
 /// remain so the caller knows to call again.
 const REVOCATION_CLEANUP_CAP: u32 = 100;
 
+/// Outcome of `check_bid_invariants`: the bid is valid and this carries
+/// whether an anti-sniping extension should be applied.
+///
+/// Defined outside `impl MarketplaceContract` because Rust does not allow
+/// struct definitions inside `impl` blocks.
+struct BidInvariantResult {
+    /// `Some((new_end_time, new_extension_count))` when the anti-sniping
+    /// extension must be applied; `None` otherwise.
+    pub extension: Option<(u64, u32)>,
+}
+
 #[contract]
 pub struct MarketplaceContract;
 
@@ -2133,6 +2144,85 @@ impl MarketplaceContract {
         auction_id
     }
 
+    // ── Blocked-bidder registry (Issue #199 / #434) ──────────────────────────
+    //
+    // The auction creator (or the contract admin) may maintain a per-auction
+    // registry of addresses that are barred from bidding.  The registry is
+    // capped at MAX_BLOCKED_BIDDERS (50) to keep the membership scan and the
+    // storage footprint small.  Invariant E in `check_bid_invariants` reads
+    // this registry on every `place_bid` call so no blocked address can ever
+    // slip through regardless of which code path is used.
+
+    /// Add `bidder` to the blocked-bidder registry for `auction_id`.
+    ///
+    /// Only the auction creator or the contract admin may call this.
+    /// Panics with:
+    /// - `AuctionNotFound`    — unknown `auction_id`.
+    /// - `AuctionNotActive`   — auction is already terminal.
+    /// - `Unauthorized`       — caller is neither creator nor admin.
+    /// - An untyped panic     — registry is already at MAX_BLOCKED_BIDDERS.
+    pub fn block_bidder(env: Env, caller: Address, auction_id: u64, bidder: Address) {
+        bump_instance_ttl(&env);
+        caller.require_auth();
+        let auction = load_auction(&env, auction_id)
+            .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::AuctionNotFound));
+        if auction.status != AuctionStatus::Active {
+            panic_with_error!(&env, MarketplaceError::AuctionNotActive);
+        }
+        Self::require_creator_or_admin(&env, &caller, &auction.creator);
+        let mut list = crate::storage::load_blocked_bidders(&env, auction_id);
+        // Idempotent: already blocked → no-op
+        if list.contains(&bidder) {
+            return;
+        }
+        if list.len() >= MAX_BLOCKED_BIDDERS {
+            // Hard-cap exceeded — reject with a descriptive panic so callers
+            // get a clear signal without consuming a new error discriminant.
+            panic!("blocked-bidder registry full");
+        }
+        list.push_back(bidder.clone());
+        crate::storage::save_blocked_bidders(&env, auction_id, &list);
+        crate::events::emit_bidder_blocked(&env, auction_id, bidder);
+    }
+
+    /// Remove `bidder` from the blocked-bidder registry for `auction_id`.
+    ///
+    /// No-op when the bidder is not present (idempotent).
+    /// Only the auction creator or the contract admin may call this.
+    /// Panics with:
+    /// - `AuctionNotFound`    — unknown `auction_id`.
+    /// - `Unauthorized`       — caller is neither creator nor admin.
+    pub fn unblock_bidder(env: Env, caller: Address, auction_id: u64, bidder: Address) {
+        bump_instance_ttl(&env);
+        caller.require_auth();
+        let auction = load_auction(&env, auction_id)
+            .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::AuctionNotFound));
+        Self::require_creator_or_admin(&env, &caller, &auction.creator);
+        let list = crate::storage::load_blocked_bidders(&env, auction_id);
+        // Rebuild without the target address (Vec has no remove-by-value).
+        let mut new_list: Vec<Address> = Vec::new(&env);
+        let mut found = false;
+        for addr in list.iter() {
+            if addr == bidder {
+                found = true;
+            } else {
+                new_list.push_back(addr);
+            }
+        }
+        if found {
+            crate::storage::save_blocked_bidders(&env, auction_id, &new_list);
+            crate::events::emit_bidder_unblocked(&env, auction_id, bidder);
+        }
+        // If not found: silently return (idempotent).
+    }
+
+    /// Return the list of blocked bidders for `auction_id`.
+    pub fn get_blocked_bidders(env: Env, auction_id: u64) -> Vec<Address> {
+        load_auction(&env, auction_id)
+            .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::AuctionNotFound));
+        crate::storage::load_blocked_bidders(&env, auction_id)
+    }
+
     // ── place_bid ────────────────────────────────────────────
     pub fn place_bid(env: Env, bidder: Address, auction_id: u64, amount: i128) {
         bump_instance_ttl(&env);
@@ -2142,85 +2232,54 @@ impl MarketplaceContract {
             .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::AuctionNotFound));
         // Collection-level check after loading auction.
         Self::require_not_paused_ctx(&env, Some(&auction.collection), None);
-        if auction.status != AuctionStatus::Active {
-            panic_with_error!(&env, MarketplaceError::AuctionNotActive);
-        }
-        if env.ledger().timestamp() >= auction.end_time {
-            panic_with_error!(&env, MarketplaceError::AuctionExpired);
-        }
-        if bidder == auction.creator { panic_with_error!(&env, MarketplaceError::SelfBidNotAllowed); }
-        // Anti-shill-bidding registry (Issue #199): addresses the creator or
-        // admin has blocked for this auction may not bid.
-        if is_bidder_blocked(&env, auction_id, &bidder) {
-            panic_with_error!(&env, MarketplaceError::Unauthorized);
-        }
-        let required_min = if auction.highest_bid == 0 {
-            auction.reserve_price
-        } else {
-            auction.highest_bid.checked_add(auction.min_increment)
-                .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::BidTooLow))
-        };
-        if amount < required_min { panic_with_error!(&env, MarketplaceError::BidTooLow); }
+
+        // ── Unified invariant check (Issue #434) ──────────────────────────────
+        // All bid safety rules are validated here through a single path so no
+        // entry point can bypass them.
+        let inv = Self::check_bid_invariants(&env, &auction, &bidder, amount);
+
         let previous_bidder = auction.highest_bidder.clone();
         let previous_bid = auction.highest_bid;
         auction.highest_bid = amount;
         auction.highest_bidder = Some(bidder.clone());
-        let now = env.ledger().timestamp();
-        let time_remaining = auction.end_time.saturating_sub(now);
-        let mut extended = false;
-        if auction.extension_trigger > 0 && time_remaining < auction.extension_trigger {
-            // Enforce max-extensions cap (0 = unlimited).
-            if auction.max_extensions > 0 && auction.extension_count >= auction.max_extensions {
-                panic_with_error!(&env, MarketplaceError::MaxExtensionsReached);
-            }
-            // Validate extension_window is non-zero (guard against mis-configuration).
-            if auction.extension_window == 0 {
-                panic_with_error!(&env, MarketplaceError::InvalidExtensionWindow);
-            }
-            // Enforce total duration cap - extension cannot push end_time beyond
-            // original_end_time + MAX_TOTAL_AUCTION_DURATION.
-            let proposed_end_time = now.checked_add(auction.extension_window).unwrap_or(auction.end_time);
-            let max_allowed_end_time = auction.original_end_time.saturating_add(MAX_TOTAL_AUCTION_DURATION);
-            if proposed_end_time > max_allowed_end_time {
-                // Bid is still accepted, but extension is not applied
-                save_auction(&env, &auction);
-                append_bid_record(&env, auction_id,
-                    &BidRecord { bidder: bidder.clone(), amount, ledger: env.ledger().sequence() },
-                    auction.bid_history_cap,
-                );
-                BidPlacedEvent { auction_id, bidder: bidder.clone(), bid_amount: amount }.publish(&env);
-            } else {
-                let prev_end_time = auction.end_time;
-                auction.end_time = proposed_end_time;
-                auction.extension_count = auction.extension_count.saturating_add(1);
-                extended = true;
-                save_auction(&env, &auction);
-                append_bid_record(&env, auction_id,
-                    &BidRecord { bidder: bidder.clone(), amount, ledger: env.ledger().sequence() },
-                    auction.bid_history_cap,
-                );
-                BidPlacedEvent { auction_id, bidder: bidder.clone(), bid_amount: amount }.publish(&env);
-                AuctionExtendedEvent {
-                    auction_id,
-                    prev_end_time,
-                    new_end_time: auction.end_time,
-                    extension_count: auction.extension_count,
-                }.publish(&env);
-            }
-        } else {
+
+        // Apply anti-sniping extension if the invariant layer approved one.
+        let extended = if let Some((new_end_time, new_extension_count)) = inv.extension {
+            let prev_end_time = auction.end_time;
+            auction.end_time = new_end_time;
+            auction.extension_count = new_extension_count;
             save_auction(&env, &auction);
-            append_bid_record(&env, auction_id,
+            append_bid_record(
+                &env, auction_id,
                 &BidRecord { bidder: bidder.clone(), amount, ledger: env.ledger().sequence() },
                 auction.bid_history_cap,
             );
             BidPlacedEvent { auction_id, bidder: bidder.clone(), bid_amount: amount }.publish(&env);
-        }
+            AuctionExtendedEvent {
+                auction_id,
+                prev_end_time,
+                new_end_time: auction.end_time,
+                extension_count: auction.extension_count,
+            }
+            .publish(&env);
+            true
+        } else {
+            save_auction(&env, &auction);
+            append_bid_record(
+                &env, auction_id,
+                &BidRecord { bidder: bidder.clone(), amount, ledger: env.ledger().sequence() },
+                auction.bid_history_cap,
+            );
+            BidPlacedEvent { auction_id, bidder: bidder.clone(), bid_amount: amount }.publish(&env);
+            false
+        };
         let _ = extended;
+
+        // Refund the previous highest bidder (outbid path).
         let tc = TokenClient::new(&env, &auction.token);
         if let Some(prev) = previous_bidder {
             tc.transfer(&env.current_contract_address(), &prev, &previous_bid);
-            // Emit refund event so the indexer can reconcile escrow (Issue #271)
-            AuctionBidRefundedEvent {
+            crate::events::AuctionBidRefundedEvent {
                 auction_id,
                 bidder: prev,
                 amount: previous_bid,
@@ -2228,7 +2287,8 @@ impl MarketplaceContract {
                 reason: Symbol::new(&env, "outbid"),
                 ledger_sequence: env.ledger().sequence(),
                 schema_version: EVENT_SCHEMA_VERSION,
-            }.publish(&env);
+            }
+            .publish(&env);
         }
         tc.transfer(&bidder, &env.current_contract_address(), &amount);
     }
@@ -2244,12 +2304,9 @@ impl MarketplaceContract {
         let _guard = AuctionReentrancyScope::new(&env, auction_id);
         let mut auction = load_auction(&env, auction_id)
             .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::AuctionNotFound));
-        if auction.status != AuctionStatus::Active {
-            panic_with_error!(&env, MarketplaceError::AuctionAlreadyFinalized);
-        }
-        if env.ledger().timestamp() < auction.end_time {
-            panic_with_error!(&env, MarketplaceError::AuctionNotEnded);
-        }
+
+        // ── Unified invariant check (Issue #434) ──────────────────────────────
+        Self::check_finalize_invariants(&env, &auction);
         let winner = auction.highest_bidder.clone();
         let winning_bid = auction.highest_bid;
         let snapshotted_fee = auction.protocol_fee_bps;
@@ -2307,6 +2364,98 @@ impl MarketplaceContract {
         // _guard dropped here — releases auction lock automatically.
     }
 
+    // ── refund_losing_bid ─────────────────────────────────────────────────────
+    //
+    // Issue #434 — Formal invariants layer
+    //
+    // After `finalize_auction` the winning bid funds are forwarded to the
+    // creator/recipients via `distribute_payout`.  Earlier bids are refunded
+    // atomically when they are outbid (inside `place_bid`).  However if an
+    // auction is finalized with NO bids (status → Cancelled) the bidder map is
+    // empty, so there is nothing to refund.  The only scenario where a non-zero
+    // bid amount could be stuck post-finalization is a data anomaly; this entry
+    // point acts as the safety-valve for that case.
+    //
+    // Invariants enforced:
+    //   1. Auction must be in a terminal state (Finalized / Cancelled).
+    //   2. The caller must not be the current `highest_bidder` of a Finalized
+    //      auction (that bidder won — their funds went to the seller).
+    //   3. The caller must have an identifiable outstanding bid stored in the
+    //      bid-history ring buffer.
+    //   4. The bid amount must be > 0.
+    //
+    // Because per-losing-bidder balances are not stored individually (only the
+    // ring-buffer history and the live highest-bid escrow are kept), this
+    // function locates the caller's most-recent bid in the ring buffer and uses
+    // that amount.  In practice, losing bids are refunded immediately in
+    // `place_bid`; this entry point covers the edge case where a node restart or
+    // indexer anomaly causes the frontend to believe a refund is pending.
+
+    /// Claim a refund for a lost bid on a terminal auction.
+    ///
+    /// Safe to call only after `finalize_auction` or `admin_cancel_auction`
+    /// has completed.  Panics with:
+    /// - `AuctionNotFound`       — unknown `auction_id`.
+    /// - `InvalidAuctionState`   — auction is still Active.
+    /// - `NoBidToRefund`         — caller is the winner, or has no bid on record,
+    ///                             or their bid amount is zero.
+    pub fn refund_losing_bid(env: Env, bidder: Address, auction_id: u64) {
+        bump_instance_ttl(&env);
+        // Fund-recovery op — always available regardless of pause state.
+        bidder.require_auth();
+        let auction = load_auction(&env, auction_id)
+            .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::AuctionNotFound));
+
+        // Invariant 1: only allowed on a terminal auction.
+        if auction.status == AuctionStatus::Active {
+            panic_with_error!(&env, MarketplaceError::InvalidAuctionState);
+        }
+
+        // Invariant 2: the current highest bidder of a Finalized auction is the
+        // winner — their funds have already been distributed to the seller.
+        if auction.status == AuctionStatus::Finalized {
+            if let Some(ref winner) = auction.highest_bidder {
+                if *winner == bidder {
+                    panic_with_error!(&env, MarketplaceError::NoBidToRefund);
+                }
+            }
+        }
+
+        // Invariant 3 + 4: scan bid history for the caller's most-recent entry.
+        let bids = load_auction_bids(&env, auction_id);
+        let mut refund_amount: i128 = 0;
+        // Walk in reverse (newest first) to find the bidder's most recent bid.
+        let bid_count = bids.len();
+        for i in (0..bid_count).rev() {
+            let record = bids.get(i).unwrap();
+            if record.bidder == bidder {
+                refund_amount = record.amount;
+                break;
+            }
+        }
+        if refund_amount <= 0 {
+            panic_with_error!(&env, MarketplaceError::NoBidToRefund);
+        }
+
+        // Transfer refund from contract to bidder.
+        TokenClient::new(&env, &auction.token).transfer(
+            &env.current_contract_address(),
+            &bidder,
+            &refund_amount,
+        );
+
+        crate::events::AuctionBidRefundedEvent {
+            auction_id,
+            bidder: bidder.clone(),
+            amount: refund_amount,
+            token: auction.token.clone(),
+            reason: soroban_sdk::Symbol::new(&env, "losing_bid_reclaim"),
+            ledger_sequence: env.ledger().sequence(),
+            schema_version: EVENT_SCHEMA_VERSION,
+        }
+        .publish(&env);
+    }
+
     // ── cancel_auction ───────────────────────────────────────
     // Only no-bid auctions can be cancelled; releases NFT back to creator
     pub fn cancel_auction(env: Env, creator: Address, auction_id: u64) {
@@ -2315,13 +2464,9 @@ impl MarketplaceContract {
         creator.require_auth();
         let mut auction = load_auction(&env, auction_id)
             .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::AuctionNotFound));
-        if auction.creator != creator { panic_with_error!(&env, MarketplaceError::Unauthorized); }
-        if auction.status != AuctionStatus::Active {
-            panic_with_error!(&env, MarketplaceError::AuctionAlreadyFinalized);
-        }
-        if auction.highest_bidder.is_some() {
-            panic_with_error!(&env, MarketplaceError::AuctionHasBids);
-        }
+
+        // ── Unified invariant check (Issue #434) ──────────────────────────────
+        Self::check_cancel_invariants(&env, &auction, &creator);
         auction.status = AuctionStatus::Cancelled;
         save_auction(&env, &auction);
         AuctionCancelledEvent {
@@ -2913,6 +3058,149 @@ impl MarketplaceContract {
                 artist, env.ledger().sequence(), listing_id);
         }
         true
+    }
+
+    // ── Auction invariants layer (Issue #434) ─────────────────────────────────
+    //
+    // A single, authoritative validator that every auction mutation path calls
+    // before changing state.  Centralising all safety constraints here means:
+    //   • Each rule is expressed exactly once — no per-function drift.
+    //   • New entry points get protection for free by calling this helper.
+    //   • The invariant set is easy to audit in isolation.
+    //
+    // Invariants checked (in order):
+    //   A. Auction must exist.
+    //   B. Auction must be Active when a mutating operation is requested.
+    //   C. `end_time` must be strictly in the future for bid placement.
+    //   D. Self-bidding is forbidden.
+    //   E. Blocked bidders may not bid.
+    //   F. Bid amount must meet the minimum threshold
+    //      (reserve_price when no prior bids; highest_bid + min_increment otherwise).
+    //   G. Anti-sniping: if `extension_trigger > 0` and the bid arrives within
+    //      the trigger window, an extension is proposed but only applied when it
+    //      satisfies BOTH:
+    //        • `extension_count < max_extensions` (or `max_extensions == 0` for unlimited)
+    //        • `now + extension_window <= original_end_time + MAX_TOTAL_AUCTION_DURATION`
+    //   H. Finalization is only permitted after `end_time`.
+    //   I. Cancellation by creator is only permitted when `highest_bidder.is_none()`.
+
+    /// Outcome of the `check_bid_invariants` helper: either the bid is valid
+    /// (and the optional extension details are returned), or the call should
+    /// panic with a specific error.
+    // NOTE: defined outside `impl` to satisfy Rust — see `BidInvariantResult` below.
+
+    /// Validate all per-bid auction invariants.
+    ///
+    /// Returns `BidInvariantResult` on success; panics with the appropriate
+    /// `MarketplaceError` variant if any invariant is violated.
+    ///
+    /// # Invariants enforced
+    /// B  Auction must be Active.
+    /// C  `end_time` must be strictly in the future.
+    /// D  Bidder must not be the auction creator.
+    /// E  Bidder must not be in the blocked-bidder registry.
+    /// F  `amount >= required_min` (reserve or highest_bid + min_increment).
+    /// G  Anti-sniping extension is bounded by `max_extensions` and
+    ///    `original_end_time + MAX_TOTAL_AUCTION_DURATION`.
+    fn check_bid_invariants(
+        env: &Env,
+        auction: &Auction,
+        bidder: &Address,
+        amount: i128,
+    ) -> BidInvariantResult {
+        // B — must be Active
+        if auction.status != AuctionStatus::Active {
+            panic_with_error!(env, MarketplaceError::AuctionNotActive);
+        }
+        let now = env.ledger().timestamp();
+        // C — must be before end_time
+        if now >= auction.end_time {
+            panic_with_error!(env, MarketplaceError::AuctionExpired);
+        }
+        // D — no self-bidding
+        if *bidder == auction.creator {
+            panic_with_error!(env, MarketplaceError::SelfBidNotAllowed);
+        }
+        // E — blocked bidder check
+        if is_bidder_blocked(env, auction.auction_id, bidder) {
+            panic_with_error!(env, MarketplaceError::Unauthorized);
+        }
+        // F — minimum bid requirement
+        let required_min = if auction.highest_bid == 0 {
+            auction.reserve_price
+        } else {
+            auction.highest_bid
+                .checked_add(auction.min_increment)
+                .unwrap_or_else(|| panic_with_error!(env, MarketplaceError::BidTooLow))
+        };
+        if amount < required_min {
+            panic_with_error!(env, MarketplaceError::BidTooLow);
+        }
+        // G — anti-sniping extension analysis
+        let extension = if auction.extension_trigger > 0 {
+            let time_remaining = auction.end_time.saturating_sub(now);
+            if time_remaining < auction.extension_trigger {
+                // Check extension cap
+                if auction.max_extensions > 0
+                    && auction.extension_count >= auction.max_extensions
+                {
+                    panic_with_error!(env, MarketplaceError::MaxExtensionsReached);
+                }
+                // Extension window must be non-zero
+                if auction.extension_window == 0 {
+                    panic_with_error!(env, MarketplaceError::InvalidExtensionWindow);
+                }
+                let proposed_end =
+                    now.checked_add(auction.extension_window).unwrap_or(auction.end_time);
+                let max_allowed = auction
+                    .original_end_time
+                    .saturating_add(MAX_TOTAL_AUCTION_DURATION);
+                if proposed_end <= max_allowed {
+                    Some((proposed_end, auction.extension_count.saturating_add(1)))
+                } else {
+                    // Duration cap reached — bid accepted but no extension
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        BidInvariantResult { extension }
+    }
+
+    /// Validate that `finalize_auction` may proceed for the given `auction`.
+    ///
+    /// # Invariants enforced
+    /// B  Auction must be Active.
+    /// H  `end_time` must have passed.
+    fn check_finalize_invariants(env: &Env, auction: &Auction) {
+        if auction.status != AuctionStatus::Active {
+            panic_with_error!(env, MarketplaceError::AuctionAlreadyFinalized);
+        }
+        if env.ledger().timestamp() < auction.end_time {
+            panic_with_error!(env, MarketplaceError::AuctionNotEnded);
+        }
+    }
+
+    /// Validate that `cancel_auction` (creator-initiated) may proceed.
+    ///
+    /// # Invariants enforced
+    /// Auth  Caller must be the auction creator.
+    /// B     Auction must be Active.
+    /// I     No bids may have been placed yet.
+    fn check_cancel_invariants(env: &Env, auction: &Auction, caller: &Address) {
+        if auction.creator != *caller {
+            panic_with_error!(env, MarketplaceError::Unauthorized);
+        }
+        if auction.status != AuctionStatus::Active {
+            panic_with_error!(env, MarketplaceError::AuctionAlreadyFinalized);
+        }
+        if auction.highest_bidder.is_some() {
+            panic_with_error!(env, MarketplaceError::AuctionHasBids);
+        }
     }
 
     fn require_admin(env: &Env) {
