@@ -42,8 +42,7 @@ const TTL_THRESHOLD: u32 = 50_000;
 const TTL_BUMP: u32 = 100_000;
 /// Maximum number of vouchers accepted by a single redeem_batch call (#274).
 const MAX_BATCH_SIZE: u32 = 100;
-/// Maximum URI length in bytes (#276).
-const MAX_URI_LEN: u32 = 2048;
+const MAX_BPS: u32 = 10_000;
 
 // ─── Errors ──────────────────────────────────────────────────────────────────
 
@@ -75,6 +74,10 @@ pub enum Error {
     BatchTooLarge = 17,
     /// redeem_batch contains two items with the same voucher token_id.
     DuplicateVoucherInBatch = 18,
+    /// set_approval_for_all called with an already-past `expires_at`.
+    ApprovalExpired = 19,
+    /// Royalty BPS exceeds 10 000 (100 %).
+    InvalidBps = 20,
 }
 
 // ─── Data types ───────────────────────────────────────────────────────────────
@@ -139,6 +142,7 @@ pub enum DataKey {
     Approved(u64),
     BalanceOf(Address),
     ApprovedForAll(Address, Address),
+    ApprovedForAllExpiry(Address, Address), // (owner, operator) → u32 ledger sequence
     UsedVoucher(u64),    // nonce → bool  (redeemed)
     RevokedVoucher(u64), // nonce → bool  (creator-revoked, per-nonce)
     MerkleRoot,          // BytesN<32> — root of allowlist Merkle tree
@@ -753,12 +757,42 @@ impl LazyMint721 {
         Ok(())
     }
 
-    pub fn set_approval_for_all(env: Env, owner: Address, operator: Address, approved: bool) {
+    pub fn set_approval_for_all(
+        env: Env,
+        owner: Address,
+        operator: Address,
+        approved: bool,
+        expires_at: Option<u32>,
+    ) -> Result<(), Error> {
         Self::extend_instance_ttl(&env);
         owner.require_auth();
+
+        if approved {
+            if let Some(exp) = expires_at {
+                if env.ledger().sequence() >= exp {
+                    return Err(Error::ApprovalExpired);
+                }
+            }
+        }
+
         let key = DataKey::ApprovedForAll(owner.clone(), operator.clone());
+        let expiry_key = DataKey::ApprovedForAllExpiry(owner.clone(), operator.clone());
+
         env.storage().persistent().set(&key, &approved);
         env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_BUMP);
+
+        match (approved, expires_at) {
+            (true, Some(exp)) => {
+                env.storage().persistent().set(&expiry_key, &exp);
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&expiry_key, TTL_THRESHOLD, TTL_BUMP);
+            }
+            _ => {
+                env.storage().persistent().remove(&expiry_key);
+            }
+        }
+        Ok(())
     }
 
     // ── View functions ────────────────────────────────────────────────────
@@ -851,10 +885,24 @@ impl LazyMint721 {
     }
 
     pub fn is_approved_for_all(env: Env, owner: Address, operator: Address) -> bool {
-        env.storage()
+        let approved: bool = env
+            .storage()
             .persistent()
-            .get(&DataKey::ApprovedForAll(owner, operator))
-            .unwrap_or(false)
+            .get(&DataKey::ApprovedForAll(owner.clone(), operator.clone()))
+            .unwrap_or(false);
+        if !approved {
+            return false;
+        }
+        if let Some(exp) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, u32>(&DataKey::ApprovedForAllExpiry(owner, operator))
+        {
+            if env.ledger().sequence() >= exp {
+                return false;
+            }
+        }
+        true
     }
 
     // ── Admin ─────────────────────────────────────────────────────────────
@@ -880,6 +928,9 @@ impl LazyMint721 {
     pub fn update_royalty(env: Env, receiver: Address, bps: u32) -> Result<(), Error> {
         Self::extend_instance_ttl(&env);
         Self::only_creator(&env)?;
+        if bps > MAX_BPS {
+            return Err(Error::InvalidBps);
+        }
         env.storage()
             .instance()
             .set(&DataKey::RoyaltyReceiver, &receiver);
@@ -1086,13 +1137,23 @@ impl LazyMint721 {
                 return Ok(());
             }
         }
-        if env
+        let all_approved: bool = env
             .storage()
             .persistent()
             .get::<DataKey, bool>(&DataKey::ApprovedForAll(from.clone(), spender.clone()))
-            .unwrap_or(false)
-        {
-            return Ok(());
+            .unwrap_or(false);
+        if all_approved {
+            let expiry: Option<u32> = env
+                .storage()
+                .persistent()
+                .get::<DataKey, u32>(&DataKey::ApprovedForAllExpiry(
+                    from.clone(),
+                    spender.clone(),
+                ));
+            let expired = expiry.map_or(false, |exp| env.ledger().sequence() >= exp);
+            if !expired {
+                return Ok(());
+            }
         }
         Err(Error::NotApproved)
     }

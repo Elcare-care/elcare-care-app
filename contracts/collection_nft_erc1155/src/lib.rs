@@ -68,6 +68,8 @@ pub enum Error {
     BatchTooLarge = 19,
     /// Token does not exist.
     TokenNotFound = 20,
+    /// Approval expiry is in the past.
+    ApprovalExpired = 21,
 }
 
 // ─── Storage Keys ─────────────────────────────────────────────────────────────
@@ -96,6 +98,8 @@ pub enum DataKey {
     // Persistent storage
     Balance(Address, u64),            // (account, token_id) → u128
     ApprovedForAll(Address, Address), // (owner, operator) → bool
+    /// Optional expiry (ledger sequence) for an operator approval.
+    ApprovedForAllExpiry(Address, Address), // (owner, operator) → u32
     TokenUri(u64),
     TotalSupply(u64), // per token_id
     /// Per-token maximum supply cap. 0 means no cap.
@@ -165,6 +169,9 @@ impl NormalNFT1155 {
     ) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Initialized) {
             return Err(Error::AlreadyInitialized);
+        }
+        if royalty_bps > MAX_BPS {
+            return Err(Error::InvalidBps);
         }
         env.storage().instance().set(&DataKey::Initialized, &true);
         env.storage().instance().set(&DataKey::Creator, &creator);
@@ -811,6 +818,9 @@ impl NormalNFT1155 {
             return Err(Error::NotApproved);
         }
 
+        if token_ids.is_empty() {
+            return Err(Error::EmptyBatch);
+        }
         if token_ids.len() != amounts.len() {
             return Err(Error::LengthMismatch);
         }
@@ -821,6 +831,9 @@ impl NormalNFT1155 {
         for i in 0..token_ids.len() {
             let id = token_ids.get(i).unwrap();
             let amount = amounts.get(i).unwrap();
+            if amount == 0 {
+                return Err(Error::ZeroAmount);
+            }
             Self::_transfer(&env, &from, &to, id, amount)?;
         }
         Ok(())
@@ -843,14 +856,53 @@ impl NormalNFT1155 {
 
     // ── Approvals ─────────────────────────────────────────────────────────
 
-    pub fn set_approval_for_all(env: Env, owner: Address, operator: Address, approved: bool) {
+    /// Grant or revoke operator-level approval over all tokens owned by the
+    /// caller.  `expires_at` — optional ledger sequence after which this
+    /// approval is treated as absent.  A past expiry on a new grant is
+    /// rejected with `ApprovalExpired`.  Ignored when `approved` is `false`.
+    pub fn set_approval_for_all(
+        env: Env,
+        owner: Address,
+        operator: Address,
+        approved: bool,
+        expires_at: Option<u32>,
+    ) -> Result<(), Error> {
         Self::extend_instance_ttl(&env);
         owner.require_auth();
+
+        if approved {
+            if let Some(exp) = expires_at {
+                if env.ledger().sequence() >= exp {
+                    return Err(Error::ApprovalExpired);
+                }
+            }
+        }
+
         let key = DataKey::ApprovedForAll(owner.clone(), operator.clone());
+        let expiry_key = DataKey::ApprovedForAllExpiry(owner.clone(), operator.clone());
+
         env.storage().persistent().set(&key, &approved);
-        env.storage().persistent().extend_ttl(&key, 50_000, 100_000);
+        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_BUMP);
+
+        match (approved, expires_at) {
+            (true, Some(exp)) => {
+                env.storage().persistent().set(&expiry_key, &exp);
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&expiry_key, TTL_THRESHOLD, TTL_BUMP);
+            }
+            _ => {
+                env.storage().persistent().remove(&expiry_key);
+            }
+        }
+
+        env.events().publish(
+            (symbol_short!("apfa_set"), owner.clone()),
+            (operator.clone(), approved, expires_at),
+        );
         env.events()
             .publish((symbol_short!("appr_all"), owner), (operator, approved));
+        Ok(())
     }
 
     // ── Burn ──────────────────────────────────────────────────────────────
@@ -1060,6 +1112,9 @@ impl NormalNFT1155 {
     pub fn update_royalty(env: Env, receiver: Address, bps: u32) -> Result<(), Error> {
         Self::extend_instance_ttl(&env);
         Self::only_creator(&env)?;
+        if bps > MAX_BPS {
+            return Err(Error::InvalidBps);
+        }
         env.storage()
             .instance()
             .set(&DataKey::RoyaltyReceiver, &receiver);
@@ -1198,10 +1253,27 @@ impl NormalNFT1155 {
     }
 
     fn _is_approved_for_all(env: &Env, operator: &Address, owner: &Address) -> bool {
-        env.storage()
+        let approved: bool = env
+            .storage()
             .persistent()
             .get(&DataKey::ApprovedForAll(owner.clone(), operator.clone()))
-            .unwrap_or(false)
+            .unwrap_or(false);
+        if !approved {
+            return false;
+        }
+        if let Some(exp) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, u32>(&DataKey::ApprovedForAllExpiry(
+                owner.clone(),
+                operator.clone(),
+            ))
+        {
+            if env.ledger().sequence() >= exp {
+                return false;
+            }
+        }
+        true
     }
 
     fn _check_supply_cap(env: &Env, token_id: u64, amount: u128) -> Result<(), Error> {
