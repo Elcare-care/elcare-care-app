@@ -276,6 +276,16 @@ pub enum DataKey {
     /// alongside `MigrationCursor`/`MigrationDone` to support the
     /// `get_migration_status` view.
     MigrationStuck(soroban_sdk::String),
+    /// Pending two-step treasury rotation proposal (Issue #459).
+    /// Mirrors `PendingAdmin` semantics: written by `propose_treasury`,
+    /// consumed (or cleared) by `accept_treasury` / `cancel_treasury_proposal`.
+    PendingTreasury,
+    /// Global minimum listing duration in seconds (Issue #460).
+    /// When set, `expires_at` must be at least `now + MinListingDuration`.
+    MinListingDuration,
+    /// Global maximum listing duration in seconds (Issue #460).
+    /// When set, `expires_at` must be at most `now + MaxListingDuration`.
+    MaxListingDuration,
 }
 
 /// Custody record for an NFT held by the marketplace, keyed by
@@ -1866,4 +1876,117 @@ pub fn get_auction_max_extensions_storage(env: &Env) -> u32 {
         bump_entry_ttl(env, &DataKey::AuctionMaxExtensions);
     }
     value.unwrap_or(DEFAULT_AUCTION_MAX_EXTENSIONS)
+}
+
+// ── Pending treasury rotation (Issue #459) ───────────────────────────────────
+//
+// A two-step, time-bounded treasury rotation mirrors the `PendingAdminProposal`
+// pattern: `propose_treasury` writes this struct, `accept_treasury` (callable
+// only by the proposed address, before `expires_at`) atomically moves it to
+// `DataKey::Treasury`, and `cancel_treasury_proposal` lets the ProtocolConfig
+// role holder abort at any point before acceptance.
+
+/// A pending two-step treasury address rotation (Issue #459).
+#[contracttype]
+#[derive(Clone)]
+pub struct PendingTreasuryProposal {
+    /// Address proposed to become the new protocol fee destination.
+    pub candidate: Address,
+    /// Absolute ledger timestamp after which the proposal can no longer be accepted.
+    pub proposed_at: u64,
+    /// Absolute ledger timestamp after which the proposal can no longer be accepted.
+    pub expires_at: u64,
+}
+
+pub fn set_pending_treasury_storage(env: &Env, pending: &PendingTreasuryProposal) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::PendingTreasury, pending);
+    bump_entry_ttl(env, &DataKey::PendingTreasury);
+}
+
+pub fn get_pending_treasury_storage(env: &Env) -> Option<PendingTreasuryProposal> {
+    let value = env
+        .storage()
+        .persistent()
+        .get::<DataKey, PendingTreasuryProposal>(&DataKey::PendingTreasury);
+    if value.is_some() {
+        bump_entry_ttl(env, &DataKey::PendingTreasury);
+    }
+    value
+}
+
+pub fn clear_pending_treasury_storage(env: &Env) {
+    env.storage()
+        .persistent()
+        .remove(&DataKey::PendingTreasury);
+}
+
+// ── Listing duration bounds (Issue #460) ─────────────────────────────────────
+
+/// Persist the global minimum listing duration (seconds).
+pub fn set_min_listing_duration_storage(env: &Env, secs: u64) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::MinListingDuration, &secs);
+    bump_entry_ttl(env, &DataKey::MinListingDuration);
+}
+
+/// Read the global minimum listing duration, or `None` when unset.
+pub fn get_min_listing_duration_storage(env: &Env) -> Option<u64> {
+    let value = env
+        .storage()
+        .persistent()
+        .get::<DataKey, u64>(&DataKey::MinListingDuration);
+    if value.is_some() {
+        bump_entry_ttl(env, &DataKey::MinListingDuration);
+    }
+    value
+}
+
+/// Persist the global maximum listing duration (seconds).
+pub fn set_max_listing_duration_storage(env: &Env, secs: u64) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::MaxListingDuration, &secs);
+    bump_entry_ttl(env, &DataKey::MaxListingDuration);
+}
+
+/// Read the global maximum listing duration, or `None` when unset.
+pub fn get_max_listing_duration_storage(env: &Env) -> Option<u64> {
+    let value = env
+        .storage()
+        .persistent()
+        .get::<DataKey, u64>(&DataKey::MaxListingDuration);
+    if value.is_some() {
+        bump_entry_ttl(env, &DataKey::MaxListingDuration);
+    }
+    value
+}
+
+/// Enforce that `expires_at` (when provided) lies within the configured
+/// duration window `[now + min, now + max]`.
+///
+/// - When `MinListingDuration` is unset, no lower-bound check is applied.
+/// - When `MaxListingDuration` is unset, no upper-bound check is applied.
+/// - `None` `expires_at` is accepted unless the configuration requires a
+///   non-expiring listing to be explicitly gated (currently allowed; callers
+///   that need to block non-expiring listings should check separately).
+///
+/// Panics with `InvalidListingDuration` on violation. (Issue #460)
+pub fn assert_listing_duration_policy(env: &Env, expires_at: Option<u64>) {
+    let Some(exp) = expires_at else { return };
+    let now = env.ledger().timestamp();
+    if let Some(min_secs) = get_min_listing_duration_storage(env) {
+        let earliest = now.saturating_add(min_secs);
+        if exp < earliest {
+            panic_with_error!(env, MarketplaceError::InvalidListingDuration);
+        }
+    }
+    if let Some(max_secs) = get_max_listing_duration_storage(env) {
+        let latest = now.saturating_add(max_secs);
+        if exp > latest {
+            panic_with_error!(env, MarketplaceError::InvalidListingDuration);
+        }
+    }
 }

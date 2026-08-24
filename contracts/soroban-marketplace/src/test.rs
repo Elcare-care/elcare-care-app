@@ -11198,3 +11198,615 @@ fn test_finalize_auction_no_bid_not_blocked_by_token_removal() {
     client.finalize_auction(&artist, &auction_id);
 }
 
+
+// ══════════════════════════════════════════════════════════════
+// SECTION: Issue #459 — Treasury rotation with timelock
+// ══════════════════════════════════════════════════════════════
+
+#[test]
+fn test_propose_treasury_stores_pending_proposal() {
+    let (env, client, artist, _, _, _, _) = setup();
+    client.set_admin(&artist);
+    let new_treasury = Address::generate(&env);
+    client.propose_treasury(&artist, &new_treasury);
+    let pending = client.get_pending_treasury().expect("proposal should be pending");
+    assert_eq!(pending.candidate, new_treasury);
+    assert!(pending.expires_at > env.ledger().timestamp());
+}
+
+#[test]
+fn test_accept_treasury_after_timelock_activates_new_treasury() {
+    let (env, client, artist, _, _, _, _) = setup();
+    client.set_admin(&artist);
+    let new_treasury = Address::generate(&env);
+    let now = env.ledger().timestamp();
+    client.propose_treasury(&artist, &new_treasury);
+    // Advance past the TREASURY_TIMELOCK (1 hour = 3600 s)
+    env.ledger().set_timestamp(now + 3601);
+    client.accept_treasury(&new_treasury);
+    assert_eq!(client.get_treasury(), Some(new_treasury.clone()));
+    assert!(client.get_pending_treasury().is_none());
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #59)")]
+fn test_accept_treasury_before_timelock_panics() {
+    let (env, client, artist, _, _, _, _) = setup();
+    client.set_admin(&artist);
+    let new_treasury = Address::generate(&env);
+    client.propose_treasury(&artist, &new_treasury);
+    // Do NOT advance time — timelock has not elapsed
+    client.accept_treasury(&new_treasury);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #56)")]
+fn test_accept_treasury_after_expiry_panics() {
+    let (env, client, artist, _, _, _, _) = setup();
+    client.set_admin(&artist);
+    let new_treasury = Address::generate(&env);
+    let now = env.ledger().timestamp();
+    client.propose_treasury(&artist, &new_treasury);
+    // Advance past the TREASURY_PROPOSAL_TTL (7 days = 604800 s)
+    env.ledger().set_timestamp(now + 604_801);
+    client.accept_treasury(&new_treasury);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #57)")]
+fn test_accept_treasury_with_no_proposal_panics() {
+    let (env, client, artist, _, _, _, _) = setup();
+    client.set_admin(&artist);
+    let new_treasury = Address::generate(&env);
+    // No propose_treasury call — no pending proposal
+    client.accept_treasury(&new_treasury);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #58)")]
+fn test_propose_treasury_self_panics() {
+    let (env, client, artist, _, _, _, _) = setup();
+    client.set_admin(&artist);
+    let treasury = Address::generate(&env);
+    // First set treasury directly
+    client.set_treasury(&artist, &treasury);
+    // Now propose the same address — must fail TreasuryProposalSelf
+    client.propose_treasury(&artist, &treasury);
+}
+
+#[test]
+fn test_cancel_treasury_proposal_clears_pending() {
+    let (env, client, artist, _, _, _, _) = setup();
+    client.set_admin(&artist);
+    let new_treasury = Address::generate(&env);
+    client.propose_treasury(&artist, &new_treasury);
+    assert!(client.get_pending_treasury().is_some());
+    client.cancel_treasury_proposal(&artist);
+    assert!(client.get_pending_treasury().is_none());
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #57)")]
+fn test_cancel_treasury_proposal_without_pending_panics() {
+    let (_env, client, artist, _, _, _, _) = setup();
+    client.set_admin(&artist);
+    client.cancel_treasury_proposal(&artist);
+}
+
+#[test]
+fn test_propose_treasury_emits_event() {
+    let (env, client, artist, _, _, _, _) = setup();
+    client.set_admin(&artist);
+    let new_treasury = Address::generate(&env);
+    client.propose_treasury(&artist, &new_treasury);
+    assert!(
+        has_event_with_topic(&env.events().all(), "treasury_proposed"),
+        "treasury_proposed event must be emitted"
+    );
+}
+
+#[test]
+fn test_accept_treasury_emits_event() {
+    let (env, client, artist, _, _, _, _) = setup();
+    client.set_admin(&artist);
+    let new_treasury = Address::generate(&env);
+    let now = env.ledger().timestamp();
+    client.propose_treasury(&artist, &new_treasury);
+    env.ledger().set_timestamp(now + 3601);
+    client.accept_treasury(&new_treasury);
+    assert!(
+        has_event_with_topic(&env.events().all(), "treasury_accepted"),
+        "treasury_accepted event must be emitted"
+    );
+}
+
+#[test]
+fn test_cancel_treasury_proposal_emits_event() {
+    let (env, client, artist, _, _, _, _) = setup();
+    client.set_admin(&artist);
+    let new_treasury = Address::generate(&env);
+    client.propose_treasury(&artist, &new_treasury);
+    client.cancel_treasury_proposal(&artist);
+    assert!(
+        has_event_with_topic(&env.events().all(), "treasury_proposal_cancelled"),
+        "treasury_proposal_cancelled event must be emitted"
+    );
+}
+
+#[test]
+fn test_settlements_use_new_treasury_after_rotation() {
+    let (env, client, artist, buyer, token_id, _cid, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&artist, &token_id);
+    let old_treasury = Address::generate(&env);
+    let new_treasury = Address::generate(&env);
+    client.set_treasury(&artist, &old_treasury);
+    client.set_protocol_fee(&artist, &500u32);
+    let now = env.ledger().timestamp();
+    client.propose_treasury(&artist, &new_treasury);
+    env.ledger().set_timestamp(now + 3601);
+    client.accept_treasury(&new_treasury);
+    let price = 10_000_000_i128;
+    let recipients = vec![
+        &env,
+        Recipient { address: artist.clone(), percentage: 9_500 },
+    ];
+    let id = client.create_listing(
+        &artist, &price, &symbol_short!("XLM"),
+        &token_id, &collection_id, &1u64, &1u64,
+        &recipients, &None::<u64>,
+    );
+    client.buy_artwork(&buyer, &id);
+    let token = TokenClient::new(&env, &token_id);
+    // New treasury should have received the fee; old treasury should have nothing
+    assert_eq!(token.balance(&new_treasury), 500_000_i128);
+    assert_eq!(token.balance(&old_treasury), 0_i128);
+}
+
+// ══════════════════════════════════════════════════════════════
+// SECTION: Issue #460 — Configurable min/max listing durations
+// ══════════════════════════════════════════════════════════════
+
+#[test]
+fn test_set_and_get_min_listing_duration() {
+    let (_env, client, artist, _, _, _, _) = setup();
+    client.set_admin(&artist);
+    client.set_min_listing_duration(&artist, &3600u64);
+    assert_eq!(client.get_min_listing_duration(), Some(3600u64));
+}
+
+#[test]
+fn test_set_and_get_max_listing_duration() {
+    let (_env, client, artist, _, _, _, _) = setup();
+    client.set_admin(&artist);
+    client.set_max_listing_duration(&artist, &86400u64);
+    assert_eq!(client.get_max_listing_duration(), Some(86400u64));
+}
+
+#[test]
+fn test_clear_min_listing_duration() {
+    let (_env, client, artist, _, _, _, _) = setup();
+    client.set_admin(&artist);
+    client.set_min_listing_duration(&artist, &3600u64);
+    client.clear_min_listing_duration(&artist);
+    assert_eq!(client.get_min_listing_duration(), None);
+}
+
+#[test]
+fn test_clear_max_listing_duration() {
+    let (_env, client, artist, _, _, _, _) = setup();
+    client.set_admin(&artist);
+    client.set_max_listing_duration(&artist, &86400u64);
+    client.clear_max_listing_duration(&artist);
+    assert_eq!(client.get_max_listing_duration(), None);
+}
+
+#[test]
+fn test_create_listing_within_duration_bounds_succeeds() {
+    let (env, client, artist, _, token_id, _, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&artist, &token_id);
+    // min = 1 hour, max = 30 days
+    client.set_min_listing_duration(&artist, &3600u64);
+    client.set_max_listing_duration(&artist, &2_592_000u64);
+    let now = env.ledger().timestamp();
+    let expires_at = now + 7200u64; // 2 hours — within bounds
+    let id = client.create_listing(
+        &artist, &1_000_000_i128, &symbol_short!("XLM"),
+        &token_id, &collection_id, &1u64, &1u64,
+        &valid_recipients(&env, &artist), &Some(expires_at),
+    );
+    assert_eq!(client.get_listing(&id).status, ListingStatus::Active);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #59)")]
+fn test_create_listing_below_min_duration_panics() {
+    let (env, client, artist, _, token_id, _, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&artist, &token_id);
+    client.set_min_listing_duration(&artist, &3600u64); // min = 1 hour
+    let now = env.ledger().timestamp();
+    let expires_at = now + 100u64; // only 100 s — below minimum
+    client.create_listing(
+        &artist, &1_000_000_i128, &symbol_short!("XLM"),
+        &token_id, &collection_id, &1u64, &1u64,
+        &valid_recipients(&env, &artist), &Some(expires_at),
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #59)")]
+fn test_create_listing_above_max_duration_panics() {
+    let (env, client, artist, _, token_id, _, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&artist, &token_id);
+    client.set_max_listing_duration(&artist, &86400u64); // max = 1 day
+    let now = env.ledger().timestamp();
+    let expires_at = now + 2 * 86400u64; // 2 days — above maximum
+    client.create_listing(
+        &artist, &1_000_000_i128, &symbol_short!("XLM"),
+        &token_id, &collection_id, &1u64, &1u64,
+        &valid_recipients(&env, &artist), &Some(expires_at),
+    );
+}
+
+#[test]
+fn test_create_listing_no_expiry_always_accepted_with_duration_bounds() {
+    let (env, client, artist, _, token_id, _, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&artist, &token_id);
+    client.set_min_listing_duration(&artist, &3600u64);
+    client.set_max_listing_duration(&artist, &86400u64);
+    // expires_at = None — always accepted regardless of duration config
+    let id = client.create_listing(
+        &artist, &1_000_000_i128, &symbol_short!("XLM"),
+        &token_id, &collection_id, &1u64, &1u64,
+        &valid_recipients(&env, &artist), &None::<u64>,
+    );
+    assert_eq!(client.get_listing(&id).status, ListingStatus::Active);
+}
+
+#[test]
+fn test_duration_config_emits_event() {
+    let (env, client, artist, _, _, _, _) = setup();
+    client.set_admin(&artist);
+    client.set_min_listing_duration(&artist, &3600u64);
+    assert!(
+        has_event_with_topic(&env.events().all(), "listing_duration_config_updated"),
+        "listing_duration_config_updated event must be emitted"
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #59)")]
+fn test_set_max_listing_duration_zero_panics() {
+    let (_env, client, artist, _, _, _, _) = setup();
+    client.set_admin(&artist);
+    client.set_max_listing_duration(&artist, &0u64);
+}
+
+#[test]
+fn test_boundary_min_duration_exact_is_accepted() {
+    let (env, client, artist, _, token_id, _, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&artist, &token_id);
+    client.set_min_listing_duration(&artist, &3600u64);
+    let now = env.ledger().timestamp();
+    // Exactly at min boundary: now + 3600
+    let id = client.create_listing(
+        &artist, &1_000_000_i128, &symbol_short!("XLM"),
+        &token_id, &collection_id, &1u64, &1u64,
+        &valid_recipients(&env, &artist), &Some(now + 3600u64),
+    );
+    assert_eq!(client.get_listing(&id).status, ListingStatus::Active);
+}
+
+#[test]
+fn test_boundary_max_duration_exact_is_accepted() {
+    let (env, client, artist, _, token_id, _, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&artist, &token_id);
+    client.set_max_listing_duration(&artist, &86400u64);
+    let now = env.ledger().timestamp();
+    // Exactly at max boundary: now + 86400
+    let id = client.create_listing(
+        &artist, &1_000_000_i128, &symbol_short!("XLM"),
+        &token_id, &collection_id, &1u64, &1u64,
+        &valid_recipients(&env, &artist), &Some(now + 86400u64),
+    );
+    assert_eq!(client.get_listing(&id).status, ListingStatus::Active);
+}
+
+// ══════════════════════════════════════════════════════════════
+// SECTION: Issue #458 — Collection compatibility validation
+// ══════════════════════════════════════════════════════════════
+
+mod mock_nft_typed {
+    use soroban_sdk::{contract, contractimpl, Address, Env, Symbol};
+
+    #[soroban_sdk::contracttype]
+    enum TypedNftKey { Owner(u64), Kind }
+
+    #[contract]
+    pub struct MockNftTyped;
+
+    #[contractimpl]
+    impl MockNftTyped {
+        pub fn owner_of(env: Env, token_id: u64) -> Address {
+            env.storage().instance()
+                .get::<TypedNftKey, Address>(&TypedNftKey::Owner(token_id))
+                .expect("token has no owner")
+        }
+        pub fn set_owner(env: Env, token_id: u64, owner: Address) {
+            env.storage().instance().set(&TypedNftKey::Owner(token_id), &owner);
+        }
+        pub fn transfer_from(env: Env, _spender: Address, from: Address, to: Address, token_id: u64) {
+            let cur: Address = env.storage().instance()
+                .get::<TypedNftKey, Address>(&TypedNftKey::Owner(token_id))
+                .expect("token has no owner");
+            assert_eq!(cur, from, "transfer_from: wrong owner");
+            env.storage().instance().set(&TypedNftKey::Owner(token_id), &to);
+        }
+        pub fn royalty_info(env: Env) -> (Address, u32) {
+            use soroban_sdk::testutils::Address as _;
+            (Address::generate(&env), 0u32)
+        }
+        /// Expose collection type so the marketplace can check compatibility.
+        pub fn contract_type(env: Env) -> Symbol {
+            let kind: Symbol = env.storage().instance()
+                .get::<TypedNftKey, Symbol>(&TypedNftKey::Kind)
+                .unwrap_or_else(|| Symbol::new(&env, "ERC721"));
+            kind
+        }
+        pub fn set_kind(env: Env, kind: Symbol) {
+            env.storage().instance().set(&TypedNftKey::Kind, &kind);
+        }
+    }
+}
+use mock_nft_typed::MockNftTypedClient;
+
+#[test]
+fn test_create_listing_erc721_quantity_one_succeeds() {
+    let (env, client, artist, _, token_id, _, _) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&artist, &token_id);
+    let col = env.register(mock_nft_typed::MockNftTyped, ());
+    let col_client = MockNftTypedClient::new(&env, &col);
+    col_client.set_owner(&1u64, &artist);
+    col_client.set_kind(&Symbol::new(&env, "ERC721"));
+    let id = client.create_listing(
+        &artist, &1_000_000_i128, &symbol_short!("XLM"),
+        &token_id, &col, &1u64, &1u64,
+        &valid_recipients(&env, &artist), &None::<u64>,
+    );
+    assert_eq!(client.get_listing(&id).status, ListingStatus::Active);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #60)")]
+fn test_create_listing_erc721_quantity_gt_one_panics() {
+    let (env, client, artist, _, token_id, _, _) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&artist, &token_id);
+    let col = env.register(mock_nft_typed::MockNftTyped, ());
+    let col_client = MockNftTypedClient::new(&env, &col);
+    col_client.set_owner(&1u64, &artist);
+    col_client.set_kind(&Symbol::new(&env, "ERC721"));
+    // ERC-721 with quantity > 1 should fail CollectionIncompatible
+    client.create_listing(
+        &artist, &1_000_000_i128, &symbol_short!("XLM"),
+        &token_id, &col, &1u64, &5u64,
+        &valid_recipients(&env, &artist), &None::<u64>,
+    );
+}
+
+#[test]
+fn test_create_listing_erc1155_quantity_gt_one_succeeds() {
+    let (env, client, artist, _, token_id, _, _) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&artist, &token_id);
+    let col = env.register(mock_nft_typed::MockNftTyped, ());
+    let col_client = MockNftTypedClient::new(&env, &col);
+    col_client.set_owner(&1u64, &artist);
+    col_client.set_kind(&Symbol::new(&env, "ERC1155"));
+    let id = client.create_listing(
+        &artist, &1_000_000_i128, &symbol_short!("XLM"),
+        &token_id, &col, &1u64, &10u64,
+        &valid_recipients(&env, &artist), &None::<u64>,
+    );
+    assert_eq!(client.get_listing(&id).status, ListingStatus::Active);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #60)")]
+fn test_create_listing_zero_quantity_panics() {
+    let (env, client, artist, _, token_id, _, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&artist, &token_id);
+    client.create_listing(
+        &artist, &1_000_000_i128, &symbol_short!("XLM"),
+        &token_id, &collection_id, &1u64, &0u64,
+        &valid_recipients(&env, &artist), &None::<u64>,
+    );
+}
+
+// ══════════════════════════════════════════════════════════════
+// SECTION: Issue #457 — Atomic batch listing creation
+// ══════════════════════════════════════════════════════════════
+
+fn make_batch_input(
+    env: &Env,
+    price: i128,
+    token: &Address,
+    collection: &Address,
+    token_id: u64,
+    artist: &Address,
+    expires_at: Option<u64>,
+) -> BatchCreateListingInput {
+    BatchCreateListingInput {
+        price,
+        currency: symbol_short!("XLM"),
+        token: token.clone(),
+        collection: collection.clone(),
+        token_id,
+        quantity: 1u64,
+        recipients: valid_recipients(env, artist),
+        expires_at,
+    }
+}
+
+#[test]
+fn test_batch_create_all_valid_returns_ids() {
+    let (env, client, artist, _, token_id, _, _) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&artist, &token_id);
+
+    // Mint tokens 1, 2, 3 to artist across three separate mock collections
+    let col1 = env.register(mock_nft::MockNft, ());
+    let col2 = env.register(mock_nft::MockNft, ());
+    let col3 = env.register(mock_nft::MockNft, ());
+    MockNftClient::new(&env, &col1).set_owner(&1u64, &artist);
+    MockNftClient::new(&env, &col2).set_owner(&1u64, &artist);
+    MockNftClient::new(&env, &col3).set_owner(&1u64, &artist);
+
+    let requests = vec![
+        &env,
+        make_batch_input(&env, 1_000_000, &token_id, &col1, 1, &artist, None),
+        make_batch_input(&env, 2_000_000, &token_id, &col2, 1, &artist, None),
+        make_batch_input(&env, 3_000_000, &token_id, &col3, 1, &artist, None),
+    ];
+    let ids = client.create_listings(&artist, &requests);
+    assert_eq!(ids.len(), 3u32);
+    assert_eq!(client.get_listing(&ids.get(0).unwrap()).status, ListingStatus::Active);
+    assert_eq!(client.get_listing(&ids.get(1).unwrap()).status, ListingStatus::Active);
+    assert_eq!(client.get_listing(&ids.get(2).unwrap()).status, ListingStatus::Active);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #61)")]
+fn test_batch_create_one_invalid_price_entire_batch_rejected() {
+    let (env, client, artist, _, token_id, _, _) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&artist, &token_id);
+
+    let col1 = env.register(mock_nft::MockNft, ());
+    let col2 = env.register(mock_nft::MockNft, ());
+    MockNftClient::new(&env, &col1).set_owner(&1u64, &artist);
+    MockNftClient::new(&env, &col2).set_owner(&1u64, &artist);
+
+    let requests = vec![
+        &env,
+        make_batch_input(&env, 1_000_000, &token_id, &col1, 1, &artist, None),
+        // Second item has zero price — invalid
+        make_batch_input(&env, 0, &token_id, &col2, 1, &artist, None),
+    ];
+    client.create_listings(&artist, &requests);
+}
+
+#[test]
+fn test_batch_create_invalid_item_leaves_no_state() {
+    let (env, client, artist, _, token_id, _, _) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&artist, &token_id);
+
+    let col1 = env.register(mock_nft::MockNft, ());
+    let col2 = env.register(mock_nft::MockNft, ());
+    MockNftClient::new(&env, &col1).set_owner(&1u64, &artist);
+    MockNftClient::new(&env, &col2).set_owner(&1u64, &artist);
+
+    let listing_count_before = client.get_total_listings();
+
+    let requests = vec![
+        &env,
+        make_batch_input(&env, 1_000_000, &token_id, &col1, 1, &artist, None),
+        make_batch_input(&env, 0, &token_id, &col2, 1, &artist, None), // invalid
+    ];
+    // Catch the panic so we can inspect state after
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.create_listings(&artist, &requests);
+    }));
+    assert!(result.is_err(), "batch with invalid item must panic");
+    // No new listings should have been created
+    assert_eq!(client.get_total_listings(), listing_count_before,
+        "listing count must not change when batch is rejected");
+    // token in col1 must not be escrowed
+    assert!(client.get_escrow(&col1, &1u64).is_none(),
+        "no escrow must be created for a rejected batch");
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #36)")]
+fn test_batch_create_exceeds_max_size_panics() {
+    let (env, client, artist, _, token_id, _, _) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&artist, &token_id);
+
+    // Build 21 items — MAX_BATCH_LISTINGS is 20
+    let mut requests = soroban_sdk::Vec::new(&env);
+    for i in 1u64..=21u64 {
+        let col = env.register(mock_nft::MockNft, ());
+        MockNftClient::new(&env, &col).set_owner(&i, &artist);
+        requests.push_back(make_batch_input(&env, 1_000_000, &token_id, &col, i, &artist, None));
+    }
+    client.create_listings(&artist, &requests);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #61)")]
+fn test_batch_create_invalid_recipient_sum_panics() {
+    let (env, client, artist, _, token_id, _, _) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&artist, &token_id);
+
+    let col = env.register(mock_nft::MockNft, ());
+    MockNftClient::new(&env, &col).set_owner(&1u64, &artist);
+
+    let bad_recipients = vec![
+        &env,
+        Recipient { address: artist.clone(), percentage: 10_001 }, // >100%
+    ];
+    let bad_item = BatchCreateListingInput {
+        price: 1_000_000,
+        currency: symbol_short!("XLM"),
+        token: token_id.clone(),
+        collection: col.clone(),
+        token_id: 1u64,
+        quantity: 1u64,
+        recipients: bad_recipients,
+        expires_at: None,
+    };
+    let requests = vec![&env, bad_item];
+    client.create_listings(&artist, &requests);
+}
+
+#[test]
+fn test_batch_create_valid_emits_one_event_per_item() {
+    let (env, client, artist, _, token_id, _, _) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&artist, &token_id);
+
+    let col1 = env.register(mock_nft::MockNft, ());
+    let col2 = env.register(mock_nft::MockNft, ());
+    MockNftClient::new(&env, &col1).set_owner(&1u64, &artist);
+    MockNftClient::new(&env, &col2).set_owner(&1u64, &artist);
+
+    let requests = vec![
+        &env,
+        make_batch_input(&env, 1_000_000, &token_id, &col1, 1, &artist, None),
+        make_batch_input(&env, 2_000_000, &token_id, &col2, 1, &artist, None),
+    ];
+    client.create_listings(&artist, &requests);
+
+    let all_events = env.events().all();
+    let created_count = all_events.events().iter().filter(|e| {
+        use soroban_sdk::xdr::{ContractEventBody, ScVal};
+        if let ContractEventBody::V0(v0) = &e.body {
+            if let Some(ScVal::Symbol(s)) = v0.topics.first() {
+                return s.to_string() == "listing_created";
+            }
+        }
+        false
+    }).count();
+    assert_eq!(created_count, 2, "one listing_created event per valid item");
+}
