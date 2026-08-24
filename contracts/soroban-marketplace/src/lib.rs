@@ -23,6 +23,9 @@ mod migration_tests;
 #[cfg(test)]
 mod governance_tests;
 
+#[cfg(test)]
+mod ownership_tests;
+
 pub use contract::MarketplaceContract;
 pub use types::{
     BidRecord, CancelReason, Listing, ListingStatus, MarketplaceError, Offer, OfferStatus,

@@ -2832,6 +2832,81 @@ impl MarketplaceContract {
         load_listing(&env, listing_id)
             .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::ListingNotFound))
     }
+
+    /// Returns the effective owner of a listing based on its current status.
+    ///
+    /// Ownership lifecycle invariants (Issue #456):
+    ///   - Active   → `owner` is None (not yet transferred); the artist is the
+    ///                effective owner and custodian.
+    ///   - Sold     → `owner` is Some(buyer_address); buyer is the effective owner.
+    ///   - Cancelled → `owner` is None; the NFT has been returned to the artist.
+    ///
+    /// Returns `artist` when `owner` is None so callers always receive a
+    /// non-null address.
+    pub fn get_effective_owner(env: Env, listing_id: u64) -> Address {
+        let listing = load_listing(&env, listing_id)
+            .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::ListingNotFound));
+        listing.owner.unwrap_or(listing.artist)
+    }
+
+    /// Guarded, idempotent reconciliation of a listing's `owner` field.
+    ///
+    /// Called by an authorized `CollectionAdmin` when off-chain monitoring
+    /// detects that the on-chain `owner` field is inconsistent with the actual
+    /// NFT custodian (e.g. after an NFT transfer outside the normal listing
+    /// lifecycle).
+    ///
+    /// Guards:
+    ///   1. Caller must hold the `CollectionAdmin` role.
+    ///   2. `expected_owner` must match `get_effective_owner(listing_id)` to
+    ///      prevent concurrent reconciliation races.
+    ///   3. Listing must exist.
+    ///
+    /// Idempotency: if `new_owner == get_effective_owner(listing_id)` already,
+    /// the method returns without writing to storage or emitting an event.
+    ///
+    /// Emits `own_reconciled` on every state change so downstream consumers
+    /// (indexer, audit tools) can persist the transition.
+    pub fn reconcile_listing_owner(
+        env: Env,
+        caller: Address,
+        listing_id: u64,
+        expected_owner: Address,
+        new_owner: Address,
+    ) -> Result<(), MarketplaceError> {
+        bump_instance_ttl(&env);
+        Self::require_role(&env, &caller, RoleType::CollectionAdmin);
+
+        let mut listing = load_listing(&env, listing_id)
+            .ok_or(MarketplaceError::ListingNotFound)?;
+
+        // Compute the current effective owner (artist when owner field is None).
+        let current_effective = listing.owner.clone().unwrap_or(listing.artist.clone());
+
+        // Guard: reject if the caller's expected_owner doesn't match what's stored.
+        if current_effective != expected_owner {
+            return Err(MarketplaceError::OwnershipMismatch);
+        }
+
+        // Idempotency: no-op when the new_owner already matches.
+        if current_effective == new_owner {
+            return Ok(());
+        }
+
+        let previous_owner = listing.owner.clone();
+        listing.owner = Some(new_owner.clone());
+        save_listing(&env, &listing);
+
+        crate::events::emit_listing_ownership_reconciled(
+            &env,
+            listing_id,
+            previous_owner,
+            new_owner,
+            caller,
+        );
+
+        Ok(())
+    }
     pub fn get_total_listings(env: Env) -> u64 { get_listing_count(&env) }
     pub fn get_artist_listings(env: Env, artist: Address) -> Vec<u64> {
         get_artist_listing_ids(&env, &artist)

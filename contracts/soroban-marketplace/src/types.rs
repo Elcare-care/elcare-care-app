@@ -153,6 +153,11 @@ pub enum MarketplaceError {
     /// create an irrecoverable governance state (no key can sign for a contract
     /// address in the normal Soroban auth model).
     RoleTransferToContract = 55,
+    /// A listing ownership reconciliation was attempted but the provided
+    /// expected owner does not match the current stored owner (or artist
+    /// for an Active listing with no separate owner). Guards against
+    /// concurrent reconciliation races.
+    OwnershipMismatch = 56,
 }
 
 #[contracttype]
