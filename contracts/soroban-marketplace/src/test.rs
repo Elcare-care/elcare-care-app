@@ -10101,13 +10101,14 @@ fn setup_with_roles() -> (
     Address, // admin (also initial ProtocolConfig / EmergencyPause holder)
     Address, // non-admin (unprivileged)
     Address, // payment_token
+    Address, // contract_id
     Address, // collection_id
 ) {
-    let (env, client, admin, non_admin, token, _, collection) = setup();
+    let (env, client, admin, non_admin, token, cid, collection) = setup();
     client.set_admin(&admin);
     // Run migrate_roles so every role has an explicit holder equal to admin.
     client.migrate_roles(&admin);
-    (env, client, admin, non_admin, token, collection)
+    (env, client, admin, non_admin, token, cid, collection)
 }
 
 // â”€â”€ Authorization: set_protocol_fee â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -10115,13 +10116,13 @@ fn setup_with_roles() -> (
 #[test]
 #[should_panic(expected = "Error(Contract, #5)")]
 fn test_set_protocol_fee_non_admin_panics() {
-    let (_, client, _, non_admin, _, _) = setup_with_roles();
+    let (_, client, _, non_admin, _, _, _) = setup_with_roles();
     client.set_protocol_fee(&non_admin, &250u32);
 }
 
 #[test]
 fn test_set_protocol_fee_role_holder_succeeds() {
-    let (env, client, admin, _, _, _) = setup_with_roles();
+    let (env, client, admin, _, _, _, _) = setup_with_roles();
     // Transfer ProtocolConfig role to a separate key
     let config_role = Address::generate(&env);
     client.propose_role_transfer(&admin, &RoleType::ProtocolConfig, &config_role);
@@ -10135,13 +10136,13 @@ fn test_set_protocol_fee_role_holder_succeeds() {
 #[test]
 #[should_panic(expected = "Error(Contract, #5)")]
 fn test_set_collection_fee_bps_non_admin_panics() {
-    let (env, client, _, non_admin, _, collection) = setup_with_roles();
+    let (env, client, _, non_admin, _, _, collection) = setup_with_roles();
     client.set_collection_fee_bps(&non_admin, &collection, &500u32);
 }
 
 #[test]
 fn test_set_collection_fee_bps_protocol_config_role_succeeds() {
-    let (env, client, admin, _, _, collection) = setup_with_roles();
+    let (env, client, admin, _, _, _, collection) = setup_with_roles();
     let config_role = Address::generate(&env);
     client.propose_role_transfer(&admin, &RoleType::ProtocolConfig, &config_role);
     client.accept_role_transfer(&RoleType::ProtocolConfig, &config_role);
@@ -10152,7 +10153,7 @@ fn test_set_collection_fee_bps_protocol_config_role_succeeds() {
 #[test]
 #[should_panic(expected = "Error(Contract, #2)")]
 fn test_set_collection_fee_bps_over_10000_panics() {
-    let (_, client, admin, _, _, collection) = setup_with_roles();
+    let (_, client, admin, _, _, _, collection) = setup_with_roles();
     client.set_collection_fee_bps(&admin, &collection, &10_001u32);
 }
 
@@ -10161,7 +10162,7 @@ fn test_set_collection_fee_bps_over_10000_panics() {
 #[test]
 #[should_panic(expected = "Error(Contract, #5)")]
 fn test_add_token_non_admin_panics() {
-    let (env, client, _, non_admin, _, _) = setup_with_roles();
+    let (env, client, _, non_admin, _, _, _) = setup_with_roles();
     let fake_token = Address::generate(&env);
     client.add_token_to_whitelist(&non_admin, &fake_token);
 }
@@ -10171,13 +10172,13 @@ fn test_add_token_non_admin_panics() {
 #[test]
 #[should_panic(expected = "Error(Contract, #5)")]
 fn test_pause_non_admin_panics() {
-    let (_, client, _, non_admin, _, _) = setup_with_roles();
+    let (_, client, _, non_admin, _, _, _) = setup_with_roles();
     client.admin_pause(&non_admin);
 }
 
 #[test]
 fn test_pause_emergency_role_holder_succeeds() {
-    let (env, client, admin, _, _, _) = setup_with_roles();
+    let (env, client, admin, _, _, _, _) = setup_with_roles();
     let pause_role = Address::generate(&env);
     client.propose_role_transfer(&admin, &RoleType::EmergencyPause, &pause_role);
     client.accept_role_transfer(&RoleType::EmergencyPause, &pause_role);
@@ -10192,7 +10193,7 @@ fn test_pause_emergency_role_holder_succeeds() {
 #[test]
 #[should_panic(expected = "Error(Contract, #23)")]
 fn test_buy_artwork_blocked_when_paused() {
-    let (env, client, admin, buyer, token_id, collection_id) = setup_with_roles();
+    let (env, client, admin, buyer, token_id, _, collection_id) = setup_with_roles();
     client.add_token_to_whitelist(&admin, &token_id);
     let id = client.create_listing(
         &admin, &5_000_000_i128, &symbol_short!("XLM"),
@@ -10206,7 +10207,7 @@ fn test_buy_artwork_blocked_when_paused() {
 #[test]
 #[should_panic(expected = "Error(Contract, #23)")]
 fn test_create_listing_blocked_when_paused() {
-    let (env, client, admin, _, token_id, collection_id) = setup_with_roles();
+    let (env, client, admin, _, token_id, _, collection_id) = setup_with_roles();
     client.add_token_to_whitelist(&admin, &token_id);
     client.admin_pause(&admin);
     client.create_listing(
@@ -10220,7 +10221,7 @@ fn test_create_listing_blocked_when_paused() {
 
 #[test]
 fn test_cancel_listing_allowed_when_paused() {
-    let (env, client, admin, _, token_id, collection_id) = setup_with_roles();
+    let (env, client, admin, _, token_id, _, collection_id) = setup_with_roles();
     client.add_token_to_whitelist(&admin, &token_id);
     let id = client.create_listing(
         &admin, &5_000_000_i128, &symbol_short!("XLM"),
@@ -10235,7 +10236,7 @@ fn test_cancel_listing_allowed_when_paused() {
 #[test]
 fn test_withdraw_offer_allowed_when_paused() {
     use soroban_sdk::token::StellarAssetClient;
-    let (env, client, admin, buyer, token_id, collection_id) = setup_with_roles();
+    let (env, client, admin, buyer, token_id, _, collection_id) = setup_with_roles();
     client.add_token_to_whitelist(&admin, &token_id);
     let lid = client.create_listing(
         &admin, &10_000_000_i128, &symbol_short!("XLM"),
@@ -10253,7 +10254,7 @@ fn test_withdraw_offer_allowed_when_paused() {
 
 #[test]
 fn test_propose_role_and_cancel() {
-    let (env, client, admin, _, _, _) = setup_with_roles();
+    let (env, client, admin, _, _, _, _) = setup_with_roles();
     let candidate = Address::generate(&env);
     client.propose_role_transfer(&admin, &RoleType::ProtocolConfig, &candidate);
     // Current holder can cancel
@@ -10267,7 +10268,7 @@ fn test_propose_role_and_cancel() {
 #[test]
 #[should_panic(expected = "Error(Contract, #5)")]
 fn test_accept_role_wrong_candidate_panics() {
-    let (env, client, admin, _, _, _) = setup_with_roles();
+    let (env, client, admin, _, _, _, _) = setup_with_roles();
     let candidate  = Address::generate(&env);
     let wrong_addr = Address::generate(&env);
     client.propose_role_transfer(&admin, &RoleType::ProtocolConfig, &candidate);
@@ -10277,7 +10278,7 @@ fn test_accept_role_wrong_candidate_panics() {
 #[test]
 #[should_panic(expected = "Error(Contract, #53)")]
 fn test_accept_role_after_expiry_panics() {
-    let (env, client, admin, _, _, _) = setup_with_roles();
+    let (env, client, admin, _, _, _, _) = setup_with_roles();
     let candidate = Address::generate(&env);
     client.propose_role_transfer(&admin, &RoleType::ProtocolConfig, &candidate);
     // Advance ledger timestamp past the 7-day TTL (604_800 seconds)
@@ -10289,7 +10290,7 @@ fn test_accept_role_after_expiry_panics() {
 
 #[test]
 fn test_full_role_rotation_cycle() {
-    let (env, client, admin, _, _, _) = setup_with_roles();
+    let (env, client, admin, _, _, _, _) = setup_with_roles();
     let new_holder = Address::generate(&env);
     client.propose_role_transfer(&admin, &RoleType::EmergencyPause, &new_holder);
     client.accept_role_transfer(&RoleType::EmergencyPause, &new_holder);
@@ -10304,7 +10305,7 @@ fn test_full_role_rotation_cycle() {
 
 #[test]
 fn test_migrate_roles_idempotent() {
-    let (_, client, admin, _, _, _) = setup_with_roles();
+    let (_, client, admin, _, _, _, _) = setup_with_roles();
     // Already ran once in setup_with_roles; second call is a no-op
     client.migrate_roles(&admin);
     assert_eq!(client.get_role(&RoleType::ProtocolConfig), admin);
@@ -10316,7 +10317,7 @@ fn test_migrate_roles_idempotent() {
 #[test]
 #[should_panic(expected = "Error(Contract, #5)")]
 fn test_migrate_roles_non_admin_panics() {
-    let (_, client, _, non_admin, _, _) = setup_with_roles();
+    let (_, client, _, non_admin, _, _, _) = setup_with_roles();
     client.migrate_roles(&non_admin);
 }
 
@@ -10325,7 +10326,7 @@ fn test_migrate_roles_non_admin_panics() {
 #[test]
 #[should_panic(expected = "Error(Contract, #26)")]
 fn test_recipient_percentage_sum_exceeds_10000_panics() {
-    let (env, client, admin, _, token_id, collection_id) = setup_with_roles();
+    let (env, client, admin, _, token_id, _, collection_id) = setup_with_roles();
     client.add_token_to_whitelist(&admin, &token_id);
     client.set_protocol_fee(&admin, &500u32); // 500 bps fee
     // Two recipients summing 11_000 bps > 10_000 â†’ RoyaltyExceedsLimit (#26)
@@ -10344,7 +10345,7 @@ fn test_recipient_percentage_sum_exceeds_10000_panics() {
 #[test]
 #[should_panic(expected = "Error(Contract, #43)")]
 fn test_zero_recipient_bps_panics() {
-    let (env, client, admin, _, token_id, collection_id) = setup_with_roles();
+    let (env, client, admin, _, token_id, _, collection_id) = setup_with_roles();
     client.add_token_to_whitelist(&admin, &token_id);
     let recipients = soroban_sdk::vec![
         &env,
@@ -10360,7 +10361,7 @@ fn test_zero_recipient_bps_panics() {
 #[test]
 #[should_panic(expected = "Error(Contract, #44)")]
 fn test_duplicate_recipient_panics() {
-    let (env, client, admin, _, token_id, collection_id) = setup_with_roles();
+    let (env, client, admin, _, token_id, _, collection_id) = setup_with_roles();
     client.add_token_to_whitelist(&admin, &token_id);
     let recipients = soroban_sdk::vec![
         &env,
@@ -10377,7 +10378,7 @@ fn test_duplicate_recipient_panics() {
 #[test]
 #[should_panic(expected = "Error(Contract, #2)")]
 fn test_protocol_fee_above_1000_panics() {
-    let (_, client, admin, _, _, _) = setup_with_roles();
+    let (_, client, admin, _, _, _, _) = setup_with_roles();
     client.set_protocol_fee(&admin, &1_001u32);
 }
 
@@ -10386,7 +10387,7 @@ fn test_protocol_fee_above_1000_panics() {
 #[test]
 #[should_panic(expected = "Error(Contract, #23)")]
 fn test_collection_pause_blocks_new_listing() {
-    let (env, client, admin, _, token_id, collection_id) = setup_with_roles();
+    let (env, client, admin, _, token_id, _, collection_id) = setup_with_roles();
     client.add_token_to_whitelist(&admin, &token_id);
     client.pause_collection(&admin, &collection_id);
     client.create_listing(
@@ -10398,7 +10399,7 @@ fn test_collection_pause_blocks_new_listing() {
 
 #[test]
 fn test_collection_unpause_restores_access() {
-    let (env, client, admin, _, token_id, collection_id) = setup_with_roles();
+    let (env, client, admin, _, token_id, _, collection_id) = setup_with_roles();
     client.add_token_to_whitelist(&admin, &token_id);
     client.pause_collection(&admin, &collection_id);
     assert!(client.is_collection_paused(&collection_id));
@@ -10415,14 +10416,14 @@ fn test_collection_unpause_restores_access() {
 #[test]
 #[should_panic(expected = "Error(Contract, #5)")]
 fn test_pause_collection_non_emergency_role_panics() {
-    let (_, client, _, non_admin, _, collection_id) = setup_with_roles();
+    let (_, client, _, non_admin, _, _, collection_id) = setup_with_roles();
     client.pause_collection(&non_admin, &collection_id);
 }
 
 #[test]
 fn test_function_pause_blocks_specific_function() {
     use soroban_sdk::Symbol;
-    let (env, client, admin, buyer, token_id, collection_id) = setup_with_roles();
+    let (env, client, admin, buyer, token_id, _, collection_id) = setup_with_roles();
     client.add_token_to_whitelist(&admin, &token_id);
     let id = client.create_listing(
         &admin, &5_000_000_i128, &symbol_short!("XLM"),
@@ -10445,13 +10446,13 @@ fn test_function_pause_blocks_specific_function() {
 #[test]
 #[should_panic(expected = "Error(Contract, #5)")]
 fn test_revoke_artist_non_collection_admin_panics() {
-    let (_, client, _, non_admin, _, _) = setup_with_roles();
+    let (_, client, _, non_admin, _, _, _) = setup_with_roles();
     client.revoke_artist(&non_admin, &non_admin);
 }
 
 #[test]
 fn test_revoke_and_reinstate_artist() {
-    let (env, client, admin, artist2, _, _) = setup_with_roles();
+    let (env, client, admin, artist2, _, _, _) = setup_with_roles();
     // Use a distinct address as the target artist (not the admin/role holder)
     let _ = artist2; // silence unused warning
     let target = Address::generate(&env);
@@ -10467,7 +10468,7 @@ fn test_revoke_and_reinstate_artist() {
 #[test]
 #[should_panic(expected = "Error(Contract, #41)")]
 fn test_accept_admin_after_expiry_panics() {
-    let (env, client, admin, _, _, _) = setup_with_roles();
+    let (env, client, admin, _, _, _, _) = setup_with_roles();
     let candidate = Address::generate(&env);
     client.transfer_admin(&admin, &candidate);
     env.ledger().with_mut(|l| {
@@ -10478,7 +10479,7 @@ fn test_accept_admin_after_expiry_panics() {
 
 #[test]
 fn test_cancel_admin_proposal() {
-    let (env, client, admin, _, _, _) = setup_with_roles();
+    let (env, client, admin, _, _, _, _) = setup_with_roles();
     let candidate = Address::generate(&env);
     client.transfer_admin(&admin, &candidate);
     assert!(client.get_pending_admin().is_some());
@@ -10489,7 +10490,7 @@ fn test_cancel_admin_proposal() {
 #[test]
 #[should_panic(expected = "Error(Contract, #42)")]
 fn test_accept_admin_no_proposal_panics() {
-    let (env, client, _, _, _, _) = setup_with_roles();
+    let (env, client, _, _, _, _, _) = setup_with_roles();
     let random = Address::generate(&env);
     client.accept_admin(&random);
 }
@@ -10499,7 +10500,7 @@ fn test_accept_admin_no_proposal_panics() {
 #[test]
 #[should_panic(expected = "Error(Contract, #39)")]
 fn test_listing_below_min_price_panics() {
-    let (env, client, admin, _, token_id, collection_id) = setup_with_roles();
+    let (env, client, admin, _, token_id, _, collection_id) = setup_with_roles();
     client.add_token_to_whitelist(&admin, &token_id);
     client.set_price_bounds(&admin, &5_000_000_i128, &100_000_000_i128);
     client.create_listing(
@@ -10512,7 +10513,7 @@ fn test_listing_below_min_price_panics() {
 #[test]
 #[should_panic(expected = "Error(Contract, #39)")]
 fn test_listing_above_max_price_panics() {
-    let (env, client, admin, _, token_id, collection_id) = setup_with_roles();
+    let (env, client, admin, _, token_id, _, collection_id) = setup_with_roles();
     client.add_token_to_whitelist(&admin, &token_id);
     client.set_price_bounds(&admin, &1_000_i128, &5_000_000_i128);
     client.create_listing(
@@ -10527,7 +10528,7 @@ fn test_listing_above_max_price_panics() {
 #[test]
 #[should_panic(expected = "Error(Contract, #37)")]
 fn test_double_migrate_panics() {
-    let (_, client, admin, _, _, _) = setup_with_roles();
+    let (_, client, admin, _, _, _, _) = setup_with_roles();
     client.migrate(&admin);
     client.migrate(&admin); // second call must revert
 }
@@ -11722,10 +11723,8 @@ fn test_batch_create_invalid_item_leaves_no_state() {
         make_batch_input(&env, 1_000_000, &token_id, &col1, 1, &artist, None),
         make_batch_input(&env, 0, &token_id, &col2, 1, &artist, None), // invalid
     ];
-    // Catch the panic so we can inspect state after
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        client.create_listings(&artist, &requests);
-    }));
+    // Use try_ variant so we can inspect state after the rejected batch.
+    let result = client.try_create_listings(&artist, &requests);
     assert!(result.is_err(), "batch with invalid item must panic");
     // No new listings should have been created
     assert_eq!(client.get_total_listings(), listing_count_before,
@@ -11803,7 +11802,7 @@ fn test_batch_create_valid_emits_one_event_per_item() {
         use soroban_sdk::xdr::{ContractEventBody, ScVal};
         if let ContractEventBody::V0(v0) = &e.body {
             if let Some(ScVal::Symbol(s)) = v0.topics.first() {
-                return s.to_string() == "listing_created";
+                return core::str::from_utf8(s.0.as_slice()).unwrap_or("") == "listing_created";
             }
         }
         false

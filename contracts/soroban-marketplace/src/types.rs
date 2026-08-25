@@ -175,6 +175,43 @@ pub enum MarketplaceError {
     /// The `item_index` field of the returned `BatchItemError` identifies
     /// the zero-based position of the failing item. (Issue #457)
     BatchItemInvalid = 61,
+    /// `reconcile_listing_owner` was called with an `expected_owner` that does
+    /// not match the current effective owner of the listing. The reconciliation
+    /// is rejected so stale or concurrent updates cannot silently overwrite
+    /// each other.
+    OwnershipMismatch = 62,
+    /// `claim_royalty` was called for a settlement whose royalty for this
+    /// recipient has already been claimed.  Prevents double-payment on retry.
+    RoyaltyAlreadyClaimed = 63,
+    /// `claim_royalty` was called for a (settlement_id, is_listing, recipient)
+    /// triple that has no corresponding claim record in storage.
+    RoyaltyClaimNotFound = 64,
+}
+
+/// One pending or completed royalty claim for a single recipient.
+///
+/// Written at settlement time, updated (claimed → true) when the recipient
+/// pulls their payment via `claim_royalty`.  The separate write-before-transfer
+/// ordering means the payout status is always queryable via `get_royalty_claim`
+/// even in the hypothetical case where a future upgrade interrupts settlement
+/// mid-distribution.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoyaltyClaimRecord {
+    pub settlement_id: u64,
+    /// `true` when the settlement was a fixed-price listing or offer acceptance;
+    /// `false` when it was an auction finalization.
+    pub is_listing: bool,
+    pub recipient: Address,
+    pub token: Address,
+    pub amount: i128,
+    /// `true` once the recipient has successfully called `claim_royalty` (or the
+    /// direct transfer at settlement time succeeded and the record was auto-marked).
+    pub claimed: bool,
+    /// Ledger sequence at which the claim record was written (settlement time).
+    pub created_at: u32,
+    /// Ledger sequence at which the claim was redeemed; `None` while unclaimed.
+    pub claimed_at: Option<u32>,
 }
 
 #[contracttype]

@@ -21,7 +21,7 @@ use crate::{MarketplaceContract, MarketplaceContractClient};
 use crate::types::{AuctionStatus, ListingStatus, MarketplaceError, OfferStatus};
 use soroban_sdk::{
     symbol_short,
-    testutils::{Address as _, Ledger},
+    testutils::{Address as _, Events as _, Ledger},
     token::{StellarAssetClient, TokenClient},
     vec, Address, Env,
 };
@@ -1125,8 +1125,8 @@ fn inv434_extension_cap_exhaustion() {
     assert_eq!(client.get_auction(&aid).extension_count, 1);
 
     // Second snipe: max_extensions = 1, count already 1 → must fail
-    env.ledger()
-        .with_mut(|li| li.timestamp = client.get_auction(&aid).end_time - 100);
+    let auction_end_time = client.get_auction(&aid).end_time;
+    env.ledger().with_mut(|li| li.timestamp = auction_end_time - 100);
     assert_eq!(
         client
             .try_place_bid(&bidder2, &aid, &4_000_000_i128)
@@ -1464,7 +1464,7 @@ fn inv434_prop_no_token_loss_across_bid_sequences() {
 
 fn run_bid_sequence_no_loss(seed: u64) {
     let mut rng = Lcg::new(seed);
-    let (env, client, creator, bidder, token, _cid, _col, aid) = auction_setup();
+    let (env, client, creator, bidder, token, cid, _col, aid) = auction_setup();
     let bidder2 = Address::generate(&env);
     let sac = StellarAssetClient::new(&env, &token);
     sac.mint(&bidder2, &500_000_000_000_i128);
@@ -1473,7 +1473,7 @@ fn run_bid_sequence_no_loss(seed: u64) {
     let initial_total = tk.balance(&creator)
         + tk.balance(&bidder)
         + tk.balance(&bidder2)
-        + tk.balance(&env.current_contract_address());
+        + tk.balance(&cid);
 
     let mut current_time: u64 = 1_000_000;
     let end_time: u64 = 1_000_000 + 7_200;
@@ -1515,7 +1515,7 @@ fn run_bid_sequence_no_loss(seed: u64) {
     let final_total = tk.balance(&creator)
         + tk.balance(&bidder)
         + tk.balance(&bidder2)
-        + tk.balance(&env.current_contract_address());
+        + tk.balance(&cid);
 
     assert_eq!(
         initial_total, final_total,

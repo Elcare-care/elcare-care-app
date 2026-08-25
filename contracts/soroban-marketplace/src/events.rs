@@ -1169,28 +1169,8 @@ impl CleanupSummaryEvent {
 // ── Token whitelist event emitters (Issue #435) ──────────────────────────────
 //
 // The event structs (`TokenWhitelistedEvent`, `TokenRemovedEvent`) were defined
-// above (Issue #208). These are the corresponding thin emitter helpers so
-// contract.rs can call `emit_token_whitelisted` / `emit_token_removed` without
-// constructing the struct at each call site.
-
-/// Emit `token_whitelisted` when a token is added to or reactivated in the
-/// registry.
-pub fn emit_token_whitelisted(env: &Env, token: &Address, added_by: &Address) {
-    TokenWhitelistedEvent {
-        token: token.clone(),
-        added_by: added_by.clone(),
-    }
-    .publish(env);
-}
-
-/// Emit `token_removed` when a token is soft-deleted from the registry.
-pub fn emit_token_removed(env: &Env, token: &Address, removed_by: &Address) {
-    TokenRemovedEvent {
-        token: token.clone(),
-        removed_by: removed_by.clone(),
-    }
-    .publish(env);
-}
+// above (Issue #208). The corresponding thin emitter helpers are also defined
+// above (Issue #208 section) as `emit_token_whitelisted` / `emit_token_removed`.
 
 // ── Listing ownership reconciliation (Issue #456) ────────────────────────────
 
@@ -1410,6 +1390,95 @@ pub fn emit_listing_duration_config_updated(
         field,
         old_value,
         new_value,
+    }
+    .publish(env);
+}
+
+// ── Royalty payout observability events (Issue #461) ─────────────────────────
+
+pub const ROYALTY_CLAIM_QUEUED: &str = "royalty_claim_queued";
+pub const ROYALTY_CLAIMED: &str = "royalty_claimed";
+
+/// Emitted once per recipient at settlement time when the direct transfer
+/// succeeds and the claim record is auto-marked as claimed.  Carrying both
+/// `settlement_id` and `is_listing` lets the indexer correlate this with the
+/// `RoyaltySettlementEvent` and the sale record without extra lookups.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoyaltyClaimQueuedEvent {
+    pub settlement_id: u64,
+    pub is_listing: bool,
+    pub recipient: Address,
+    pub token: Address,
+    pub amount: i128,
+    pub ledger_sequence: u32,
+}
+
+impl RoyaltyClaimQueuedEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, ROYALTY_CLAIM_QUEUED),), self);
+    }
+}
+
+/// Emitted when a recipient successfully pulls an unclaimed royalty via
+/// `claim_royalty`.  In the normal (direct-transfer) path this fires
+/// immediately at settlement; in the recovery path it fires when the
+/// recipient manually triggers the claim.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoyaltyClaimedEvent {
+    pub settlement_id: u64,
+    pub is_listing: bool,
+    pub recipient: Address,
+    pub token: Address,
+    pub amount: i128,
+    pub ledger_sequence: u32,
+}
+
+impl RoyaltyClaimedEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, ROYALTY_CLAIMED),), self);
+    }
+}
+
+pub fn emit_royalty_claim_queued(
+    env: &Env,
+    settlement_id: u64,
+    is_listing: bool,
+    recipient: Address,
+    token: Address,
+    amount: i128,
+) {
+    RoyaltyClaimQueuedEvent {
+        settlement_id,
+        is_listing,
+        recipient,
+        token,
+        amount,
+        ledger_sequence: env.ledger().sequence(),
+    }
+    .publish(env);
+}
+
+pub fn emit_royalty_claimed(
+    env: &Env,
+    settlement_id: u64,
+    is_listing: bool,
+    recipient: Address,
+    token: Address,
+    amount: i128,
+) {
+    RoyaltyClaimedEvent {
+        settlement_id,
+        is_listing,
+        recipient,
+        token,
+        amount,
+        ledger_sequence: env.ledger().sequence(),
     }
     .publish(env);
 }
