@@ -12,16 +12,16 @@
  *   - An optional primary action button (install, switch network, retry, etc.)
  *   - An optional secondary dismiss action
  *
+ * WRONG_NETWORK errors additionally render a NetworkSwitchPanel with:
+ *   - Step-by-step per-provider manual instructions
+ *   - A "Checking…" waiting state after the user acts
+ *   - A post-switch re-simulation trigger once the correct network is detected
+ *
  * Used by ConnectWalletModal, WalletGuard, CheckoutModal, BiddingPanel,
  * OfferPanel, and any other component that surfaces wallet errors.
- *
- * Design goals:
- *   - Never shows "Unknown error" without a fallback action
- *   - Consistent look across all wallet error scenarios
- *   - Accessible: role="alert", live region, focus-managed CTA
  */
 
-import React, { useRef, useEffect } from "react";
+import React, { useRef, useEffect, useState, useCallback } from "react";
 import {
   AlertTriangle,
   WifiOff,
@@ -33,8 +33,16 @@ import {
   HelpCircle,
   ExternalLink,
   X,
+  CheckCircle2,
+  List,
+  Loader2,
 } from "lucide-react";
 import type { WalletAdapterError } from "@/lib/wallet-adapter";
+import {
+  getSwitchNetworkSteps,
+  getTargetNetworkLabel,
+  type WalletProviderName,
+} from "@/lib/networkStatus";
 
 // ── Per-kind display config ──────────────────────────────────────────────────
 
@@ -91,7 +99,7 @@ function getDisplayConfig(
         title: "Wrong Network",
         explanation: `Your wallet is connected to ${detectedLabel}. This app requires "${networkShortLabel(expected)}".`,
         instruction:
-          "Open your wallet extension, navigate to Settings → Network, and switch to the correct network.",
+          "Follow the steps below to switch networks in your wallet, then return to this page.",
         primaryLabel: "Refresh Connection",
         primaryAction: onSwitchNetwork ?? onRetry,
         severity: "error",
@@ -221,6 +229,24 @@ export interface WalletErrorDisplayProps {
    * Useful inside modals where focus management is important.
    */
   autoFocusPrimary?: boolean;
+  /**
+   * Which wallet provider is active — used to show provider-specific switch
+   * instructions in the WRONG_NETWORK panel.
+   * Defaults to "unknown".
+   */
+  provider?: WalletProviderName;
+  /**
+   * Called after the user has followed the switch steps and this component
+   * detects (or the parent signals) the network is now correct.
+   * The parent should re-run simulation after this fires.
+   */
+  onReadyToResimulate?: () => void;
+  /**
+   * When true the WRONG_NETWORK panel shows a "Checking network…" spinner
+   * instead of the step list — set this while the parent is polling to
+   * confirm the switch completed.
+   */
+  isCheckingNetwork?: boolean;
 }
 
 export function WalletErrorDisplay({
@@ -230,6 +256,9 @@ export function WalletErrorDisplay({
   onDismiss,
   className = "",
   autoFocusPrimary = false,
+  provider = "unknown",
+  onReadyToResimulate,
+  isCheckingNetwork = false,
 }: WalletErrorDisplayProps) {
   const primaryRef = useRef<HTMLButtonElement | HTMLAnchorElement | null>(null);
   const cfg = getDisplayConfig(error, onRetry, onSwitchNetwork);
@@ -281,8 +310,21 @@ export function WalletErrorDisplay({
             {cfg.instruction}
           </p>
 
-          {/* Actions */}
-          {(cfg.primaryLabel || onDismiss !== null) && (
+          {/* WRONG_NETWORK: inline step-by-step switch panel */}
+          {error.kind === "WRONG_NETWORK" && (
+            <NetworkSwitchPanel
+              provider={provider}
+              expectedPassphrase={error.expected}
+              isChecking={isCheckingNetwork}
+              onDoneSteps={onSwitchNetwork ?? onRetry}
+              onReadyToResimulate={onReadyToResimulate}
+              className="mt-3"
+            />
+          )}
+
+          {/* Actions for non-WRONG_NETWORK errors */}
+          {error.kind !== "WRONG_NETWORK" &&
+            (cfg.primaryLabel || onDismiss !== null) && (
             <div className="mt-3 flex flex-wrap gap-2">
               {cfg.primaryHref ? (
                 <a
@@ -310,6 +352,183 @@ export function WalletErrorDisplay({
         </div>
       </div>
     </div>
+  );
+}
+
+// ── NetworkSwitchPanel ───────────────────────────────────────────────────────
+
+/**
+ * Step-by-step guided panel for switching the wallet network.
+ *
+ * Shown inline inside WalletErrorDisplay for WRONG_NETWORK errors.
+ * Also exported for use in WalletGuard and ConnectWalletModal.
+ *
+ * States:
+ *  - default   : numbered step list with "I've switched" CTA
+ *  - checking  : spinner while parent polls for the new network
+ *  - confirmed : success tick + "Re-simulate" CTA
+ */
+export interface NetworkSwitchPanelProps {
+  provider?: WalletProviderName;
+  expectedPassphrase?: string;
+  /** When true show the checking spinner instead of steps */
+  isChecking?: boolean;
+  /** Called when user clicks "I've switched — check now" */
+  onDoneSteps?: () => void;
+  /** Called when the user clicks "Re-simulate transaction" */
+  onReadyToResimulate?: () => void;
+  className?: string;
+}
+
+export function NetworkSwitchPanel({
+  provider = "unknown",
+  expectedPassphrase,
+  isChecking = false,
+  onDoneSteps,
+  onReadyToResimulate,
+  className = "",
+}: NetworkSwitchPanelProps) {
+  const targetLabel = getTargetNetworkLabel(expectedPassphrase);
+  const steps = getSwitchNetworkSteps(provider, targetLabel);
+  const [done, setDone] = useState(false);
+
+  const handleDone = useCallback(() => {
+    setDone(true);
+    onDoneSteps?.();
+  }, [onDoneSteps]);
+
+  const handleResimulate = useCallback(() => {
+    setDone(false);
+    onReadyToResimulate?.();
+  }, [onReadyToResimulate]);
+
+  if (isChecking) {
+    return (
+      <div
+        role="status"
+        aria-live="polite"
+        data-testid="network-switch-checking"
+        className={`flex items-center gap-2 rounded-xl bg-yellow-50 border border-yellow-200 px-3 py-2.5 text-xs text-yellow-800 ${className}`}
+      >
+        <Loader2 size={14} className="animate-spin shrink-0 text-yellow-600" aria-hidden="true" />
+        <span>Checking network… this will update automatically.</span>
+      </div>
+    );
+  }
+
+  if (done && onReadyToResimulate) {
+    return (
+      <div
+        role="status"
+        aria-live="polite"
+        data-testid="network-switch-confirmed"
+        className={`rounded-xl border border-green-200 bg-green-50 px-3 py-2.5 space-y-2 ${className}`}
+      >
+        <div className="flex items-center gap-2 text-xs font-semibold text-green-800">
+          <CheckCircle2 size={14} className="text-green-600" aria-hidden="true" />
+          Wallet switched — your previous transaction preview is no longer valid.
+        </div>
+        <button
+          type="button"
+          onClick={handleResimulate}
+          data-testid="network-switch-resimulate-btn"
+          className="inline-flex items-center gap-1.5 rounded-xl bg-green-600 px-3 py-1.5 text-xs font-bold text-white hover:bg-green-700 transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-green-400 focus-visible:ring-offset-1"
+        >
+          <RefreshCw size={11} aria-hidden="true" />
+          Re-simulate transaction
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div
+      data-testid="network-switch-steps"
+      className={`rounded-xl border border-red-100 bg-white/60 px-3 py-2.5 space-y-2 ${className}`}
+    >
+      <p className="flex items-center gap-1.5 text-[11px] font-bold uppercase tracking-wide text-red-700">
+        <List size={11} aria-hidden="true" />
+        How to switch to {targetLabel}
+      </p>
+      <ol
+        aria-label={`Steps to switch to ${targetLabel}`}
+        className="space-y-1.5 pl-1"
+      >
+        {steps.map((step, i) => (
+          <li key={i} className="flex gap-2 text-xs text-gray-700">
+            <span
+              className="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-red-100 text-[10px] font-bold text-red-700"
+              aria-hidden="true"
+            >
+              {i + 1}
+            </span>
+            <span>{step}</span>
+          </li>
+        ))}
+      </ol>
+      {onDoneSteps && (
+        <button
+          type="button"
+          onClick={handleDone}
+          data-testid="network-switch-done-btn"
+          className="mt-1 inline-flex items-center gap-1.5 rounded-xl bg-red-600 px-3 py-1.5 text-xs font-bold text-white hover:bg-red-700 transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-400 focus-visible:ring-offset-1"
+        >
+          <RefreshCw size={11} aria-hidden="true" />
+          I&apos;ve switched — check now
+        </button>
+      )}
+    </div>
+  );
+}
+
+// ── WrongNetworkBanner ───────────────────────────────────────────────────────
+
+/**
+ * Convenience banner for use in WalletGuard and page-level wrong-network states.
+ * Composes WalletErrorDisplay with a WRONG_NETWORK error and the NetworkSwitchPanel.
+ */
+export interface WrongNetworkBannerProps {
+  expectedPassphrase?: string;
+  detectedPassphrase?: string | null;
+  provider?: WalletProviderName;
+  onSwitchNetwork?: () => void;
+  /** Called when user clicks "I've switched — check now" */
+  onDoneSteps?: () => void;
+  onReadyToResimulate?: () => void;
+  isCheckingNetwork?: boolean;
+  onDismiss?: (() => void) | null;
+  className?: string;
+}
+
+export function WrongNetworkBanner({
+  expectedPassphrase,
+  detectedPassphrase,
+  provider,
+  onSwitchNetwork,
+  onDoneSteps,
+  onReadyToResimulate,
+  isCheckingNetwork,
+  onDismiss,
+  className = "",
+}: WrongNetworkBannerProps) {
+  const error: WalletAdapterError = {
+    kind: "WRONG_NETWORK",
+    message: `Wrong network detected.`,
+    expected: expectedPassphrase ?? "",
+    detected: detectedPassphrase ?? null,
+  };
+
+  return (
+    <WalletErrorDisplay
+      error={error}
+      onSwitchNetwork={onSwitchNetwork ?? onDoneSteps}
+      onReadyToResimulate={onReadyToResimulate}
+      isCheckingNetwork={isCheckingNetwork}
+      onDismiss={onDismiss}
+      provider={provider}
+      autoFocusPrimary
+      className={className}
+    />
   );
 }
 

@@ -8,17 +8,19 @@
 //       ↘ (at any stage) → error
 //
 // Key features:
+//   - Real RPC polling during the confirming phase via lookupTxOnRpc
 //   - Persists pending tx hash in sessionStorage so a page reload can recover
 //   - Typed error categories (wallet_rejection, simulation_failure, rpc_failure,
 //     indexer_delay, unknown)
-//   - Retry guard: a retry after submission requires explicit confirmation that
-//     the previous outcome was terminal (failed or timed-out)
+//   - Duplicate-submission guard: a run() call while one is already active
+//     returns null immediately without starting a second submission
 //   - Cancellation: an in-progress run can be aborted via the returned abort()
 // ─────────────────────────────────────────────────────────────────────────────
 
 "use client";
 
 import { useCallback, useRef, useState, useEffect } from "react";
+import { lookupTxOnRpc } from "@/lib/txLookup";
 
 // ── State model ───────────────────────────────────────────────────────────────
 
@@ -33,13 +35,13 @@ import { useCallback, useRef, useState, useEffect } from "react";
  */
 export type TxState =
   | "idle"
-  | "simulating"   // building + simulating the transaction
-  | "signing"      // waiting for wallet signature
-  | "broadcasting" // submitted to the network, awaiting inclusion
-  | "confirming"   // in ledger, awaiting final RPC confirmation
+  | "simulating"      // building + simulating the transaction
+  | "signing"         // waiting for wallet signature
+  | "broadcasting"    // submitted to the network, awaiting inclusion
+  | "confirming"      // polling RPC until ledger inclusion is confirmed
   | "indexer_pending" // confirmed on-chain, not yet visible in indexer
-  | "success"      // confirmed on-chain AND visible in indexer (or timeout elapsed)
-  | "error";       // terminal failure
+  | "success"         // confirmed on-chain AND visible in indexer (or timeout elapsed)
+  | "error";          // terminal failure
 
 /** Low-cardinality categories that let the UI distinguish failure causes. */
 export type TxErrorCategory =
@@ -80,6 +82,13 @@ export interface TxLifecycleOptions {
   indexerConfirmTimeoutMs?: number;
 
   /**
+   * How long (ms) to poll the Soroban RPC for on-chain confirmation before
+   * giving up and treating the transaction as failed.
+   * Defaults to 60 000 ms (60 s).
+   */
+  rpcConfirmTimeoutMs?: number;
+
+  /**
    * Storage key prefix for sessionStorage persistence.
    * Defaults to "txLifecycle".
    * Set to null to disable persistence.
@@ -98,6 +107,9 @@ export interface UseTxLifecycleResult {
 
   /**
    * Execute a write action through the full lifecycle.
+   *
+   * The duplicate-submission guard ensures that calling run() while a run is
+   * already active returns null immediately without submitting again.
    *
    * @param fn        The async action (must resolve with a result containing
    *                  a `hash` or `txHash` string field, or return null).
@@ -259,6 +271,45 @@ export function extractTxHash(result: unknown): string | null {
   return null;
 }
 
+// ── RPC confirmation poll ─────────────────────────────────────────────────────
+
+/**
+ * Polls the Soroban RPC until the transaction is confirmed (success or failed)
+ * or the timeout elapses.
+ *
+ * Returns:
+ *   "success"   – transaction included and all ops succeeded
+ *   "failed"    – transaction included but at least one op failed
+ *   "timeout"   – RPC confirmation did not arrive within rpcConfirmTimeoutMs
+ *   "aborted"   – abort signal fired
+ */
+async function pollRpcForConfirmation(
+  hash: string,
+  rpcConfirmTimeoutMs: number,
+  signal: AbortSignal
+): Promise<"success" | "failed" | "timeout" | "aborted"> {
+  const deadline = Date.now() + rpcConfirmTimeoutMs;
+  // Max 20 poll attempts with a 3-second interval gives 60 s coverage.
+  const maxAttempts = Math.ceil(rpcConfirmTimeoutMs / 3_000);
+
+  const result = await lookupTxOnRpc(hash, {
+    maxPollAttempts: maxAttempts,
+    pollIntervalMs: 3_000,
+    signal,
+  });
+
+  if (signal.aborted) return "aborted";
+
+  switch (result.chainStatus) {
+    case "success":   return "success";
+    case "failed":    return "failed";
+    case "rpc_error": return "timeout";  // treat RPC errors like timeouts
+    default:
+      // not_found after exhausted retries
+      return Date.now() >= deadline ? "timeout" : "timeout";
+  }
+}
+
 // ── Hook ──────────────────────────────────────────────────────────────────────
 
 const INITIAL_STATE: TxLifecycleState = {
@@ -275,8 +326,10 @@ export function useTxLifecycle(
 
   // Abort flag: set to true when abort() is called mid-run
   const abortedRef = useRef(false);
-  // Whether a run is currently executing
+  // Whether a run is currently executing (duplicate-submission guard)
   const runningRef = useRef(false);
+  // AbortController for the in-progress RPC poll
+  const abortControllerRef = useRef<AbortController | null>(null);
   // Resolved persist key
   const persistKeyRef = useRef<string | null>(null);
 
@@ -318,12 +371,14 @@ export function useTxLifecycle(
   const abort = useCallback(() => {
     if (!runningRef.current) return;
     abortedRef.current = true;
-    // Will be picked up in the run() loop and transition to error
+    abortControllerRef.current?.abort();
   }, []);
 
   const reset = useCallback(() => {
     abortedRef.current = false;
     runningRef.current = false;
+    abortControllerRef.current?.abort();
+    abortControllerRef.current = null;
     const key = persistKeyRef.current;
     if (key !== null) clearPersistedTx(storageKey(key));
     setTxState(INITIAL_STATE);
@@ -337,16 +392,24 @@ export function useTxLifecycle(
       const {
         action = defaultOpts.action ?? "Transaction",
         indexerConfirmTimeoutMs = defaultOpts.indexerConfirmTimeoutMs ?? 30_000,
+        rpcConfirmTimeoutMs = defaultOpts.rpcConfirmTimeoutMs ?? 60_000,
         persistKey = defaultOpts.persistKey !== undefined
           ? defaultOpts.persistKey
           : STORAGE_KEY_PREFIX,
       } = opts;
 
-      // Guard: do not start a new run while one is already active
+      // ── Duplicate-submission guard ─────────────────────────────────────────
+      // If a run is already active, return null immediately. This prevents
+      // the user from clicking "Buy" twice and sending duplicate transactions.
       if (runningRef.current) return null;
 
       runningRef.current = true;
       abortedRef.current = false;
+
+      // Create a fresh AbortController for this run's RPC poll
+      const ac = new AbortController();
+      abortControllerRef.current = ac;
+
       const resolvedPersistKey = persistKey !== null ? storageKey(persistKey) : null;
 
       // ── Phase: simulating ──────────────────────────────────────────────────
@@ -365,6 +428,8 @@ export function useTxLifecycle(
       }
 
       // ── Phase: signing ─────────────────────────────────────────────────────
+      // fn() encompasses simulation + signing + submission in invokeContract.
+      // We label this "signing" because that is the user-facing blocking step.
       transition({ state: "signing" });
 
       let result: T;
@@ -372,6 +437,7 @@ export function useTxLifecycle(
         result = await fn();
       } catch (err: unknown) {
         runningRef.current = false;
+        abortControllerRef.current = null;
 
         if (abortedRef.current) {
           transition({
@@ -392,6 +458,7 @@ export function useTxLifecycle(
 
       if (abortedRef.current) {
         runningRef.current = false;
+        abortControllerRef.current = null;
         transition({
           state: "error",
           error: { category: "unknown", message: `${action} cancelled by user.` },
@@ -400,30 +467,87 @@ export function useTxLifecycle(
       }
 
       // ── Phase: broadcasting ────────────────────────────────────────────────
+      // fn() returned — invokeContract has submitted the transaction.
+      // Extract the hash from the result so we can poll RPC and persist.
       const txHash = extractTxHash(result);
       transition({ state: "broadcasting", txHash });
 
-      // Persist hash so page reload can recover
+      // Persist hash so a page reload can recover the pending state
       if (resolvedPersistKey && txHash) {
         persistTx(resolvedPersistKey, txHash);
       }
 
       // ── Phase: confirming ──────────────────────────────────────────────────
+      // Poll the Soroban RPC until the transaction is included in a ledger.
       transition({ state: "confirming", txHash });
 
+      if (txHash) {
+        const rpcOutcome = await pollRpcForConfirmation(
+          txHash,
+          rpcConfirmTimeoutMs,
+          ac.signal
+        );
+
+        if (rpcOutcome === "aborted") {
+          runningRef.current = false;
+          abortControllerRef.current = null;
+          // Transaction may still be on-chain — do not clear the persisted hash
+          return result;
+        }
+
+        if (rpcOutcome === "failed") {
+          if (resolvedPersistKey) clearPersistedTx(resolvedPersistKey);
+          runningRef.current = false;
+          abortControllerRef.current = null;
+          transition({
+            state: "error",
+            txHash,
+            error: {
+              category: "rpc_failure",
+              message: buildTxErrorMessage(
+                new Error("Transaction failed on-chain"),
+                action,
+                "rpc_failure"
+              ),
+            },
+          });
+          return null;
+        }
+
+        if (rpcOutcome === "timeout") {
+          // We couldn't confirm in time — surface as rpc_failure so the user
+          // can check /tx/[hash] for the actual outcome.
+          if (resolvedPersistKey) clearPersistedTx(resolvedPersistKey);
+          runningRef.current = false;
+          abortControllerRef.current = null;
+          transition({
+            state: "error",
+            txHash,
+            error: {
+              category: "rpc_failure",
+              message: `${action} confirmation timed out. Check your transaction status at /tx/${txHash}.`,
+            },
+          });
+          return null;
+        }
+        // rpcOutcome === "success" → fall through to indexer_pending
+      }
+
       // ── Phase: indexer_pending ─────────────────────────────────────────────
-      // The transaction is on-chain; wait for the indexer to pick it up.
+      // The transaction is confirmed on-chain; wait for the indexer to pick it up.
       transition({ state: "indexer_pending", txHash });
 
       // Set a timeout: if indexer confirmation doesn't arrive within the
-      // configured window we transition to success with an indexer_delay flag.
+      // configured window we transition to success anyway with an indexer_delay
+      // note so the user is not stuck.
       await new Promise<void>((resolve) =>
         setTimeout(resolve, indexerConfirmTimeoutMs)
       );
 
       if (abortedRef.current) {
         runningRef.current = false;
-        // Don't overwrite — we're already on-chain
+        abortControllerRef.current = null;
+        // Transaction is already on-chain — transition to success
         if (resolvedPersistKey) clearPersistedTx(resolvedPersistKey);
         transition({ state: "success", txHash });
         return result;
@@ -432,6 +556,7 @@ export function useTxLifecycle(
       // ── Phase: success ─────────────────────────────────────────────────────
       if (resolvedPersistKey) clearPersistedTx(resolvedPersistKey);
       runningRef.current = false;
+      abortControllerRef.current = null;
       transition({ state: "success", txHash });
 
       return result;
