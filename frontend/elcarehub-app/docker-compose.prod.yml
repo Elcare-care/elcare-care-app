@@ -1,4 +1,4 @@
-# docker-compose.prod.yml — Production security overrides
+# docker-compose.prod.yml — Production security overrides for frontend
 #
 # Usage:
 #   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
@@ -9,10 +9,9 @@
 # What this adds:
 #   read_only    — mounts the container filesystem as read-only; writable
 #                  paths are covered by explicit tmpfs volumes.
-#   cap_drop ALL — drops every Linux capability; the indexer needs none.
+#   cap_drop ALL — drops every Linux capability; the frontend needs none.
 #   security_opt — prevents setuid/setgid privilege escalation.
 #   restart      — always restart so a crash doesn't leave the service dark.
-#   tmpfs        — additional tmpfs mounts for write-only paths.
 #
 # Base-image update process:
 #   1. Run: docker pull node:20-alpine && docker inspect node:20-alpine --format '{{index .RepoDigests 0}}'
@@ -23,28 +22,13 @@
 version: '3.8'
 
 services:
-  db:
-    restart: always
-    security_opt:
-      - "no-new-privileges:true"
-    # PostgreSQL requires writable data directory, handled by volume mount
-    # No additional hardening needed beyond security_opt
-
-  redis:
-    restart: always
-    security_opt:
-      - "no-new-privileges:true"
-    command: ["redis-server", "--save", "", "--appendonly", "no"]
-    # Redis requires writable data directory, handled by volume mount
-    # No additional hardening needed beyond security_opt
-
-  indexer:
+  frontend:
     restart: always
     read_only: true
     tmpfs:
-      # Indexer needs writable /tmp for temporary files and health check operations
-      - /tmp:size=64m,mode=1777
-      # Prisma may need writable cache directories during migrations
-      - /app/prisma:size=32m,mode=1777
+      # Next.js needs writable /tmp for build artifacts and cache
+      - /tmp:size=128m,mode=1777
+      # Next.js cache directory (if needed for edge cases)
+      - /app/.next/cache:size=64m,mode=1777
     environment:
       - NODE_ENV=production

@@ -1,9 +1,13 @@
 # ── Stage 1: builder ─────────────────────────────────────────────────────────
+# Base image digest pinning for reproducibility and security
+# To pin: docker pull node:20-alpine && docker inspect node:20-alpine --format '{{index .RepoDigests 0}}'
+# Update FROM line to: FROM node:20-alpine@sha256:<digest> AS builder
+# Schedule: review and rotate base images at least monthly
 FROM node:20-alpine AS builder
 
 WORKDIR /build
 
-# Install openssl (needed by Prisma at generate time)
+# Install build dependencies
 RUN apk add --no-cache openssl
 
 # Install dependencies (including devDeps for TypeScript compilation)
@@ -32,11 +36,16 @@ RUN BUILD_SHA="$BUILD_SHA" BUILD_TIME="$BUILD_TIME" \
     npm run build
 
 # ── Stage 2: runtime ─────────────────────────────────────────────────────────
+# Base image digest pinning for reproducibility and security
+# To pin: docker pull node:20-alpine && docker inspect node:20-alpine --format '{{index .RepoDigests 0}}'
+# Update FROM line to: FROM node:20-alpine@sha256:<digest> AS runtime
+# Schedule: review and rotate base images at least monthly
 FROM node:20-alpine AS runtime
 
 WORKDIR /app
 
 # Runtime system deps: openssl (Prisma), wget is provided by busybox (health probe)
+# Minimal package set to reduce attack surface
 RUN apk add --no-cache openssl \
  && addgroup -S appgroup \
  && adduser  -S appuser -G appgroup
