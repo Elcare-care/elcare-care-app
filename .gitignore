@@ -94,3 +94,9 @@ coverage/
 *.tmp
 *.bak
 *.orig
+
+# Locally generated SBOMs (scripts/sbom/generate-all.sh) — CI generates and
+# uploads these fresh on every run; local runs are for iteration/debugging.
+/sbom-*.cdx.json
+/sbom-*.meta.json
+/cargo-metadata.json
