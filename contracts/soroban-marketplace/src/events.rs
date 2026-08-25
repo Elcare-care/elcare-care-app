@@ -1265,3 +1265,151 @@ impl MigrationPhaseCompletedEvent {
             .publish((soroban_sdk::Symbol::new(env, MIGRATION_PHASE_COMPLETE),), self);
     }
 }
+
+// ── Treasury rotation events (Issue #459) ────────────────────────────────────
+
+pub const TREASURY_PROPOSED: &str = "treasury_proposed";
+pub const TREASURY_ACCEPTED: &str = "treasury_accepted";
+pub const TREASURY_PROPOSAL_CANCELLED: &str = "treasury_proposal_cancelled";
+
+/// Emitted when the ProtocolConfig role holder proposes a new treasury address.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TreasuryProposedEvent {
+    /// The current active treasury (may be `None` if no treasury was set yet).
+    pub current_treasury: Option<Address>,
+    /// The address being proposed as the new treasury destination.
+    pub proposed_treasury: Address,
+    /// Ledger timestamp when the proposal was created.
+    pub proposed_at: u64,
+    /// Absolute ledger timestamp after which the proposal expires and cannot
+    /// be accepted.
+    pub expires_at: u64,
+}
+
+impl TreasuryProposedEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, TREASURY_PROPOSED),), self);
+    }
+}
+
+/// Emitted when the proposed treasury address accepts and the rotation becomes
+/// active. All subsequent settlements use `new_treasury` as the fee destination.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TreasuryAcceptedEvent {
+    /// The treasury address that was active before the rotation.
+    pub old_treasury: Option<Address>,
+    /// The treasury address that is now active.
+    pub new_treasury: Address,
+    /// Ledger sequence at which acceptance occurred (for audit ordering).
+    pub ledger_sequence: u32,
+}
+
+impl TreasuryAcceptedEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, TREASURY_ACCEPTED),), self);
+    }
+}
+
+/// Emitted when a pending treasury proposal is cancelled before it was accepted.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TreasuryProposalCancelledEvent {
+    /// The address that cancelled the proposal (ProtocolConfig role holder).
+    pub cancelled_by: Address,
+    /// The candidate whose proposal was cancelled.
+    pub cancelled_candidate: Address,
+}
+
+impl TreasuryProposalCancelledEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, TREASURY_PROPOSAL_CANCELLED),), self);
+    }
+}
+
+pub fn emit_treasury_proposed(
+    env: &Env,
+    current_treasury: Option<Address>,
+    proposed_treasury: Address,
+    proposed_at: u64,
+    expires_at: u64,
+) {
+    TreasuryProposedEvent {
+        current_treasury,
+        proposed_treasury,
+        proposed_at,
+        expires_at,
+    }
+    .publish(env);
+}
+
+pub fn emit_treasury_accepted(
+    env: &Env,
+    old_treasury: Option<Address>,
+    new_treasury: Address,
+    ledger_sequence: u32,
+) {
+    TreasuryAcceptedEvent {
+        old_treasury,
+        new_treasury,
+        ledger_sequence,
+    }
+    .publish(env);
+}
+
+pub fn emit_treasury_proposal_cancelled(
+    env: &Env,
+    cancelled_by: Address,
+    cancelled_candidate: Address,
+) {
+    TreasuryProposalCancelledEvent {
+        cancelled_by,
+        cancelled_candidate,
+    }
+    .publish(env);
+}
+
+// ── Listing duration config events (Issue #460) ───────────────────────────────
+
+pub const LISTING_DURATION_CONFIG_UPDATED: &str = "listing_duration_config_updated";
+
+/// Emitted when the ProtocolConfig role updates the min/max listing duration.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ListingDurationConfigUpdatedEvent {
+    /// "min_listing_duration" or "max_listing_duration"
+    pub field: soroban_sdk::Symbol,
+    /// Previous value (`None` if it was not previously configured).
+    pub old_value: Option<u64>,
+    /// New value (`None` means the bound was cleared/removed).
+    pub new_value: Option<u64>,
+}
+
+impl ListingDurationConfigUpdatedEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, LISTING_DURATION_CONFIG_UPDATED),), self);
+    }
+}
+
+pub fn emit_listing_duration_config_updated(
+    env: &Env,
+    field: soroban_sdk::Symbol,
+    old_value: Option<u64>,
+    new_value: Option<u64>,
+) {
+    ListingDurationConfigUpdatedEvent {
+        field,
+        old_value,
+        new_value,
+    }
+    .publish(env);
+}

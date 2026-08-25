@@ -28,8 +28,8 @@ mod ownership_tests;
 
 pub use contract::MarketplaceContract;
 pub use types::{
-    BidRecord, CancelReason, Listing, ListingStatus, MarketplaceError, Offer, OfferStatus,
-    RoleType,
+    BatchItemError, BidRecord, CancelReason, CollectionStandard, Listing, ListingStatus,
+    MarketplaceError, Offer, OfferStatus, RoleType,
 };
 
 #[cfg(any(test, feature = "testutils"))]

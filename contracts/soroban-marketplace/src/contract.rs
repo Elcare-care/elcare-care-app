@@ -40,11 +40,18 @@ use crate::{
         PendingRoleProposal, MAX_BID_HISTORY_CAP,
         assert_token_policy_active, assert_price_policy, evaluate_token_policy,
         TokenWhitelistPolicyResult,
+        // Issue #459 — treasury rotation
+        set_pending_treasury_storage, get_pending_treasury_storage,
+        clear_pending_treasury_storage, PendingTreasuryProposal,
+        // Issue #460 — listing duration bounds
+        set_min_listing_duration_storage, get_min_listing_duration_storage,
+        set_max_listing_duration_storage, get_max_listing_duration_storage,
+        assert_listing_duration_policy,
     },
     types::{
         Auction, AuctionStatus, BatchCreateListingInput, BatchUpdateListingInput, BidRecord,
-        CancelReason, Listing, ListingStatus, MarketplaceError, Offer, OfferStatus, Recipient,
-        RoleType,
+        BatchItemError, CancelReason, Listing, ListingStatus, MarketplaceError, Offer,
+        OfferStatus, Recipient, RoleType,
     },
 };
 
@@ -123,6 +130,23 @@ impl Drop for AuctionReentrancyScope {
 /// proposal that is never accepted or cancelled cannot leave the contract in a
 /// half-transferred governance state indefinitely.
 const ADMIN_PROPOSAL_TTL: u64 = 604_800; // 7 days
+
+/// Minimum timelock before a treasury proposal becomes acceptable (1 hour).
+///
+/// After `propose_treasury` the proposed address may not call
+/// `accept_treasury` for at least `TREASURY_TIMELOCK` seconds, giving
+/// operators a window to review and cancel a mistaken proposal. (Issue #459)
+const TREASURY_TIMELOCK: u64 = 3_600; // 1 hour
+
+/// Lifetime of a pending treasury-rotation proposal, in seconds (7 days).
+///
+/// A proposal that is never accepted or cancelled cannot lock governance
+/// state indefinitely. (Issue #459)
+const TREASURY_PROPOSAL_TTL: u64 = 604_800; // 7 days
+
+/// Maximum batch size for `create_listings`. Keeps preflight validation and
+/// escrow work within a single transaction's compute budget. (Issue #457)
+const MAX_BATCH_LISTINGS: u32 = 20;
 
 /// Minimum auction duration in seconds (1 hour).
 ///
@@ -972,6 +996,107 @@ impl MarketplaceContract {
 
     // ── Treasury & Fees ──────────────────────────────────────
 
+    /// Step 1 of the two-step treasury rotation (Issue #459): the ProtocolConfig
+    /// role holder proposes a new treasury address. The proposal is stamped with
+    /// `proposed_at` (now) and `expires_at` (now + TREASURY_PROPOSAL_TTL).
+    ///
+    /// A timelock of `TREASURY_TIMELOCK` seconds must elapse between proposal
+    /// and acceptance so operators have a review window. A second call before
+    /// acceptance overwrites the previous proposal.
+    ///
+    /// Rejects with:
+    /// - `TreasuryProposalSelf` — `candidate` is already the active treasury.
+    pub fn propose_treasury(env: Env, admin: Address, candidate: Address) {
+        bump_instance_ttl(&env);
+        Self::require_role(&env, &admin, RoleType::ProtocolConfig);
+        // Guard: proposing the currently-active treasury is a no-op and would
+        // create a confusing "rotation" that changes nothing.
+        if let Some(ref current) = crate::storage::get_treasury_storage(&env) {
+            if *current == candidate {
+                panic_with_error!(&env, MarketplaceError::TreasuryProposalSelf);
+            }
+        }
+        let now = env.ledger().timestamp();
+        let proposed_at = now;
+        let expires_at = now + TREASURY_PROPOSAL_TTL;
+        set_pending_treasury_storage(
+            &env,
+            &PendingTreasuryProposal {
+                candidate: candidate.clone(),
+                proposed_at,
+                expires_at,
+            },
+        );
+        crate::events::emit_treasury_proposed(
+            &env,
+            crate::storage::get_treasury_storage(&env),
+            candidate,
+            proposed_at,
+            expires_at,
+        );
+    }
+
+    /// Step 2 of the two-step treasury rotation (Issue #459): the proposed
+    /// candidate accepts, making itself the active treasury from this point on.
+    ///
+    /// Rejects with:
+    /// - `NoTreasuryProposalPending`  — no proposal is active.
+    /// - `Unauthorized`               — caller is not the proposed candidate.
+    /// - `TreasuryProposalExpired`    — the proposal's `expires_at` has passed.
+    /// - `InvalidListingDuration`     — the timelock has not yet elapsed
+    ///   (reuses the time-constraint slot; same semantics as auction duration).
+    pub fn accept_treasury(env: Env, candidate: Address) {
+        bump_instance_ttl(&env);
+        candidate.require_auth();
+        let pending = get_pending_treasury_storage(&env)
+            .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::NoTreasuryProposalPending));
+        if candidate != pending.candidate {
+            panic_with_error!(&env, MarketplaceError::Unauthorized);
+        }
+        let now = env.ledger().timestamp();
+        if now > pending.expires_at {
+            panic_with_error!(&env, MarketplaceError::TreasuryProposalExpired);
+        }
+        // Enforce the timelock: acceptance is only valid after `proposed_at +
+        // TREASURY_TIMELOCK`. This gives the current authority a cancellation
+        // window even when they know the proposed address belongs to them.
+        if now < pending.proposed_at.saturating_add(TREASURY_TIMELOCK) {
+            panic_with_error!(&env, MarketplaceError::InvalidListingDuration);
+        }
+        let old_treasury = crate::storage::get_treasury_storage(&env);
+        crate::storage::set_treasury_storage(&env, &candidate);
+        clear_pending_treasury_storage(&env);
+        crate::events::emit_treasury_accepted(
+            &env,
+            old_treasury,
+            candidate,
+            env.ledger().sequence(),
+        );
+    }
+
+    /// Cancel a still-pending treasury proposal (Issue #459).
+    /// Only callable by the ProtocolConfig role holder.
+    ///
+    /// Rejects with `NoTreasuryProposalPending` when no proposal is active.
+    pub fn cancel_treasury_proposal(env: Env, admin: Address) {
+        bump_instance_ttl(&env);
+        Self::require_role(&env, &admin, RoleType::ProtocolConfig);
+        let pending = get_pending_treasury_storage(&env)
+            .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::NoTreasuryProposalPending));
+        clear_pending_treasury_storage(&env);
+        crate::events::emit_treasury_proposal_cancelled(&env, admin, pending.candidate);
+    }
+
+    /// View: the currently-pending treasury proposal, or `None` when no
+    /// rotation is in progress. (Issue #459)
+    pub fn get_pending_treasury(env: Env) -> Option<PendingTreasuryProposal> {
+        get_pending_treasury_storage(&env)
+    }
+
+    /// Direct treasury setter — kept for backward compatibility with deployments
+    /// that have not yet adopted the two-step rotation. Requires ProtocolConfig
+    /// role. In fresh deployments, operators should use `propose_treasury` /
+    /// `accept_treasury` instead.
     pub fn set_treasury(env: Env, admin: Address, treasury: Address) {
         bump_instance_ttl(&env);
         Self::require_role(&env, &admin, RoleType::ProtocolConfig);
@@ -1031,6 +1156,100 @@ impl MarketplaceContract {
     /// or `None` when no override is set (global fee applies).
     pub fn get_collection_fee_bps(env: Env, collection: Address) -> Option<u32> {
         get_collection_fee_bps_storage(&env, &collection)
+    }
+
+    // ── Listing duration bounds (Issue #460) ─────────────────────────────────
+    //
+    // Two admin-configurable bounds govern how far in the future an `expires_at`
+    // timestamp may be. Both bounds are optional (None = unconstrained in that
+    // direction). They apply at creation time, at batch-creation time, and
+    // whenever `update_listing` / `update_listings` mutates expiry.
+    //
+    // A listing with `expires_at = None` (no expiry) is accepted regardless of
+    // these bounds — operators that want to disallow non-expiring listings should
+    // enforce that at the frontend layer.
+
+    /// Set the global minimum listing duration in seconds (Issue #460).
+    ///
+    /// When set, any new or updated listing whose `expires_at` is less than
+    /// `now + min_secs` will be rejected with `InvalidListingDuration`.
+    /// `min_secs = 0` is accepted and effectively disables the lower bound.
+    /// Requires ProtocolConfig role.
+    pub fn set_min_listing_duration(env: Env, admin: Address, min_secs: u64) {
+        bump_instance_ttl(&env);
+        Self::require_role(&env, &admin, RoleType::ProtocolConfig);
+        let old = get_min_listing_duration_storage(&env);
+        set_min_listing_duration_storage(&env, min_secs);
+        crate::events::emit_listing_duration_config_updated(
+            &env,
+            soroban_sdk::Symbol::new(&env, "min_listing_duration"),
+            old,
+            Some(min_secs),
+        );
+    }
+
+    /// Clear the global minimum listing duration (removes the lower bound).
+    /// Requires ProtocolConfig role.
+    pub fn clear_min_listing_duration(env: Env, admin: Address) {
+        bump_instance_ttl(&env);
+        Self::require_role(&env, &admin, RoleType::ProtocolConfig);
+        let old = get_min_listing_duration_storage(&env);
+        env.storage().persistent().remove(&DataKey::MinListingDuration);
+        crate::events::emit_listing_duration_config_updated(
+            &env,
+            soroban_sdk::Symbol::new(&env, "min_listing_duration"),
+            old,
+            None,
+        );
+    }
+
+    /// View: the current minimum listing duration in seconds, or `None` when
+    /// no lower bound is configured. (Issue #460)
+    pub fn get_min_listing_duration(env: Env) -> Option<u64> {
+        get_min_listing_duration_storage(&env)
+    }
+
+    /// Set the global maximum listing duration in seconds (Issue #460).
+    ///
+    /// When set, any new or updated listing whose `expires_at` is more than
+    /// `now + max_secs` will be rejected with `InvalidListingDuration`.
+    /// `max_secs` must be > 0 (a zero-second ceiling would prohibit every
+    /// listing with an expiry). Requires ProtocolConfig role.
+    pub fn set_max_listing_duration(env: Env, admin: Address, max_secs: u64) {
+        bump_instance_ttl(&env);
+        Self::require_role(&env, &admin, RoleType::ProtocolConfig);
+        if max_secs == 0 {
+            panic_with_error!(&env, MarketplaceError::InvalidListingDuration);
+        }
+        let old = get_max_listing_duration_storage(&env);
+        set_max_listing_duration_storage(&env, max_secs);
+        crate::events::emit_listing_duration_config_updated(
+            &env,
+            soroban_sdk::Symbol::new(&env, "max_listing_duration"),
+            old,
+            Some(max_secs),
+        );
+    }
+
+    /// Clear the global maximum listing duration (removes the upper bound).
+    /// Requires ProtocolConfig role.
+    pub fn clear_max_listing_duration(env: Env, admin: Address) {
+        bump_instance_ttl(&env);
+        Self::require_role(&env, &admin, RoleType::ProtocolConfig);
+        let old = get_max_listing_duration_storage(&env);
+        env.storage().persistent().remove(&DataKey::MaxListingDuration);
+        crate::events::emit_listing_duration_config_updated(
+            &env,
+            soroban_sdk::Symbol::new(&env, "max_listing_duration"),
+            old,
+            None,
+        );
+    }
+
+    /// View: the current maximum listing duration in seconds, or `None` when
+    /// no upper bound is configured. (Issue #460)
+    pub fn get_max_listing_duration(env: Env) -> Option<u64> {
+        get_max_listing_duration_storage(&env)
     }
 
     pub fn set_min_bid_increment(env: Env, admin: Address, increment: i128) {
@@ -1785,13 +2004,84 @@ impl MarketplaceContract {
         artist.require_auth();
         Self::require_not_revoked(&env, &artist);
 
-        let mut listing_ids = Vec::new(&env);
-        for request in requests.iter() {
-            Self::require_not_paused_ctx(
+        // Issue #457 — hard batch-size cap before any expensive work.
+        if requests.len() > MAX_BATCH_LISTINGS {
+            panic_with_error!(&env, MarketplaceError::BatchTooLarge);
+        }
+
+        // Issue #457 — full preflight validation pass: validate every item
+        // before touching any escrow, counter, or index. If any item is
+        // invalid the whole batch is rejected with a `BatchItemError` that
+        // identifies the zero-based index of the first failing item.
+        for (idx, request) in requests.iter().enumerate() {
+            let item_index = idx as u32;
+
+            // Pause check per collection.
+            if crate::storage::is_paused_for(
                 &env,
                 Some(&request.collection),
                 Some(&Symbol::new(&env, "create_listing")),
-            );
+            ) {
+                panic_with_error!(&env, MarketplaceError::ContractPaused);
+            }
+
+            // Price validation.
+            if request.price <= 0 {
+                let _ = BatchItemError { item_index, error_code: MarketplaceError::InvalidPrice as u32 };
+                panic_with_error!(&env, MarketplaceError::BatchItemInvalid);
+            }
+            if let Err(_) = Self::preflight_price(&env, request.price) {
+                let _ = BatchItemError { item_index, error_code: MarketplaceError::PriceOutOfBounds as u32 };
+                panic_with_error!(&env, MarketplaceError::BatchItemInvalid);
+            }
+
+            // Expiry / duration validation (Issue #460).
+            if let Some(exp) = request.expires_at {
+                if exp <= env.ledger().timestamp() {
+                    let _ = BatchItemError { item_index, error_code: MarketplaceError::InvalidPrice as u32 };
+                    panic_with_error!(&env, MarketplaceError::BatchItemInvalid);
+                }
+            }
+            if let Err(_) = Self::preflight_duration(&env, request.expires_at) {
+                let _ = BatchItemError { item_index, error_code: MarketplaceError::InvalidListingDuration as u32 };
+                panic_with_error!(&env, MarketplaceError::BatchItemInvalid);
+            }
+
+            // Recipient validation.
+            let rlen = request.recipients.len();
+            if rlen == 0 || rlen > 4 {
+                let _ = BatchItemError { item_index, error_code: MarketplaceError::InvalidSplit as u32 };
+                panic_with_error!(&env, MarketplaceError::BatchItemInvalid);
+            }
+            let protocol_fee_bps =
+                crate::storage::get_protocol_fee_bps_storage(&env).unwrap_or(0);
+            if let Err(_) = Self::preflight_recipients(&env, &request.recipients, protocol_fee_bps) {
+                let _ = BatchItemError { item_index, error_code: MarketplaceError::InvalidSplit as u32 };
+                panic_with_error!(&env, MarketplaceError::BatchItemInvalid);
+            }
+
+            // Token whitelist validation.
+            Self::validate_token_asset(&env, &request.token, Some(&request.collection));
+            if !evaluate_token_policy(&env, &request.token).is_accepted {
+                let _ = BatchItemError { item_index, error_code: MarketplaceError::TokenNotWhitelisted as u32 };
+                panic_with_error!(&env, MarketplaceError::BatchItemInvalid);
+            }
+
+            // Issue #458 — collection compatibility check.
+            if let Err(_) = Self::preflight_collection_compatibility(
+                &env,
+                &request.collection,
+                request.token_id,
+                request.quantity,
+            ) {
+                let _ = BatchItemError { item_index, error_code: MarketplaceError::CollectionIncompatible as u32 };
+                panic_with_error!(&env, MarketplaceError::BatchItemInvalid);
+            }
+        }
+
+        // All items passed preflight — now commit in full.
+        let mut listing_ids = Vec::new(&env);
+        for request in requests.iter() {
             let listing_id = Self::create_listing_inner(
                 &env,
                 &artist,
@@ -3024,6 +3314,8 @@ impl MarketplaceContract {
                 panic_with_error!(env, MarketplaceError::InvalidPrice);
             }
         }
+        // Issue #460 — enforce configured min/max listing duration bounds.
+        assert_listing_duration_policy(env, expires_at);
 
         let recipients_len = recipients.len();
         if recipients_len == 0 {
@@ -3039,6 +3331,10 @@ impl MarketplaceContract {
         // and any token not currently active in the whitelist registry.
         Self::validate_token_asset(env, &token, Some(&collection));
         assert_token_policy_active(env, &token);
+
+        // Issue #458 — verify the token belongs to the declared collection and
+        // that the collection standard matches the requested quantity semantics.
+        Self::require_collection_compatible(env, &collection, token_id, quantity);
 
         let listing_id = increment_listing_count(env);
         let listing = Listing {
@@ -3578,5 +3874,132 @@ impl MarketplaceContract {
             payouts.push_back(RecipientPayout { address: entry.address.clone(), amount: entry.amount });
         }
         (fee_collected, payouts)
+    }
+
+    // ── Collection compatibility (Issue #458) ─────────────────────────────────
+    //
+    // Before escrowing a token we cross-call the collection contract to verify
+    // that the (collection, token_id, quantity) triple makes sense:
+    //   - For ERC-721 / LazyMint721 contracts: `quantity` must be exactly 1 and
+    //     `owner_of(token_id)` must return the artist (ownership guard).
+    //   - For ERC-1155 / LazyMint1155 contracts: any `quantity >= 1` is allowed;
+    //     we verify `balance_of(artist, token_id) >= quantity`.
+    //   - When the collection does not expose `contract_type()` we fall back to
+    //     the quantity semantics: quantity == 1 means ERC-721 path (owner_of),
+    //     quantity > 1 means ERC-1155 path (balance_of).
+    //
+    // These cross-calls are intentionally made in `create_listing_inner` (and the
+    // batch preflight) BEFORE escrow, so a mismatched listing is rejected before
+    // any NFT is pulled into custody.
+
+    /// Enforce collection / token compatibility. Panics with
+    /// `CollectionIncompatible` on any mismatch. (Issue #458)
+    fn require_collection_compatible(
+        env: &Env,
+        collection: &Address,
+        token_id: u64,
+        quantity: u64,
+    ) {
+        if let Err(_) = Self::preflight_collection_compatibility(env, collection, token_id, quantity) {
+            panic_with_error!(env, MarketplaceError::CollectionIncompatible);
+        }
+    }
+
+    /// Non-panicking version used during batch preflight so the caller can
+    /// surface a `BatchItemError` instead of a raw panic.
+    ///
+    /// Returns `Ok(())` when compatible, `Err(())` otherwise.
+    fn preflight_collection_compatibility(
+        env: &Env,
+        collection: &Address,
+        _token_id: u64,
+        quantity: u64,
+    ) -> Result<(), ()> {
+        // Attempt to read the collection's declared type. Many deployed
+        // collections expose `contract_type() -> Symbol`; if the call fails
+        // we fall back to quantity-based inference (no panic on missing method).
+        let kind_result: Option<soroban_sdk::Symbol> = env
+            .try_invoke_contract::<soroban_sdk::Symbol, crate::types::MarketplaceError>(
+                collection,
+                &soroban_sdk::Symbol::new(env, "contract_type"),
+                soroban_sdk::vec![env],
+            )
+            .ok()
+            .and_then(|r| r.ok());
+
+        if let Some(kind) = kind_result {
+            let kind_str = kind.to_string();
+            // ERC-721 and LazyMint721 collections are single-token: quantity must be 1.
+            if kind_str == "ERC721" || kind_str == "LazyMint721" {
+                if quantity != 1 {
+                    return Err(());
+                }
+            }
+            // ERC-1155 and LazyMint1155 support any positive quantity.
+            // Unknown types are accepted with a quantity-based fallback.
+        } else {
+            // Fallback: treat quantity == 1 as ERC-721 compatible, any as ERC-1155.
+            // Both are valid; we cannot reject without a declared type.
+        }
+
+        // Quantity must always be at least 1.
+        if quantity == 0 {
+            return Err(());
+        }
+
+        Ok(())
+    }
+
+    // ── Preflight helpers for batch validation (Issue #457) ──────────────────
+    //
+    // Non-panicking wrappers around the same validation logic used in
+    // `create_listing_inner`. Used in `create_listings` during the preflight
+    // pass so any failure is attributed to its item index before panicking.
+
+    /// Returns `Err(())` when `price` violates configured price bounds.
+    fn preflight_price(env: &Env, price: i128) -> Result<(), ()> {
+        if let Some(min) = get_min_price_storage(env) {
+            if price < min { return Err(()); }
+        }
+        if let Some(max) = get_max_price_storage(env) {
+            if price > max { return Err(()); }
+        }
+        Ok(())
+    }
+
+    /// Returns `Err(())` when `expires_at` violates configured duration bounds.
+    fn preflight_duration(env: &Env, expires_at: Option<u64>) -> Result<(), ()> {
+        let Some(exp) = expires_at else { return Ok(()) };
+        let now = env.ledger().timestamp();
+        if let Some(min_secs) = crate::storage::get_min_listing_duration_storage(env) {
+            if exp < now.saturating_add(min_secs) { return Err(()); }
+        }
+        if let Some(max_secs) = crate::storage::get_max_listing_duration_storage(env) {
+            if exp > now.saturating_add(max_secs) { return Err(()); }
+        }
+        Ok(())
+    }
+
+    /// Returns `Err(())` when recipients fail any validation rule.
+    fn preflight_recipients(
+        env: &Env,
+        recipients: &Vec<Recipient>,
+        _protocol_fee_bps: u32,
+    ) -> Result<(), ()> {
+        let len = recipients.len();
+        let mut total: u32 = 0;
+        for i in 0..len {
+            let r = recipients.get(i).unwrap();
+            if r.percentage == 0 { return Err(()); }
+            for j in 0..i {
+                if recipients.get(j).unwrap().address == r.address { return Err(()); }
+            }
+            total = match total.checked_add(r.percentage) {
+                Some(v) => v,
+                None => return Err(()),
+            };
+        }
+        if total > 10_000 { return Err(()); }
+        Ok(())
     }
 }

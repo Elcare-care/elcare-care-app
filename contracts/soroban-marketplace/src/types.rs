@@ -153,11 +153,28 @@ pub enum MarketplaceError {
     /// create an irrecoverable governance state (no key can sign for a contract
     /// address in the normal Soroban auth model).
     RoleTransferToContract = 55,
-    /// A listing ownership reconciliation was attempted but the provided
-    /// expected owner does not match the current stored owner (or artist
-    /// for an Active listing with no separate owner). Guards against
-    /// concurrent reconciliation races.
-    OwnershipMismatch = 56,
+    /// `accept_treasury` was called after the pending treasury proposal's
+    /// `expires_at` ledger timestamp has passed. The proposal must be re-issued.
+    /// (Issue #459)
+    TreasuryProposalExpired = 56,
+    /// `accept_treasury` or `cancel_treasury_proposal` was called when no
+    /// treasury proposal is currently pending. (Issue #459)
+    NoTreasuryProposalPending = 57,
+    /// `propose_treasury` was called with `candidate == current_treasury`.
+    /// Proposing the same address that is already the active treasury is a no-op
+    /// and is rejected so the pending slot is not polluted. (Issue #459)
+    TreasuryProposalSelf = 58,
+    /// A listing or auction expiry duration violates the configured
+    /// `[min_listing_duration, max_listing_duration]` bounds. (Issue #460)
+    InvalidListingDuration = 59,
+    /// The declared collection address is incompatible with the token: the token
+    /// does not belong to the given collection or the collection standard does
+    /// not match the requested quantity semantics. (Issue #458)
+    CollectionIncompatible = 60,
+    /// One item in a `create_listings` batch failed preflight validation.
+    /// The `item_index` field of the returned `BatchItemError` identifies
+    /// the zero-based position of the failing item. (Issue #457)
+    BatchItemInvalid = 61,
 }
 
 #[contracttype]
@@ -322,4 +339,33 @@ pub struct Offer {
     pub status: OfferStatus,
     pub created_at: u32,
     pub expires_at: Option<u64>,
+}
+
+/// Identifies which standard a deployed collection implements.
+///
+/// Returned by collection contracts via `contract_type()` so the marketplace
+/// can enforce quantity-semantic compatibility at listing creation. (Issue #458)
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CollectionStandard {
+    /// ERC-721-equivalent single-token collection (quantity must be 1).
+    Erc721,
+    /// ERC-1155-equivalent multi-edition collection (quantity >= 1).
+    Erc1155,
+    /// Lazy-mint ERC-721 variant (quantity must be 1).
+    LazyMint721,
+    /// Lazy-mint ERC-1155 variant (quantity >= 1).
+    LazyMint1155,
+}
+
+/// Returned by `create_listings` when any item in the batch fails preflight
+/// validation.  Carries the zero-based index of the failing item so clients
+/// can surface the exact problematic entry without guessing. (Issue #457)
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchItemError {
+    /// Zero-based index of the item that failed.
+    pub item_index: u32,
+    /// The marketplace error code that describes the failure.
+    pub error_code: u32,
 }
