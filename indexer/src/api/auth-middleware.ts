@@ -1,6 +1,8 @@
 import { Request, Response, NextFunction } from 'express';
 import { logger } from '../logger.js';
 import { unauthorized, forbidden } from './errors.js';
+import { getAuditService, AuditActionType, AuditOutcome } from '../audit/audit-service.js';
+import { PrismaClient } from '@prisma/client';
 
 // ── Route classification ────────────────────────────────────────────────────────
 //
@@ -30,8 +32,10 @@ export function loadAuthConfig(): AuthConfig {
   return cachedConfig;
 }
 
-export function resetAuthConfigCache(): void {
-  cachedConfig = null;
+export let prismaClient: PrismaClient | null = null;
+
+export function setPrismaClient(client: PrismaClient): void {
+  prismaClient = client;
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
@@ -87,6 +91,28 @@ export function auditLog(
     method: req.method,
     userAgent: req.headers['user-agent'] || undefined,
   });
+
+  // Log operator auth attempts to audit trail
+  if (policy === 'operator' && prismaClient) {
+    const auditService = getAuditService(prismaClient);
+    auditService.log({
+      actor: getClientIp(req),
+      actionType: AuditActionType.AdminRoleChange,
+      target: req.path,
+      requestId: getRequestId(res) || undefined,
+      outcome: outcome === 'allowed' ? AuditOutcome.Success : AuditOutcome.Failure,
+      context: {
+        reason,
+        policy,
+        method: req.method,
+      },
+      ipAddress: getClientIp(req),
+      userAgent: req.headers['user-agent'] as string,
+    }).catch((err) => {
+      // Don't block auth if audit logging fails
+      logger.error('audit.log_failed', { error: err.message });
+    });
+  }
 }
 
 // ── Middleware ─────────────────────────────────────────────────────────────────
@@ -187,6 +213,9 @@ export const OPERATOR_ROUTES = new Set([
   '/sync/jobs',
   '/sync/jobs/{id}',
   '/admin/contracts',
+  '/admin/audit',
+  '/admin/audit/{requestId}',
+  '/admin/audit/stats',
 ]);
 
 export function classifyRoute(path: string): RoutePolicy {

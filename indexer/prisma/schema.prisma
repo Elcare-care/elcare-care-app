@@ -779,3 +779,53 @@ model ArchivedKeeperAction {
   @@index([targetType, status])
   @@index([archivedAt])
 }
+
+// ── Operational Audit Trail ─────────────────────────────────────────────────────
+//
+// Append-only audit log for high-risk operational actions. Records cannot be
+// edited through the application. Sensitive context is redacted before storage.
+// Indexed by actor, action, and timestamp for efficient search and export.
+//
+// actionType: "admin_role_change" | "recovery_operation" | "cache_invalidation" |
+//            "replay_job" | "contract_upgrade" | "emergency_pause" | "data_correction"
+// outcome: "success" | "failure" | "partial"
+// redactedContext: JSON object with sensitive fields redacted (e.g., secrets, keys)
+
+enum AuditActionType {
+  AdminRoleChange
+  RecoveryOperation
+  CacheInvalidation
+  ReplayJob
+  ContractUpgrade
+  EmergencyPause
+  DataCorrection
+  BackfillJob
+  GapRepair
+  DeadLetterReplay
+}
+
+enum AuditOutcome {
+  Success
+  Failure
+  Partial
+}
+
+model OperationalAudit {
+  id              Int           @id @default(autoincrement())
+  actor           String        // wallet address or operator identifier
+  actionType      AuditActionType
+  target          String?       // resource identifier (e.g., listing_id, contract_id)
+  requestId       String        // unique request ID for tracing
+  outcome         AuditOutcome
+  redactedContext Json          // action context with sensitive data redacted
+  ipAddress       String?       // client IP address
+  userAgent       String?       // client user agent
+  createdAt       DateTime      @default(now())
+  
+  @@index([actor])
+  @@index([actionType])
+  @@index([createdAt])
+  @@index([actor, actionType])
+  @@index([actionType, createdAt])
+  @@index([requestId])
+}
