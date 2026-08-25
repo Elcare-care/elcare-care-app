@@ -82,6 +82,9 @@ export const ListingResponseV1 = z.object({
   status: z.string(),
   createdAtLedger: z.number(),
   updatedAtLedger: z.number(),
+  // Moderation overlay (Issue #542) — null when no ModerationCase exists for
+  // this listing. Never affects the underlying provenance fields above.
+  moderationState: z.string().nullable().optional(),
 });
 
 export const AuctionResponseV1 = z.object({

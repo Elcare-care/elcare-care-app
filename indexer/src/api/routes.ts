@@ -204,6 +204,51 @@ const OFFER_MONEY_FIELDS = [['amount', 'token']] as const;
 
 const serializeListing = (row: any) => withDecimalAmounts(serialize(row), LISTING_MONEY_FIELDS);
 const serializeListings = (rows: any[]) => serialize(rows).map((row: any) => withDecimalAmounts(row, LISTING_MONEY_FIELDS));
+
+// ── Moderation overlay for listing responses (Issue #542) ─────────────────────
+//
+// Listings are never deleted or rewritten when moderated — moderation is a
+// pure overlay looked up by ModerationCase.listingId. `moderationState` is
+// null when no case exists (the common case). Hidden states are excluded
+// from default public listing paths (list/search) but a listing is still
+// fetchable by id so the frontend can render the "moderated" overlay.
+const HIDDEN_MODERATION_STATES = new Set(['QUARANTINED', 'REJECTED']);
+
+async function attachModerationState<T extends { listingId: bigint | number | string }>(
+  rows: T[]
+): Promise<Array<T & { moderationState: string | null }>> {
+  if (rows.length === 0) return [];
+  try {
+    const ids = rows.map((r) => BigInt(r.listingId as any));
+    const cases = await prisma.moderationCase.findMany({
+      where: { listingId: { in: ids } },
+      select: { listingId: true, state: true },
+    });
+    const stateByListing = new Map(cases.map((c) => [c.listingId!.toString(), c.state as string]));
+    return rows.map((r) => ({ ...r, moderationState: stateByListing.get(String(r.listingId)) ?? null }));
+  } catch {
+    // Moderation lookup is best-effort — never fail a listing read because
+    // of it.
+    return rows.map((r) => ({ ...r, moderationState: null }));
+  }
+}
+
+async function getModerationStateForListing(listingId: bigint): Promise<string | null> {
+  try {
+    const moderationCase = await prisma.moderationCase.findFirst({
+      where: { listingId },
+      select: { state: true },
+    });
+    return moderationCase?.state ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** Excludes QUARANTINED/REJECTED rows from a default public listing response. */
+function excludeModerated<T extends { moderationState: string | null }>(rows: T[]): T[] {
+  return rows.filter((r) => !HIDDEN_MODERATION_STATES.has(r.moderationState ?? ''));
+}
 const serializeAuction = (row: any) => withDecimalAmounts(serialize(row), AUCTION_MONEY_FIELDS);
 const serializeAuctions = (rows: any[]) => serialize(rows).map((row: any) => withDecimalAmounts(row, AUCTION_MONEY_FIELDS));
 const serializeOffers = (rows: any[]) => serialize(rows).map((row: any) => withDecimalAmounts(row, OFFER_MONEY_FIELDS));
@@ -400,9 +445,16 @@ router.get('/listings', lightRateLimiter, cacheMiddleware(TTL.LISTINGS_LIST), va
         ? String(results[results.length - 1].updatedAtLedger)
         : '';
 
+      // Moderation overlay: QUARANTINED/REJECTED listings are excluded from
+      // this default public search result (still fetchable via /listings/:id).
+      // Note: `count` above is a raw-SQL count and is not adjusted for the
+      // moderation exclusion below — an acceptable approximation for a public
+      // listing count that avoids an extra full-table scan per request.
+      const withModeration = excludeModerated(await attachModerationState(results));
+
       res.setHeader('X-Next-Cursor', nextCursor);
       res.setHeader('X-Total-Count', String(count));
-      return res.json({ listings: serialize(results), total: Number(count) });
+      return res.json({ listings: serialize(withModeration), total: Number(count) });
     }
 
     // ── Short-term ILIKE fallback (<3 chars) or no search ────────────────
@@ -432,20 +484,24 @@ router.get('/listings', lightRateLimiter, cacheMiddleware(TTL.LISTINGS_LIST), va
     res.setHeader('X-Next-Cursor', nextCursor);
     res.setHeader('X-Total-Count', String(total));
 
+    // Moderation overlay — see comment on the FTS branch above. `total` is
+    // not adjusted for the exclusion below.
+    const withModeration = excludeModerated(await attachModerationState(results));
+
     // When search is active always return { listings, total } shape
     // (consistent with the FTS path above).
     if (search) {
-      return res.json({ listings: serialize(results), total });
+      return res.json({ listings: serialize(withModeration), total });
     }
 
     if (limit !== undefined || offset !== undefined || cursor_ledger !== undefined) {
       const validated = validateResponse(z.object({ listings: ListingResponseV1.array(), total: z.number() }), {
-        listings: serialize(results),
+        listings: serialize(withModeration),
         total: Number(total),
       });
       return ok(res, validated);
     }
-    const validated = validateResponse(ListingResponseV1.array(), serialize(results));
+    const validated = validateResponse(ListingResponseV1.array(), serialize(withModeration));
     return ok(res, validated);
   } catch (err) {
     next(internalError('Failed to fetch listings'));
@@ -467,7 +523,12 @@ router.get('/listings/:id', lightRateLimiter, cacheMiddleware(TTL.LISTING_DETAIL
       ? await (prisma as any).ipfsMetadata.findUnique({ where: { cid: listing.token } }).catch(() => null)
       : null;
 
-    return res.json(serializeListing({ ...listing, ipfsMetadata: ipfsMetadata ?? null }));
+    // Moderation is an overlay, never a delete — a QUARANTINED/REJECTED listing
+    // is still fetchable by id so the frontend can render the moderated
+    // overlay (see ModerationBlockedOverlay in the frontend).
+    const moderationState = await getModerationStateForListing(listing.listingId);
+
+    return res.json(serializeListing({ ...listing, ipfsMetadata: ipfsMetadata ?? null, moderationState }));
   } catch (err) {
     next(internalError('Failed to fetch listing details'));
   }
@@ -1609,7 +1670,10 @@ router.get('/search', mediumRateLimiter, validateQuery(searchQuerySchema), async
            WHERE "searchVector" @@ plainto_tsquery('english', $1)`,
           sanitised,
         );
-        result.listings = { items: serialize(rows), total: Number(count) };
+        // Moderation overlay — QUARANTINED/REJECTED listings excluded from
+        // this default public search result (still fetchable by id).
+        const withModeration = excludeModerated(await attachModerationState(rows));
+        result.listings = { items: serialize(withModeration), total: Number(count) };
       } else {
         // Short term — ILIKE fallback
         const [rows, total] = await Promise.all([
@@ -1636,7 +1700,8 @@ router.get('/search', mediumRateLimiter, validateQuery(searchQuerySchema), async
             },
           }),
         ]);
-        result.listings = { items: serialize(rows), total };
+        const withModeration = excludeModerated(await attachModerationState(rows));
+        result.listings = { items: serialize(withModeration), total };
       }
     }
 
@@ -1745,5 +1810,9 @@ router.get('/config/auction', cacheMiddleware(60), async (req: Request, res: Res
 // ── Notification routes (Issue #8) ────────────────────────────────────────────
 import notificationRouter from './notification-routes.js';
 router.use(notificationRouter);
+
+// ── Moderation routes (Issue #542) ────────────────────────────────────────────
+import moderationRouter from './moderation-routes.js';
+router.use(moderationRouter);
 
 export default router;
