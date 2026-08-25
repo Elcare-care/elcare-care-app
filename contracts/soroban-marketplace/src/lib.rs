@@ -35,10 +35,13 @@ mod reservation_tests;
 #[cfg(test)]
 mod asset_equivalence_tests;
 
+#[cfg(test)]
+mod settlement_pause_tests;
+
 pub use contract::MarketplaceContract;
 pub use types::{
     BatchItemError, BidRecord, CancelReason, CollectionStandard, Listing, ListingStatus,
-    MarketplaceError, Offer, OfferStatus, RoleType,
+    MarketplaceError, Offer, OfferStatus, PauseMatrix, RoleType,
 };
 
 #[cfg(any(test, feature = "testutils"))]

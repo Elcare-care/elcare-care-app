@@ -1452,6 +1452,35 @@ impl MarketplaceContract {
         crate::storage::is_function_paused(&env, &function_name)
     }
 
+    /// Return a snapshot of all three pause axes for a given (collection, function) context.
+    ///
+    /// Intended for off-chain monitoring dashboards and emergency operator tooling.
+    /// `any_paused` mirrors the predicate evaluated by `require_not_paused_ctx` — if
+    /// `any_paused` is true the corresponding settlement operation is blocked.
+    ///
+    /// Pass `None` for either axis to skip that check (e.g., `None` collection when
+    /// querying global + function state only).
+    pub fn get_pause_matrix(
+        env: Env,
+        collection: Option<Address>,
+        function_name: Option<Symbol>,
+    ) -> crate::types::PauseMatrix {
+        bump_instance_ttl(&env);
+        let global = crate::storage::is_paused(&env);
+        let collection_paused = collection
+            .as_ref()
+            .map_or(false, |c| crate::storage::is_collection_paused(&env, c));
+        let function_paused = function_name
+            .as_ref()
+            .map_or(false, |f| crate::storage::is_function_paused(&env, f));
+        crate::types::PauseMatrix {
+            global,
+            collection_paused,
+            function_paused,
+            any_paused: global || collection_paused || function_paused,
+        }
+    }
+
     // ── Artist Moderation ────────────────────────────────────
 
     /// Mark an artist as revoked (CollectionAdmin only).
@@ -3052,7 +3081,14 @@ impl MarketplaceContract {
     // CEI: lock → checks → effects → emit → interactions (payout + release_nft + refunds) → unlock
     pub fn accept_offer(env: Env, artist: Address, offer_id: u64) {
         bump_instance_ttl(&env);
-        Self::require_not_paused(&env);
+        // Full 3-axis pause check: global, per-collection, and per-function (Issue #464).
+        // Collection is loaded after the offer, so we perform function + global check first,
+        // then collection check once the listing is loaded.
+        Self::require_not_paused_ctx(
+            &env,
+            None,
+            Some(&Symbol::new(&env, "accept_offer")),
+        );
         artist.require_auth();
         let mut offer = load_offer(&env, offer_id)
             .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::OfferNotFound));
@@ -3061,6 +3097,8 @@ impl MarketplaceContract {
         let _guard = ListingReentrancyScope::new(&env, listing_id);
         let mut listing = load_listing(&env, listing_id)
             .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::ListingNotFound));
+        // Per-collection pause axis (Issue #464).
+        Self::require_not_paused_ctx(&env, Some(&listing.collection), None);
         if listing.artist != artist {
             panic_with_error!(&env, MarketplaceError::Unauthorized);
         }

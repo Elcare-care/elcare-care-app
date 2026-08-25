@@ -422,3 +422,20 @@ pub struct BatchItemError {
     /// The marketplace error code that describes the failure.
     pub error_code: u32,
 }
+
+/// Snapshot of the three-axis pause state for a given (collection, function) context.
+///
+/// Returned by `get_pause_matrix` for off-chain monitoring and emergency tooling.
+/// `any_paused` is the same predicate used by `require_not_paused_ctx` internally.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PauseMatrix {
+    /// Global circuit-breaker (`admin_pause` / `admin_unpause`).
+    pub global: bool,
+    /// True when the queried collection is individually paused.
+    pub collection_paused: bool,
+    /// True when the queried function name is individually paused.
+    pub function_paused: bool,
+    /// True when ANY of the three axes is active (mirrors `require_not_paused_ctx`).
+    pub any_paused: bool,
+}
