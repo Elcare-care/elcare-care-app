@@ -47,6 +47,7 @@ export type TxErrorCategory =
   | "simulation_failure"  // contract simulation failed (pre-flight check)
   | "rpc_failure"         // network / RPC submission error
   | "indexer_delay"       // on-chain success but indexer confirmation timed out
+  | "intent_mismatch"     // Issue #536: assembled tx didn't match the displayed intent — aborted before signing
   | "unknown";            // catch-all
 
 export interface TxError {
@@ -152,6 +153,14 @@ function loadPersistedTx(key: string): string | null {
 /** Classify an error into a TxErrorCategory. */
 export function classifyTxError(err: unknown): TxErrorCategory {
   if (!err) return "unknown";
+
+  // Issue #536: transaction-substitution guard tripped — checked by name
+  // rather than message content so it's never mis-bucketed as some other
+  // category regardless of the wording of the message.
+  if (err instanceof Error && err.name === "TxIntentMismatchError") {
+    return "intent_mismatch";
+  }
+
   const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
 
   // Wallet rejection signals from Freighter / Lobstr / Magic
@@ -242,6 +251,9 @@ export function buildTxErrorMessage(
 
     case "indexer_delay":
       return `Your ${action} was confirmed on-chain but the indexer hasn't caught up yet. This usually resolves within 30 seconds.`;
+
+    case "intent_mismatch":
+      return `We stopped your ${action} before asking your wallet to sign it because the transaction details changed unexpectedly. Nothing was sent to your wallet. Please refresh and try again.`;
 
     case "unknown":
     default:

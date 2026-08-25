@@ -158,6 +158,32 @@ function indexerConfirmTimeout(
 }
 
 /**
+ * Fired when the transaction intent re-derived immediately before signing
+ * (Issue #536) does not match the intent that was rendered in the
+ * confirmation UI moments earlier. Signing is aborted whenever this fires.
+ *
+ * The payload intentionally carries only field *names* that mismatched and
+ * the method/contract/network involved — never the full argument values —
+ * so this is safe to send even though the underlying mismatch could in
+ * theory be adversarial. Method, contract id, and network passphrase are
+ * public transaction parameters (they are not secrets), so including them
+ * is fine for diagnosis; no wallet secrets are ever touched by this path.
+ */
+function txIntentMismatch(
+  context: string,
+  method: string,
+  contractId: string,
+  mismatchedFields: string[]
+): void {
+  capture("tx_intent_mismatch", {
+    context,
+    method,
+    contract_id: contractId,
+    mismatched_fields: mismatchedFields,
+  });
+}
+
+/**
  * Fired when a transaction succeeds end-to-end.
  */
 function transactionSuccess(
@@ -199,6 +225,7 @@ export const walletTelemetry = {
   // signing / tx
   signingRejected,
   transactionFailed,
+  txIntentMismatch,
   indexerConfirmTimeout,
   transactionSuccess,
   // onboarding

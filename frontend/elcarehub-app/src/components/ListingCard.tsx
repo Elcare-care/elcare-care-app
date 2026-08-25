@@ -8,6 +8,7 @@ import { useState, useEffect, useCallback } from "react";
 import Image from "next/image";
 import Link from "next/link";
 import { Listing, stroopsToXlm } from "@/lib/contract";
+import { buildExpectedBuyArtworkIntent } from "@/lib/tx-intent";
 import { ArtworkMetadata, fetchMetadata, getGatewayUrls } from "@/lib/ipfs";
 import { useWalletContext } from "@/context/WalletContext";
 import { useBuyArtwork } from "@/hooks/useMarketplace";
@@ -123,7 +124,13 @@ export function ListingCard({ listing, onPurchased }: ListingCardProps) {
   }, [listing.status, listing.expires_at]);
 
   const handleBuy = async () => {
-    return await buy(listing.listing_id);
+    // Issue #536: build the canonical intent from the same inputs the
+    // confirmation UI (CheckoutModal) rendered, so the pre-sign check can
+    // verify the transaction actually sent to the wallet still matches it.
+    const expectedIntent = publicKey
+      ? buildExpectedBuyArtworkIntent(listing.listing_id, publicKey)
+      : undefined;
+    return await buy(listing.listing_id, expectedIntent);
   };
 
   return (
@@ -133,6 +140,7 @@ export function ListingCard({ listing, onPurchased }: ListingCardProps) {
         onClose={() => setShowCheckout(false)}
         listing={listing}
         onCryptoPurchase={handleBuy}
+        buyerPublicKey={publicKey}
         onPurchased={() => {
           setPurchaseSuccess(true);
           onPurchased?.();
@@ -354,6 +362,7 @@ import { useState, useEffect } from "react";
 import Image from "next/image";
 import Link from "next/link";
 import { Listing, stroopsToXlm } from "@/lib/contract";
+import { buildExpectedBuyArtworkIntent } from "@/lib/tx-intent";
 import { ArtworkMetadata, fetchMetadata, getGatewayUrls } from "@/lib/ipfs";
 import { useWalletContext } from "@/context/WalletContext";
 import { useBuyArtwork } from "@/hooks/useMarketplace";
@@ -436,7 +445,13 @@ export function ListingCard({ listing, onPurchased }: ListingCardProps) {
   }, [listing.status, listing.expires_at]);
 
   const handleBuy = async () => {
-    return await buy(listing.listing_id);
+    // Issue #536: build the canonical intent from the same inputs the
+    // confirmation UI (CheckoutModal) rendered, so the pre-sign check can
+    // verify the transaction actually sent to the wallet still matches it.
+    const expectedIntent = publicKey
+      ? buildExpectedBuyArtworkIntent(listing.listing_id, publicKey)
+      : undefined;
+    return await buy(listing.listing_id, expectedIntent);
   };
 
   return (
