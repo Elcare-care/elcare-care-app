@@ -82,6 +82,8 @@ const TOPIC_MAP: Record<string, string> = {
   'dep_n1155': 'DEPLOY_NORMAL_1155',
   'dep_l721':  'DEPLOY_LAZY_721',
   'dep_l1155': 'DEPLOY_LAZY_1155',
+  // ── Listing ownership reconciliation (Issue #456) ────────────────────
+  'own_reconciled': 'LISTING_OWNERSHIP_RECONCILED',
 };
 
 /** All event type names this parser can produce (exported for tests/UI). */

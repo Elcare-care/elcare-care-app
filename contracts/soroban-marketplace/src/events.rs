@@ -1192,6 +1192,57 @@ pub fn emit_token_removed(env: &Env, token: &Address, removed_by: &Address) {
     .publish(env);
 }
 
+// ── Listing ownership reconciliation (Issue #456) ────────────────────────────
+
+pub const LISTING_OWNERSHIP_RECONCILED: &str = "own_reconciled";
+
+/// Emitted when an authorized collection administrator reconciles the
+/// effective owner of a listing.  The event is idempotent — if the stored
+/// owner already matches `new_owner` no state change occurs and no event
+/// is emitted, so downstream consumers can safely replay this without
+/// concern about phantom updates.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ListingOwnershipReconciledEvent {
+    pub listing_id: u64,
+    /// The owner stored before the reconciliation (None for an Active listing
+    /// whose stored `owner` field is still unset, meaning the artist is the
+    /// effective owner).
+    pub previous_owner: Option<Address>,
+    /// The owner written by the reconciliation call.
+    pub new_owner: Address,
+    /// The operator who authorized this reconciliation (must hold the
+    /// `CollectionAdmin` role).
+    pub reconciled_by: Address,
+    pub ledger_sequence: u32,
+}
+
+impl ListingOwnershipReconciledEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, LISTING_OWNERSHIP_RECONCILED),), self);
+    }
+}
+
+/// Emit `own_reconciled` for a completed ownership reconciliation.
+pub fn emit_listing_ownership_reconciled(
+    env: &Env,
+    listing_id: u64,
+    previous_owner: Option<Address>,
+    new_owner: Address,
+    reconciled_by: Address,
+) {
+    ListingOwnershipReconciledEvent {
+        listing_id,
+        previous_owner,
+        new_owner,
+        reconciled_by,
+        ledger_sequence: env.ledger().sequence(),
+    }
+    .publish(env);
+}
+
 // ── Migration phase observability ─────────────────────────────────────────────
 
 /// Emitted when a migration phase transitions to the next, carrying postcondition

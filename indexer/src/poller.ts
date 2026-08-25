@@ -1498,6 +1498,19 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
     // ROYALTY_PAID, ADMIN_TRANSFER_PROPOSED, ADMIN_TRANSFERRED,
     // ARTIST_REVOKED, ARTIST_REINSTATED, CONTRACT_PAUSED, CONTRACT_UNPAUSED:
     // persisted to MarketplaceEvent (with actor) above; no state reduction.
+
+    // Issue #456: listing ownership reconciliation — sync the owner field in DB.
+    case 'LISTING_OWNERSHIP_RECONCILED': {
+      const newOwner: string | null = data.new_owner?.toString() ?? null;
+      if (newOwner && listingId) {
+        await db.listing.updateMany({
+          where: { listingId },
+          data: { owner: newOwner, updatedAtLedger: ledgerSequence },
+        });
+      }
+      invalidateListing(listingId?.toString() ?? '').catch(() => {});
+      break;
+    }
   }
 
   // ── Update sync lag gauge ─────────────────────────────────────────────────

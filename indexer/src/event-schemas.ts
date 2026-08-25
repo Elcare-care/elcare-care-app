@@ -779,6 +779,30 @@ export const LAUNCHPAD_COLLECTION_UPGRADED_SCHEMA: ContractEventSchema = {
   data: [],
 };
 
+// ── Listing ownership reconciliation (Issue #456) ────────────────────────────
+
+/** Emitted when a CollectionAdmin reconciles an inconsistent listing owner. */
+export interface ListingOwnershipReconciledData {
+  listing_id: bigint;
+  /** The owner before reconciliation; null/absent for Active listings (artist was effective owner). */
+  previous_owner?: string | null;
+  new_owner: string;
+  reconciled_by: string;
+  ledger_sequence?: bigint;
+}
+
+export const LISTING_OWNERSHIP_RECONCILED_SCHEMA: ContractEventSchema = {
+  type: 'LISTING_OWNERSHIP_RECONCILED',
+  data: [
+    { name: 'listing_id',    type: 'bigint' },
+    { name: 'new_owner',     type: 'string' },
+    { name: 'reconciled_by', type: 'string' },
+    // previous_owner is Option<Address> — absent on first-ever reconciliation
+    { name: 'previous_owner',  type: 'string',  optional: true },
+    { name: 'ledger_sequence', type: 'bigint',  optional: true },
+  ],
+};
+
 // ── Schema registry ───────────────────────────────────────────────────────────
 
 export const SCHEMA_REGISTRY: Map<string, ContractEventSchema> = new Map([
@@ -819,6 +843,8 @@ export const SCHEMA_REGISTRY: Map<string, ContractEventSchema> = new Map([
   ['DEPLOY_LAZY_1155', DEPLOY_SCHEMA],
   ['LAUNCHPAD_WASM_UPDATED', LAUNCHPAD_WASM_UPDATED_SCHEMA],
   ['LAUNCHPAD_COLLECTION_UPGRADED', LAUNCHPAD_COLLECTION_UPGRADED_SCHEMA],
+  // Issue #456: listing ownership reconciliation
+  ['LISTING_OWNERSHIP_RECONCILED', LISTING_OWNERSHIP_RECONCILED_SCHEMA],
 ]);
 
 // ── Schema-driven decoder ─────────────────────────────────────────────────────
