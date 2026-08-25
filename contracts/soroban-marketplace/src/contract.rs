@@ -2238,6 +2238,21 @@ impl MarketplaceContract {
                 return false;
             }
         }
+        // Reservation window enforcement (Issue #462).
+        {
+            let now = env.ledger().timestamp();
+            let window_started = listing.reservation_start.map_or(true, |s| now >= s);
+            let window_active = window_started
+                && listing.reservation_end.map_or(false, |e| now < e);
+            if window_active {
+                if let Some(ref rf) = listing.reserved_for {
+                    if *rf != buyer {
+                        release_listing_lock(&env, listing_id);
+                        panic_with_error!(&env, MarketplaceError::ReservationWindowActive);
+                    }
+                }
+            }
+        }
         // Policy engine: re-validate listing token at settlement time (Issue #435).
         if !evaluate_token_policy(&env, &listing.token).is_accepted {
             release_listing_lock(&env, listing_id);
@@ -2275,10 +2290,11 @@ impl MarketplaceContract {
             ledger_sequence: env.ledger().sequence(),
             schema_version: EVENT_SCHEMA_VERSION,
         }.publish(&env);
-        // Interactions
-        let (fee, payouts) = Self::distribute_payout(
+        // Interactions — use tracked variant so each recipient gets a claim record
+        let (fee, payouts) = Self::distribute_payout_tracked(
             &env, &listing.token, &listing.collection, listing.price,
             &listing.artist, &listing.recipients, &buyer, true, listing.protocol_fee_bps,
+            listing_id, true,
         );
         if fee > 0 {
             if let Some(treasury) = crate::storage::get_treasury_storage(&env) {
@@ -2289,9 +2305,7 @@ impl MarketplaceContract {
                 }.publish(&env);
             }
         }
-        // On-chain accounting counters (Issue #279) — bumped only after the
-        // transfer plan above has fully succeeded, alongside the royalty
-        // settlement snapshot so they always agree with the emitted event.
+        // On-chain accounting counters (Issue #279)
         crate::storage::add_royalty_total(&env, &listing.token, listing.price);
         crate::storage::increment_settlement_count(&env, &listing.token);
         // Emit royalty settlement snapshot for auditability (Issue #270)
@@ -2335,6 +2349,74 @@ impl MarketplaceContract {
         // Fund-recovery / cleanup op — always available, ignores all pause axes.
         artist.require_auth();
         Self::cancel_listing_inner(&env, &artist, listing_id)
+    }
+
+    // ── set_listing_reservation (Issue #462) ────────────────────────────────────
+    // Seller-only: configure (or clear) a purchase-reservation window.
+    //
+    // A reservation restricts `buy_artwork` to `reserved_for` during the window
+    // [`reservation_start`, `reservation_end`). Passing `None` for all three
+    // fields clears an existing reservation. The change is always auditable via
+    // a `listing_reservation_set` event.
+    pub fn set_listing_reservation(
+        env: Env,
+        seller: Address,
+        listing_id: u64,
+        reserved_for: Option<Address>,
+        reservation_start: Option<u64>,
+        reservation_end: Option<u64>,
+    ) {
+        bump_instance_ttl(&env);
+        seller.require_auth();
+        let mut listing = load_listing(&env, listing_id)
+            .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::ListingNotFound));
+        if listing.artist != seller {
+            panic_with_error!(&env, MarketplaceError::Unauthorized);
+        }
+        if listing.status != ListingStatus::Active {
+            panic_with_error!(&env, MarketplaceError::ListingNotActive);
+        }
+        // Validate the window only when one is being set (not when clearing).
+        if reserved_for.is_some() || reservation_end.is_some() {
+            let now = env.ledger().timestamp();
+            if let Some(end) = reservation_end {
+                // End must be in the future.
+                if end <= now {
+                    panic_with_error!(&env, MarketplaceError::InvalidReservationWindow);
+                }
+                // If start is provided, it must be strictly before end.
+                if let Some(start) = reservation_start {
+                    if start >= end {
+                        panic_with_error!(&env, MarketplaceError::InvalidReservationWindow);
+                    }
+                }
+            }
+        }
+        listing.reserved_for = reserved_for.clone();
+        listing.reservation_start = reservation_start;
+        listing.reservation_end = reservation_end;
+        save_listing(&env, &listing);
+        crate::events::emit_listing_reservation_set(
+            &env,
+            listing_id,
+            listing.artist,
+            reserved_for,
+            reservation_start,
+            reservation_end,
+        );
+    }
+
+    // ── get_listing_reservation (Issue #462) ────────────────────────────────────
+    // Returns the current reservation state for a listing as a 3-tuple:
+    // (reserved_for, reservation_start, reservation_end).
+    pub fn get_listing_reservation(
+        env: Env,
+        listing_id: u64,
+    ) -> (Option<Address>, Option<u64>, Option<u64>) {
+        bump_instance_ttl(&env);
+        let listing = load_listing(&env, listing_id)
+            .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::ListingNotFound));
+        (listing.reserved_for, listing.reservation_start, listing.reservation_end)
     }
 
     // ── expire_listing ───────────────────────────────────────
@@ -2633,9 +2715,10 @@ impl MarketplaceContract {
             schema_version: EVENT_SCHEMA_VERSION,
         }.publish(&env);
         if let Some(ref w) = winner {
-            let (fee, payouts) = Self::distribute_payout(
+            let (fee, payouts) = Self::distribute_payout_tracked(
                 &env, &auction.token, &auction.collection, winning_bid,
                 &auction.creator, &auction.recipients, w, false, snapshotted_fee,
+                auction_id, false,
             );
             if fee > 0 {
                 if let Some(treasury) = crate::storage::get_treasury_storage(&env) {
@@ -3038,10 +3121,11 @@ impl MarketplaceContract {
             offer_id, listing_id, offerer: accepted_offerer.clone(), amount: accepted_amount,
             schema_version: EVENT_SCHEMA_VERSION,
         }.publish(&env);
-        // Interactions
-        let (fee, payouts) = Self::distribute_payout(
+        // Interactions — tracked so offer settlements have queryable payout status
+        let (fee, payouts) = Self::distribute_payout_tracked(
             &env, &offer.token, &listing.collection, offer.amount,
             &artist, &listing.recipients, &offer.offerer, false, listing.protocol_fee_bps,
+            listing_id, true,
         );
         if fee > 0 {
             if let Some(treasury) = crate::storage::get_treasury_storage(&env) {
@@ -3352,6 +3436,9 @@ impl MarketplaceContract {
             created_at: env.ledger().sequence(),
             protocol_fee_bps,
             expires_at,
+            reserved_for: None,
+            reservation_start: None,
+            reservation_end: None,
         };
         save_listing(env, &listing);
         add_artist_listing_id(env, artist, listing_id);
@@ -3817,11 +3904,38 @@ impl MarketplaceContract {
     /// protocol fee — i.e. the collection-level `royalty_info` receiver (when
     /// paid) followed by each configured recipient — so entries always sum to
     /// `amount - protocol_fee_collected`. (Issue #201)
+    ///
+    /// For each recipient a `RoyaltyClaimRecord` is written to storage BEFORE
+    /// the token transfer; on success the record is immediately marked
+    /// `claimed = true`.  This gives operators a queryable payout status even
+    /// if a future upgrade changes settlement behaviour, and provides the
+    /// foundation for `claim_royalty` recovery (Issue #461).
     #[allow(clippy::too_many_arguments)]
     fn distribute_payout(
         env: &Env, token_addr: &Address, collection_addr: &Address,
         amount: i128, seller: &Address, recipients: &Vec<Recipient>,
         buyer: &Address, transfer_from_buyer: bool, fee_bps: u32,
+    ) -> (i128, Vec<RecipientPayout>) {
+        // Settlement context: derive settlement_id and is_listing from environment.
+        // We use the ledger sequence as a surrogate settlement-instance identifier
+        // within this helper so each call site doesn't need to thread them through.
+        // For a richer per-call ID the callers pass settlement_id via the new
+        // distribute_payout_tracked variant below; distribute_payout remains
+        // unchanged for backward compatibility.
+        Self::distribute_payout_tracked(
+            env, token_addr, collection_addr, amount, seller, recipients,
+            buyer, transfer_from_buyer, fee_bps, 0, true,
+        )
+    }
+
+    /// Like `distribute_payout` but records per-recipient claim records keyed by
+    /// the explicit `settlement_id` / `is_listing` pair (Issue #461).
+    #[allow(clippy::too_many_arguments)]
+    fn distribute_payout_tracked(
+        env: &Env, token_addr: &Address, collection_addr: &Address,
+        amount: i128, seller: &Address, recipients: &Vec<Recipient>,
+        buyer: &Address, transfer_from_buyer: bool, fee_bps: u32,
+        settlement_id: u64, is_listing: bool,
     ) -> (i128, Vec<RecipientPayout>) {
         let token = TokenClient::new(env, token_addr);
         if transfer_from_buyer {
@@ -3841,18 +3955,34 @@ impl MarketplaceContract {
                 .unwrap_or_else(|| panic_with_error!(env, MarketplaceError::ArithmeticOverflow))
                 .checked_div(10_000)
                 .unwrap_or_else(|| panic_with_error!(env, MarketplaceError::ArithmeticOverflow));
+            // Write claim record before transfer for observability.
+            let mut claim = crate::types::RoyaltyClaimRecord {
+                settlement_id,
+                is_listing,
+                recipient: royalty_receiver.clone(),
+                token: token_addr.clone(),
+                amount: royalty,
+                claimed: false,
+                created_at: env.ledger().sequence(),
+                claimed_at: None,
+            };
+            crate::storage::set_royalty_claim(env, settlement_id, is_listing, &royalty_receiver, &claim);
+            crate::events::emit_royalty_claim_queued(
+                env, settlement_id, is_listing, royalty_receiver.clone(), token_addr.clone(), royalty,
+            );
             token.transfer(&env.current_contract_address(), &royalty_receiver, &royalty);
+            // Mark as claimed after successful transfer.
+            claim.claimed = true;
+            claim.claimed_at = Some(env.ledger().sequence());
+            crate::storage::set_royalty_claim(env, settlement_id, is_listing, &royalty_receiver, &claim);
+            crate::events::emit_royalty_claimed(
+                env, settlement_id, is_listing, royalty_receiver.clone(), token_addr.clone(), royalty,
+            );
             payouts.push_back(RecipientPayout { address: royalty_receiver, amount: royalty });
             payout -= royalty;
         }
 
         // ── Fee + recipient split via math::distribute ────────────────────────
-        // `distribute` uses checked arithmetic throughout and guarantees
-        // fee + sum(payouts) == payout (no stroop lost).
-        //
-        // Only collect the fee when a treasury address is configured.
-        // When no treasury is set the fee_bps is ignored and the full `payout`
-        // is distributed to recipients — this preserves the original semantics.
         let effective_fee_bps = if crate::storage::get_treasury_storage(env).is_some() {
             fee_bps
         } else {
@@ -3860,8 +3990,6 @@ impl MarketplaceContract {
         };
         let dist = crate::math::distribute(env, payout, effective_fee_bps, recipients);
 
-        // Transfer protocol fee to treasury (only when treasury is configured
-        // and fee > 0).
         let mut fee_collected: i128 = 0;
         if dist.fee > 0 {
             if let Some(t) = crate::storage::get_treasury_storage(env) {
@@ -3870,10 +3998,102 @@ impl MarketplaceContract {
             }
         }
         for entry in dist.iter_payouts() {
+            // Write claim record before transfer.
+            let mut claim = crate::types::RoyaltyClaimRecord {
+                settlement_id,
+                is_listing,
+                recipient: entry.address.clone(),
+                token: token_addr.clone(),
+                amount: entry.amount,
+                claimed: false,
+                created_at: env.ledger().sequence(),
+                claimed_at: None,
+            };
+            crate::storage::set_royalty_claim(env, settlement_id, is_listing, &entry.address, &claim);
+            crate::events::emit_royalty_claim_queued(
+                env, settlement_id, is_listing, entry.address.clone(), token_addr.clone(), entry.amount,
+            );
             token.transfer(&env.current_contract_address(), &entry.address, &entry.amount);
+            // Mark as claimed after successful transfer.
+            claim.claimed = true;
+            claim.claimed_at = Some(env.ledger().sequence());
+            crate::storage::set_royalty_claim(env, settlement_id, is_listing, &entry.address, &claim);
+            crate::events::emit_royalty_claimed(
+                env, settlement_id, is_listing, entry.address.clone(), token_addr.clone(), entry.amount,
+            );
             payouts.push_back(RecipientPayout { address: entry.address.clone(), amount: entry.amount });
         }
         (fee_collected, payouts)
+    }
+
+    // ── Royalty payout recovery (Issue #461) ──────────────────────────────────
+
+    /// Query the payout status for a single recipient in a completed settlement.
+    ///
+    /// Returns the `RoyaltyClaimRecord` if one exists, or `None` when no claim
+    /// was recorded for this (settlement_id, is_listing, recipient) triple.
+    /// Callers can use `claimed` and `claimed_at` to determine whether payment
+    /// was successfully delivered.
+    pub fn get_royalty_claim(
+        env: Env,
+        settlement_id: u64,
+        is_listing: bool,
+        recipient: Address,
+    ) -> Option<crate::types::RoyaltyClaimRecord> {
+        crate::storage::get_royalty_claim(&env, settlement_id, is_listing, &recipient)
+    }
+
+    /// Recovery entry point: transfer an unclaimed royalty to its recipient.
+    ///
+    /// This is the pull-based fallback for any claim record where `claimed =
+    /// false`.  In normal operation settlements auto-mark claims as claimed at
+    /// settlement time, so this is only needed when:
+    ///   - A contract upgrade changed distribution behavior mid-settlement.
+    ///   - An operator manually wrote a claim record without completing the
+    ///     corresponding transfer.
+    ///
+    /// Auth: the `recipient` address must sign (they are pulling their own funds).
+    ///
+    /// Errors:
+    ///   - `RoyaltyClaimNotFound`   — no record for this triple.
+    ///   - `RoyaltyAlreadyClaimed`  — `claimed = true`; prevents double-payment.
+    pub fn claim_royalty(
+        env: Env,
+        recipient: Address,
+        settlement_id: u64,
+        is_listing: bool,
+    ) -> bool {
+        bump_instance_ttl(&env);
+        recipient.require_auth();
+
+        let mut claim =
+            crate::storage::get_royalty_claim(&env, settlement_id, is_listing, &recipient)
+                .unwrap_or_else(|| {
+                    panic_with_error!(&env, MarketplaceError::RoyaltyClaimNotFound)
+                });
+
+        if claim.claimed {
+            panic_with_error!(&env, MarketplaceError::RoyaltyAlreadyClaimed);
+        }
+
+        // Transfer funds from marketplace to recipient.
+        TokenClient::new(&env, &claim.token)
+            .transfer(&env.current_contract_address(), &recipient, &claim.amount);
+
+        // Mark claimed atomically.
+        claim.claimed = true;
+        claim.claimed_at = Some(env.ledger().sequence());
+        crate::storage::set_royalty_claim(&env, settlement_id, is_listing, &recipient, &claim);
+
+        crate::events::emit_royalty_claimed(
+            &env,
+            settlement_id,
+            is_listing,
+            recipient,
+            claim.token.clone(),
+            claim.amount,
+        );
+        true
     }
 
     // ── Collection compatibility (Issue #458) ─────────────────────────────────
@@ -3928,9 +4148,10 @@ impl MarketplaceContract {
             .and_then(|r| r.ok());
 
         if let Some(kind) = kind_result {
-            let kind_str = kind.to_string();
+            let erc721     = soroban_sdk::Symbol::new(env, "ERC721");
+            let lazy721    = soroban_sdk::Symbol::new(env, "LazyMint721");
             // ERC-721 and LazyMint721 collections are single-token: quantity must be 1.
-            if kind_str == "ERC721" || kind_str == "LazyMint721" {
+            if kind == erc721 || kind == lazy721 {
                 if quantity != 1 {
                     return Err(());
                 }

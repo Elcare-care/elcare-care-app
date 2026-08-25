@@ -26,6 +26,15 @@ mod governance_tests;
 #[cfg(test)]
 mod ownership_tests;
 
+#[cfg(test)]
+mod royalty_recovery_tests;
+
+#[cfg(test)]
+mod reservation_tests;
+
+#[cfg(test)]
+mod asset_equivalence_tests;
+
 pub use contract::MarketplaceContract;
 pub use types::{
     BatchItemError, BidRecord, CancelReason, CollectionStandard, Listing, ListingStatus,
