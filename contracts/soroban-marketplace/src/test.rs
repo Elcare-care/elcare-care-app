@@ -8909,6 +8909,9 @@ fn setup_legacy_v1_fixture(
                     created_at: 0,
                     protocol_fee_bps: 0,
                     expires_at: None,
+                    reserved_for: None,
+                    reservation_start: None,
+                    reservation_end: None,
                 },
             );
         }

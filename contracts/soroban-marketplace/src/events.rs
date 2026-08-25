@@ -1482,3 +1482,51 @@ pub fn emit_royalty_claimed(
     }
     .publish(env);
 }
+
+// ── Issue #462: Listing Reservation Window Events ─────────────────────────────
+
+pub const LISTING_RESERVATION_SET: &str = "listing_reservation_set";
+
+/// Emitted whenever `set_listing_reservation` is called (including clears).
+///
+/// The indexer uses this to maintain a current-reservation projection without
+/// re-fetching the full listing record. When `reserved_for` is `None` the
+/// reservation has been cleared.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ListingReservationSetEvent {
+    pub listing_id: u64,
+    pub artist: Address,
+    /// `None` when the reservation is being cleared.
+    pub reserved_for: Option<Address>,
+    pub reservation_start: Option<u64>,
+    pub reservation_end: Option<u64>,
+    pub ledger_sequence: u32,
+}
+
+impl ListingReservationSetEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, LISTING_RESERVATION_SET),), self);
+    }
+}
+
+pub fn emit_listing_reservation_set(
+    env: &Env,
+    listing_id: u64,
+    artist: Address,
+    reserved_for: Option<Address>,
+    reservation_start: Option<u64>,
+    reservation_end: Option<u64>,
+) {
+    ListingReservationSetEvent {
+        listing_id,
+        artist,
+        reserved_for,
+        reservation_start,
+        reservation_end,
+        ledger_sequence: env.ledger().sequence(),
+    }
+    .publish(env);
+}

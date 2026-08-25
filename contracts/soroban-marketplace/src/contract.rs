@@ -2238,6 +2238,21 @@ impl MarketplaceContract {
                 return false;
             }
         }
+        // Reservation window enforcement (Issue #462).
+        {
+            let now = env.ledger().timestamp();
+            let window_started = listing.reservation_start.map_or(true, |s| now >= s);
+            let window_active = window_started
+                && listing.reservation_end.map_or(false, |e| now < e);
+            if window_active {
+                if let Some(ref rf) = listing.reserved_for {
+                    if *rf != buyer {
+                        release_listing_lock(&env, listing_id);
+                        panic_with_error!(&env, MarketplaceError::ReservationWindowActive);
+                    }
+                }
+            }
+        }
         // Policy engine: re-validate listing token at settlement time (Issue #435).
         if !evaluate_token_policy(&env, &listing.token).is_accepted {
             release_listing_lock(&env, listing_id);
@@ -2334,6 +2349,74 @@ impl MarketplaceContract {
         // Fund-recovery / cleanup op — always available, ignores all pause axes.
         artist.require_auth();
         Self::cancel_listing_inner(&env, &artist, listing_id)
+    }
+
+    // ── set_listing_reservation (Issue #462) ────────────────────────────────────
+    // Seller-only: configure (or clear) a purchase-reservation window.
+    //
+    // A reservation restricts `buy_artwork` to `reserved_for` during the window
+    // [`reservation_start`, `reservation_end`). Passing `None` for all three
+    // fields clears an existing reservation. The change is always auditable via
+    // a `listing_reservation_set` event.
+    pub fn set_listing_reservation(
+        env: Env,
+        seller: Address,
+        listing_id: u64,
+        reserved_for: Option<Address>,
+        reservation_start: Option<u64>,
+        reservation_end: Option<u64>,
+    ) {
+        bump_instance_ttl(&env);
+        seller.require_auth();
+        let mut listing = load_listing(&env, listing_id)
+            .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::ListingNotFound));
+        if listing.artist != seller {
+            panic_with_error!(&env, MarketplaceError::Unauthorized);
+        }
+        if listing.status != ListingStatus::Active {
+            panic_with_error!(&env, MarketplaceError::ListingNotActive);
+        }
+        // Validate the window only when one is being set (not when clearing).
+        if reserved_for.is_some() || reservation_end.is_some() {
+            let now = env.ledger().timestamp();
+            if let Some(end) = reservation_end {
+                // End must be in the future.
+                if end <= now {
+                    panic_with_error!(&env, MarketplaceError::InvalidReservationWindow);
+                }
+                // If start is provided, it must be strictly before end.
+                if let Some(start) = reservation_start {
+                    if start >= end {
+                        panic_with_error!(&env, MarketplaceError::InvalidReservationWindow);
+                    }
+                }
+            }
+        }
+        listing.reserved_for = reserved_for.clone();
+        listing.reservation_start = reservation_start;
+        listing.reservation_end = reservation_end;
+        save_listing(&env, &listing);
+        crate::events::emit_listing_reservation_set(
+            &env,
+            listing_id,
+            listing.artist,
+            reserved_for,
+            reservation_start,
+            reservation_end,
+        );
+    }
+
+    // ── get_listing_reservation (Issue #462) ────────────────────────────────────
+    // Returns the current reservation state for a listing as a 3-tuple:
+    // (reserved_for, reservation_start, reservation_end).
+    pub fn get_listing_reservation(
+        env: Env,
+        listing_id: u64,
+    ) -> (Option<Address>, Option<u64>, Option<u64>) {
+        bump_instance_ttl(&env);
+        let listing = load_listing(&env, listing_id)
+            .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::ListingNotFound));
+        (listing.reserved_for, listing.reservation_start, listing.reservation_end)
     }
 
     // ── expire_listing ───────────────────────────────────────
@@ -3353,6 +3436,9 @@ impl MarketplaceContract {
             created_at: env.ledger().sequence(),
             protocol_fee_bps,
             expires_at,
+            reserved_for: None,
+            reservation_start: None,
+            reservation_end: None,
         };
         save_listing(env, &listing);
         add_artist_listing_id(env, artist, listing_id);

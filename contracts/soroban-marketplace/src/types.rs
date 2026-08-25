@@ -186,6 +186,12 @@ pub enum MarketplaceError {
     /// `claim_royalty` was called for a (settlement_id, is_listing, recipient)
     /// triple that has no corresponding claim record in storage.
     RoyaltyClaimNotFound = 64,
+    /// `buy_artwork` was called during an active reservation window by a buyer
+    /// who is not the reserved address (`reserved_for`).
+    ReservationWindowActive = 65,
+    /// `set_listing_reservation` was called with an invalid window:
+    /// `reservation_end <= reservation_start`, or `reservation_end` is in the past.
+    InvalidReservationWindow = 66,
 }
 
 /// One pending or completed royalty claim for a single recipient.
@@ -299,6 +305,16 @@ pub struct Listing {
     pub created_at: u32,
     pub protocol_fee_bps: u32,
     pub expires_at: Option<u64>,
+    /// Address that has the exclusive right to purchase during the reservation
+    /// window. `None` means no reservation is active.
+    pub reserved_for: Option<Address>,
+    /// Ledger timestamp at which the reservation window opens (inclusive).
+    /// `None` means the window has already started (i.e. effective immediately).
+    pub reservation_start: Option<u64>,
+    /// Ledger timestamp at which the reservation window closes (exclusive).
+    /// Once `now >= reservation_end`, the listing is open to any buyer.
+    /// `None` means no reservation end is set.
+    pub reservation_end: Option<u64>,
 }
 
 #[contracttype]

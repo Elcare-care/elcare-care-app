@@ -100,6 +100,9 @@ fn get_effective_owner_active_listing_returns_artist() {
         created_at: 1,
         protocol_fee_bps: 0,
         expires_at: None,
+        reserved_for: None,
+        reservation_start: None,
+        reservation_end: None,
     };
     env.as_contract(&cid, || {
         crate::storage::save_listing(&env, &listing);
@@ -139,6 +142,9 @@ fn get_effective_owner_sold_listing_returns_buyer() {
         created_at: 1,
         protocol_fee_bps: 0,
         expires_at: None,
+        reserved_for: None,
+        reservation_start: None,
+        reservation_end: None,
     };
     env.as_contract(&cid, || {
         crate::storage::save_listing(&env, &listing);
@@ -177,6 +183,9 @@ fn get_effective_owner_cancelled_listing_returns_artist() {
         created_at: 1,
         protocol_fee_bps: 0,
         expires_at: None,
+        reserved_for: None,
+        reservation_start: None,
+        reservation_end: None,
     };
     env.as_contract(&cid, || {
         crate::storage::save_listing(&env, &listing);
@@ -232,6 +241,9 @@ fn reconcile_listing_owner_succeeds_and_emits_event() {
         created_at: 1,
         protocol_fee_bps: 0,
         expires_at: None,
+        reserved_for: None,
+        reservation_start: None,
+        reservation_end: None,
     };
     env.as_contract(&cid, || {
         crate::storage::save_listing(&env, &listing);
@@ -297,6 +309,9 @@ fn reconcile_listing_owner_is_idempotent() {
         created_at: 1,
         protocol_fee_bps: 0,
         expires_at: None,
+        reserved_for: None,
+        reservation_start: None,
+        reservation_end: None,
     };
     env.as_contract(&cid, || {
         crate::storage::save_listing(&env, &listing);
@@ -348,6 +363,9 @@ fn reconcile_listing_owner_rejects_ownership_mismatch() {
         created_at: 1,
         protocol_fee_bps: 0,
         expires_at: None,
+        reserved_for: None,
+        reservation_start: None,
+        reservation_end: None,
     };
     env.as_contract(&cid, || {
         crate::storage::save_listing(&env, &listing);
@@ -420,6 +438,9 @@ fn reconcile_listing_owner_requires_collection_admin_role() {
         created_at: 1,
         protocol_fee_bps: 0,
         expires_at: None,
+        reserved_for: None,
+        reservation_start: None,
+        reservation_end: None,
     };
     env.as_contract(&cid, || {
         crate::storage::save_listing(&env, &listing);
@@ -472,6 +493,9 @@ fn reconcile_already_sold_listing_updates_owner() {
         created_at: 1,
         protocol_fee_bps: 0,
         expires_at: None,
+        reserved_for: None,
+        reservation_start: None,
+        reservation_end: None,
     };
     env.as_contract(&cid, || {
         crate::storage::save_listing(&env, &listing);
