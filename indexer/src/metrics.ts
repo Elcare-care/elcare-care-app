@@ -484,6 +484,49 @@ export const reconcilerSkippedTotal = new client.Counter({
   labelNames: ['reason'],
 });
 
+// ── Abuse / anomaly detection metrics (Issue #539) ────────────────────────────
+//
+// route_family: 'search' | 'sse' | 'wallet-activity' | 'tx-lookup'
+// key_type:     'wallet' | 'ip_hash' — the label is always the KIND of key,
+//               never the raw wallet address or IP itself, so metric labels
+//               never become a long-lived per-user identity log. A wallet
+//               address is a public blockchain identifier, not verified
+//               identity — see indexer/src/api/abuse-detection.ts.
+
+/** Total requests rejected for exceeding a per-route-family abuse quota. */
+export const abuseQuotaExceededTotal = new client.Counter({
+  name: 'elcarehub_abuse_quota_exceeded_total',
+  help: 'Total requests rejected for exceeding a per-route-family abuse quota, by route family and key type',
+  labelNames: ['route_family', 'key_type'],
+});
+
+/** Total abuse anomaly signals detected (quota breaches, blocklist hits, etc). */
+export const abuseAnomalyDetectedTotal = new client.Counter({
+  name: 'elcarehub_abuse_anomaly_detected_total',
+  help: 'Total abuse anomaly signals detected, by route family, key type, and reason',
+  labelNames: ['route_family', 'key_type', 'reason'],
+});
+
+/** Total requests rejected because the key was on the temporary abuse blocklist. */
+export const abuseBlockedRequestsTotal = new client.Counter({
+  name: 'elcarehub_abuse_blocked_requests_total',
+  help: 'Total requests rejected because the key was on the temporary abuse blocklist, by route family and key type',
+  labelNames: ['route_family', 'key_type'],
+});
+
+/** Current number of keys (wallet or IP hash) on the temporary abuse blocklist. */
+export const abuseBlocklistActiveGauge = new client.Gauge({
+  name: 'elcarehub_abuse_blocklist_active',
+  help: 'Current number of keys (wallet or IP hash) on the temporary abuse blocklist',
+});
+
+/** Total times abuse detection failed open because Redis was unavailable. */
+export const abuseDetectionRedisFailureTotal = new client.Counter({
+  name: 'elcarehub_abuse_detection_redis_failures_total',
+  help: 'Total times abuse detection failed open (request allowed) because Redis was unavailable, by operation',
+  labelNames: ['operation'],
+});
+
 // ── Expose metrics handler ────────────────────────────────────────────────────
 
 export async function handleMetrics(req: express.Request, res: express.Response) {

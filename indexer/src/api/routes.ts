@@ -6,6 +6,14 @@ import { Prisma } from '@prisma/client';
 import { cacheMiddleware } from './cache-middleware.js';
 import { etagMiddleware } from './etag-middleware.js';
 import { strictRateLimiter, sseConcurrencyGuard, heavyRateLimiter, lightRateLimiter, mediumRateLimiter, operationalRateLimiter } from './rate-limit-middleware.js';
+import {
+  abuseDetection,
+  blockKey,
+  unblockKey,
+  listBlocklist,
+  isBlocked,
+  ABUSE_BLOCK_DURATION_SECONDS,
+} from './abuse-detection.js';
 import { badRequest, notFound, internalError } from './errors.js';
 import {
   versioningMiddleware,
@@ -210,7 +218,7 @@ const serializeOffers = (rows: any[]) => serialize(rows).map((row: any) => withD
 
 // ── GET /events (SSE) ─────────────────────────────────────────────────────────
 
-router.get('/events', sseConcurrencyGuard, validateQuery(eventsQuerySchema), (req: Request, res: Response) => {
+router.get('/events', abuseDetection('sse'), sseConcurrencyGuard, validateQuery(eventsQuerySchema), (req: Request, res: Response) => {
   if (sseClients.size >= MAX_SSE_CONNECTIONS) {
     return res.status(503).json({ error: { code: 'SERVICE_UNAVAILABLE', message: 'Too many SSE connections', class: 'CLIENT_ERROR' } });
   }
@@ -475,7 +483,7 @@ router.get('/listings/:id', lightRateLimiter, cacheMiddleware(TTL.LISTING_DETAIL
 
 // ── GET /listings/:id/history ─────────────────────────────────────────────────
 
-router.get('/listings/:id/history', heavyRateLimiter, async (req: Request, res: Response, next: NextFunction) => {
+router.get('/listings/:id/history', heavyRateLimiter, abuseDetection('tx-lookup'), async (req: Request, res: Response, next: NextFunction) => {
   const id = req.params.id as string;
   if (!/^\d+$/.test(id)) {
     return next(badRequest('Invalid ID format'));
@@ -883,7 +891,7 @@ router.get('/creators/:address/collections', lightRateLimiter, validateQuery(cre
 
 // ── GET /wallets/:address/activity ────────────────────────────────────────────
 
-router.get('/wallets/:address/activity', strictRateLimiter, validateQuery(walletActivityQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
+router.get('/wallets/:address/activity', strictRateLimiter, abuseDetection('wallet-activity'), validateQuery(walletActivityQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
   const address = req.params.address as string;
   const { limit, offset, cursor_ledger, cursor_direction } = (req as any).validatedQuery;
   const take = Math.min(limit ?? 50, 200);
@@ -923,7 +931,7 @@ router.get('/wallets/:address/activity', strictRateLimiter, validateQuery(wallet
 
 // ── GET /wallets/:address/royalty-stats ───────────────────────────────────────
 
-router.get('/wallets/:address/royalty-stats', strictRateLimiter, async (req: Request, res: Response, next: NextFunction) => {
+router.get('/wallets/:address/royalty-stats', strictRateLimiter, abuseDetection('wallet-activity'), async (req: Request, res: Response, next: NextFunction) => {
   // Ensure rate-limit header is always present on this endpoint for ISSUE-068
   res.setHeader('RateLimit-Limit', String(20));
   const { address } = req.params;
@@ -968,7 +976,7 @@ router.get('/wallets/:address/royalty-stats', strictRateLimiter, async (req: Req
 // the given recipient address, newest-first, optionally bounded to the
 // inclusive ledger-sequence window [from, to]. Cached for 60 seconds.
 
-router.get('/wallets/:address/royalty-breakdown', lightRateLimiter, cacheMiddleware(60), validateQuery(royaltyBreakdownQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
+router.get('/wallets/:address/royalty-breakdown', lightRateLimiter, abuseDetection('wallet-activity'), cacheMiddleware(60), validateQuery(royaltyBreakdownQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
   const address = req.params.address as string;
   if (!isValidStellarAddress(address)) {
     return next(badRequest(STELLAR_ADDRESS_ERROR));
@@ -1420,6 +1428,82 @@ router.delete('/admin/contracts/:id', operationalRateLimiter, authMiddleware('op
   }
 });
 
+// ── Abuse detection operator workflow (Issue #539) ───────────────────────────
+//
+// Temporary blocklist for keys (wallet:<address> or ip:<hash>, matching the
+// key format abuse-detection.ts uses internally) identified as abusive.
+// Gated by the same operator-token auth (`authMiddleware('operator')`) as
+// the other /admin/* routes above. Blocks are TTL-bound in Redis — there is
+// no permanent ban list here, by design: temporary friction discourages
+// abuse without requiring a human to remember to lift a block, and without
+// permanently penalizing a wallet/IP that may later be reused legitimately.
+
+// ── POST /admin/abuse/block ───────────────────────────────────────────────────
+// Body: { key: string, durationSeconds?: number, reason?: string }
+// `key` must be the exact abuse-detection key, e.g. "wallet:G..." or "ip:<hash>".
+
+router.post('/admin/abuse/block', operationalRateLimiter, authMiddleware('operator'), async (req: Request, res: Response, next: NextFunction) => {
+  const { key, durationSeconds, reason } = req.body ?? {};
+
+  if (!key || typeof key !== 'string' || key.trim() === '') {
+    return next(badRequest('key is required (e.g. "wallet:G..." or "ip:<hash>")'));
+  }
+  const duration = durationSeconds !== undefined ? Number(durationSeconds) : ABUSE_BLOCK_DURATION_SECONDS;
+  if (!Number.isFinite(duration) || duration <= 0 || duration > 30 * 24 * 60 * 60) {
+    return next(badRequest('durationSeconds must be a positive number of seconds (max 30 days)'));
+  }
+
+  try {
+    await blockKey(key.trim(), duration, typeof reason === 'string' && reason.trim() ? reason.trim() : 'operator_block');
+    res.status(201).json({ key: key.trim(), blocked: true, durationSeconds: duration });
+  } catch (err) {
+    next(internalError('Failed to add abuse blocklist entry'));
+  }
+});
+
+// ── DELETE /admin/abuse/block/:key ────────────────────────────────────────────
+// :key is URL-encoded, e.g. /admin/abuse/block/wallet%3AG...
+
+router.delete('/admin/abuse/block/:key', operationalRateLimiter, authMiddleware('operator'), async (req: Request, res: Response, next: NextFunction) => {
+  const key = decodeURIComponent(req.params.key || '');
+  if (!key) return next(badRequest('key is required'));
+
+  try {
+    await unblockKey(key);
+    res.json({ key, blocked: false });
+  } catch (err) {
+    next(internalError('Failed to remove abuse blocklist entry'));
+  }
+});
+
+// ── GET /admin/abuse/blocklist ────────────────────────────────────────────────
+// Lists all currently-active temporary blocks with remaining TTL.
+
+router.get('/admin/abuse/blocklist', operationalRateLimiter, authMiddleware('operator'), async (_req: Request, res: Response, next: NextFunction) => {
+  try {
+    const entries = await listBlocklist();
+    res.json({ entries, total: entries.length });
+  } catch (err) {
+    next(internalError('Failed to list abuse blocklist'));
+  }
+});
+
+// ── GET /admin/abuse/block/:key ───────────────────────────────────────────────
+// Checks whether a single key is currently blocked (used by operators to
+// verify a block took effect without listing the entire blocklist).
+
+router.get('/admin/abuse/block/:key', operationalRateLimiter, authMiddleware('operator'), async (req: Request, res: Response, next: NextFunction) => {
+  const key = decodeURIComponent(req.params.key || '');
+  if (!key) return next(badRequest('key is required'));
+
+  try {
+    const result = await isBlocked(key);
+    res.json({ key, blocked: result.blocked, ttlSeconds: result.ttlSeconds });
+  } catch (err) {
+    next(internalError('Failed to check abuse blocklist status'));
+  }
+});
+
 // ── GET /tokens ───────────────────────────────────────────────────────────────
 // Returns the list of whitelisted payment tokens.
 // Optional ?active=true filters to only active tokens.
@@ -1442,7 +1526,7 @@ router.get('/tokens', lightRateLimiter, async (req: Request, res: Response, next
 // ── GET /tokens/:address/history ──────────────────────────────────────────────
 // Returns the whitelist event history for a specific token address.
 
-router.get('/tokens/:address/history', lightRateLimiter, async (req: Request, res: Response, next: NextFunction) => {
+router.get('/tokens/:address/history', lightRateLimiter, abuseDetection('tx-lookup'), async (req: Request, res: Response, next: NextFunction) => {
   const address = req.params.address as string;
   const limitRaw  = req.query.limit  as string | undefined;
   const offsetRaw = req.query.offset as string | undefined;
@@ -1579,7 +1663,7 @@ router.get('/stats/top-artists', lightRateLimiter, async (req: Request, res: Res
 // }
 // Entity buckets not requested in ?types= are omitted from the response.
 
-router.get('/search', mediumRateLimiter, validateQuery(searchQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
+router.get('/search', mediumRateLimiter, abuseDetection('search'), validateQuery(searchQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
   const { q, types, limit } = (req as any).validatedQuery as {
     q: string;
     types: Array<'listings' | 'auctions' | 'collections'>;

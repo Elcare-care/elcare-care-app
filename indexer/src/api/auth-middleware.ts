@@ -216,6 +216,9 @@ export const OPERATOR_ROUTES = new Set([
   '/admin/audit',
   '/admin/audit/{requestId}',
   '/admin/audit/stats',
+  '/admin/abuse/block',
+  '/admin/abuse/block/{key}',
+  '/admin/abuse/blocklist',
 ]);
 
 export function classifyRoute(path: string): RoutePolicy {
