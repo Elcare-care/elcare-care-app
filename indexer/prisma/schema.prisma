@@ -821,11 +821,77 @@ model OperationalAudit {
   ipAddress       String?       // client IP address
   userAgent       String?       // client user agent
   createdAt       DateTime      @default(now())
-  
+
   @@index([actor])
   @@index([actionType])
   @@index([createdAt])
   @@index([actor, actionType])
   @@index([actionType, createdAt])
   @@index([requestId])
+}
+
+// ── Privacy requests (Issue #543) ─────────────────────────────────────────────
+//
+// Self-service data export / deletion requests for off-chain, wallet-linked
+// application data (see docs/PRIVACY_POLICY.md sections 4, 6, 7).
+//
+// Wallet identity uses the same trust model as the rest of the "authenticated"
+// route class (X-Wallet-Address header, no signature challenge) — see
+// indexer/src/api/auth-middleware.ts. Because a wallet address is already the
+// caller's claimed identity everywhere else in this API, a PrivacyRequest is
+// considered VERIFIED as soon as it is created; there is no separate proof step.
+//
+// EXPORT requests: `exportPayload` holds the generated export document (JSON) once
+// COMPLETED — see generateExportForWallet() in indexer/src/api/privacy-routes.ts.
+// It contains only ELIGIBLE off-chain records plus a RETAINED section that lists
+// canonical on-chain-mirrored records by reference (ids / tx hashes) for
+// informational completeness; it never contains secrets or signatures.
+//
+// DELETION requests: processDeletionForWallet() removes/anonymises ELIGIBLE
+// off-chain rows for the wallet (e.g. previously generated export payloads) and
+// leaves canonical mirror tables (Listing, Auction, Offer, Bid, RoyaltyPayment,
+// MarketplaceEvent, OperationalAudit, ...) untouched. `retainedRecordsNote`
+// records a human-readable explanation of what could not be deleted and why.
+//
+// Never stored here: private keys, signatures, JWTs, or any other secret.
+
+enum PrivacyRequestType {
+  EXPORT
+  DELETION
+}
+
+enum PrivacyRequestStatus {
+  PENDING     // created, not yet processed
+  VERIFIED    // wallet identity accepted (immediate, see note above)
+  PROCESSING  // export/deletion work in progress
+  COMPLETED   // work finished; see exportPayload / retainedRecordsNote
+  REJECTED    // request rejected before processing (e.g. invalid wallet)
+  FAILED      // processing was attempted but failed
+}
+
+model PrivacyRequest {
+  /// Human-facing id, e.g. "PRIV-A1B2C3D4" — mirrors the SupportReport ("SUP-xxxxxxxx")
+  /// id convention used by the frontend support flow.
+  id                  String                @id
+  walletAddress       String
+  type                PrivacyRequestType
+  status              PrivacyRequestStatus  @default(PENDING)
+  requestedAt         DateTime              @default(now())
+  verifiedAt          DateTime?
+  completedAt         DateTime?
+  /// Generated export document for COMPLETED EXPORT requests. Null for DELETION
+  /// requests and for EXPORT requests that have not completed yet.
+  exportPayload       Json?
+  /// Human-readable explanation of canonical/legal data that was retained
+  /// (not deleted) and why. Set on COMPLETED DELETION requests.
+  retainedRecordsNote String?
+  /// Non-secret audit note (e.g. "processed via self-service flow").
+  auditNote           String?
+  createdAt           DateTime              @default(now())
+  updatedAt           DateTime              @updatedAt
+
+  @@index([walletAddress])
+  @@index([walletAddress, type])
+  @@index([status])
+  @@index([requestedAt])
 }

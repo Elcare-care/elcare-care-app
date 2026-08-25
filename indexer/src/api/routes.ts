@@ -1746,4 +1746,8 @@ router.get('/config/auction', cacheMiddleware(60), async (req: Request, res: Res
 import notificationRouter from './notification-routes.js';
 router.use(notificationRouter);
 
+// ── Privacy routes (Issue #543) ────────────────────────────────────────────────
+import privacyRouter from './privacy-routes.js';
+router.use(privacyRouter);
+
 export default router;

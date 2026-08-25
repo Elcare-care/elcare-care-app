@@ -201,6 +201,9 @@ export const AUTHENTICATED_ROUTES = new Set([
   '/wallets/{address}/activity',
   '/wallets/{address}/royalty-stats',
   '/wallets/{address}/royalty-breakdown',
+  // Issue #543 — wallet-scoped privacy (export/deletion) requests.
+  '/privacy/requests',
+  '/privacy/requests/{id}',
 ]);
 
 export const OPERATOR_ROUTES = new Set([
