@@ -199,6 +199,10 @@ model MarketplaceEvent {
   /// behind the network tip.  On reorg, events past the safe ledger are
   /// hard-deleted (provisional by definition).
   confirmed       Boolean  @default(false)
+  /// Issue #532: position of this event within its ledger transaction, used
+  /// for deterministic same-ledger ordering in the provenance timeline.
+  /// NULL for legacy rows ingested before this field was introduced.
+  eventIndex      Int?
   @@index([actor])
   @@index([eventType])
   @@index([listingId])
@@ -207,6 +211,8 @@ model MarketplaceEvent {
   @@index([contractId])
   @@index([actor, ledgerSequence])
   @@index([contractId, ledgerSequence])
+  // Issue #532: composite index for provenance timeline ordering
+  @@index([ledgerSequence, eventIndex])
   @@unique([listingId, eventType, ledgerSequence])
 }
 
@@ -828,4 +834,63 @@ model OperationalAudit {
   @@index([actor, actionType])
   @@index([actionType, createdAt])
   @@index([requestId])
+}
+
+// ── Moderation Queue (Issue #534) ─────────────────────────────────────────
+enum ModerationStatus {
+  Pending
+  UnderReview
+  Approved
+  Rejected
+  Revoked
+  Reinstated
+}
+
+enum ModerationActionType {
+  Flag
+  Review
+  Approve
+  Reject
+  Revoke
+  Reinstate
+  CollectionCleanup
+}
+
+model ModerationCase {
+  id              Int                  @id @default(autoincrement())
+  targetType      String               // "listing" | "artist" | "collection"
+  targetId        String               // listingId, artist address, or collection address
+  status          ModerationStatus     @default(Pending)
+  reportedBy      String?              // reporter address (optional)
+  assignedTo      String?              // admin address handling the case
+  reason          String               // reason for flagging
+  evidenceRef     String?              // IPFS CID or URL for evidence
+  notes           String?              // off-chain review notes (not on-chain)
+  txHash          String?              // on-chain tx hash for finalized actions
+  resolvedBy      String?              // admin who finalized the action
+  resolvedAt      DateTime?
+  createdAt       DateTime             @default(now())
+  updatedAt       DateTime             @updatedAt
+  actions         ModerationAction[]
+
+  @@index([status])
+  @@index([targetType, targetId])
+  @@index([assignedTo])
+  @@index([createdAt])
+}
+
+model ModerationAction {
+  id              Int                  @id @default(autoincrement())
+  caseId          Int
+  case            ModerationCase       @relation(fields: [caseId], references: [id])
+  actor           String               // admin wallet address
+  actionType      ModerationActionType
+  notes           String?
+  txHash          String?              // on-chain tx hash if applicable
+  successful      Boolean              @default(true)
+  createdAt       DateTime             @default(now())
+
+  @@index([caseId])
+  @@index([actor])
+  @@index([createdAt])
 }
