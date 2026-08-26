@@ -355,13 +355,43 @@ function sanitiseTsQuery(raw: string): string {
   return raw.replace(/[&|!:<>()]/g, ' ').trim();
 }
 
+// Non-default sort options that order by a field other than updatedAtLedger.
+// Ledger-based cursor pagination (cursor_ledger) is only meaningful when the
+// result set is primarily ordered by updatedAtLedger, so these two sorts are
+// rejected in combination with cursor_ledger at the schema level
+// (listingsQuerySchema) — see the comment there for why.
+const PRICE_SORTS = new Set(['price-low', 'price-high']);
+
+/** Map a validated `sort` value (or its absence) to a Prisma `orderBy` clause. */
+function listingsOrderBy(sort: string | undefined, direction: 'asc' | 'desc'): Prisma.ListingOrderByWithRelationInput {
+  switch (sort) {
+    case 'oldest':        return { updatedAtLedger: 'asc' };
+    case 'price-low':     return { price: 'asc' };
+    case 'price-high':    return { price: 'desc' };
+    // "recently-sold" and the default ("newest"/undefined) both order by
+    // updatedAtLedger — recently-sold additionally scopes `where.status`
+    // to 'Sold' (see below) so the same cursor mechanics apply unchanged.
+    case 'recently-sold':
+    case 'newest':
+    default:
+      return { updatedAtLedger: direction };
+  }
+}
+
 router.get('/listings', lightRateLimiter, cacheMiddleware(TTL.LISTINGS_LIST), queryCostGuard(), validateQuery(listingsQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
-  const { artist, owner, status, limit, offset, minPrice, maxPrice, search, cursor_ledger, cursor_direction } =
+  const { artist, owner, status, limit, offset, minPrice, maxPrice, search, sort, collection, token, cursor_ledger, cursor_direction } =
     (req as any).validatedQuery;
   try {
     const where: any = {};
     if (artist) where.artist = artist;
     if (owner) where.owner = owner;
+    if (token) where.token = token;
+    // `collection` is the collection contract address on Listing (not a
+    // relation) — matches FilterSidebar.tsx's `coll.contractAddress` values.
+    // A single selected collection still works fine with `in: [addr]`.
+    if (collection && collection.length > 0) {
+      where.collection = collection.length === 1 ? collection[0] : { in: collection };
+    }
 
     // status=expired is a virtual filter: Cancelled listings whose
     // LISTING_CANCELLED event carries reason.Expired (tag 2).
@@ -380,6 +410,10 @@ router.get('/listings', lightRateLimiter, cacheMiddleware(TTL.LISTINGS_LIST), qu
       where.status = 'Cancelled';
     } else if (status) {
       where.status = status;
+    } else if (sort === 'recently-sold') {
+      // "recently-sold" implicitly scopes to Sold listings when the caller
+      // hasn't already filtered status explicitly.
+      where.status = 'Sold';
     }
 
     if (minPrice !== undefined || maxPrice !== undefined) {
@@ -389,7 +423,10 @@ router.get('/listings', lightRateLimiter, cacheMiddleware(TTL.LISTINGS_LIST), qu
     }
 
     // ── Cursor pagination ─────────────────────────────────────────────────
-    const direction: 'asc' | 'desc' = cursor_direction ?? 'desc';
+    // "oldest" reverses the default direction; price sorts never reach here
+    // with a cursor_ledger set — listingsQuerySchema rejects that combination
+    // up front because ledger order and price order are incompatible cursors.
+    const direction: 'asc' | 'desc' = sort === 'oldest' ? 'asc' : (cursor_direction ?? 'desc');
     if (cursor_ledger !== undefined) {
       where.updatedAtLedger = direction === 'desc'
         ? { lt: cursor_ledger }
@@ -418,7 +455,13 @@ router.get('/listings', lightRateLimiter, cacheMiddleware(TTL.LISTINGS_LIST), qu
 
       if (artist)   { filterClauses.push(`"artist" = $${pIdx++}`);  params.push(artist); }
       if (owner)    { filterClauses.push(`"owner" = $${pIdx++}`);   params.push(owner); }
+      if (token)    { filterClauses.push(`"token" = $${pIdx++}`);   params.push(token); }
+      if (collection && collection.length > 0) {
+        filterClauses.push(`"collection" = ANY($${pIdx++}::text[])`);
+        params.push(collection);
+      }
       if (status)   { filterClauses.push(`"status" = $${pIdx++}::"ListingStatus"`); params.push(status); }
+      else if (sort === 'recently-sold') { filterClauses.push(`"status" = $${pIdx++}::"ListingStatus"`); params.push('Sold'); }
       if (minPrice !== undefined) { filterClauses.push(`"price" >= $${pIdx++}`); params.push(String(minPrice)); }
       if (maxPrice !== undefined) { filterClauses.push(`"price" <= $${pIdx++}`); params.push(String(maxPrice)); }
       if (cursor_ledger !== undefined) {
@@ -432,6 +475,13 @@ router.get('/listings', lightRateLimiter, cacheMiddleware(TTL.LISTINGS_LIST), qu
 
       const whereSQL = filterClauses.length ? `WHERE ${filterClauses.join(' AND ')}` : '';
 
+      // Relevance (_rank) is always the primary key for a text search; the
+      // secondary tie-break follows the requested sort so results are stable
+      // and predictable when multiple rows share a rank.
+      const tieBreakSQL = (!!sort && PRICE_SORTS.has(sort))
+        ? `"price" ${sort === 'price-low' ? 'ASC' : 'DESC'}`
+        : `"updatedAtLedger" ${direction === 'desc' ? 'DESC' : 'ASC'}`;
+
       // ts_rank_cd is the coverage-density variant; it rewards documents where
       // the query terms are near each other.  Normalisation option 1 divides
       // rank by the document length to avoid bias toward longer descriptions.
@@ -440,7 +490,7 @@ router.get('/listings', lightRateLimiter, cacheMiddleware(TTL.LISTINGS_LIST), qu
                 ts_rank_cd("searchVector", plainto_tsquery('english', $1), 1) AS "_rank"
          FROM "Listing"
          ${whereSQL}
-         ORDER BY "_rank" DESC, "updatedAtLedger" ${direction === 'desc' ? 'DESC' : 'ASC'}
+         ORDER BY "_rank" DESC, ${tieBreakSQL}
          LIMIT ${take} OFFSET ${skip}`,
         ...params
       );
@@ -450,7 +500,10 @@ router.get('/listings', lightRateLimiter, cacheMiddleware(TTL.LISTINGS_LIST), qu
         ...params
       );
 
-      const nextCursor = results.length === take
+      // A ledger cursor is only valid when the tie-break (and therefore the
+      // page boundary) is ledger-based; price-sorted search results must be
+      // paginated with offset instead (see listingsQuerySchema's refine).
+      const nextCursor = results.length === take && !(!!sort && PRICE_SORTS.has(sort))
         ? String(results[results.length - 1].updatedAtLedger)
         : '';
 
@@ -479,14 +532,17 @@ router.get('/listings', lightRateLimiter, cacheMiddleware(TTL.LISTINGS_LIST), qu
     const [results, total] = await Promise.all([
       prisma.listing.findMany({
         where,
-        orderBy: { updatedAtLedger: direction },
+        orderBy: listingsOrderBy(sort, direction),
         take,
         skip,
       }),
       prisma.listing.count({ where: { ...where, updatedAtLedger: undefined } }),
     ]);
 
-    const nextCursor = results.length === take
+    // See the schema-level refine on listingsQuerySchema: a ledger cursor is
+    // only meaningful when the page boundary is ledger-ordered, so price
+    // sorts never advertise a next cursor — callers must use offset instead.
+    const nextCursor = results.length === take && !(!!sort && PRICE_SORTS.has(sort))
       ? String(results[results.length - 1].updatedAtLedger)
       : '';
 
