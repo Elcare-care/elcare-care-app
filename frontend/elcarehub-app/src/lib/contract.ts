@@ -399,6 +399,23 @@ function toScRecipientVec(recipients: Array<{ address: string; percentage: numbe
 
 /**
  * create_listing — Artist creates a new on-chain listing.
+ *
+ * Mirrors the on-chain signature exactly (contracts/soroban-marketplace/src/contract.rs):
+ *   create_listing(artist, price, currency, token, collection, token_id,
+ *                  quantity, recipients, expires_at)
+ *
+ * @param quantity   Number of editions being listed. Must be `1` for
+ *                    single-edition (ERC-721 / LazyMint721) collections; any
+ *                    value `>= 1` up to the artist's on-chain balance for
+ *                    multi-edition (ERC-1155 / LazyMint1155) collections.
+ *                    Defaults to `1` for backward compatibility with existing
+ *                    call sites that only ever listed single-edition tokens.
+ * @param expiresAt  Optional unix-seconds timestamp after which the listing
+ *                    auto-expires. `null`/`undefined` means "no expiry".
+ * @param expectedIntent  Optional canonical intent (Issue #536) built by a
+ *                    confirmation UI (e.g. the listing-creation wizard's
+ *                    review step) — verified against the transaction
+ *                    actually about to be signed; any mismatch aborts.
  */
 export async function createListing(
   artistPublicKey: string,
@@ -406,7 +423,10 @@ export async function createListing(
   tokenAddress: string = DEFAULT_TOKEN.address,
   collectionAddress: string,
   nftTokenId: number,
-  recipients: Array<{ address: string; percentage: number }> = []
+  recipients: Array<{ address: string; percentage: number }> = [],
+  quantity: number = 1,
+  expiresAt?: number | null,
+  expectedIntent?: TransactionIntent
 ): Promise<number> {
   if (isE2eMockChain()) {
     if (typeof window !== "undefined") registerE2eMockListingsOnWindow();
@@ -423,8 +443,8 @@ export async function createListing(
   const selectedToken = resolveConfiguredToken(tokenAddress);
 
   // If no recipients provided, default to 100% to the artist
-  const finalRecipients = recipients.length > 0 
-    ? recipients 
+  const finalRecipients = recipients.length > 0
+    ? recipients
     : [{ address: artistPublicKey, percentage: 100 }];
 
   const args: xdr.ScVal[] = [
@@ -434,11 +454,144 @@ export async function createListing(
     new Address(selectedToken.address).toScVal(),
     new Address(collectionAddress).toScVal(),
     nativeToScVal(nftTokenId, { type: "u64" }),
+    nativeToScVal(BigInt(Math.max(1, Math.trunc(quantity))), { type: "u64" }),
     toScRecipientVec(finalRecipients),
+    // Option<u64> — Soroban represents `None` as ScVal::Void and `Some(x)`
+    // as the plain encoded value (not wrapped in a vec).
+    expiresAt != null
+      ? nativeToScVal(BigInt(expiresAt), { type: "u64" })
+      : xdr.ScVal.scvVoid(),
   ];
 
-  const retVal = await invokeContract(artistPublicKey, "create_listing", args);
+  const retVal = await invokeContract(
+    artistPublicKey,
+    "create_listing",
+    args,
+    false,
+    config.contractId,
+    expectedIntent
+  );
   return Number(scValToNative(retVal));
+}
+
+// ── Collection ownership + approval (single-edition vs multi-edition) ──────
+//
+// The listing-creation wizard needs to verify, before ever asking the
+// wallet to sign, that the connected wallet actually holds the token being
+// listed — the exact check differs by collection standard:
+//   - ERC-721 / LazyMint721 ("single-edition"): `owner_of(token_id)` must
+//     equal the connected wallet.
+//   - ERC-1155 / LazyMint1155 ("multi-edition"): `balance_of(owner,
+//     token_id)` must be >= the quantity being listed.
+// These mirror the exact cross-contract calls the marketplace contract
+// itself makes in `require_collection_compatible` (contract.rs) before
+// escrowing the NFT, so a wizard rejection here always matches what the
+// chain would have rejected anyway — just surfaced before signing instead
+// of as a failed transaction.
+
+/**
+ * owner_of — Read the current owner of a single-edition (721-style) token.
+ * Returns `null` when the call fails (e.g. token doesn't exist, or the
+ * collection isn't a single-edition contract).
+ */
+export async function getNftOwner(
+  collectionAddress: string,
+  tokenId: number
+): Promise<string | null> {
+  const callerPublicKey = await getReadOnlyCallerPublicKey();
+  try {
+    const args: xdr.ScVal[] = [nativeToScVal(BigInt(tokenId), { type: "u64" })];
+    const retVal = await invokeContract(
+      callerPublicKey,
+      "owner_of",
+      args,
+      true,
+      collectionAddress
+    );
+    const native = scValToNative(retVal);
+    return native ? (native as Address).toString() : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * balance_of — Read a wallet's balance of a multi-edition (1155-style)
+ * token. Returns `0n` when the call fails.
+ */
+export async function getNftBalance(
+  collectionAddress: string,
+  ownerPublicKey: string,
+  tokenId: number
+): Promise<bigint> {
+  const callerPublicKey = await getReadOnlyCallerPublicKey();
+  try {
+    const args: xdr.ScVal[] = [
+      new Address(ownerPublicKey).toScVal(),
+      nativeToScVal(BigInt(tokenId), { type: "u64" }),
+    ];
+    const retVal = await invokeContract(
+      callerPublicKey,
+      "balance_of",
+      args,
+      true,
+      collectionAddress
+    );
+    return BigInt(scValToNative(retVal) as bigint | number);
+  } catch {
+    return 0n;
+  }
+}
+
+/**
+ * is_approved_for_all — Read whether `operator` (typically the marketplace
+ * contract) has operator approval over every token `owner` holds in
+ * `collectionAddress`. The marketplace needs this approval to call
+ * `transfer_from` at escrow time.
+ */
+export async function isApprovedForAll(
+  collectionAddress: string,
+  ownerPublicKey: string,
+  operatorAddress: string
+): Promise<boolean> {
+  const callerPublicKey = await getReadOnlyCallerPublicKey();
+  try {
+    const args: xdr.ScVal[] = [
+      new Address(ownerPublicKey).toScVal(),
+      new Address(operatorAddress).toScVal(),
+    ];
+    const retVal = await invokeContract(
+      callerPublicKey,
+      "is_approved_for_all",
+      args,
+      true,
+      collectionAddress
+    );
+    return scValToNative(retVal) as boolean;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * set_approval_for_all — Grant the marketplace operator approval over the
+ * caller's tokens in a collection. This is a one-time, per-collection write
+ * transaction required before the marketplace can escrow an NFT on the
+ * artist's behalf.
+ */
+export async function checkAndApproveMarketplace(
+  ownerPublicKey: string,
+  collectionAddress: string,
+  marketplaceContractId: string = config.contractId
+): Promise<boolean> {
+  const args: xdr.ScVal[] = [
+    new Address(ownerPublicKey).toScVal(),
+    new Address(marketplaceContractId).toScVal(),
+    nativeToScVal(true, { type: "bool" }),
+    xdr.ScVal.scvVoid(), // expires_at: Option<u32> — None (no expiry)
+  ];
+  await invokeContract(ownerPublicKey, "set_approval_for_all", args, false, collectionAddress);
+  return true;
 }
 
 /**
