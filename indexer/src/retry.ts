@@ -20,6 +20,15 @@
 import client from 'prom-client';
 import { rpcRetryExhaustedCounter } from './metrics.js';
 import { logger } from './logger.js';
+import {
+  withTimeout,
+  TIMEOUT_BUDGETS,
+  TimeoutError,
+  CancellationError,
+  enforceDeadline,
+  calculateRetryAttempts,
+  type TimeoutBudget,
+} from './timeout.js';
 
 // ── Retry config ──────────────────────────────────────────────────────────────
 
@@ -44,6 +53,10 @@ export interface RetryConfig {
   retryable?: (err: unknown) => boolean;
   /** Label for metrics and logs. */
   operation?: string;
+  /** Optional timeout budget to enforce per-operation and total deadlines. */
+  timeoutBudget?: TimeoutBudget;
+  /** Parent AbortSignal to propagate for cancellation. */
+  signal?: AbortSignal;
 }
 
 // Legacy interface kept for backward-compat with existing call sites
@@ -66,6 +79,7 @@ export const STELLAR_RPC_RETRY_CONFIG: RetryConfig = {
   jitterFactor: 0.3,
   retryable: isRpcRetryable,
   operation: 'rpc',
+  timeoutBudget: TIMEOUT_BUDGETS.rpc,
 };
 
 /** PostgreSQL via Prisma: only retry on connection-pool errors. */
@@ -76,6 +90,7 @@ export const DB_RETRY_CONFIG: RetryConfig = {
   jitterFactor: 0.2,
   retryable: isDbRetryable,
   operation: 'db',
+  timeoutBudget: TIMEOUT_BUDGETS.db,
 };
 
 /** IPFS gateway fetch: retry on network errors and gateway timeouts. */
@@ -86,6 +101,18 @@ export const IPFS_RETRY_CONFIG: RetryConfig = {
   jitterFactor: 0.4,
   retryable: isIpfsRetryable,
   operation: 'ipfs',
+  timeoutBudget: TIMEOUT_BUDGETS.ipfs,
+};
+
+/** Redis operations: retry on connection errors. */
+export const REDIS_RETRY_CONFIG: RetryConfig = {
+  maxAttempts: 3,
+  baseDelayMs: 50,
+  maxDelayMs: 2_000,
+  jitterFactor: 0.2,
+  retryable: isDbRetryable, // Similar retry logic to DB
+  operation: 'redis',
+  timeoutBudget: TIMEOUT_BUDGETS.redis,
 };
 
 // ── Retryability predicates ───────────────────────────────────────────────────
@@ -258,9 +285,10 @@ export class CircuitBreaker {
 
 // Singleton circuit breakers, one per external dependency
 export const circuitBreakers = {
-  rpc:  new CircuitBreaker({ dependency: 'rpc',  failureThreshold: 5, resetTimeoutMs: 60_000 }),
-  db:   new CircuitBreaker({ dependency: 'db',   failureThreshold: 5, resetTimeoutMs: 60_000 }),
-  ipfs: new CircuitBreaker({ dependency: 'ipfs', failureThreshold: 5, resetTimeoutMs: 60_000 }),
+  rpc:   new CircuitBreaker({ dependency: 'rpc',   failureThreshold: 5, resetTimeoutMs: 60_000 }),
+  db:    new CircuitBreaker({ dependency: 'db',    failureThreshold: 5, resetTimeoutMs: 60_000 }),
+  ipfs:  new CircuitBreaker({ dependency: 'ipfs',  failureThreshold: 5, resetTimeoutMs: 60_000 }),
+  redis: new CircuitBreaker({ dependency: 'redis', failureThreshold: 5, resetTimeoutMs: 60_000 }),
 } as const;
 
 export class CircuitOpenError extends Error {
@@ -301,6 +329,8 @@ export async function withExponentialBackoff<T>(
     jitterFactor = 0.3,
     retryable   = () => true,
     operation   = 'unknown',
+    timeoutBudget,
+    signal: parentSignal,
   } = config;
 
   // Fast-fail when the circuit is open
@@ -311,15 +341,47 @@ export async function withExponentialBackoff<T>(
     }
   }
 
+  // Use timeout budget if provided
+  const startTime = Date.now();
+  const budget = timeoutBudget ?? { operationTimeoutMs: 30_000, totalBudgetMs: 300_000, useAbortSignal: false };
+  
+  // Calculate remaining budget and adjust retry attempts
+  let effectiveMaxAttempts = maxAttempts;
+  if (timeoutBudget) {
+    const remaining = enforceDeadline(startTime, budget.totalBudgetMs, operation);
+    effectiveMaxAttempts = calculateRetryAttempts(remaining, baseDelayMs, maxDelayMs, maxAttempts);
+  }
+
   let lastErr: unknown;
 
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+  for (let attempt = 1; attempt <= effectiveMaxAttempts; attempt++) {
     try {
-      const result = await fn();
+      // Wrap function with timeout if budget is configured
+      let result: T;
+      if (timeoutBudget && budget.useAbortSignal) {
+        result = await withTimeout(
+          (signal) => fn(),
+          {
+            budget,
+            signal: parentSignal,
+            dependency: operation,
+            operation: `${operation}_attempt_${attempt}`,
+          }
+        );
+      } else {
+        result = await fn();
+      }
+      
       breaker?.recordSuccess();
       return result;
     } catch (err) {
       lastErr = err;
+
+      // Re-throw timeout and cancellation errors immediately (don't retry)
+      if (err instanceof TimeoutError || err instanceof CancellationError) {
+        breaker?.recordFailure();
+        throw err;
+      }
 
       // Fast-fail non-retryable errors immediately
       if (!retryable(err)) {
@@ -329,13 +391,13 @@ export async function withExponentialBackoff<T>(
 
       breaker?.recordFailure();
 
-      if (attempt === maxAttempts) break;
+      if (attempt === effectiveMaxAttempts) break;
 
       const delay = computeDelay(attempt - 1, baseDelayMs, maxDelayMs, jitterFactor);
-      logger.warn(`[withExponentialBackoff] ${operation} failed — attempt ${attempt}/${maxAttempts}, retrying in ${delay.toFixed(0)}ms`, {
+      logger.warn(`[withExponentialBackoff] ${operation} failed — attempt ${attempt}/${effectiveMaxAttempts}, retrying in ${delay.toFixed(0)}ms`, {
         operation,
         attempt,
-        maxAttempts,
+        maxAttempts: effectiveMaxAttempts,
         delayMs: delay,
         error: err instanceof Error ? err.message : String(err),
       });
@@ -344,7 +406,7 @@ export async function withExponentialBackoff<T>(
   }
 
   rpcRetryExhaustedCounter.inc({ operation });
-  logger.error(`[withExponentialBackoff] ${operation} exhausted all ${maxAttempts} attempts`, {
+  logger.error(`[withExponentialBackoff] ${operation} exhausted all ${effectiveMaxAttempts} attempts`, {
     operation,
     error: lastErr instanceof Error ? lastErr.message : String(lastErr),
     stack: lastErr instanceof Error ? lastErr.stack : undefined,
@@ -367,6 +429,11 @@ export function withDbRetry<T>(fn: () => Promise<T>, overrides?: Partial<RetryCo
 /** Wrap an IPFS fetch with the IPFS retry config + circuit breaker. */
 export function withIpfsRetry<T>(fn: () => Promise<T>, overrides?: Partial<RetryConfig>): Promise<T> {
   return withExponentialBackoff(fn, { ...IPFS_RETRY_CONFIG, ...overrides }, circuitBreakers.ipfs);
+}
+
+/** Wrap a Redis operation with the Redis retry config + circuit breaker. */
+export function withRedisRetry<T>(fn: () => Promise<T>, overrides?: Partial<RetryConfig>): Promise<T> {
+  return withExponentialBackoff(fn, { ...REDIS_RETRY_CONFIG, ...overrides }, circuitBreakers.redis);
 }
 
 // ── Backward-compatible withRetry (legacy call sites) ─────────────────────────

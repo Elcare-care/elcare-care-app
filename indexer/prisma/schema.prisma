@@ -827,7 +827,7 @@ model OperationalAudit {
   ipAddress       String?       // client IP address
   userAgent       String?       // client user agent
   createdAt       DateTime      @default(now())
-  
+
   @@index([actor])
   @@index([actionType])
   @@index([createdAt])
@@ -836,61 +836,116 @@ model OperationalAudit {
   @@index([requestId])
 }
 
-// ── Moderation Queue (Issue #534) ─────────────────────────────────────────
-enum ModerationStatus {
+// ── Financial Reconciliation (Issue #XXX) ───────────────────────────────────────
+//
+// Tracks financial reconciliation for protocol fees, royalties, sales, and refunds.
+// Aggregates are computed per-ledger, per-token, per-collection, and protocol-wide.
+// Supports tolerance policies for provisional events and chain timing.
+
+enum FinancialReconcileStatus {
   Pending
-  UnderReview
-  Approved
-  Rejected
-  Revoked
-  Reinstated
+  Matched
+  DriftDetected
+  AlertRaised
+  Resolved
 }
 
-enum ModerationActionType {
-  Flag
-  Review
-  Approve
-  Reject
-  Revoke
-  Reinstate
-  CollectionCleanup
+enum FinancialDriftSeverity {
+  Low
+  Medium
+  High
+  Critical
 }
 
-model ModerationCase {
-  id              Int                  @id @default(autoincrement())
-  targetType      String               // "listing" | "artist" | "collection"
-  targetId        String               // listingId, artist address, or collection address
-  status          ModerationStatus     @default(Pending)
-  reportedBy      String?              // reporter address (optional)
-  assignedTo      String?              // admin address handling the case
-  reason          String               // reason for flagging
-  evidenceRef     String?              // IPFS CID or URL for evidence
-  notes           String?              // off-chain review notes (not on-chain)
-  txHash          String?              // on-chain tx hash for finalized actions
-  resolvedBy      String?              // admin who finalized the action
-  resolvedAt      DateTime?
-  createdAt       DateTime             @default(now())
-  updatedAt       DateTime             @updatedAt
-  actions         ModerationAction[]
-
-  @@index([status])
-  @@index([targetType, targetId])
-  @@index([assignedTo])
-  @@index([createdAt])
+model FinancialReconcileRun {
+  id                  Int                     @id @default(autoincrement())
+  startedAt           DateTime                @default(now())
+  completedAt         DateTime?
+  ledgerFrom          Int
+  ledgerTo            Int
+  confirmedDepth      Int                     // confirmation depth used for this run
+  toleranceBps        Int                     @default(100) // tolerance in basis points
+  includeProvisional  Boolean                 @default(false)
+  driftsDetected      Int                     @default(0)
+  alertsRaised        Int                     @default(0)
+  dryRun              Boolean                 @default(false)
+  errorMessage        String?
+  drifts              FinancialDrift[]
+  
+  @@index([startedAt])
+  @@index([ledgerFrom, ledgerTo])
 }
 
-model ModerationAction {
-  id              Int                  @id @default(autoincrement())
-  caseId          Int
-  case            ModerationCase       @relation(fields: [caseId], references: [id])
-  actor           String               // admin wallet address
-  actionType      ModerationActionType
-  notes           String?
-  txHash          String?              // on-chain tx hash if applicable
-  successful      Boolean              @default(true)
-  createdAt       DateTime             @default(now())
+model FinancialDrift {
+  id                  Int                       @id @default(autoincrement())
+  runId               Int
+  run                 FinancialReconcileRun     @relation(fields: [runId], references: [id])
+  
+  // Entity identification
+  entityType          String                    // "protocol_fee" | "royalty" | "sale" | "refund"
+  entityId            String                    // event hash or transaction ID
+  ledgerSequence      Int
+  
+  // Scope dimensions
+  token               String?
+  collection          String?
+  
+  // Expected vs actual values
+  expectedAmount      Decimal                   @db.Decimal(32, 7)
+  actualAmount        Decimal                   @db.Decimal(32, 7)
+  driftAmount         Decimal                   @db.Decimal(32, 7)
+  driftBps            Int                       // drift in basis points
+  
+  // Classification
+  severity            FinancialDriftSeverity
+  status              FinancialReconcileStatus  @default(DriftDetected)
+  reason              String                    // e.g., "missing_payout", "duplicate_payout", "wrong_token"
+  
+  // Provisional handling
+  isProvisional       Boolean                    @default(false)
+  confirmationDepth   Int?
+  
+  // Resolution tracking
+  resolvedAt          DateTime?
+  resolvedBy          String?
+  resolutionNotes     String?
+  
+  detectedAt          DateTime                  @default(now())
+  
+  @@index([runId])
+  @@index([entityType, ledgerSequence])
+  @@index([status, severity])
+  @@index([token])
+  @@index([collection])
+  @@index([isProvisional])
+  @@index([detectedAt])
+}
 
-  @@index([caseId])
-  @@index([actor])
-  @@index([createdAt])
+// Materialized view refresh tracking (managed by application, not Prisma)
+model FinancialAggregateSnapshot {
+  id                  Int                       @id @default(autoincrement())
+  snapshotType        String                    // "per_ledger" | "per_token" | "per_collection" | "protocol"
+  scopeKey            String?                   // ledger sequence, token address, or collection address
+  ledgerFrom          Int
+  ledgerTo            Int
+  
+  // Aggregated values from events
+  protocolFeesTotal   Decimal                   @default(0) @db.Decimal(32, 7)
+  royaltiesTotal      Decimal                   @default(0) @db.Decimal(32, 7)
+  salesTotal          Decimal                   @default(0) @db.Decimal(32, 7)
+  refundsTotal        Decimal                   @default(0) @db.Decimal(32, 7)
+  
+  // Counts
+  protocolFeeCount    Int                       @default(0)
+  royaltyCount        Int                       @default(0)
+  saleCount           Int                       @default(0)
+  refundCount         Int                       @default(0)
+  
+  // Confirmation state
+  confirmedOnly       Boolean                   @default(true)
+  createdAt           DateTime                  @default(now())
+  
+  @@unique([snapshotType, scopeKey, ledgerFrom, ledgerTo, confirmedOnly])
+  @@index([snapshotType, ledgerFrom, ledgerTo])
+  @@index([scopeKey])
 }

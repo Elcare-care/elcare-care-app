@@ -17,6 +17,7 @@ import {
   Listing,
   stroopsToXlm,
 } from "@/lib/contract";
+import type { TransactionIntent } from "@/lib/tx-intent";
 import { fetchListings, fetchArtistListings, FreshnessMetadata, makeFreshness } from "@/lib/indexer";
 import {
   uploadImageToIPFS,
@@ -247,7 +248,7 @@ export function useBuyArtwork(buyerPublicKey: string | null) {
   const { run, isRunning: isBuying } = useTxToast();
 
   const buy = useCallback(
-    async (listingId: number): Promise<boolean> => {
+    async (listingId: number, expectedIntent?: TransactionIntent): Promise<boolean> => {
       if (!buyerPublicKey) return false;
       const result = await run(
         async () => {
@@ -257,7 +258,9 @@ export function useBuyArtwork(buyerPublicKey: string | null) {
           // an unsupported or misconfigured token must never reach
           // buyArtwork (and the wallet signing prompt) in the first place.
           await assertSupportedTokenAddress(listing.token, "listing");
-          await buyArtwork(buyerPublicKey, listingId);
+          // Issue #536: expectedIntent, when supplied by the checkout UI, is
+          // verified against the transaction actually about to be signed.
+          await buyArtwork(buyerPublicKey, listingId, expectedIntent);
           // Track successful purchase
           trackEvent.purchaseSuccessful(
             listingId,

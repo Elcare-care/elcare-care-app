@@ -154,6 +154,21 @@ For detailed architectural walk-throughs, component boundaries, and step-by-step
 | 🚀 **[Deployment](docs/guides/deployment.md)** | Contract deployment, indexer containers, readiness probes, and Next.js builds |
 | 🗄️ **[Database Migrations](docs/guides/database-migrations.md)** | Prisma ORM schema updates, rollback resolution, and zero-downtime rules |
 | 🛡️ **[Security Triage](docs/guides/security-triage.md)** | Cargo Audit, npm Audit, Gitleaks, and Safe Redaction guidelines |
+| 🎫 **[Support Triage](docs/guides/support-triage.md)** | Safe diagnostic collection, severity classification, and escalation paths |
+
+---
+
+## Reliability & Operational Runbooks
+
+ElcareHub maintains a living reliability backlog, quarterly review process, and operational runbooks for incident response:
+
+| Resource | Description |
+|---|---|
+| 📊 **[Reliability Program](docs/reliability/README.md)** | Domain ownership, quarterly review cadence, backlog, and decision records |
+| 📋 **[Quarterly Review Process](docs/reliability/quarterly-review-process.md)** | Review inputs, scoring, incident rules, and version alignment |
+| 📝 **[Quarterly Review Input Template](docs/reliability/quarterly-review-template-inputs.md)** | Pre-review artifact collection checklist |
+| 🔍 **[Reliability Backlog](docs/reliability/backlog.md)** | Scored open reliability items with domain owners and milestones |
+| 🚨 **[Incident Runbooks](docs/runbooks/README.md)** | Contract pause, database outage, reorg, stalled ingestion, and more |
 
 ---
 
@@ -445,6 +460,7 @@ ElcareHub handles on-chain value on behalf of artists and collectors. We take se
 - **Operational runbooks:** [docs/runbooks/](docs/runbooks/README.md) — detailed procedures for stalled ingestion, reorgs, DB/Redis outage, compromised keys, Pinata outage, wallet issues, and deployment config errors.
 - **Secret inventory:** [docs/secret-inventory.md](docs/secret-inventory.md) — every secret classified with storage location, owner, and rotation schedule.
 - **Reliability program:** [docs/reliability/](docs/reliability/README.md) — quarterly reviews, domain owners, scored backlog, and decision records aligned with `versions.toml`.
+- **Release verification:** [docs/RELEASE_VERIFICATION.md](docs/RELEASE_VERIFICATION.md) — how contract WASM, ABI, frontend, and indexer image release artifacts are signed (GitHub build provenance + keyless cosign) and how to independently verify each one before deploying.
 
 ## Contributing
 

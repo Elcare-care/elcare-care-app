@@ -1,75 +1,58 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // app/tx/[hash]/page.tsx — Transaction status and recovery page (Issue #301)
 //
-// Accepts a Stellar transaction hash in the URL, reads authoritative chain
-// status from the indexer API, and presents a clear timeline with:
-//   - Chain confirmation status (distinct from indexer ingestion status)
-//   - Stale-indexer messaging when the chain confirms but indexer hasn't yet
-//   - Explorer link built from the configured network
-//   - Links to affected resources (listing, auction, offer)
-//   - Safe retry / refresh actions
-//   - Mobile-friendly layout preserving all critical recovery actions
+// Accepts a Stellar transaction hash in the URL and presents a clear recovery
+// timeline. Relies on lib/txLookup.ts for all data-fetching so this file stays
+// purely presentational.
+//
+// States handled:
+//   success       — confirmed on-chain; may show stale-indexer warning
+//   failed        — included but reverted; safe to retry
+//   pending       — not yet included; auto-polls
+//   not_found     — no record on RPC or indexer; may still be propagating
+//   wrong_network — hash belongs to a different network
+//   rpc_error     — the RPC is temporarily unreachable
+//
+// Security:
+//   - Never asks for secret keys or XDR
+//   - Does not expose raw error XDR to non-technical users
+//   - "Do not re-submit" warning guards against double-payment
 // ─────────────────────────────────────────────────────────────────────────────
 
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import Link from "next/link";
-import { config } from "@/lib/config";
-
-// ── Types ─────────────────────────────────────────────────────────────────────
-
-type ChainStatus = "success" | "failed" | "pending" | "unknown";
-type IndexerStatus = "confirmed" | "pending" | "not_found";
-
-interface TxEvent {
-  id: number;
-  eventType: string;
-  listingId?: string | null;
-  actor: string;
-  ledgerSequence: number;
-  ledgerTimestamp?: string | null;
-  contractId?: string | null;
-}
-
-interface TxStatusResponse {
-  hash: string;
-  chain_status: ChainStatus;
-  indexer_status: IndexerStatus;
-  stale_indexer: boolean;
-  explorer_url: string;
-  events: TxEvent[];
-  related_resources: {
-    listing_id?: string | null;
-    auction_id?: string | null;
-    offer_id?: string | null;
-  };
-  network: string;
-}
-
-// ── Polling backoff helper ────────────────────────────────────────────────────
-
-const POLL_INTERVALS_MS = [3_000, 5_000, 10_000, 15_000, 30_000];
-
-function nextInterval(attempt: number): number {
-  return POLL_INTERVALS_MS[Math.min(attempt, POLL_INTERVALS_MS.length - 1)];
-}
+import {
+  lookupTx,
+  isValidTxHash,
+  isTxLookupTerminal,
+  nextTxPageInterval,
+  type TxLookupResult,
+  type TxChainStatus,
+  type TxIndexerStatus,
+} from "@/lib/txLookup";
 
 // ── Status badge ──────────────────────────────────────────────────────────────
 
+const BADGE_STYLES: Record<string, string> = {
+  success:       "bg-green-100 text-green-800 border border-green-300",
+  confirmed:     "bg-green-100 text-green-800 border border-green-300",
+  failed:        "bg-red-100 text-red-800 border border-red-300",
+  pending:       "bg-yellow-100 text-yellow-800 border border-yellow-300",
+  not_found:     "bg-gray-100 text-gray-700 border border-gray-300",
+  wrong_network: "bg-orange-100 text-orange-800 border border-orange-300",
+  rpc_error:     "bg-gray-100 text-gray-700 border border-gray-300",
+  unknown:       "bg-gray-100 text-gray-700 border border-gray-300",
+};
+
 function StatusBadge({ status }: { status: string }) {
-  const styles: Record<string, string> = {
-    success:   "bg-green-100 text-green-800 border border-green-300",
-    confirmed: "bg-green-100 text-green-800 border border-green-300",
-    failed:    "bg-red-100 text-red-800 border border-red-300",
-    pending:   "bg-yellow-100 text-yellow-800 border border-yellow-300",
-    unknown:   "bg-gray-100 text-gray-700 border border-gray-300",
-    not_found: "bg-gray-100 text-gray-700 border border-gray-300",
-  };
-  const cls = styles[status] ?? styles.unknown;
+  const cls = BADGE_STYLES[status] ?? BADGE_STYLES.unknown;
   return (
-    <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${cls}`}>
-      {status.replace("_", " ")}
+    <span
+      className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${cls}`}
+    >
+      {status.replace(/_/g, " ")}
     </span>
   );
 }
@@ -87,13 +70,7 @@ function TimelineStep({
   active: boolean;
   failed?: boolean;
 }) {
-  const icon = failed
-    ? "✗"
-    : done
-    ? "✓"
-    : active
-    ? "⟳"
-    : "○";
+  const icon = failed ? "✗" : done ? "✓" : active ? "⟳" : "○";
   const iconCls = failed
     ? "text-red-500"
     : done
@@ -104,15 +81,120 @@ function TimelineStep({
 
   return (
     <div className="flex items-start gap-3">
-      <span className={`text-xl font-bold w-6 text-center ${iconCls}`}>{icon}</span>
-      <span className={`text-sm mt-0.5 ${done || active ? "text-gray-900" : "text-gray-400"}`}>
+      <span className={`text-xl font-bold w-6 text-center ${iconCls}`} aria-hidden="true">
+        {icon}
+      </span>
+      <span
+        className={`text-sm mt-0.5 ${done || active ? "text-gray-900" : "text-gray-400"}`}
+      >
         {label}
       </span>
     </div>
   );
 }
 
-// ── Main component ────────────────────────────────────────────────────────────
+// ── Alert banner ──────────────────────────────────────────────────────────────
+
+function AlertBanner({
+  severity,
+  children,
+}: {
+  severity: "info" | "warning" | "error" | "neutral";
+  children: React.ReactNode;
+}) {
+  const styles = {
+    info:    "bg-blue-50 border-blue-200 text-blue-900",
+    warning: "bg-yellow-50 border-yellow-200 text-yellow-900",
+    error:   "bg-red-50 border-red-200 text-red-900",
+    neutral: "bg-gray-50 border-gray-200 text-gray-800",
+  };
+  return (
+    <div
+      role="alert"
+      className={`border rounded-lg p-3 text-sm ${styles[severity]}`}
+    >
+      {children}
+    </div>
+  );
+}
+
+// ── Loading screen ────────────────────────────────────────────────────────────
+
+function LoadingScreen() {
+  return (
+    <main className="min-h-screen bg-gray-50 flex items-center justify-center p-4">
+      <div className="text-center">
+        <div className="text-4xl mb-4 animate-spin inline-block" aria-hidden="true">
+          ⟳
+        </div>
+        <p className="text-gray-600">Looking up transaction…</p>
+      </div>
+    </main>
+  );
+}
+
+// ── Error screen (invalid hash / not found) ───────────────────────────────────
+
+function ErrorScreen({ hash, message }: { hash: string; message: string }) {
+  return (
+    <main className="min-h-screen bg-gray-50 flex items-center justify-center p-4">
+      <div className="bg-white rounded-xl shadow p-6 max-w-lg w-full">
+        <h1 className="text-xl font-semibold text-red-700 mb-2">
+          Transaction Not Found
+        </h1>
+        <p className="text-gray-700 text-sm mb-4">{message}</p>
+        <p className="text-xs text-gray-500 mb-6">
+          Hash:{" "}
+          <code className="break-all font-mono">{hash}</code>
+        </p>
+        <Link
+          href="/"
+          className="px-4 py-2 bg-gray-100 hover:bg-gray-200 text-gray-800 rounded-lg text-sm"
+        >
+          ← Back to marketplace
+        </Link>
+      </div>
+    </main>
+  );
+}
+
+// ── Wrong-network screen ──────────────────────────────────────────────────────
+
+function WrongNetworkScreen({
+  hash,
+  message,
+}: {
+  hash: string;
+  message: string;
+}) {
+  return (
+    <main className="min-h-screen bg-gray-50 flex items-center justify-center p-4">
+      <div className="bg-white rounded-xl shadow p-6 max-w-lg w-full space-y-4">
+        <h1 className="text-xl font-semibold text-orange-700">
+          Wrong Network
+        </h1>
+        <AlertBanner severity="warning">
+          <strong>Network mismatch.</strong> {message}
+        </AlertBanner>
+        <p className="text-xs text-gray-500">
+          Hash: <code className="break-all font-mono">{hash}</code>
+        </p>
+        <p className="text-sm text-gray-600">
+          Switch your wallet to the correct network and try again. No funds
+          were moved by visiting this page.
+        </p>
+        <Link
+          href="/"
+          className="inline-block px-4 py-2 bg-gray-100 hover:bg-gray-200 text-gray-800 rounded-lg text-sm"
+        >
+          ← Back to marketplace
+        </Link>
+      </div>
+    </main>
+  );
+}
+
+// ── Main page ─────────────────────────────────────────────────────────────────
 
 interface PageProps {
   params: { hash: string };
@@ -121,64 +203,65 @@ interface PageProps {
 export default function TxStatusPage({ params }: PageProps) {
   const { hash } = params;
 
-  const [data, setData] = useState<TxStatusResponse | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [data, setData]             = useState<TxLookupResult | null>(null);
+  const [loading, setLoading]       = useState(true);
   const [pollAttempt, setPollAttempt] = useState(0);
   const [lastRefreshed, setLastRefreshed] = useState<Date | null>(null);
 
-  // Validate hash format client-side to give instant feedback
-  const isValidHash = /^[0-9a-fA-F]{64}$/.test(hash ?? "");
+  // AbortController lets us cancel in-flight lookups on unmount / new fetch
+  const abortRef = useRef<AbortController | null>(null);
+
+  // Client-side hash format validation — gives instant feedback without a
+  // round trip and prevents the RPC from receiving garbage hashes.
+  const isValidHash = isValidTxHash(hash ?? "");
 
   const fetchStatus = useCallback(async () => {
     if (!isValidHash) {
-      setError("Invalid transaction hash — must be 64 hex characters.");
+      setData(null);
       setLoading(false);
       return;
     }
 
-    setError(null);
+    // Cancel any previous in-flight request
+    abortRef.current?.abort();
+    const ac = new AbortController();
+    abortRef.current = ac;
+
+    setLoading(true);
     try {
-      const url = `${config.indexerUrl}/transactions/${hash}`;
-      const res = await fetch(url);
-      if (res.status === 400) {
-        const body = await res.json().catch(() => ({}));
-        setError(body?.error?.message ?? "Invalid transaction hash.");
-        setLoading(false);
-        return;
-      }
-      if (res.status === 404) {
-        setError("Transaction not found on this network.");
-        setLoading(false);
-        return;
-      }
-      if (!res.ok) {
-        throw new Error(`Server error ${res.status}`);
-      }
-      const json: TxStatusResponse = await res.json();
-      setData(json);
+      const result = await lookupTx(hash, {
+        // Single-pass lookup on the page: the auto-poll loop handles retries.
+        // Use a short RPC poll (1 attempt) so the page renders quickly and the
+        // polling useEffect handles the wait-and-retry logic.
+        maxPollAttempts: 1,
+        signal: ac.signal,
+      });
+
+      if (ac.signal.aborted) return;
+
+      setData(result);
       setLastRefreshed(new Date());
-    } catch (e: unknown) {
-      setError(
-        e instanceof Error ? e.message : "Failed to load transaction status."
-      );
+    } catch {
+      // Aborted or unexpected error — leave previous data visible if any
     } finally {
-      setLoading(false);
+      if (!ac.signal.aborted) setLoading(false);
     }
   }, [hash, isValidHash]);
 
   // Initial fetch
   useEffect(() => {
     fetchStatus();
+    return () => {
+      abortRef.current?.abort();
+    };
   }, [fetchStatus]);
 
-  // Auto-poll while the tx is still pending / stale
+  // Auto-poll while the tx is not yet terminal
   useEffect(() => {
     if (!data) return;
-    if (data.chain_status === "success" && !data.stale_indexer) return;
-    if (data.chain_status === "failed") return;
+    if (isTxLookupTerminal(data)) return;
 
-    const delay = nextInterval(pollAttempt);
+    const delay = nextTxPageInterval(pollAttempt);
     const timer = setTimeout(() => {
       setPollAttempt((a) => a + 1);
       fetchStatus();
@@ -186,50 +269,47 @@ export default function TxStatusPage({ params }: PageProps) {
     return () => clearTimeout(timer);
   }, [data, pollAttempt, fetchStatus]);
 
-  // ── Render states ──────────────────────────────────────────────────────────
+  // Cleanup on unmount
+  useEffect(() => () => { abortRef.current?.abort(); }, []);
 
-  if (loading) {
+  // ── Render guards ──────────────────────────────────────────────────────────
+
+  if (loading && !data) return <LoadingScreen />;
+
+  if (!isValidHash) {
     return (
-      <main className="min-h-screen bg-gray-50 flex items-center justify-center p-4">
-        <div className="text-center">
-          <div className="text-4xl mb-4 animate-spin inline-block">⟳</div>
-          <p className="text-gray-600">Looking up transaction…</p>
-        </div>
-      </main>
+      <ErrorScreen
+        hash={hash}
+        message="Invalid transaction hash — must be 64 hexadecimal characters."
+      />
     );
   }
 
-  if (error) {
+  if (!data) return <LoadingScreen />;
+
+  if (data.chainStatus === "wrong_network") {
     return (
-      <main className="min-h-screen bg-gray-50 flex items-center justify-center p-4">
-        <div className="bg-white rounded-xl shadow p-6 max-w-lg w-full">
-          <h1 className="text-xl font-semibold text-red-700 mb-2">
-            Transaction Not Found
-          </h1>
-          <p className="text-gray-700 text-sm mb-4">{error}</p>
-          <p className="text-xs text-gray-500 mb-6">
-            Hash: <code className="break-all font-mono">{hash}</code>
-          </p>
-          <div className="flex flex-wrap gap-3">
-            <Link
-              href="/"
-              className="px-4 py-2 bg-gray-100 hover:bg-gray-200 text-gray-800 rounded-lg text-sm"
-            >
-              ← Back to marketplace
-            </Link>
-          </div>
-        </div>
-      </main>
+      <WrongNetworkScreen
+        hash={hash}
+        message={
+          data.lookupError ??
+          "This transaction was submitted on a different network."
+        }
+      />
     );
   }
 
-  if (!data) return null;
+  // "not_found" after the initial call — show a soft message; auto-poll continues
+  const showNotFoundWarning =
+    data.chainStatus === "not_found" && !loading;
 
-  const isSuccess    = data.chain_status === "success";
-  const isFailed     = data.chain_status === "failed";
-  const isPending    = data.chain_status === "pending";
-  const isUnknown    = data.chain_status === "unknown";
-  const indexerDone  = data.indexer_status === "confirmed";
+  const isSuccess   = data.chainStatus === "success";
+  const isFailed    = data.chainStatus === "failed";
+  const isPending   = data.chainStatus === "pending" || data.chainStatus === "not_found";
+  const isRpcError  = data.chainStatus === "rpc_error";
+  const indexerDone = data.indexerStatus === "confirmed";
+
+  const isAutoPolling = !isTxLookupTerminal(data);
 
   return (
     <main className="min-h-screen bg-gray-50 py-8 px-4">
@@ -253,11 +333,11 @@ export default function TxStatusPage({ params }: PageProps) {
           <div className="flex flex-wrap gap-4">
             <div>
               <p className="text-xs text-gray-500 mb-1">Chain status</p>
-              <StatusBadge status={data.chain_status} />
+              <StatusBadge status={data.chainStatus} />
             </div>
             <div>
               <p className="text-xs text-gray-500 mb-1">Indexer status</p>
-              <StatusBadge status={data.indexer_status} />
+              <StatusBadge status={data.indexerStatus} />
             </div>
             <div>
               <p className="text-xs text-gray-500 mb-1">Network</p>
@@ -267,45 +347,47 @@ export default function TxStatusPage({ params }: PageProps) {
             </div>
           </div>
 
-          {/* Stale-indexer warning */}
-          {data.stale_indexer && (
-            <div
-              role="alert"
-              className="bg-yellow-50 border border-yellow-200 rounded-lg p-3 text-sm text-yellow-900"
-            >
-              <strong>Indexer is still catching up.</strong> Your transaction was
-              confirmed on-chain but hasn&apos;t been picked up by the indexer yet.
-              The marketplace will update automatically — no action needed. You can
-              refresh below to check for progress.
-            </div>
+          {/* ── Contextual alerts ── */}
+
+          {/* Stale indexer: on-chain confirmed but indexer catching up */}
+          {data.staleIndexer && (
+            <AlertBanner severity="warning">
+              <strong>Indexer is still catching up.</strong> Your transaction
+              was confirmed on-chain but hasn&apos;t been picked up by the
+              indexer yet. The marketplace will update automatically — no action
+              needed. You can refresh below to check for progress.
+            </AlertBanner>
           )}
 
-          {/* Failed warning */}
+          {/* Failed: safe to retry */}
           {isFailed && (
-            <div
-              role="alert"
-              className="bg-red-50 border border-red-200 rounded-lg p-3 text-sm text-red-900"
-            >
-              <strong>Transaction failed on-chain.</strong> No funds or NFTs were
-              transferred. It is safe to retry this action.
-            </div>
+            <AlertBanner severity="error">
+              <strong>Transaction failed on-chain.</strong> No funds or NFTs
+              were transferred. It is safe to retry this action.
+            </AlertBanner>
           )}
 
-          {/* Unknown — do NOT tell user to retry potentially successful payment */}
-          {isUnknown && (
-            <div
-              role="alert"
-              className="bg-gray-50 border border-gray-200 rounded-lg p-3 text-sm text-gray-800"
-            >
+          {/* RPC error: transient */}
+          {isRpcError && (
+            <AlertBanner severity="neutral">
+              <strong>RPC temporarily unavailable.</strong> The Stellar RPC
+              could not be reached. This is usually a transient issue — the
+              page will retry automatically.
+            </AlertBanner>
+          )}
+
+          {/* Not found: may still be propagating — WARN against double-spend */}
+          {showNotFoundWarning && (
+            <AlertBanner severity="neutral">
               <strong>Status unknown.</strong> This hash was not found on the
-              current network. If you recently submitted this transaction, it may
-              still be propagating. Wait a few seconds and refresh.{" "}
+              current network. If you recently submitted this transaction, it
+              may still be propagating. Wait a few seconds and refresh.{" "}
               <em>
                 Do not re-submit a payment until you have confirmed the original
                 transaction failed — submitting twice could result in a double
                 payment.
               </em>
-            </div>
+            </AlertBanner>
           )}
         </div>
 
@@ -318,55 +400,55 @@ export default function TxStatusPage({ params }: PageProps) {
             <TimelineStep
               label="Transaction submitted to network"
               done={isSuccess || isFailed}
-              active={isPending}
+              active={isPending && !showNotFoundWarning}
               failed={isFailed}
             />
             <TimelineStep
               label="Confirmed in a finalized ledger"
               done={isSuccess}
-              active={isPending && !isUnknown}
+              active={isPending}
               failed={isFailed}
             />
             <TimelineStep
               label="Indexed by marketplace"
               done={indexerDone}
-              active={isSuccess && data.stale_indexer}
+              active={isSuccess && data.staleIndexer}
               failed={false}
             />
           </div>
         </div>
 
         {/* Related resources */}
-        {(data.related_resources.listing_id ||
-          data.related_resources.auction_id ||
-          data.related_resources.offer_id) && (
+        {(data.relatedResources.listing_id ||
+          data.relatedResources.auction_id ||
+          data.relatedResources.offer_id) && (
           <div className="bg-white rounded-xl shadow p-5">
             <h2 className="text-sm font-semibold text-gray-700 mb-3">
               Affected Resources
             </h2>
             <div className="flex flex-wrap gap-3 text-sm">
-              {data.related_resources.listing_id && (
+              {data.relatedResources.listing_id && (
                 <Link
-                  href={`/listings/${data.related_resources.listing_id}`}
+                  href={`/listings/${data.relatedResources.listing_id}`}
                   className="text-blue-600 hover:underline"
                 >
-                  View listing #{data.related_resources.listing_id}
+                  View listing #{data.relatedResources.listing_id}
                 </Link>
               )}
-              {data.related_resources.auction_id && (
+              {data.relatedResources.auction_id && (
                 <Link
-                  href={`/auctions/${data.related_resources.auction_id}`}
+                  href={`/auctions/${data.relatedResources.auction_id}`}
                   className="text-blue-600 hover:underline"
                 >
-                  View auction #{data.related_resources.auction_id}
+                  View auction #{data.relatedResources.auction_id}
                 </Link>
               )}
-              {data.related_resources.offer_id && (
+              {data.relatedResources.offer_id && (
                 <Link
-                  href={`/offers/${data.related_resources.offer_id}`}
+                  href={`/offers/${data.relatedResources.offer_id}`}
                   className="text-blue-600 hover:underline"
                 >
-                  View offer #{data.related_resources.offer_id}
+                  View offer #{data.relatedResources.offer_id}
                 </Link>
               )}
             </div>
@@ -382,7 +464,9 @@ export default function TxStatusPage({ params }: PageProps) {
             <ul className="divide-y divide-gray-100 text-sm">
               {data.events.map((ev) => (
                 <li key={ev.id} className="py-2">
-                  <span className="font-medium text-gray-800">{ev.eventType}</span>
+                  <span className="font-medium text-gray-800">
+                    {ev.eventType}
+                  </span>
                   {ev.ledgerSequence > 0 && (
                     <span className="ml-2 text-xs text-gray-500">
                       ledger {ev.ledgerSequence}
@@ -405,7 +489,7 @@ export default function TxStatusPage({ params }: PageProps) {
           <div className="flex flex-wrap gap-3">
             {/* Explorer link — network-aware, never hard-coded */}
             <a
-              href={data.explorer_url}
+              href={data.explorerUrl}
               target="_blank"
               rel="noopener noreferrer"
               className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-sm font-medium"
@@ -413,16 +497,16 @@ export default function TxStatusPage({ params }: PageProps) {
               View on Stellar Expert ↗
             </a>
 
-            {/* Refresh — always safe */}
+            {/* Manual refresh — always safe */}
             <button
               type="button"
               onClick={() => {
-                setLoading(true);
+                setPollAttempt(0);
                 fetchStatus();
               }}
               className="px-4 py-2 bg-gray-100 hover:bg-gray-200 text-gray-800 rounded-lg text-sm"
             >
-              Refresh status
+              {loading ? "Refreshing…" : "Refresh status"}
             </button>
 
             <Link
@@ -436,10 +520,25 @@ export default function TxStatusPage({ params }: PageProps) {
           {lastRefreshed && (
             <p className="text-xs text-gray-400 mt-3">
               Last checked: {lastRefreshed.toLocaleTimeString()}
-              {(isPending || data.stale_indexer) && " · auto-refreshing…"}
+              {isAutoPolling && " · auto-refreshing…"}
             </p>
           )}
         </div>
+
+        {/* Support diagnostic — no secret keys involved */}
+        {(isFailed || isRpcError) && (
+          <div className="bg-white rounded-xl shadow p-5 text-sm text-gray-600 space-y-2">
+            <h2 className="font-semibold text-gray-700">Need help?</h2>
+            <p>
+              Share the transaction hash above with{" "}
+              <Link href="/support" className="text-blue-600 hover:underline">
+                support
+              </Link>{" "}
+              and we can investigate. You will never need to share your secret
+              key or seed phrase.
+            </p>
+          </div>
+        )}
       </div>
     </main>
   );

@@ -2,6 +2,7 @@ import pino from 'pino';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
+import { redact, redactString } from './redact.js';
 
 // ── Service metadata ─────────────────────────────────────────────────────────
 //
@@ -51,6 +52,15 @@ const baseOptions: pino.LoggerOptions = {
   formatters: {
     level: (label) => ({ level: label }),
   },
+  // Defense-in-depth: static glob-path redaction for well-known sensitive
+  // field shapes (see log-redaction.ts). This is a backstop, not the primary
+  // guard — arbitrary/dynamic keys (e.g. a full request body object) are
+  // caught by `sanitizeFields` in `wrap()` below, which pino's static paths
+  // can't anticipate.
+  redact: {
+    paths: PINO_REDACT_PATHS,
+    censor: '[REDACTED]',
+  },
 };
 
 const pinoInstance: pino.Logger =
@@ -84,13 +94,18 @@ export interface StructuredLogger {
   child(bindings: Record<string, unknown>): StructuredLogger;
 }
 
+// Every field object and message string is passed through `redact` /
+// `redactString` before it reaches pino's serializer. This is the last line
+// of defense if a Stellar key, DB URL, Pinata token, or other secret shape
+// ends up interpolated into a log call — see redact.ts and
+// src/__tests__/log-redaction.test.ts.
 function wrap(instance: pino.Logger): StructuredLogger {
   return {
-    debug: (msg, fields) => instance.debug(fields ?? {}, msg),
-    info: (msg, fields) => instance.info(fields ?? {}, msg),
-    warn: (msg, fields) => instance.warn(fields ?? {}, msg),
-    error: (msg, fields) => instance.error(fields ?? {}, msg),
-    child: (bindings) => wrap(instance.child(bindings)),
+    debug: (msg, fields) => instance.debug(redact(fields ?? {}) as Record<string, unknown>, redactString(msg)),
+    info: (msg, fields) => instance.info(redact(fields ?? {}) as Record<string, unknown>, redactString(msg)),
+    warn: (msg, fields) => instance.warn(redact(fields ?? {}) as Record<string, unknown>, redactString(msg)),
+    error: (msg, fields) => instance.error(redact(fields ?? {}) as Record<string, unknown>, redactString(msg)),
+    child: (bindings) => wrap(instance.child(redact(bindings) as Record<string, unknown>)),
   };
 }
 

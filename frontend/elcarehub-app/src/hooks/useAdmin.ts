@@ -33,6 +33,14 @@ import { Horizon } from "@stellar/stellar-sdk";
 import { config } from "@/lib/config";
 import { emitAuditEvent, extractTxHash } from "@/lib/auditLog";
 import { pseudonymiseAddress } from "@/lib/privacy";
+import {
+    listModerationCases,
+    getModerationCaseFull,
+    decideModerationCase,
+    decideAppeal,
+    type ModerationCaseFull,
+    type ModerationState,
+} from "@/lib/moderation";
 
 export interface AdminStats {
     totalListings: number;
@@ -835,6 +843,134 @@ export function useListingOversight(adminPublicKey: string | null) {
         filter,
         setFilter,
         isLoading,
+        error,
+        refresh,
+    };
+}
+
+// ── useModerationQueue (Issue #542) ────────────────────────────────────────────
+//
+// Operator triage queue for content moderation cases. Calls route through
+// the Next.js server-side proxy under app/api/moderation/admin/* so the
+// indexer's OPERATOR_TOKEN never reaches the browser bundle — see
+// lib/moderation.ts for the underlying fetch calls.
+
+export function useModerationQueue(adminPublicKey: string | null) {
+    const [cases, setCases] = useState<ModerationCaseFull[]>([]);
+    const [total, setTotal] = useState(0);
+    const [stateFilter, setStateFilter] = useState<ModerationState | "">("");
+    const [selectedCase, setSelectedCase] = useState<ModerationCaseFull | null>(null);
+    const [isLoading, setIsLoading] = useState(false);
+    const [isProcessing, setIsProcessing] = useState(false);
+    const [error, setError] = useState<string | null>(null);
+
+    const refresh = useCallback(async () => {
+        if (!adminPublicKey) return;
+        setIsLoading(true);
+        setError(null);
+        try {
+            const { cases: rows, total: count } = await listModerationCases({
+                state: stateFilter || undefined,
+                limit: 50,
+            });
+            setCases(rows);
+            setTotal(count);
+        } catch (err: unknown) {
+            setError(err instanceof Error ? err.message : "Failed to load moderation cases");
+        } finally {
+            setIsLoading(false);
+        }
+    }, [adminPublicKey, stateFilter]);
+
+    useEffect(() => {
+        refresh();
+    }, [refresh]);
+
+    const openCase = useCallback(async (cid: string) => {
+        try {
+            const full = await getModerationCaseFull(cid);
+            setSelectedCase(full);
+        } catch (err: unknown) {
+            setError(err instanceof Error ? err.message : "Failed to load case detail");
+        }
+    }, []);
+
+    const closeCase = useCallback(() => setSelectedCase(null), []);
+
+    const decide = useCallback(async (
+        cid: string,
+        state: "APPROVED" | "QUARANTINED" | "REJECTED",
+        reason?: string
+    ) => {
+        if (!adminPublicKey) return false;
+        setIsProcessing(true);
+        setError(null);
+        emitAuditEvent("moderation.decision", adminPublicKey, "initiated", {
+            target: cid,
+            value: state,
+        });
+        try {
+            await decideModerationCase(cid, { state, actor: adminPublicKey, reason });
+            emitAuditEvent("moderation.decision", adminPublicKey, "success", {
+                target: cid,
+                value: state,
+            });
+            await refresh();
+            if (selectedCase?.cid === cid) await openCase(cid);
+            return true;
+        } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : "Failed to record decision";
+            emitAuditEvent("moderation.decision", adminPublicKey, "failed", { target: cid, errorMessage: msg });
+            setError(msg);
+            return false;
+        } finally {
+            setIsProcessing(false);
+        }
+    }, [adminPublicKey, refresh, selectedCase, openCase]);
+
+    const resolveAppeal = useCallback(async (
+        appealId: number,
+        status: "UPHELD" | "OVERTURNED",
+        decisionReason?: string
+    ) => {
+        if (!adminPublicKey) return false;
+        setIsProcessing(true);
+        setError(null);
+        emitAuditEvent("moderation.appeal_decision", adminPublicKey, "initiated", {
+            target: String(appealId),
+            value: status,
+        });
+        try {
+            await decideAppeal(appealId, { status, decidedBy: adminPublicKey, decisionReason });
+            emitAuditEvent("moderation.appeal_decision", adminPublicKey, "success", {
+                target: String(appealId),
+                value: status,
+            });
+            await refresh();
+            if (selectedCase) await openCase(selectedCase.cid);
+            return true;
+        } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : "Failed to resolve appeal";
+            emitAuditEvent("moderation.appeal_decision", adminPublicKey, "failed", { target: String(appealId), errorMessage: msg });
+            setError(msg);
+            return false;
+        } finally {
+            setIsProcessing(false);
+        }
+    }, [adminPublicKey, refresh, selectedCase, openCase]);
+
+    return {
+        cases,
+        total,
+        stateFilter,
+        setStateFilter,
+        selectedCase,
+        openCase,
+        closeCase,
+        decide,
+        resolveAppeal,
+        isLoading,
+        isProcessing,
         error,
         refresh,
     };

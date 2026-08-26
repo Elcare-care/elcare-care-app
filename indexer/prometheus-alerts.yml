@@ -169,3 +169,75 @@ groups:
           description: >
             {{ $value }} records showed drift in the last reconciliation run.
             Review the reconciler logs and consider triggering a targeted repair.
+
+      # ── Financial reconciliation alerts (Issue #XXX) ─────────────────────────────
+
+      - alert: FinancialDriftCritical
+        expr: financial_drifts_open{severity="Critical"} > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Critical financial drift detected"
+          description: >
+            {{ $value }} critical financial drift(s) are currently unresolved.
+            Immediate investigation required - this may indicate missing or duplicate
+            payouts affecting protocol fees, royalties, sales, or refunds.
+
+      - alert: FinancialDriftHigh
+        expr: financial_drifts_open{severity="High"} > 5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Multiple high-severity financial drifts detected"
+          description: >
+            {{ $value }} high-severity financial drift(s) have been unresolved for
+            over 5 minutes. Review the financial reconciliation dashboard and investigate
+            the affected entities.
+
+      - alert: FinancialDriftStale
+        expr: financial_drift_oldest_age_seconds > 86400
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Financial drift unresolved for over 24 hours"
+          description: >
+            The oldest unresolved financial drift is
+            {{ $value | humanizeDuration }} old. Unresolved drifts may indicate
+            persistent reconciliation issues requiring manual intervention.
+
+      - alert: FinancialAlertRateHigh
+        expr: rate(financial_alerts_raised_total[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Elevated financial alert rate"
+          description: >
+            Financial alerts are being raised at {{ $value | humanize }} per second.
+            This may indicate a systematic issue with event processing or payout tracking.
+
+      - alert: FinancialReconcileFailed
+        expr: increase(financial_reconcile_runs_total{outcome="error"}[10m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Financial reconciliation run failed"
+          description: >
+            One or more financial reconciliation runs have failed in the last 10 minutes.
+            Check the logs for database connectivity or query execution issues.
+
+      - alert: FinancialReconcileLag
+        expr: >
+          (time() - max_over_time(financial_reconcile_runs_total{outcome="ok"}[1h]) > 3600)
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Financial reconciliation not running"
+          description: >
+            No successful financial reconciliation run has completed in the last hour.
+            The reconciliation job may be stopped or failing silently.

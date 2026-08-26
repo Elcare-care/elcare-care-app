@@ -8,6 +8,7 @@ backlog**, and **decision records**.
 | Document | Purpose |
 |---|---|
 | [quarterly-review-process.md](./quarterly-review-process.md) | Participants, inputs, scoring, incident rules, version alignment |
+| [quarterly-review-template-inputs.md](./quarterly-review-template-inputs.md) | Pre-review artifact collection template |
 | [backlog.md](./backlog.md) | Domain owners, scored open items, deployment baseline |
 | [reviews/](./reviews/) | Published decision records (one file per quarter) |
 
