@@ -17,6 +17,7 @@ import {
 import { fetchAuctions } from "@/lib/indexer";
 import { uploadImageToIPFS, uploadMetadataToIPFS, ArtworkMetadata } from "@/lib/ipfs";
 import { getReadableErrorMessage } from "@/lib/errors";
+import { config } from "@/lib/config";
 import { useTransientErrorToast } from "./useTransientErrorToast";
 import { useTxToast } from "./useTxToast";
 import { assertSupportedTokenAddress } from "@/lib/token-support";
@@ -227,7 +228,17 @@ import { useRef } from "react";
 
 export function useAuctionsWithReconciliation() {
   const auctionsHook = useAuctions();
-  const recon = useReconciliation<Auction>({ mutationTtlMs: 60_000 });
+  const auctionsRefreshRef = useRef(auctionsHook.refresh);
+  auctionsRefreshRef.current = auctionsHook.refresh;
+
+  const recon = useReconciliation<Auction>({
+    mutationTtlMs: 60_000,
+    // Issue #520: a chain reorg invalidates any provisional bid/finalize
+    // state — reset and re-fetch confirmed truth instead of leaving stale
+    // local entities behind.
+    reorgIndexerUrl: config.indexerUrl || null,
+    onReorgReset: () => auctionsRefreshRef.current(),
+  });
 
   const prevRef = useRef<Auction[]>([]);
   useEffect(() => {

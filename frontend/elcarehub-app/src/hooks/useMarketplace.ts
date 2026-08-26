@@ -245,7 +245,7 @@ export function useCreateListing(artistPublicKey: string | null) {
 // ── useBuyArtwork ─────────────────────────────────────────────
 
 export function useBuyArtwork(buyerPublicKey: string | null) {
-  const { run, isRunning: isBuying } = useTxToast();
+  const { run, isRunning: isBuying, txHash } = useTxToast();
 
   const buy = useCallback(
     async (listingId: number, expectedIntent?: TransactionIntent): Promise<boolean> => {
@@ -276,7 +276,9 @@ export function useBuyArtwork(buyerPublicKey: string | null) {
     [buyerPublicKey, run],
   );
 
-  return { buy, isBuying, error: null };
+  // Issue #520: expose the real transaction hash once known so callers can
+  // key a provisional/optimistic UI update against it (see useReconciliation).
+  return { buy, isBuying, error: null, txHash };
 }
 
 // ── useCancelListing ──────────────────────────────────────────
@@ -473,7 +475,19 @@ export interface ListingMutationPayload {
 
 export function useMarketplaceWithReconciliation(opts?: { page?: number; limit?: number }) {
   const marketplace = useMarketplace(opts);
-  const recon = useReconciliation<Listing>({ mutationTtlMs: 60_000 });
+  const marketplaceRefreshRef = useRef(marketplace.refresh);
+  marketplaceRefreshRef.current = marketplace.refresh;
+
+  const recon = useReconciliation<Listing>({
+    mutationTtlMs: 60_000,
+    // Issue #520: a REORG/CRITICAL_REORG event invalidates any provisional
+    // state built on the now-orphaned chain history — discard all local
+    // pending mutations and confirmed snapshots, then re-fetch confirmed
+    // truth so the UI performs a full reconciliation rather than leaving
+    // stale local entities behind.
+    reorgIndexerUrl: config.indexerUrl || null,
+    onReorgReset: () => marketplaceRefreshRef.current(),
+  });
 
   // When fresh listing data arrives (from SSE-triggered refresh), push it into
   // the reconciler as confirmed snapshots.

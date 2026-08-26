@@ -22,6 +22,7 @@ import {
   OfferUIStatus,
 } from "@/lib/contract";
 import { getReadableErrorMessage } from "@/lib/errors";
+import { config } from "@/lib/config";
 import { useTransientErrorToast } from "./useTransientErrorToast";
 import {
   useReconciliation,
@@ -449,7 +450,16 @@ export function useMakeOffer(publicKey: string | null) {
 
 export function useOffersWithReconciliation(publicKey: string | null) {
   const offersHook = useOffererOffers(publicKey);
-  const recon = useReconciliation<OffererOffer>({ mutationTtlMs: 60_000 });
+  const offersRefreshRef = useRef(offersHook.refresh);
+  offersRefreshRef.current = offersHook.refresh;
+
+  const recon = useReconciliation<OffererOffer>({
+    mutationTtlMs: 60_000,
+    // Issue #520: a chain reorg invalidates any provisional offer state —
+    // reset and re-fetch confirmed truth instead of leaving stale entities.
+    reorgIndexerUrl: config.indexerUrl || null,
+    onReorgReset: () => offersRefreshRef.current(),
+  });
 
   const prevRef = useRef<OffererOffer[]>([]);
   useEffect(() => {
