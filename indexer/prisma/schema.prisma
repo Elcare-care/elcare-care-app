@@ -821,7 +821,7 @@ model OperationalAudit {
   ipAddress       String?       // client IP address
   userAgent       String?       // client user agent
   createdAt       DateTime      @default(now())
-  
+
   @@index([actor])
   @@index([actionType])
   @@index([createdAt])

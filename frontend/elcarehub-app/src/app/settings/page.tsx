@@ -7,14 +7,14 @@
 import { useState, useEffect } from "react";
 import { useWalletContext } from "@/context/WalletContext";
 import { getLocalePreferences, setLocalePreferences } from "@/lib/format";
-import { 
-  Settings, 
-  Wallet, 
-  Network, 
-  Shield, 
-  Globe, 
-  Bell, 
-  Eye, 
+import {
+  Settings,
+  Wallet,
+  Network,
+  Shield,
+  Globe,
+  Bell,
+  Eye,
   EyeOff,
   Save,
   RefreshCw,
@@ -22,8 +22,36 @@ import {
   X,
   AlertTriangle,
   Info,
-  ExternalLink
+  ExternalLink,
+  Download,
+  Trash2,
+  Loader2,
+  FileJson
 } from "lucide-react";
+
+// ── Privacy requests (Issue #543) ───────────────────────────────
+//
+// Mirrors the record shape returned by indexer/src/api/privacy-routes.ts
+// via the frontend proxy at /api/privacy/requests.
+
+type PrivacyRequestType = "EXPORT" | "DELETION";
+type PrivacyRequestStatus =
+  | "PENDING"
+  | "VERIFIED"
+  | "PROCESSING"
+  | "COMPLETED"
+  | "REJECTED"
+  | "FAILED";
+
+interface PrivacyRequestRecord {
+  id: string;
+  type: PrivacyRequestType;
+  status: PrivacyRequestStatus;
+  requestedAt: string;
+  completedAt: string | null;
+  exportPayload: unknown;
+  retainedRecordsNote: string | null;
+}
 
 export default function SettingsPage() {
   const { 
@@ -82,6 +110,87 @@ export default function SettingsPage() {
 
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+
+  // ── Privacy requests (Issue #543) ─────────────────────────────
+  const [privacyRequests, setPrivacyRequests] = useState<PrivacyRequestRecord[]>([]);
+  const [privacyLoading, setPrivacyLoading] = useState(false);
+  const [privacyActionPending, setPrivacyActionPending] = useState<PrivacyRequestType | null>(null);
+  const [privacyError, setPrivacyError] = useState<string | null>(null);
+
+  const loadPrivacyRequests = async () => {
+    if (!publicKey) return;
+    setPrivacyLoading(true);
+    setPrivacyError(null);
+    try {
+      const res = await fetch("/api/privacy/requests", {
+        headers: { "x-wallet-address": publicKey },
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data?.error ?? "Failed to load privacy requests.");
+      setPrivacyRequests(Array.isArray(data) ? data : []);
+    } catch (err) {
+      setPrivacyError(err instanceof Error ? err.message : "Failed to load privacy requests.");
+    } finally {
+      setPrivacyLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (isConnected && publicKey) {
+      loadPrivacyRequests();
+    } else {
+      setPrivacyRequests([]);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isConnected, publicKey]);
+
+  const submitPrivacyRequest = async (type: PrivacyRequestType) => {
+    if (!publicKey) return;
+    if (
+      type === "DELETION" &&
+      !window.confirm(
+        "This will delete eligible off-chain data linked to your wallet. " +
+          "Canonical blockchain records (listings, auctions, offers, bids, royalties) " +
+          "cannot be deleted and will be reported as retained. Continue?"
+      )
+    ) {
+      return;
+    }
+    setPrivacyActionPending(type);
+    setPrivacyError(null);
+    try {
+      const res = await fetch("/api/privacy/requests", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-wallet-address": publicKey,
+        },
+        body: JSON.stringify({ type }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data?.error ?? `Failed to submit ${type.toLowerCase()} request.`);
+      await loadPrivacyRequests();
+    } catch (err) {
+      setPrivacyError(err instanceof Error ? err.message : "Request failed.");
+    } finally {
+      setPrivacyActionPending(null);
+    }
+  };
+
+  const downloadExport = (request: PrivacyRequestRecord) => {
+    if (typeof window === "undefined" || !request.exportPayload) return;
+    const blob = new Blob([JSON.stringify(request.exportPayload, null, 2)], {
+      type: "application/json",
+    });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `elcarehub-privacy-export-${request.id}.json`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  };
 
   const handleSave = async () => {
     setSaving(true);
@@ -516,6 +625,113 @@ export default function SettingsPage() {
                 </div>
               </div>
             </div>
+          </div>
+        </div>
+
+        {/* Data & Privacy Controls (Issue #543) */}
+        <div className="bg-midnight-900 rounded-xl border border-white/5 p-6 mb-6">
+          <div className="flex items-center gap-3 mb-4">
+            <FileJson className="h-5 w-5 text-brand-400" />
+            <h2 className="text-lg font-semibold text-white">Data &amp; Privacy Controls</h2>
+          </div>
+
+          <p className="text-xs text-gray-400 mb-4 leading-relaxed">
+            Request an export of the off-chain application data linked to your wallet, or
+            request deletion of the parts we can remove. Blockchain transactions and
+            IPFS-pinned metadata are public and permanent and cannot be deleted by us or
+            anyone else — see the{" "}
+            <a href="/privacy" className="text-brand-400 hover:underline">
+              Privacy Policy
+            </a>{" "}
+            for the full data inventory and retention rules.
+          </p>
+
+          <div className="flex flex-col sm:flex-row gap-3 mb-4">
+            <button
+              onClick={() => submitPrivacyRequest("EXPORT")}
+              disabled={privacyActionPending !== null}
+              className="flex items-center justify-center gap-2 flex-1 rounded-lg bg-white/5 border border-white/10 px-4 py-2.5 text-sm font-medium text-white hover:bg-white/10 disabled:opacity-50 disabled:cursor-not-allowed transition-all"
+            >
+              {privacyActionPending === "EXPORT" ? (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              ) : (
+                <Download className="h-4 w-4" />
+              )}
+              Request data export
+            </button>
+            <button
+              onClick={() => submitPrivacyRequest("DELETION")}
+              disabled={privacyActionPending !== null}
+              className="flex items-center justify-center gap-2 flex-1 rounded-lg border border-terracotta-500/30 bg-terracotta-500/10 px-4 py-2.5 text-sm font-medium text-terracotta-400 hover:bg-terracotta-500/20 disabled:opacity-50 disabled:cursor-not-allowed transition-all"
+            >
+              {privacyActionPending === "DELETION" ? (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              ) : (
+                <Trash2 className="h-4 w-4" />
+              )}
+              Request account deletion
+            </button>
+          </div>
+
+          {privacyError && (
+            <div className="mb-4 p-3 rounded-lg bg-terracotta-500/10 border border-terracotta-500/30 text-xs text-terracotta-300">
+              {privacyError}
+            </div>
+          )}
+
+          <div className="space-y-2">
+            <div className="flex items-center justify-between">
+              <span className="text-sm font-medium text-gray-300">Request history</span>
+              <button
+                onClick={loadPrivacyRequests}
+                disabled={privacyLoading}
+                className="text-xs text-gray-400 hover:text-white flex items-center gap-1"
+              >
+                <RefreshCw className={`h-3 w-3 ${privacyLoading ? "animate-spin" : ""}`} />
+                Refresh
+              </button>
+            </div>
+
+            {privacyRequests.length === 0 ? (
+              <p className="text-xs text-gray-500 py-2">No privacy requests yet.</p>
+            ) : (
+              privacyRequests.map((r) => (
+                <div
+                  key={r.id}
+                  className="p-3 rounded-lg bg-white/5 border border-white/10 text-xs"
+                >
+                  <div className="flex items-center justify-between mb-1">
+                    <span className="font-mono text-white">{r.id}</span>
+                    <span
+                      className={`px-2 py-0.5 rounded-full font-semibold ${
+                        r.status === "COMPLETED"
+                          ? "bg-mint-500/20 text-mint-400"
+                          : r.status === "FAILED" || r.status === "REJECTED"
+                            ? "bg-terracotta-500/20 text-terracotta-400"
+                            : "bg-brand-500/20 text-brand-400"
+                      }`}
+                    >
+                      {r.status}
+                    </span>
+                  </div>
+                  <div className="text-gray-400">
+                    {r.type} — requested {new Date(r.requestedAt).toLocaleString()}
+                  </div>
+                  {r.retainedRecordsNote && (
+                    <div className="mt-2 text-gray-500 leading-relaxed">{r.retainedRecordsNote}</div>
+                  )}
+                  {r.status === "COMPLETED" && r.type === "EXPORT" && r.exportPayload ? (
+                    <button
+                      onClick={() => downloadExport(r)}
+                      className="mt-2 flex items-center gap-1 text-brand-400 hover:underline"
+                    >
+                      <Download className="h-3 w-3" />
+                      Download export JSON
+                    </button>
+                  ) : null}
+                </div>
+              ))
+            )}
           </div>
         </div>
 
