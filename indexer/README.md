@@ -349,6 +349,7 @@ Example log line:
 |----------|---------|-------------|
 | `LOG_LEVEL` | `info` | Minimum level emitted. Set to `debug` locally for verbose tracing (e.g. duplicate-event skips), or `warn`/`error` in noisy environments. |
 | `LOG_FORMAT` | `json` | `json` (default) emits one-line JSON, suitable for production and log shippers. `pretty` pipes output through [`pino-pretty`](https://github.com/pinojs/pino-pretty) for colorized, human-readable lines — use this for local development (`LOG_FORMAT=pretty npm run dev`). |
+| `ALLOW_RAW_BODY_LOGGING` | `false` | Opts into unredacted request bodies / full XDR blobs for local debugging. Ignored (no-op, with a one-time warning) when `NODE_ENV=production`. See [Logging Policy](../docs/LOGGING_POLICY.md). |
 
 ### Request correlation IDs
 
@@ -360,6 +361,12 @@ Every HTTP request is tagged with a request ID (`indexer/src/api/request-id-midd
 - Two structured log lines bracket each request — `"request started"` and `"request completed"` — both carrying `requestId`, `method`, `route`, and (on completion) `statusCode` and `durationMs`. This makes it trivial to filter a log stream down to every line produced by a single request, or to grep production logs by the request ID returned to a user reporting an issue.
 
 `/health`, `/readyz`, and `/metrics` are excluded from request logging to avoid drowning real traffic in health-check noise (they're polled every few seconds by orchestrators/Prometheus).
+
+### Redaction & privacy-safe logging
+
+Every log line is sanitized before it reaches pino (`indexer/src/log-redaction.ts`, wired in via `logger.ts`'s `wrap()`): Stellar secret keys, JWTs, `authorization`/`cookie`/`password`/`token`-shaped fields, credentials embedded in URLs (`postgres://user:pass@host` → `postgres://[REDACTED]@host`), and raw Soroban transaction XDR blobs are all redacted or truncated automatically, including inside nested objects and `Error.cause` chains. `requestId`, `statusCode`, `durationMs`, and similar diagnostic fields are never touched.
+
+Full request bodies / raw XDR are available for local debugging only via `ALLOW_RAW_BODY_LOGGING=true`, which is a hard no-op when `NODE_ENV=production`. See **[Logging Policy](../docs/LOGGING_POLICY.md)** for the full allowed/forbidden field list and the guarded-override behavior.
 
 ### Log Shipping
 
