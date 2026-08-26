@@ -45,6 +45,12 @@ import {
   gapLengthLedgers,
 } from './recovery-metrics.js';
 import { upsertEvents } from './event-idempotency.js';
+import {
+  withShutdownTimeout,
+  TIMEOUT_BUDGETS,
+  TimeoutError,
+  CancellationError,
+} from './timeout.js';
 
 dotenv.config();
 
@@ -242,24 +248,42 @@ export async function gracefulShutdown(): Promise<void> {
   if (shutdownStarted) return;
   shutdownStarted = true;
 
-  const shutdownTimeoutMs = parseInt(process.env.SHUTDOWN_TIMEOUT_MS || '30000', 10);
-
   console.log('[Shutdown] Closing resources: Prisma + Redis + registered hooks');
-  const cleanup = Promise.allSettled([
-    prisma.$disconnect(),
-    (redis && typeof redis.disconnect === 'function') ? redis.disconnect() : Promise.resolve(),
-    ...shutdownHooks.map((fn) => fn()),
-  ]);
-
+  
+  // Use timeout budget for shutdown with abort signal support
   try {
-    await Promise.race([
-      cleanup,
-      new Promise((_, rej) => setTimeout(() => rej(new Error('shutdown timeout')), shutdownTimeoutMs)),
-    ]);
+    await withShutdownTimeout(
+      async (signal) => {
+        // Check if shutdown was cancelled
+        if (signal.aborted) {
+          throw new CancellationError('shutdown cancelled by signal');
+        }
+
+        const cleanup = Promise.allSettled([
+          prisma.$disconnect(),
+          (redis && typeof redis.disconnect === 'function') ? redis.disconnect() : Promise.resolve(),
+          ...shutdownHooks.map((fn) => fn()),
+        ]);
+
+        await cleanup;
+      },
+      'graceful_shutdown',
+      TIMEOUT_BUDGETS.shutdown
+    );
+    
     logger.info('Shutdown: cleanup complete');
     process.exit(0);
   } catch (err) {
-    logger.error('Shutdown: cleanup timed out', { err });
+    if (err instanceof TimeoutError) {
+      logger.error('Shutdown: cleanup timed out', { 
+        timeoutMs: TIMEOUT_BUDGETS.shutdown.totalBudgetMs,
+        err: err.message 
+      });
+    } else if (err instanceof CancellationError) {
+      logger.warn('Shutdown: cancelled', { reason: err.message });
+    } else {
+      logger.error('Shutdown: cleanup failed', { err });
+    }
     process.exit(1);
   }
 }
