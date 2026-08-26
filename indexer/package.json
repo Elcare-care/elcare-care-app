@@ -8,6 +8,7 @@
     "backfill": "tsx src/backfill.ts",
     "keeper": "tsx src/keeper/index.ts",
     "gaps:repair": "tsx src/gap-repair.ts",
+    "rebuild": "tsx src/rebuild-projections.ts",
     "cli": "tsx src/cli.ts",
     "build": "npm run prisma:generate && tsc",
     "prestart": "npx prisma migrate deploy && npm run migrate:status",
