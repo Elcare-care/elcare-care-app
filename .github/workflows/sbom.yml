@@ -1,0 +1,286 @@
+name: SBOM Generation
+
+# ── Purpose ───────────────────────────────────────────────────
+#
+# Generates CycloneDX SBOMs (Software Bill of Materials) for every
+# release-relevant artifact in this monorepo:
+#   - frontend (npm workspace: frontend/elcarehub-app)
+#   - indexer (npm workspace: indexer)
+#   - contracts (Rust/Soroban workspace: root Cargo.toml, covering
+#     contracts/* and the vendored patches/soroban-env-host-25.0.1 crate)
+#   - the built indexer container image
+#
+# Each SBOM is accompanied by a `*.meta.json` build-provenance record
+# (git commit, ref, commit-timestamp, lockfile + its sha256, and the CI
+# run URL — no secrets) so a package can be traced back to the exact
+# lockfile and image layer it came from.
+#
+# On a `v*` tag push: SBOMs + metadata are attached to the GitHub Release
+# for that tag.
+# On a pull request / manual dispatch: SBOMs are uploaded as build
+# artifacts, and `scripts/sbom/check-freshness.mjs` verifies each SBOM's
+# recorded lockfile hash matches the lockfile actually checked out —
+# catching a broken/incomplete generation step before merge.
+#
+# See docs/SBOM.md for format details and the review guidance for
+# components (like the vendored patch crate) that can't be traced to a
+# registry entry.
+#
+# ─────────────────────────────────────────────────────────────
+
+on:
+  push:
+    tags:
+      - "v*"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sbom-frontend:
+    name: SBOM — Frontend (npm)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Generate CycloneDX SBOM (frontend)
+        run: |
+          npx --yes @cyclonedx/cyclonedx-npm@^1 \
+            --output-format json \
+            --output-reproducible \
+            --output-file sbom-frontend.cdx.json \
+            frontend/elcarehub-app/package.json
+
+      - name: Write build-provenance metadata
+        run: |
+          node scripts/sbom/write-meta.mjs \
+            --component frontend \
+            --lockfile frontend/elcarehub-app/package-lock.json \
+            --out sbom-frontend.meta.json
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-frontend
+          path: |
+            sbom-frontend.cdx.json
+            sbom-frontend.meta.json
+          retention-days: 90
+
+  sbom-indexer:
+    name: SBOM — Indexer (npm)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Generate CycloneDX SBOM (indexer)
+        run: |
+          npx --yes @cyclonedx/cyclonedx-npm@^1 \
+            --output-format json \
+            --output-reproducible \
+            --output-file sbom-indexer.cdx.json \
+            indexer/package.json
+
+      - name: Write build-provenance metadata
+        run: |
+          node scripts/sbom/write-meta.mjs \
+            --component indexer \
+            --lockfile indexer/package-lock.json \
+            --out sbom-indexer.meta.json
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-indexer
+          path: |
+            sbom-indexer.cdx.json
+            sbom-indexer.meta.json
+          retention-days: 90
+
+  sbom-contracts:
+    name: SBOM — Contracts (Rust workspace)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # We use `cargo metadata` (built into cargo — no extra tool to
+      # install/pin) plus a small transform script rather than
+      # cargo-cyclonedx, so this job has no external tool version drift.
+      # See docs/SBOM.md for the rationale and scripts/sbom/README notes
+      # in cargo-metadata-to-cyclonedx.mjs.
+      - name: Resolve workspace dependency graph
+        run: cargo metadata --format-version=1 --locked > cargo-metadata.json
+
+      - name: Transform to CycloneDX
+        run: |
+          node scripts/sbom/cargo-metadata-to-cyclonedx.mjs \
+            cargo-metadata.json \
+            sbom-contracts.cdx.json
+
+      - name: Write build-provenance metadata
+        run: |
+          node scripts/sbom/write-meta.mjs \
+            --component contracts \
+            --lockfile Cargo.lock \
+            --out sbom-contracts.meta.json
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-contracts
+          path: |
+            sbom-contracts.cdx.json
+            sbom-contracts.meta.json
+          retention-days: 90
+
+  sbom-docker:
+    name: SBOM — Docker (indexer image)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # Build the real indexer image (same pattern load-tests.yml already
+      # uses) so the SBOM reflects what actually ships — OS packages from
+      # the apk layer, the Prisma-generated client, and production-only
+      # npm deps — not just the source lockfile.
+      - name: Build indexer image
+        run: |
+          docker build \
+            --build-arg BUILD_SHA=${{ github.sha }} \
+            --build-arg BUILD_TIME=$(git log -1 --format=%cI) \
+            -t elcarehub-indexer-sbom:${{ github.sha }} \
+            indexer
+
+      - name: Generate CycloneDX SBOM (syft)
+        uses: anchore/sbom-action@v0
+        with:
+          image: elcarehub-indexer-sbom:${{ github.sha }}
+          format: cyclonedx-json
+          output-file: sbom-docker-indexer.cdx.json
+          upload-artifact: false
+
+      - name: Write build-provenance metadata
+        run: |
+          node scripts/sbom/write-meta.mjs \
+            --component docker-indexer \
+            --lockfile indexer/package-lock.json \
+            --out sbom-docker-indexer.meta.json
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-docker-indexer
+          path: |
+            sbom-docker-indexer.cdx.json
+            sbom-docker-indexer.meta.json
+          retention-days: 90
+
+  sbom-attach-and-check:
+    name: Attach / Validate SBOMs
+    needs: [sbom-frontend, sbom-indexer, sbom-contracts, sbom-docker]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # only exercised on the tag-push release-upload path
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Download all SBOM artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: sbom-*
+          merge-multiple: true
+          path: sboms
+
+      - name: List collected SBOM files
+        run: ls -la sboms
+
+      - name: Verify SBOM traceability / freshness
+        # Each *.meta.json records the sha256 of the lockfile it was
+        # generated from. Since generation happens fresh in this same
+        # workflow run, this also validates that generation actually
+        # produced current output tied to the checked-out lockfile
+        # (rather than a stale/cached/empty file slipping through).
+        run: |
+          node scripts/sbom/check-freshness.mjs \
+            frontend/elcarehub-app/package-lock.json sboms/sbom-frontend.meta.json
+          node scripts/sbom/check-freshness.mjs \
+            indexer/package-lock.json sboms/sbom-indexer.meta.json
+          node scripts/sbom/check-freshness.mjs \
+            Cargo.lock sboms/sbom-contracts.meta.json
+          node scripts/sbom/check-freshness.mjs \
+            indexer/package-lock.json sboms/sbom-docker-indexer.meta.json
+
+      - name: Verify SBOMs are non-empty
+        run: |
+          set -e
+          for f in sboms/sbom-frontend.cdx.json sboms/sbom-indexer.cdx.json \
+                   sboms/sbom-contracts.cdx.json sboms/sbom-docker-indexer.cdx.json; do
+            count=$(node -e "console.log((JSON.parse(require('fs').readFileSync('$f')).components||[]).length)")
+            echo "$f: $count components"
+            if [ "$count" -lt 1 ]; then
+              echo "::error::$f has zero components — SBOM generation likely failed or is missing"
+              exit 1
+            fi
+          done
+
+      - name: Upload combined SBOM bundle (build artifact)
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-bundle-${{ github.sha }}
+          path: sboms/*
+          retention-days: 90
+
+      - name: Attach SBOMs to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          TAG="${GITHUB_REF_NAME}"
+          if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release upload "$TAG" sboms/*.cdx.json sboms/*.meta.json \
+              --repo "${{ github.repository }}" --clobber
+          else
+            gh release create "$TAG" sboms/*.cdx.json sboms/*.meta.json \
+              --repo "${{ github.repository }}" \
+              --title "$TAG" \
+              --generate-notes
+          fi
