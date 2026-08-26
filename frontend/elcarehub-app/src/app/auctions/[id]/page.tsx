@@ -22,6 +22,7 @@ import {
   subscribeToMarketplaceEvents,
   getAuctionBidHistory,
   recordAuctionBidCount,
+  STALE_THRESHOLDS_MS,
   type BidHistoryRecord,
 } from "@/lib/indexer";
 import { getReadableErrorMessage } from "@/lib/errors";
@@ -29,8 +30,10 @@ import { categorizePageError, PageStateError } from "@/lib/pageState";
 import { useWalletContext } from "@/context/WalletContext";
 import { usePlaceBid } from "@/hooks/usePlaceBid";
 import { useFinalizeAuction } from "@/hooks/useAuctions";
+import { useServerClock } from "@/hooks/useServerClock";
 import { GuardButton } from "@/components/WalletGuard";
 import { ResourceState } from "@/components/PageStates";
+import { AuctionManagementPanel } from "@/components/AuctionManagementPanel";
 import { config } from "@/lib/config";
 import {
   ArrowLeft,
@@ -58,10 +61,18 @@ import { Breadcrumb } from "@/components/Breadcrumb";
 //
 // Live countdown hook that can absorb endTime extensions
 // delivered via the SSE AUCTION_EXTENDED event (ISSUE-021).
+//
+// `serverOffsetMs` (Issue #527) lets callers correct for client clock drift:
+// pass the offset from `useServerClock()` so "now" tracks the indexer's
+// wall clock (a close proxy for ledger time — see lib/serverTime.ts) rather
+// than a possibly-skewed local clock. Defaults to 0 (pure local clock),
+// which preserves the original behaviour for existing callers/tests.
 
-export function useAuctionCountdown(initialEndTime: number) {
+export function useAuctionCountdown(initialEndTime: number, serverOffsetMs = 0) {
   const [endTime, setEndTime] = useState(initialEndTime);
-  const [now, setNow] = useState(() => Math.floor(Date.now() / 1000));
+  const [now, setNow] = useState(() =>
+    Math.floor((Date.now() + serverOffsetMs) / 1000)
+  );
 
   // Keep endTime in sync if the parent refreshes the auction object.
   useEffect(() => {
@@ -71,11 +82,11 @@ export function useAuctionCountdown(initialEndTime: number) {
   // Tick every second.
   useEffect(() => {
     const id = setInterval(
-      () => setNow(Math.floor(Date.now() / 1000)),
+      () => setNow(Math.floor((Date.now() + serverOffsetMs) / 1000)),
       1_000
     );
     return () => clearInterval(id);
-  }, []);
+  }, [serverOffsetMs]);
 
   const remaining = Math.max(0, endTime - now);
   const days = Math.floor(remaining / 86400);
@@ -101,11 +112,23 @@ interface CountdownProps {
   endTime: number;
   /** Called when the countdown receives an extension via SSE. */
   onExtend?: (newEndTime: number) => void;
+  /** Client clock-drift correction (ms) from useServerClock(). Defaults to 0. */
+  serverOffsetMs?: number;
+  /** Show a small "synced"/"unsynced" indicator next to the countdown. */
+  showSyncBadge?: boolean;
+  /** Whether the server clock sample backing serverOffsetMs is still fresh. */
+  isSynced?: boolean;
 }
 
-export function Countdown({ endTime, onExtend }: CountdownProps) {
+export function Countdown({
+  endTime,
+  onExtend,
+  serverOffsetMs = 0,
+  showSyncBadge = false,
+  isSynced = true,
+}: CountdownProps) {
   const { days, hours, minutes, seconds, isExpired, setEndTime } =
-    useAuctionCountdown(endTime);
+    useAuctionCountdown(endTime, serverOffsetMs);
 
   // Allow parent to push an extended endTime in.
   useEffect(() => {
@@ -125,27 +148,44 @@ export function Countdown({ endTime, onExtend }: CountdownProps) {
   }
 
   return (
-    <div data-testid="countdown" className="flex items-center gap-3">
-      {(
-        [
-          { label: "Days", value: days },
-          { label: "Hours", value: hours },
-          { label: "Min", value: minutes },
-          { label: "Sec", value: seconds },
-        ] as const
-      ).map(({ label, value }) => (
-        <div
-          key={label}
-          className="flex flex-col items-center rounded-xl bg-brand-50 px-3 py-2 min-w-[52px]"
+    <div className="flex items-center gap-3">
+      <div data-testid="countdown" className="flex items-center gap-3">
+        {(
+          [
+            { label: "Days", value: days },
+            { label: "Hours", value: hours },
+            { label: "Min", value: minutes },
+            { label: "Sec", value: seconds },
+          ] as const
+        ).map(({ label, value }) => (
+          <div
+            key={label}
+            className="flex flex-col items-center rounded-xl bg-brand-50 px-3 py-2 min-w-[52px]"
+          >
+            <span className="font-mono text-2xl font-bold text-brand-700 leading-none">
+              {String(value).padStart(2, "0")}
+            </span>
+            <span className="mt-1 text-[10px] uppercase tracking-wide text-brand-400">
+              {label}
+            </span>
+          </div>
+        ))}
+      </div>
+      {showSyncBadge && (
+        <span
+          data-testid="countdown-sync-badge"
+          title={
+            isSynced
+              ? "Countdown synced with server ledger time"
+              : "Countdown may be using an unsynced local clock"
+          }
+          className={`text-[10px] font-medium uppercase tracking-wide ${
+            isSynced ? "text-gray-400" : "text-amber-500"
+          }`}
         >
-          <span className="font-mono text-2xl font-bold text-brand-700 leading-none">
-            {String(value).padStart(2, "0")}
-          </span>
-          <span className="mt-1 text-[10px] uppercase tracking-wide text-brand-400">
-            {label}
-          </span>
-        </div>
-      ))}
+          {isSynced ? "Synced" : "Unsynced"}
+        </span>
+      )}
     </div>
   );
 }
@@ -575,6 +615,16 @@ export default function AuctionDetailPage() {
   // Total bid count received from BidHistoryTable — fed to the histogram.
   const [bidTotal, setBidTotal] = useState<number | null>(null);
 
+  // Local timestamp of the last successful load — drives the "provisional /
+  // stale" lifecycle phase shown by AuctionManagementPanel (Issue #527):
+  // data older than the auction staleness threshold is visually flagged
+  // instead of being presented as confirmed current state.
+  const [lastLoadedAt, setLastLoadedAt] = useState<number | null>(null);
+
+  // Drift-corrected clock (Issue #527) — countdowns use this offset instead
+  // of trusting the viewer's local clock outright.
+  const serverClock = useServerClock();
+
   const { bid, isBidding, error: bidError } = usePlaceBid(publicKey);
   const { finalize, isFinalizing, error: finalizeError } =
     useFinalizeAuction(publicKey);
@@ -589,6 +639,7 @@ export default function AuctionDetailPage() {
       const auctionData = await getAuction(Number(id));
       setAuction(auctionData);
       setLiveEndTime(auctionData.end_time);
+      setLastLoadedAt(Date.now());
 
       const meta = await fetchMetadata(auctionData.metadata_cid).catch(() => null);
       setMetadata(meta);
@@ -605,6 +656,15 @@ export default function AuctionDetailPage() {
       setIsLoading(false);
     }
   }, [id]);
+
+  // Lightweight re-render tick so the staleness badge can flip on its own
+  // once lastLoadedAt crosses the threshold, without waiting for the next
+  // user-triggered refresh or SSE event.
+  const [, forceTick] = useState(0);
+  useEffect(() => {
+    const tickId = setInterval(() => forceTick((n) => n + 1), 5_000);
+    return () => clearInterval(tickId);
+  }, []);
 
   useEffect(() => {
     loadData();
@@ -684,7 +744,9 @@ export default function AuctionDetailPage() {
 
   // ── Derived state ─────────────────────────────────────────
 
-  const now = Math.floor(Date.now() / 1000);
+  // Server-clock-corrected "now" (Issue #527) — falls back to the local
+  // clock whenever no sync sample has landed yet (offsetMs starts at 0).
+  const now = Math.floor(serverClock.getServerNow() / 1000);
   // Use liveEndTime (updated by SSE) for expiry calculations.
   const isExpired = liveEndTime > 0 ? now >= liveEndTime : false;
   const isActive = auction?.status === "Active";
@@ -692,6 +754,8 @@ export default function AuctionDetailPage() {
   const isCancelled = auction?.status === "Cancelled";
   const canFinalize = isActive && isExpired;
   const canBid = isActive && !isExpired;
+  const isStaleData =
+    lastLoadedAt !== null && Date.now() - lastLoadedAt > STALE_THRESHOLDS_MS.auction;
 
   const imageUrl = metadata?.image ? cidToGatewayUrl(metadata.image) : null;
   const highestBidXlm = auction ? stroopsToXlm(auction.highest_bid) : "0";
@@ -806,7 +870,12 @@ export default function AuctionDetailPage() {
                   <Clock size={12} />
                   Time Remaining
                 </p>
-                <Countdown endTime={liveEndTime} />
+                <Countdown
+                  endTime={liveEndTime}
+                  serverOffsetMs={serverClock.offsetMs}
+                  showSyncBadge
+                  isSynced={serverClock.isSynced}
+                />
                 
                 {/* Extension count display */}
                 {auction.extension_count !== undefined && auction.extension_count > 0 && (
@@ -1069,6 +1138,23 @@ export default function AuctionDetailPage() {
               }}
             />
           )}
+        </div>
+
+        {/* Lifecycle status + creator controls + refund guidance (Issue #527) */}
+        <div className="mt-12">
+          <AuctionManagementPanel
+            auction={auction}
+            publicKey={publicKey}
+            isExpired={isExpired}
+            isStale={isStaleData}
+            onChanged={(newAuctionId) => {
+              if (newAuctionId) {
+                router.push(`/auctions/${newAuctionId}`);
+              } else {
+                loadData();
+              }
+            }}
+          />
         </div>
 
         {/* Blocked Bidders — creator-only registry management (Issue #199) */}

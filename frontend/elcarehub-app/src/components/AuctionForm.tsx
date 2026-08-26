@@ -1,20 +1,150 @@
 // ─────────────────────────────────────────────────────────────
-// components/AuctionForm.tsx — create auction form
+// components/AuctionForm.tsx — create-auction form (Issue #527)
+//
+// Escrows an NFT the connected wallet already owns (collection + token ID —
+// mirrors ListingForm.tsx) into a new on-chain auction. Validates duration
+// and reserve-price bounds against the live contract configuration before
+// ever building a transaction, and surfaces the platform's current
+// anti-sniping settings (which are snapshotted into the auction at creation
+// time — they are not creator-configurable, see create_auction in
+// contracts/soroban-marketplace/src/contract.rs).
 // ─────────────────────────────────────────────────────────────
 
 "use client";
 
-import { useState, useRef, useEffect } from "react";
-import Image from "next/image";
-import { useCreateAuction } from "@/hooks/useAuctions";
+import { useState, useEffect, useMemo } from "react";
+import { useCreateAuction, type CreateAuctionInput } from "@/hooks/useAuctions";
 import { useWalletContext } from "@/context/WalletContext";
-import { Upload, CheckCircle, Loader2 } from "lucide-react";
+import { CheckCircle2, Loader2, Plus, Trash2, Info } from "lucide-react";
 import { GuardButton } from "./WalletGuard";
 import { DEFAULT_TOKEN } from "@/config/tokens";
 import { useSupportedTokens } from "@/hooks/useSupportedTokens";
 import { getDefaultSupportedToken } from "@/lib/token-support";
-import { ART_CATEGORIES } from "./ListingForm";
-import { validateIpfsCid } from "@/lib/validation";
+import { isValidStellarAddress } from "@/lib/validation";
+import {
+  getAuctionConfig,
+  xlmToStroops,
+  stroopsToXlm,
+  MIN_AUCTION_DURATION_SECONDS,
+  MAX_TOTAL_AUCTION_DURATION_SECONDS,
+  type AuctionConfig,
+} from "@/lib/contract";
+
+/** Maximum number of royalty recipients (TooManyRecipients contract error). */
+const MAX_RECIPIENTS = 4;
+const REQUIRED_SPLIT_SUM = 100;
+const MIN_DURATION_HOURS = MIN_AUCTION_DURATION_SECONDS / 3600; // 1
+const MAX_DURATION_HOURS = MAX_TOTAL_AUCTION_DURATION_SECONDS / 3600; // 720 (30 days)
+
+interface RecipientRow {
+  address: string;
+  percentage: number;
+}
+
+interface FormState {
+  collectionAddress: string;
+  nftTokenId: number;
+  reservePriceXlm: number;
+  durationHours: number;
+  tokenAddress: string;
+  recipients: RecipientRow[];
+}
+
+interface FieldErrors {
+  collectionAddress?: string;
+  nftTokenId?: string;
+  reservePriceXlm?: string;
+  durationHours?: string;
+  tokenAddress?: string;
+  recipients?: string;
+  recipientRows?: Array<{ address?: string; percentage?: string }>;
+}
+
+function validateAuctionForm(
+  form: FormState,
+  minIncrementStroops: bigint | null
+): FieldErrors {
+  const errors: FieldErrors = {};
+
+  if (!form.collectionAddress.trim()) {
+    errors.collectionAddress = "Collection address is required.";
+  } else if (!isValidStellarAddress(form.collectionAddress.trim())) {
+    errors.collectionAddress = "Must be a valid Stellar contract address (starts with C).";
+  }
+
+  if (!Number.isInteger(form.nftTokenId) || form.nftTokenId < 0) {
+    errors.nftTokenId = "Token ID must be a non-negative integer.";
+  }
+
+  if (!Number.isFinite(form.reservePriceXlm) || form.reservePriceXlm <= 0) {
+    errors.reservePriceXlm = "Reserve price must be greater than 0.";
+  } else if (minIncrementStroops !== null) {
+    const stroops = xlmToStroops(form.reservePriceXlm);
+    if (stroops < minIncrementStroops) {
+      errors.reservePriceXlm = `Reserve price must be at least ${stroopsToXlm(
+        minIncrementStroops
+      )} (the platform's minimum bid increment).`;
+    }
+  }
+
+  if (!Number.isFinite(form.durationHours) || form.durationHours < MIN_DURATION_HOURS) {
+    errors.durationHours = `Duration must be at least ${MIN_DURATION_HOURS} hour${
+      MIN_DURATION_HOURS === 1 ? "" : "s"
+    }.`;
+  } else if (form.durationHours > MAX_DURATION_HOURS) {
+    errors.durationHours = `Duration cannot exceed ${MAX_DURATION_HOURS / 24} days.`;
+  }
+
+  if (!form.tokenAddress) {
+    errors.tokenAddress = "A payment token must be selected.";
+  }
+
+  if (form.recipients.length === 0) {
+    errors.recipients = "At least one recipient is required.";
+  } else if (form.recipients.length > MAX_RECIPIENTS) {
+    errors.recipients = `A maximum of ${MAX_RECIPIENTS} recipients is allowed.`;
+  } else {
+    const rowErrors = form.recipients.map((r) => {
+      const rowErr: { address?: string; percentage?: string } = {};
+      if (!r.address.trim()) {
+        rowErr.address = "Address is required.";
+      } else if (!isValidStellarAddress(r.address.trim())) {
+        rowErr.address = "Must be a valid Stellar address.";
+      }
+      if (!Number.isFinite(r.percentage) || r.percentage <= 0) {
+        rowErr.percentage = "Must be greater than 0.";
+      } else if (r.percentage > REQUIRED_SPLIT_SUM) {
+        rowErr.percentage = `Cannot exceed ${REQUIRED_SPLIT_SUM}%.`;
+      }
+      return rowErr;
+    });
+    if (rowErrors.some((e) => e.address || e.percentage)) {
+      errors.recipientRows = rowErrors;
+    }
+    const total = form.recipients.reduce((sum, r) => sum + (r.percentage || 0), 0);
+    if (Math.round(total) !== REQUIRED_SPLIT_SUM) {
+      errors.recipients = `Recipient percentages must sum to exactly ${REQUIRED_SPLIT_SUM}% (currently ${total.toFixed(
+        2
+      )}%).`;
+    }
+  }
+
+  return errors;
+}
+
+function isFormValid(errors: FieldErrors): boolean {
+  const hasTopLevel =
+    errors.collectionAddress !== undefined ||
+    errors.nftTokenId !== undefined ||
+    errors.reservePriceXlm !== undefined ||
+    errors.durationHours !== undefined ||
+    errors.tokenAddress !== undefined ||
+    errors.recipients !== undefined;
+  const hasRow =
+    errors.recipientRows !== undefined &&
+    errors.recipientRows.some((r) => r.address || r.percentage);
+  return !hasTopLevel && !hasRow;
+}
 
 interface AuctionFormProps {
   onSuccess?: (auctionId: number) => void;
@@ -26,29 +156,24 @@ export function AuctionForm({ onSuccess, onCancel }: AuctionFormProps) {
   const { tokens: availableTokens } = useSupportedTokens();
   const { create, isCreating, progress, error } = useCreateAuction(publicKey);
 
-  const [preview, setPreview] = useState<string | null>(null);
-  const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [successId, setSuccessId] = useState<number | null>(null);
-  const [cidError, setCidError] = useState<string | null>(null);
-  const [form, setForm] = useState({
-    title: "",
-    description: "",
-    artistName: "",
-    year: new Date().getFullYear().toString(),
-    category: ART_CATEGORIES[0],
+  const [submitAttempted, setSubmitAttempted] = useState(false);
+  const [auctionConfig, setAuctionConfig] = useState<AuctionConfig | null>(null);
+
+  const [form, setForm] = useState<FormState>({
+    collectionAddress: "",
+    nftTokenId: 0,
     reservePriceXlm: 1,
     durationHours: 24,
     tokenAddress: DEFAULT_TOKEN.address,
-    metadataCid: "",
+    recipients: [{ address: publicKey ?? "", percentage: 100 }],
   });
 
-  const fileRef = useRef<HTMLInputElement>(null);
   const hasTokenOptions = availableTokens.length > 0;
   const defaultToken = getDefaultSupportedToken(availableTokens);
   const selectedToken =
     availableTokens.find((t) => t.address === form.tokenAddress) ?? defaultToken;
 
-  // When available tokens load, snap to a valid selection if needed
   useEffect(() => {
     if (availableTokens.length === 0) return;
     if (!availableTokens.some((t) => t.address === form.tokenAddress)) {
@@ -59,27 +184,62 @@ export function AuctionForm({ onSuccess, onCancel }: AuctionFormProps) {
     }
   }, [availableTokens, form.tokenAddress]);
 
-  const handleFile = (file: File) => {
-    setSelectedFile(file);
-    setPreview(URL.createObjectURL(file));
-  };
+  // Sync connected wallet into recipient[0] once known.
+  useEffect(() => {
+    if (!publicKey) return;
+    setForm((cur) => {
+      if (cur.recipients.length !== 1 || cur.recipients[0].address) return cur;
+      return { ...cur, recipients: [{ address: publicKey, percentage: 100 }] };
+    });
+  }, [publicKey]);
 
-  const handleDrop = (e: React.DragEvent) => {
-    e.preventDefault();
-    const file = e.dataTransfer.files[0];
-    if (file && file.type.startsWith("image/")) handleFile(file);
+  // Fetch live contract bounds (min bid increment, anti-snipe settings) once.
+  useEffect(() => {
+    let cancelled = false;
+    getAuctionConfig()
+      .then((cfg) => {
+        if (!cancelled) setAuctionConfig(cfg);
+      })
+      .catch(() => {
+        /* Non-fatal — validation falls back to the ">0" check only. */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const errors = useMemo(
+    () => validateAuctionForm(form, auctionConfig?.minBidIncrementStroops ?? null),
+    [form, auctionConfig]
+  );
+  const formIsValid = useMemo(() => isFormValid(errors), [errors]);
+
+  const updateRecipient = (i: number, patch: Partial<RecipientRow>) => {
+    setForm((cur) => {
+      const next = [...cur.recipients];
+      next[i] = { ...next[i], ...patch };
+      return { ...cur, recipients: next };
+    });
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!selectedFile) return;
+    setSubmitAttempted(true);
+    if (!formIsValid) return;
 
-    // Validate CID before submitting — avoids a contract InvalidCid revert
-    const err = validateIpfsCid(form.metadataCid);
-    setCidError(err);
-    if (err) return;
+    const input: CreateAuctionInput = {
+      collectionAddress: form.collectionAddress.trim(),
+      nftTokenId: form.nftTokenId,
+      reservePriceXlm: form.reservePriceXlm,
+      durationSeconds: Math.round(form.durationHours * 3600),
+      recipients: form.recipients.map((r) => ({
+        address: r.address.trim(),
+        percentage: r.percentage,
+      })),
+      tokenAddress: form.tokenAddress,
+    };
 
-    const id = await create({ ...form, imageFile: selectedFile });
+    const id = await create(input);
     if (id !== null) {
       setSuccessId(id);
       onSuccess?.(id);
@@ -90,7 +250,7 @@ export function AuctionForm({ onSuccess, onCancel }: AuctionFormProps) {
     return (
       <div className="max-w-xl mx-auto flex flex-col items-center gap-6 rounded-3xl border border-green-100 bg-white p-12 text-center shadow-2xl shadow-green-900/5">
         <div className="rounded-full bg-green-50 p-4">
-          <CheckCircle size={56} className="text-green-500" />
+          <CheckCircle2 size={56} className="text-green-500" />
         </div>
         <div className="space-y-2">
           <h3 className="text-3xl font-display font-bold text-gray-900">
@@ -110,6 +270,8 @@ export function AuctionForm({ onSuccess, onCancel }: AuctionFormProps) {
     );
   }
 
+  const shouldShow = (field: keyof FieldErrors) => submitAttempted && !!errors[field];
+
   return (
     <div className="max-w-3xl mx-auto px-4 py-8">
       <div className="bg-white rounded-3xl shadow-2xl shadow-brand-900/5 border border-brand-100/50 p-6 md:p-10">
@@ -118,200 +280,92 @@ export function AuctionForm({ onSuccess, onCancel }: AuctionFormProps) {
             Create Auction
           </h2>
           <p className="text-gray-500 font-inter">
-            Set a reserve price, duration, and payment token for your auction.
+            Escrow an NFT you own and set a reserve price, duration, and payment token.
           </p>
         </header>
 
-        <form onSubmit={handleSubmit} className="space-y-8">
-          {/* Image upload */}
-          <div
-            onDrop={handleDrop}
-            onDragOver={(e) => e.preventDefault()}
-            onClick={() => fileRef.current?.click()}
-            className="group relative flex flex-col items-center justify-center rounded-3xl border-2 border-dashed border-brand-200 bg-brand-50/30 p-12 text-center cursor-pointer hover:border-brand-400 hover:bg-brand-50/60 transition-all"
-          >
-            {preview ? (
-              <div className="relative h-64 w-full">
-                <Image
-                  src={preview}
-                  alt="Preview"
-                  fill
-                  className="object-contain rounded-2xl"
-                  unoptimized
-                />
-                <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 flex items-center justify-center rounded-2xl transition-opacity">
-                  <p className="text-white text-base font-bold underline underline-offset-4">
-                    Click to change
-                  </p>
-                </div>
-              </div>
-            ) : (
-              <div className="py-4">
-                <div className="mx-auto w-16 h-16 rounded-full bg-brand-100 flex items-center justify-center mb-4 group-hover:scale-110 transition-transform">
-                  <Upload size={32} className="text-brand-500" />
-                </div>
-                <p className="text-lg font-semibold text-brand-950 font-display">
-                  Select Artwork
-                </p>
-                <p className="mt-1 text-sm text-brand-400 font-inter">
-                  PNG, JPG, GIF or WEBP — max 50 MB
-                </p>
-              </div>
-            )}
-            <input
-              ref={fileRef}
-              type="file"
-              accept="image/*"
-              className="hidden"
-              onChange={(e) => {
-                const file = e.target.files?.[0];
-                if (file) handleFile(file);
-              }}
-            />
-          </div>
-
-          {/* Fields */}
+        <form onSubmit={handleSubmit} noValidate className="space-y-8">
           <div className="grid gap-6 sm:grid-cols-2">
-
-            {/* Metadata CID */}
-            <div className="sm:col-span-2 space-y-2">
+            {/* Collection address */}
+            <div className="space-y-2">
               <label className="block text-sm font-bold text-gray-950 uppercase tracking-wider font-inter">
-                Artwork Metadata CID *
+                Collection Address *
               </label>
               <input
                 required
-                value={form.metadataCid}
-                onChange={(e) => {
-                  const val = e.target.value;
-                  setForm({ ...form, metadataCid: val });
-                  setCidError(validateIpfsCid(val));
-                }}
-                onBlur={() => setCidError(validateIpfsCid(form.metadataCid))}
-                aria-invalid={!!cidError}
-                aria-describedby={cidError ? "err-auction-cid" : undefined}
-                className={`w-full rounded-2xl border px-5 py-4 text-base font-mono focus:outline-none transition-all shadow-sm font-inter ${
-                  cidError
+                value={form.collectionAddress}
+                onChange={(e) => setForm({ ...form, collectionAddress: e.target.value })}
+                aria-invalid={shouldShow("collectionAddress")}
+                className={`w-full rounded-2xl border px-5 py-4 text-base font-mono focus:outline-none transition-all shadow-sm ${
+                  shouldShow("collectionAddress")
                     ? "border-red-400 bg-red-50/40 focus:border-red-500"
                     : "border-gray-200 bg-gray-50/50 focus:border-brand-500 focus:bg-white"
                 }`}
-                placeholder="bafybeig… or Qm…"
+                placeholder="C… collection contract address"
               />
-              {cidError ? (
-                <p id="err-auction-cid" className="text-sm text-red-600 mt-1" role="alert">
-                  {cidError}
-                </p>
-              ) : (
-                <p className="text-xs text-gray-400 font-inter">
-                  CIDv1 starts with <code className="font-mono">b</code> (46–100 chars) or
-                  CIDv0 starts with <code className="font-mono">Qm</code> (46 chars).
-                </p>
+              {shouldShow("collectionAddress") && (
+                <p className="text-sm text-red-600" role="alert">{errors.collectionAddress}</p>
               )}
             </div>
 
-            {/* Title */}
-            <div className="sm:col-span-2 space-y-2">
-              <label className="block text-sm font-bold text-gray-950 uppercase tracking-wider font-inter">
-                Title *
-              </label>
-              <input
-                required
-                value={form.title}
-                onChange={(e) => setForm({ ...form, title: e.target.value })}
-                className="w-full rounded-2xl border border-gray-200 bg-gray-50/50 px-5 py-4 text-base focus:border-brand-500 focus:bg-white focus:outline-none transition-all shadow-sm font-inter"
-                placeholder="e.g. Echoes of the Serengeti"
-              />
-            </div>
-
-            <div className="sm:col-span-2 space-y-2">
-              <label className="block text-sm font-bold text-gray-950 uppercase tracking-wider font-inter">
-                Description
-              </label>
-              <textarea
-                rows={3}
-                value={form.description}
-                onChange={(e) =>
-                  setForm({ ...form, description: e.target.value })
-                }
-                className="w-full rounded-2xl border border-gray-200 bg-gray-50/50 px-5 py-4 text-base focus:border-brand-500 focus:bg-white focus:outline-none transition-all shadow-sm font-inter"
-                placeholder="Describe the soul of this artwork…"
-              />
-            </div>
-
+            {/* Token ID */}
             <div className="space-y-2">
               <label className="block text-sm font-bold text-gray-950 uppercase tracking-wider font-inter">
-                Artist Name *
-              </label>
-              <input
-                required
-                value={form.artistName}
-                onChange={(e) =>
-                  setForm({ ...form, artistName: e.target.value })
-                }
-                className="w-full rounded-2xl border border-gray-200 bg-gray-50/50 px-5 py-4 text-base focus:border-brand-500 focus:bg-white focus:outline-none transition-all shadow-sm font-inter"
-                placeholder="Your name or alias"
-              />
-            </div>
-
-            <div className="space-y-2">
-              <label className="block text-sm font-bold text-gray-950 uppercase tracking-wider font-inter">
-                Creation Year *
+                Token ID *
               </label>
               <input
                 required
                 type="number"
-                min={1900}
-                max={2100}
-                value={form.year}
-                onChange={(e) => setForm({ ...form, year: e.target.value })}
-                className="w-full rounded-2xl border border-gray-200 bg-gray-50/50 px-5 py-4 text-base focus:border-brand-500 focus:bg-white focus:outline-none transition-all shadow-sm font-inter"
+                min={0}
+                value={form.nftTokenId}
+                onChange={(e) =>
+                  setForm({ ...form, nftTokenId: parseInt(e.target.value, 10) || 0 })
+                }
+                aria-invalid={shouldShow("nftTokenId")}
+                className={`w-full rounded-2xl border px-5 py-4 text-base focus:outline-none transition-all shadow-sm font-inter ${
+                  shouldShow("nftTokenId")
+                    ? "border-red-400 bg-red-50/40 focus:border-red-500"
+                    : "border-gray-200 bg-gray-50/50 focus:border-brand-500 focus:bg-white"
+                }`}
               />
+              {shouldShow("nftTokenId") && (
+                <p className="text-sm text-red-600" role="alert">{errors.nftTokenId}</p>
+              )}
             </div>
 
-            <div className="space-y-2">
-              <label className="block text-sm font-bold text-gray-950 uppercase tracking-wider font-inter">
-                Category *
-              </label>
-              <select
-                required
-                value={form.category}
-                onChange={(e) => setForm({ ...form, category: e.target.value })}
-                className="w-full appearance-none rounded-2xl border border-gray-200 bg-gray-50/50 px-5 py-4 text-base focus:border-brand-500 focus:bg-white focus:outline-none transition-all shadow-sm font-inter"
-              >
-                {ART_CATEGORIES.map((cat) => (
-                  <option key={cat} value={cat}>
-                    {cat}
-                  </option>
-                ))}
-              </select>
-            </div>
-
-            {/* ── Reserve price + token selector side-by-side ── */}
+            {/* Reserve price + token selector */}
             <div className="space-y-2">
               <label className="block text-sm font-bold text-gray-950 uppercase tracking-wider font-inter">
                 Reserve Price ({selectedToken?.symbol ?? "Token"}) *
               </label>
-              <div className="relative">
-                <input
-                  required
-                  type="number"
-                  min={0.0000001}
-                  step="any"
-                  value={form.reservePriceXlm}
-                  onChange={(e) =>
-                    setForm({
-                      ...form,
-                      reservePriceXlm: parseFloat(e.target.value),
-                    })
-                  }
-                  className="w-full rounded-2xl border border-gray-200 bg-gray-50/50 px-5 py-4 pr-16 text-base focus:border-brand-500 focus:bg-white focus:outline-none transition-all shadow-sm font-inter"
-                />
-                <span className="absolute right-5 top-1/2 -translate-y-1/2 text-sm font-bold text-brand-600">
-                  {selectedToken?.symbol ?? ""}
-                </span>
-              </div>
+              <input
+                required
+                type="number"
+                min={0.0000001}
+                step="any"
+                value={form.reservePriceXlm}
+                onChange={(e) =>
+                  setForm({ ...form, reservePriceXlm: parseFloat(e.target.value) || 0 })
+                }
+                aria-invalid={shouldShow("reservePriceXlm")}
+                className={`w-full rounded-2xl border px-5 py-4 text-base focus:outline-none transition-all shadow-sm font-inter ${
+                  shouldShow("reservePriceXlm")
+                    ? "border-red-400 bg-red-50/40 focus:border-red-500"
+                    : "border-gray-200 bg-gray-50/50 focus:border-brand-500 focus:bg-white"
+                }`}
+              />
+              {shouldShow("reservePriceXlm") ? (
+                <p className="text-sm text-red-600" role="alert">{errors.reservePriceXlm}</p>
+              ) : (
+                auctionConfig && (
+                  <p className="text-xs text-gray-400">
+                    Minimum: {stroopsToXlm(auctionConfig.minBidIncrementStroops)}{" "}
+                    {selectedToken?.symbol ?? ""}
+                  </p>
+                )
+              )}
             </div>
 
-            {/* Token address selector — the key addition for this issue */}
             <div className="space-y-2">
               <label className="block text-sm font-bold text-gray-950 uppercase tracking-wider font-inter">
                 Payment Token *
@@ -321,9 +375,7 @@ export function AuctionForm({ onSuccess, onCancel }: AuctionFormProps) {
                 id="auction-token-address"
                 disabled={!hasTokenOptions}
                 value={form.tokenAddress}
-                onChange={(e) =>
-                  setForm({ ...form, tokenAddress: e.target.value })
-                }
+                onChange={(e) => setForm({ ...form, tokenAddress: e.target.value })}
                 className="w-full appearance-none rounded-2xl border border-gray-200 bg-gray-50/50 px-5 py-4 text-base focus:border-brand-500 focus:bg-white focus:outline-none transition-all shadow-sm font-inter"
               >
                 {hasTokenOptions ? (
@@ -338,6 +390,7 @@ export function AuctionForm({ onSuccess, onCancel }: AuctionFormProps) {
               </select>
             </div>
 
+            {/* Duration */}
             <div className="sm:col-span-2 space-y-2">
               <label className="block text-sm font-bold text-gray-950 uppercase tracking-wider font-inter">
                 Duration (hours) *
@@ -345,15 +398,105 @@ export function AuctionForm({ onSuccess, onCancel }: AuctionFormProps) {
               <input
                 required
                 type="number"
-                min={1}
+                min={MIN_DURATION_HOURS}
+                max={MAX_DURATION_HOURS}
                 value={form.durationHours}
                 onChange={(e) =>
-                  setForm({ ...form, durationHours: parseInt(e.target.value) })
+                  setForm({ ...form, durationHours: parseFloat(e.target.value) || 0 })
                 }
-                className="w-full rounded-2xl border border-gray-200 bg-gray-50/50 px-5 py-4 text-base focus:border-brand-500 focus:bg-white focus:outline-none transition-all shadow-sm font-inter"
+                aria-invalid={shouldShow("durationHours")}
+                className={`w-full rounded-2xl border px-5 py-4 text-base focus:outline-none transition-all shadow-sm font-inter ${
+                  shouldShow("durationHours")
+                    ? "border-red-400 bg-red-50/40 focus:border-red-500"
+                    : "border-gray-200 bg-gray-50/50 focus:border-brand-500 focus:bg-white"
+                }`}
               />
+              {shouldShow("durationHours") ? (
+                <p className="text-sm text-red-600" role="alert">{errors.durationHours}</p>
+              ) : (
+                <p className="text-xs text-gray-400">
+                  Between {MIN_DURATION_HOURS} hour and {MAX_DURATION_HOURS / 24} days.
+                </p>
+              )}
+            </div>
+
+            {/* Recipients */}
+            <div className="sm:col-span-2 space-y-2">
+              <label className="block text-sm font-bold text-gray-950 uppercase tracking-wider font-inter">
+                Royalty Recipients (must total 100%) *
+              </label>
+              <div className="space-y-2">
+                {form.recipients.map((row, i) => (
+                  <div key={i} className="flex gap-2">
+                    <input
+                      value={row.address}
+                      onChange={(e) => updateRecipient(i, { address: e.target.value })}
+                      placeholder="G… recipient address"
+                      className="flex-1 rounded-xl border border-gray-200 bg-gray-50/50 px-4 py-3 font-mono text-xs focus:outline-none focus:border-brand-500 focus:bg-white"
+                    />
+                    <input
+                      type="number"
+                      min={0}
+                      max={100}
+                      value={row.percentage}
+                      onChange={(e) =>
+                        updateRecipient(i, { percentage: parseFloat(e.target.value) || 0 })
+                      }
+                      className="w-24 rounded-xl border border-gray-200 bg-gray-50/50 px-3 py-3 text-sm focus:outline-none focus:border-brand-500 focus:bg-white"
+                    />
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setForm({
+                          ...form,
+                          recipients: form.recipients.filter((_, idx) => idx !== i),
+                        })
+                      }
+                      disabled={form.recipients.length <= 1}
+                      className="rounded-xl px-2 text-gray-400 hover:text-red-500 disabled:opacity-30"
+                      aria-label="Remove recipient"
+                    >
+                      <Trash2 size={16} />
+                    </button>
+                  </div>
+                ))}
+              </div>
+              <button
+                type="button"
+                onClick={() =>
+                  setForm({
+                    ...form,
+                    recipients: [...form.recipients, { address: "", percentage: 0 }],
+                  })
+                }
+                disabled={form.recipients.length >= MAX_RECIPIENTS}
+                className="flex items-center gap-1 text-xs font-semibold text-brand-600 hover:text-brand-700 disabled:opacity-40"
+              >
+                <Plus size={12} /> Add recipient
+              </button>
+              {(shouldShow("recipients") || shouldShow("recipientRows")) && (
+                <p className="text-sm text-red-600" role="alert">
+                  {errors.recipients ?? "Check each recipient row above."}
+                </p>
+              )}
             </div>
           </div>
+
+          {/* Anti-sniping info — read-only, snapshotted from platform config */}
+          {auctionConfig && (
+            <div className="flex items-start gap-2 rounded-2xl bg-brand-50/60 px-5 py-4 text-xs text-brand-800">
+              <Info size={14} className="mt-0.5 shrink-0" />
+              <p>
+                Anti-sniping is enabled platform-wide: a bid placed within{" "}
+                <strong>{auctionConfig.extensionTrigger}s</strong> of the close extends the
+                auction by <strong>{auctionConfig.extensionWindow}s</strong>
+                {auctionConfig.maxExtensions > 0
+                  ? ` (up to ${auctionConfig.maxExtensions} times)`
+                  : " (unlimited times, capped at 30 days total)"}
+                . These settings apply automatically and aren&apos;t configurable per auction.
+              </p>
+            </div>
+          )}
 
           {/* Progress / error */}
           {isCreating && progress && (
@@ -382,7 +525,7 @@ export function AuctionForm({ onSuccess, onCancel }: AuctionFormProps) {
             )}
             <GuardButton
               type="submit"
-              disabled={isCreating || !hasTokenOptions || !selectedFile || !!cidError}
+              disabled={isCreating || !hasTokenOptions || (submitAttempted && !formIsValid)}
               actionName="to create your auction"
               className="flex-[2] flex items-center justify-center gap-3 rounded-2xl bg-brand-500 py-5 text-xl font-bold text-white shadow-2xl shadow-brand-500/30 hover:bg-brand-600 hover:scale-[1.01] transition-all active:scale-[0.98] disabled:opacity-50 disabled:hover:scale-100"
             >

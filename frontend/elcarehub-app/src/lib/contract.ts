@@ -102,6 +102,15 @@ export interface Auction {
   status: AuctionStatus;
   recipients: Recipient[];
   created_at: number;
+  /** Minimum bid increment snapshotted at creation time, in stroops. */
+  min_increment?: bigint;
+  /** Anti-snipe extension window (seconds) snapshotted at creation time. */
+  extension_window?: number;
+  /** Anti-snipe trigger window (seconds) snapshotted at creation time — a bid
+   *  placed within this many seconds of end_time triggers an extension. */
+  extension_trigger?: number;
+  /** Protocol fee (bps) snapshotted at creation time. */
+  protocol_fee_bps?: number;
   /** Maximum number of extensions allowed (0 = unlimited) */
   max_extensions?: number;
   /** Running count of extensions applied so far */
@@ -369,11 +378,17 @@ function parseListingFromScVal(raw: unknown): Listing {
 function parseAuctionFromScVal(raw: unknown): Auction {
   const obj = scValToNative(raw as xdr.ScVal) as Record<string, unknown>;
 
+  // The on-chain Auction struct (contracts/soroban-marketplace/src/types.rs)
+  // names this field `token_id`. Some historical callers used `nft_token_id`
+  // (the indexer's own DB column name for the same value) — accept either so
+  // a raw on-chain read never silently produces NaN.
+  const tokenIdRaw = obj["token_id"] ?? obj["nft_token_id"];
+
   return {
     auction_id: Number(obj["auction_id"]),
     creator: (obj["creator"] as Address).toString(),
     collection: (obj["collection"] as any).toString(),
-    token_id: Number(obj["nft_token_id"]),
+    token_id: Number(tokenIdRaw),
     token: (obj["token"] as any).toString(),
     reserve_price: BigInt(obj["reserve_price"] as bigint),
     highest_bid: BigInt(obj["highest_bid"] as bigint),
@@ -382,6 +397,20 @@ function parseAuctionFromScVal(raw: unknown): Auction {
     status: String(obj["status"]) as AuctionStatus,
     recipients: (obj["recipients"] as any[]).map(parseRecipient),
     created_at: Number(obj["created_at"] || 0),
+    min_increment:
+      obj["min_increment"] != null ? BigInt(obj["min_increment"] as bigint) : undefined,
+    extension_window:
+      obj["extension_window"] != null ? Number(obj["extension_window"]) : undefined,
+    extension_trigger:
+      obj["extension_trigger"] != null ? Number(obj["extension_trigger"]) : undefined,
+    protocol_fee_bps:
+      obj["protocol_fee_bps"] != null ? Number(obj["protocol_fee_bps"]) : undefined,
+    max_extensions:
+      obj["max_extensions"] != null ? Number(obj["max_extensions"]) : undefined,
+    extension_count:
+      obj["extension_count"] != null ? Number(obj["extension_count"]) : undefined,
+    original_end_time:
+      obj["original_end_time"] != null ? Number(obj["original_end_time"]) : undefined,
   };
 }
 
@@ -856,20 +885,28 @@ export async function getOffererOffers(offererPublicKey: string): Promise<number
 // ── Auction contract methods ──────────────────────────────────
 
 /**
- * create_auction — Artist creates a new on-chain auction.
+ * create_auction — Artist creates a new on-chain auction for an NFT they
+ * already own (collection + tokenId), escrowing it into marketplace custody
+ * for the duration of the auction.
+ *
+ * Mirrors the on-chain signature exactly:
+ *   create_auction(creator, token, collection, token_id, reserve_price, duration, recipients) -> u64
  *
  * @param creatorPublicKey   Stellar public key of the creator (must match Freighter)
- * @param metadataCid        IPFS CID string of the metadata JSON
+ * @param collectionAddress  Address of the NFT collection contract
+ * @param nftTokenId         Token ID within the collection
  * @param reservePriceXlm    Reserve price in XLM (will be converted to stroops)
- * @param durationSeconds    Auction duration in seconds
+ * @param durationSeconds    Auction duration in seconds (contract minimum: 1 hour)
+ * @param recipients         Royalty split recipients — defaults to 100% creator
+ * @param tokenAddress       Payment token contract address
  * @returns                  The new auction_id (number)
  */
 export async function createAuction(
   creatorPublicKey: string,
-  metadataCid: string,
+  collectionAddress: string,
+  nftTokenId: number,
   reservePriceXlm: number,
   durationSeconds: number,
-  royaltyBps: number = 0,
   recipients: Array<{ address: string; percentage: number }> = [],
   tokenAddress: string = DEFAULT_TOKEN.address
 ): Promise<number> {
@@ -882,15 +919,12 @@ export async function createAuction(
 
   const args: xdr.ScVal[] = [
     new Address(creatorPublicKey).toScVal(),
-    nativeToScVal(Buffer.from(metadataCid, "utf-8"), { type: "bytes" }),
     new Address(selectedToken.address).toScVal(),
+    new Address(collectionAddress).toScVal(),
+    nativeToScVal(nftTokenId, { type: "u64" }),
     nativeToScVal(reserveStroops, { type: "i128" }),
     nativeToScVal(BigInt(durationSeconds), { type: "u64" }),
-    nativeToScVal(royaltyBps, { type: "u32" }),
-    nativeToScVal(finalRecipients.map(r => ({
-        address: new Address(r.address),
-        percentage: r.percentage
-    })), { type: "vec" }),
+    toScRecipientVec(finalRecipients),
   ];
 
   const retVal = await invokeContract(
@@ -934,6 +968,51 @@ export async function finalizeAuction(
   ];
 
   await invokeContract(callerPublicKey, "finalize_auction", args);
+  return true;
+}
+
+/**
+ * cancel_auction — Creator cancels their own auction and reclaims the
+ * escrowed NFT. Only permitted while the auction is Active AND has received
+ * no bids yet (the contract rejects with `AuctionHasBids` otherwise, since
+ * cancelling would strand the bidder's escrowed funds) — the UI should gate
+ * this action on `auction.highest_bid === 0n`.
+ */
+export async function cancelAuction(
+  creatorPublicKey: string,
+  auctionId: number
+): Promise<boolean> {
+  const args: xdr.ScVal[] = [
+    new Address(creatorPublicKey).toScVal(),
+    nativeToScVal(BigInt(auctionId), { type: "u64" }),
+  ];
+
+  await invokeContract(creatorPublicKey, "cancel_auction", args);
+  return true;
+}
+
+/**
+ * refund_losing_bid — A losing bidder reclaims their escrowed funds on a
+ * terminal (Finalized or Cancelled) auction.
+ *
+ * In the common case, a losing bid is refunded automatically and immediately
+ * inside `place_bid` the moment it is outbid. This entry point is the
+ * safety-valve for the edge case where the frontend/indexer believes a
+ * refund is still pending after finalization (e.g. the auction was
+ * finalized with no bids beyond the caller's, or a node hiccup). Panics with
+ * `NoBidToRefund` if the caller is the auction's winner or has no
+ * outstanding bid on record.
+ */
+export async function refundLosingBid(
+  bidderPublicKey: string,
+  auctionId: number
+): Promise<boolean> {
+  const args: xdr.ScVal[] = [
+    new Address(bidderPublicKey).toScVal(),
+    nativeToScVal(BigInt(auctionId), { type: "u64" }),
+  ];
+
+  await invokeContract(bidderPublicKey, "refund_losing_bid", args);
   return true;
 }
 
@@ -1416,8 +1495,12 @@ export async function unpauseFunction(
 
 export interface AuctionConfig {
   minBidIncrement: string; // i128 formatted as "${value}.0000000"
+  /** Raw stroops value of minBidIncrement, used for reserve-price validation. */
+  minBidIncrementStroops: bigint;
   extensionWindow: string;  // u64 as decimal string
   extensionTrigger: string; // u64 as decimal string
+  /** Max number of anti-snipe extensions allowed (0 = unlimited). */
+  maxExtensions: number;
 }
 
 /** get_min_bid_increment — read the global minimum bid increment. */
@@ -1492,19 +1575,41 @@ export async function setAuctionExtensionTrigger(
   return true;
 }
 
+/** get_auction_max_extensions — read the global cap on anti-snipe extensions (0 = unlimited). */
+export async function getAuctionMaxExtensions(): Promise<number> {
+  const callerPublicKey = await getReadOnlyCallerPublicKey();
+  try {
+    const retVal = await invokeContract(callerPublicKey, "get_auction_max_extensions", [], true);
+    return Number(scValToNative(retVal));
+  } catch {
+    return 0; // Default: unlimited
+  }
+}
+
 /** get_auction_config — fetch all auction configuration values at once. */
 export async function getAuctionConfig(): Promise<AuctionConfig> {
-  const [minIncrement, extensionWindow, extensionTrigger] = await Promise.all([
+  const [minIncrement, extensionWindow, extensionTrigger, maxExtensions] = await Promise.all([
     getMinBidIncrement(),
     getAuctionExtensionWindow(),
     getAuctionExtensionTrigger(),
+    getAuctionMaxExtensions(),
   ]);
   return {
     minBidIncrement: `${minIncrement}.0000000`,
+    minBidIncrementStroops: minIncrement,
     extensionWindow: extensionWindow.toString(),
     extensionTrigger: extensionTrigger.toString(),
+    maxExtensions,
   };
 }
+
+/** MIN_AUCTION_DURATION mirrored from contracts/soroban-marketplace/src/contract.rs. */
+export const MIN_AUCTION_DURATION_SECONDS = 3_600; // 1 hour
+/** MAX_TOTAL_AUCTION_DURATION mirrored from contracts/soroban-marketplace/src/contract.rs.
+ *  This bounds how far anti-snipe extensions may push end_time beyond the
+ *  original end time; it is not a hard cap on the initial duration itself,
+ *  but the UI uses it as a practical upper bound for the duration input. */
+export const MAX_TOTAL_AUCTION_DURATION_SECONDS = 2_592_000; // 30 days
 
 /** is_function_paused — read the pause flag for a specific function. */
 export async function isFunctionPaused(functionName: string): Promise<boolean> {
