@@ -9,8 +9,12 @@ mod types;
 #[cfg(test)]
 mod test;
 
+#[cfg(test)]
+mod registry_tests;
+
 pub use contract::Launchpad;
-pub use types::{CollectionKind, CollectionRecord, DataKey, Error, WasmHashes};
+pub use storage::MigrationProgress;
+pub use types::{CollectionKind, CollectionRecord, DataKey, Error, WasmHashes, CONTRACT_VERSION};
 
 #[cfg(any(test, feature = "testutils"))]
 pub use contract::LaunchpadClient;

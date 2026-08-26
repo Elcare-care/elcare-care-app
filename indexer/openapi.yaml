@@ -642,19 +642,21 @@ paths:
           name: id
           in: path
       responses:
-        "200":
-          description: Auction details
+        '200':
+          description: Auction details with bid history
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/Auction"
-        "400":
-          description: Invalid ID format
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-        "404":
+                allOf:
+                  - $ref: '#/components/schemas/Auction'
+                  - type: object
+                    properties:
+                      bids:
+                        type: array
+                        description: Bid history, newest first
+                        items:
+                          $ref: '#/components/schemas/Bid'
+        '404':
           description: Auction not found
           content:
             application/json:
@@ -1083,217 +1085,3 @@ paths:
             text/plain:
               schema:
                 type: string
-
-components:
-  schemas:
-    Listing:
-      type: object
-      properties:
-        listingId:
-          type: string
-        artist:
-          type: string
-        owner:
-          type: string
-          nullable: true
-        price:
-          type: string
-        currency:
-          type: string
-        metadataCid:
-          type: string
-        status:
-          type: string
-          enum: [Active, Sold, Cancelled]
-        royaltyBps:
-          type: integer
-        updatedAtLedger:
-          type: integer
-
-    Auction:
-      type: object
-      properties:
-        auctionId:
-          type: string
-        creator:
-          type: string
-        reservePrice:
-          type: string
-        minBidIncrement:
-          type: string
-        endLedger:
-          type: integer
-        highestBidder:
-          type: string
-          nullable: true
-        highestBid:
-          type: string
-          nullable: true
-        status:
-          type: string
-          enum: [Active, Finalized, Cancelled]
-        updatedAtLedger:
-          type: integer
-
-    Offer:
-      type: object
-      properties:
-        offerId:
-          type: string
-        listingId:
-          type: string
-        offerer:
-          type: string
-        offerPrice:
-          type: string
-        status:
-          type: string
-          enum: [Pending, Accepted, Rejected, Withdrawn]
-        updatedAtLedger:
-          type: integer
-
-    MarketplaceEvent:
-      type: object
-      properties:
-        id:
-          type: string
-        eventType:
-          type: string
-        actor:
-          type: string
-        ledgerSequence:
-          type: integer
-        ledgerTimestamp:
-          type: string
-          format: date-time
-        data:
-          type: object
-
-    Collection:
-      type: object
-      properties:
-        collectionId:
-          type: string
-        creator:
-          type: string
-        kind:
-          type: string
-          enum: [ERC721, ERC1155, LazyMintERC721, LazyMintERC1155]
-        deployedAtLedger:
-          type: integer
-
-    RoyaltyStats:
-      type: object
-      properties:
-        totalEarned:
-          type: string
-        payoutCount:
-          type: integer
-        lastPayout:
-          type: integer
-
-    LedgerGap:
-      type: object
-      properties:
-        id:
-          type: integer
-        fromLedger:
-          type: integer
-        toLedger:
-          type: integer
-        source:
-          type: string
-          enum: [rpc_window_skip, reorg, manual]
-        status:
-          type: string
-          enum: [Open, Repairing, Repaired, Failed]
-        error:
-          type: string
-          nullable: true
-        createdAt:
-          type: string
-          format: date-time
-        updatedAt:
-          type: string
-          format: date-time
-        repairJob:
-          type: array
-          items:
-            $ref: '#/components/schemas/BackfillJob'
-
-    BackfillJob:
-      type: object
-      properties:
-        id:
-          type: integer
-        startLedger:
-          type: integer
-        endLedger:
-          type: integer
-        checkpointLedger:
-          type: integer
-        status:
-          type: string
-          enum: [Pending, Running, Completed, Failed, Cancelled]
-        rpcUrl:
-          type: string
-        error:
-          type: string
-          nullable: true
-        totalInserted:
-          type: integer
-        gapId:
-          type: integer
-          nullable: true
-        createdAt:
-          type: string
-          format: date-time
-        updatedAt:
-          type: string
-          format: date-time
-
-    SyncGapsResponse:
-      type: object
-      properties:
-        summary:
-          type: object
-          properties:
-            openGaps:
-              type: integer
-              description: Number of gaps currently in Open status
-            openLedgers:
-              type: integer
-              description: Total ledgers covered by all Open gaps
-        total:
-          type: integer
-          description: Total gaps matching the query filters
-        gaps:
-          type: array
-          items:
-            $ref: '#/components/schemas/LedgerGap'
-
-    Stats:
-      type: object
-      properties:
-        totalListings:
-          type: integer
-        activeListings:
-          type: integer
-        totalVolume:
-          type: string
-        activeUsers:
-          type: integer
-        totalEvents:
-          type: integer
-        totalSales:
-          type: integer
-        timeRange:
-          type: object
-          nullable: true
-          properties:
-            from:
-              type: string
-              format: date-time
-            to:
-              type: string
-              format: date-time

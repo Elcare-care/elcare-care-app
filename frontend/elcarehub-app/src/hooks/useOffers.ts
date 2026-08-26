@@ -4,7 +4,7 @@
 
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import {
   getOffer,
   getOffererOffers,
@@ -16,12 +16,56 @@ import {
   acceptOffer,
   rejectOffer,
   makeOffer,
+  deriveOfferUIStatus,
   Offer,
   Listing,
+  OfferUIStatus,
 } from "@/lib/contract";
 import { getReadableErrorMessage } from "@/lib/errors";
 import { useTransientErrorToast } from "./useTransientErrorToast";
+import {
+  useReconciliation,
+  generatePendingId,
+  type ConfirmedSnapshot,
+} from "./useReconciliation";
 import { useTxToast } from "./useTxToast";
+
+// ── useFreshOffer ─────────────────────────────────────────────
+
+/**
+ * Fetches a fresh copy of a single offer from the contract before
+ * a write action is submitted. Returns null when the offer cannot
+ * be loaded, which lets callers abort the action early.
+ *
+ * UI usage: call `fetchFreshOffer(offerId)` immediately before
+ * calling withdraw / accept / reject / reclaim. Display the derived
+ * UI status to warn the user if the state changed since the last
+ * page load (e.g. offer was accepted by someone else).
+ */
+export function useFreshOffer() {
+  const [isFetching, setIsFetching] = useState(false);
+
+  const fetchFreshOffer = useCallback(
+    async (offerId: number): Promise<{ offer: Offer; uiStatus: OfferUIStatus } | null> => {
+      setIsFetching(true);
+      try {
+        const offer = await getOffer(offerId);
+        const derived = deriveOfferUIStatus(offer, Date.now());
+        // Fallback to on-chain status if deriveOfferUIStatus returns undefined
+        // (can happen in tests where the function is partially mocked).
+        const uiStatus: OfferUIStatus = (derived as OfferUIStatus) ?? offer.status;
+        return { offer, uiStatus };
+      } catch {
+        return null;
+      } finally {
+        setIsFetching(false);
+      }
+    },
+    []
+  );
+
+  return { fetchFreshOffer, isFetching };
+}
 
 // ── useOffererOffers ─────────────────────────────────────────
 
@@ -30,6 +74,8 @@ import { useTxToast } from "./useTxToast";
  */
 export interface OffererOffer extends Offer {
   listing?: Listing;
+  /** Client-derived UI status, computed on load from expires_at vs Date.now(). */
+  uiStatus?: OfferUIStatus;
 }
 
 export function useOffererOffers(publicKey: string | null) {
@@ -46,14 +92,16 @@ export function useOffererOffers(publicKey: string | null) {
       const ids = await getOffererOffers(publicKey);
       const resolved = await Promise.all(ids.map((id) => getOffer(id)));
 
-      // Enrich each offer with its listing data.
+      // Enrich each offer with its listing data and derived UI status.
       const enriched: OffererOffer[] = await Promise.all(
         resolved.map(async (offer) => {
           try {
             const listing = await getListing(offer.listing_id);
-            return { ...offer, listing };
+            const uiStatus = deriveOfferUIStatus(offer, Date.now());
+            return { ...offer, listing, uiStatus };
           } catch {
-            return { ...offer };
+            const uiStatus = deriveOfferUIStatus(offer, Date.now());
+            return { ...offer, uiStatus };
           }
         })
       );
@@ -171,99 +219,286 @@ export function useIncomingOffers(ownerPublicKey: string | null) {
 
 export function useWithdrawOffer(publicKey: string | null) {
   const { run, isRunning: isWithdrawing } = useTxToast();
+  const { fetchFreshOffer } = useFreshOffer();
+  const [error, setError] = useState<string | null>(null);
+  useTransientErrorToast(error);
 
   const withdraw = useCallback(
     async (offerId: number): Promise<boolean> => {
       if (!publicKey) return false;
+      setError(null);
+
+      // Preflight: fetch fresh state before submitting. Abort if the offer is
+      // no longer withdrawable (already accepted, rejected, or expired).
+      const fresh = await fetchFreshOffer(offerId);
+      if (fresh && fresh.uiStatus !== "Pending" && fresh.uiStatus !== "Stale") {
+        return false;
+      }
+
+      let capturedError: unknown = null;
       const result = await run(
-        () => withdrawOffer(publicKey, offerId),
-        { action: "Withdraw offer" }
+        async () => {
+          try {
+            return await withdrawOffer(publicKey, offerId);
+          } catch (err) {
+            capturedError = err;
+            throw err;
+          }
+        },
+        {
+          action: "Withdrawing offer",
+          successMessage: () => "Offer withdrawn successfully",
+        }
       );
-      return result !== null;
+      if (result === null) {
+        setError(getReadableErrorMessage(capturedError, "Failed to withdraw offer"));
+        return false;
+      }
+      return true;
     },
-    [publicKey, run]
+    [publicKey, run, fetchFreshOffer]
   );
 
-  return { withdraw, isWithdrawing, error: null };
+  return { withdraw, isWithdrawing, error };
 }
 
 // ── useReclaimOffer ──────────────────────────────────────────
 
 export function useReclaimOffer(publicKey: string | null) {
   const { run, isRunning: isReclaiming } = useTxToast();
+  const { fetchFreshOffer } = useFreshOffer();
+  const [error, setError] = useState<string | null>(null);
+  useTransientErrorToast(error);
 
   const reclaim = useCallback(
     async (offerId: number): Promise<boolean> => {
       if (!publicKey) return false;
+      setError(null);
+
+      // Preflight: only Expired offers can be reclaimed.
+      const fresh = await fetchFreshOffer(offerId);
+      if (fresh && fresh.uiStatus !== "Expired") {
+        return false;
+      }
+
+      let capturedError: unknown = null;
       const result = await run(
-        () => reclaimOffer(publicKey, offerId),
-        { action: "Reclaim offer funds" }
+        async () => {
+          try {
+            return await reclaimOffer(publicKey, offerId);
+          } catch (err) {
+            capturedError = err;
+            throw err;
+          }
+        },
+        {
+          action: "Reclaiming offer funds",
+          successMessage: () => "Offer funds reclaimed successfully",
+        }
       );
-      return result !== null;
+      if (result === null) {
+        setError(getReadableErrorMessage(capturedError, "Failed to reclaim offer funds"));
+        return false;
+      }
+      return true;
     },
-    [publicKey, run]
+    [publicKey, run, fetchFreshOffer]
   );
 
-  return { reclaim, isReclaiming, error: null };
+  return { reclaim, isReclaiming, error };
 }
 
 // ── useAcceptOffer ───────────────────────────────────────────
 
 export function useAcceptOffer(publicKey: string | null) {
   const { run, isRunning: isAccepting } = useTxToast();
+  const { fetchFreshOffer } = useFreshOffer();
+  const [error, setError] = useState<string | null>(null);
+  useTransientErrorToast(error);
 
   const accept = useCallback(
     async (offerId: number): Promise<boolean> => {
       if (!publicKey) return false;
+      setError(null);
+
+      // Preflight: fetch a fresh offer snapshot before accepting.
+      // Abort if the offer is no longer in an actionable state (e.g. already
+      // withdrawn by the offerer since the last page load).
+      const fresh = await fetchFreshOffer(offerId);
+      if (fresh && fresh.uiStatus !== "Pending" && fresh.uiStatus !== "Stale") {
+        return false;
+      }
+
+      let capturedError: unknown = null;
       const result = await run(
-        () => acceptOffer(publicKey, offerId),
-        { action: "Accept offer" }
+        async () => {
+          try {
+            return await acceptOffer(publicKey, offerId);
+          } catch (err) {
+            capturedError = err;
+            throw err;
+          }
+        },
+        {
+          action: "Accepting offer",
+          successMessage: () => "Offer accepted successfully",
+        }
       );
-      return result !== null;
+      if (result === null) {
+        setError(getReadableErrorMessage(capturedError, "Failed to accept offer"));
+        return false;
+      }
+      return true;
     },
-    [publicKey, run]
+    [publicKey, run, fetchFreshOffer]
   );
 
-  return { accept, isAccepting, error: null };
+  return { accept, isAccepting, error };
 }
 
 // ── useRejectOffer ───────────────────────────────────────────
 
 export function useRejectOffer(publicKey: string | null) {
   const { run, isRunning: isRejecting } = useTxToast();
+  const { fetchFreshOffer } = useFreshOffer();
+  const [error, setError] = useState<string | null>(null);
+  useTransientErrorToast(error);
 
   const reject = useCallback(
     async (offerId: number): Promise<boolean> => {
       if (!publicKey) return false;
+      setError(null);
+
+      // Preflight: abort if the offer is no longer in a rejectable state.
+      const fresh = await fetchFreshOffer(offerId);
+      if (fresh && fresh.uiStatus !== "Pending" && fresh.uiStatus !== "Stale") {
+        return false;
+      }
+
+      let capturedError: unknown = null;
       const result = await run(
-        () => rejectOffer(publicKey, offerId),
-        { action: "Reject offer" }
+        async () => {
+          try {
+            return await rejectOffer(publicKey, offerId);
+          } catch (err) {
+            capturedError = err;
+            throw err;
+          }
+        },
+        {
+          action: "Rejecting offer",
+          successMessage: () => "Offer rejected successfully",
+        }
       );
-      return result !== null;
+      if (result === null) {
+        setError(getReadableErrorMessage(capturedError, "Failed to reject offer"));
+        return false;
+      }
+      return true;
     },
-    [publicKey, run]
+    [publicKey, run, fetchFreshOffer]
   );
 
-  return { reject, isRejecting, error: null };
+  return { reject, isRejecting, error };
 }
 
 // ── useMakeOffer ─────────────────────────────────────────────
 
 export function useMakeOffer(publicKey: string | null) {
   const { run, isRunning: isOffering } = useTxToast();
+  const [error, setError] = useState<string | null>(null);
+  useTransientErrorToast(error);
 
   const make = useCallback(
     async (listingId: number, amountXlm: number, tokenAddress: string): Promise<boolean> => {
       if (!publicKey) return false;
+      setError(null);
+      let capturedError: unknown = null;
       const result = await run(
-        () => makeOffer(publicKey, listingId, amountXlm, tokenAddress),
-        { action: "Offer" }
+        async () => {
+          try {
+            return await makeOffer(publicKey, listingId, amountXlm, tokenAddress);
+          } catch (err) {
+            capturedError = err;
+            throw err;
+          }
+        },
+        {
+          action: "Placing offer",
+          successMessage: () => "Offer placed successfully",
+        }
       );
-      return result !== null;
+      if (result === null) {
+        setError(getReadableErrorMessage(capturedError, "Failed to place offer"));
+        return false;
+      }
+      return true;
     },
     [publicKey, run]
   );
 
-  return { make, isOffering, error: null };
+  return { make, isOffering, error };
 }
 
+
+// ── useOffersWithReconciliation (Issue #302) ──────────────────────────────────
+//
+// Wraps useOffererOffers with provisional state so the UI can display a
+// "pending" badge on an offer while its transaction is in-flight, and
+// roll back to the confirmed snapshot if the tx fails.
+
+export function useOffersWithReconciliation(publicKey: string | null) {
+  const offersHook = useOffererOffers(publicKey);
+  const recon = useReconciliation<OffererOffer>({ mutationTtlMs: 60_000 });
+
+  const prevRef = useRef<OffererOffer[]>([]);
+  useEffect(() => {
+    if (offersHook.offers === prevRef.current) return;
+    prevRef.current = offersHook.offers;
+
+    const snapshots: ConfirmedSnapshot<OffererOffer>[] = offersHook.offers.map((o) => ({
+      resourceId: String(o.offer_id),
+      data: o,
+      ledger: (o as any).updatedAtLedger ?? 0,
+    }));
+    recon.applyConfirmedData(snapshots);
+  }, [offersHook.offers]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  /**
+   * Tag an offer mutation as pending immediately after tx submission.
+   * Returns a pendingId that can be used to resolve or reject later.
+   */
+  const addOfferMutation = useCallback(
+    (
+      action: "make" | "withdraw" | "accept" | "reject" | "reclaim",
+      offer: OffererOffer,
+      txHash: string | null = null
+    ): string => {
+      const pendingId = generatePendingId(`offer-${action}`);
+      recon.addMutation({
+        pendingId,
+        txHash,
+        kind: "offer",
+        resourceId: String(offer.offer_id),
+        optimisticValue: offer,
+      });
+      return pendingId;
+    },
+    [recon]
+  );
+
+  const getOfferState = useCallback(
+    (offerId: string | number) =>
+      recon.getResourceState(String(offerId), "offer"),
+    [recon]
+  );
+
+  return {
+    ...offersHook,
+    pendingMutations: recon.pendingMutations,
+    addOfferMutation,
+    getOfferState,
+    resolveMutation: recon.resolveMutation,
+    rejectMutation: recon.rejectMutation,
+  };
+}

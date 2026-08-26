@@ -17,6 +17,9 @@ import { ensureTokenOption, getDefaultSupportedToken } from "@/lib/token-support
 import posthog from "posthog-js";
 import { isValidStellarAddress } from "@/lib/validation";
 import { config } from "@/lib/config";
+import { useTxLifecycle, txStateLabel } from "@/hooks/useTxLifecycle";
+import { TxErrorPanel } from "@/components/TxErrorPanel";
+import Link from "next/link";
 
 export const ART_CATEGORIES = [
   "Painting",
@@ -44,16 +47,20 @@ export interface RecipientInput {
 }
 
 interface FormState {
+  metadataCid: string;
   collectionAddress: string;
   nftTokenId: number;
+  quantity: number;
   price: number;
   tokenAddress: string;
   recipients: RecipientInput[];
 }
 
 interface FieldErrors {
+  metadataCid?: string;
   collectionAddress?: string;
   nftTokenId?: string;
+  quantity?: string;
   price?: string;
   tokenAddress?: string;
   recipients?: string;
@@ -74,6 +81,12 @@ interface ListingFormProps {
  */
 export function validateListingForm(form: FormState): FieldErrors {
   const errors: FieldErrors = {};
+
+  // Metadata CID — must be a valid IPFS CIDv0 or CIDv1
+  const cidError = validateIpfsCid(form.metadataCid);
+  if (cidError) {
+    errors.metadataCid = cidError;
+  }
 
   // Collection address — must be a non-empty, valid Stellar address
   if (!form.collectionAddress.trim()) {
@@ -141,6 +154,7 @@ export function validateListingForm(form: FormState): FieldErrors {
 
 export function isFormValid(errors: FieldErrors): boolean {
   const hasTopLevelError =
+    errors.metadataCid !== undefined ||
     errors.collectionAddress !== undefined ||
     errors.nftTokenId !== undefined ||
     errors.price !== undefined ||
@@ -166,7 +180,22 @@ export function ListingForm({ listing, onSuccess, onCancel }: ListingFormProps) 
   const { update, isUpdating, progress: updateProgress, error: updateError } =
     useUpdateListing(publicKey);
 
+  // Typed lifecycle — surfaces wallet-rejection vs chain-failure in TxErrorPanel
+  // and provides a tx hash recovery link after submission.
+  const {
+    txState: listingTxState,
+    isActive: isListingTxActive,
+    run: runListingTx,
+    reset: resetListingTx,
+  } = useTxLifecycle({
+    persistKey: isEdit
+      ? `updateListing:${listing?.listing_id}`
+      : "createListing",
+    action: isEdit ? "Update listing" : "Create listing",
+  });
+
   const [form, setForm] = useState<FormState>({
+    metadataCid: "",
     collectionAddress: "",
     nftTokenId: 0,
     price: 10,
@@ -215,6 +244,7 @@ export function ListingForm({ listing, onSuccess, onCancel }: ListingFormProps) 
                 }))
               : [{ address: listing.artist, percentage: 100 }];
           setForm({
+            metadataCid: listing.metadata_cid ?? "",
             collectionAddress: listing.collection,
             nftTokenId: Number(listing.token_id),
             price: parseFloat(stroopsToXlm(listing.price)),
@@ -350,46 +380,62 @@ export function ListingForm({ listing, onSuccess, onCancel }: ListingFormProps) 
     // can create a listing (it needs to call transfer_from at escrow time).
     if (!isEdit && approvalStatus === false) return;
 
+    // Reset any previous lifecycle error before starting a new submission.
+    resetListingTx();
+
     if (isEdit && listing && currentMetadata) {
-      const success = await update({
-        listingId: listing.listing_id,
-        originalTokenAddress: listing.token,
-        collectionAddress: form.collectionAddress,
-        nftTokenId: form.nftTokenId,
-        price: form.price,
-        tokenAddress: form.tokenAddress,
-        title: currentMetadata.title ?? "",
-        description: currentMetadata.description ?? "",
-        artistName: currentMetadata.artist ?? "",
-        year: currentMetadata.year ?? "",
-        category: currentMetadata.category ?? "",
-        currentMetadata,
-      });
+      const success = await runListingTx(
+        () =>
+          update({
+            listingId: listing.listing_id,
+            originalTokenAddress: listing.token,
+            collectionAddress: form.collectionAddress,
+            nftTokenId: form.nftTokenId,
+            price: form.price,
+            tokenAddress: form.tokenAddress,
+            title: currentMetadata.title ?? "",
+            description: currentMetadata.description ?? "",
+            artistName: currentMetadata.artist ?? "",
+            year: currentMetadata.year ?? "",
+            category: currentMetadata.category ?? "",
+            currentMetadata,
+          }),
+        { action: "Update listing" }
+      );
       if (success) {
         setSuccessId(listing.listing_id);
         onSuccess?.(listing.listing_id);
       }
     } else if (!isEdit) {
-      const id = await create({
-        collectionAddress: form.collectionAddress,
-        nftTokenId: form.nftTokenId,
-        price: form.price,
-        tokenAddress: form.tokenAddress,
-        recipients: form.recipients,
-      });
+      const id = await runListingTx(
+        () =>
+          create({
+            collectionAddress: form.collectionAddress,
+            nftTokenId: form.nftTokenId,
+            price: form.price,
+            tokenAddress: form.tokenAddress,
+            recipients: form.recipients,
+          }),
+        { action: "Create listing" }
+      );
       if (id !== null) {
-        setSuccessId(id);
+        setSuccessId(id as number);
         posthog.capture("Listing Created", { listing_id: id, price_xlm: form.price });
-        onSuccess?.(id);
+        onSuccess?.(id as number);
       }
     }
   };
 
-  const isLoading = isCreating || isUpdating || isFetchingMetadata;
+  const isLoading = isCreating || isUpdating || isFetchingMetadata || isListingTxActive;
   /** True when any async operation is in flight (including approval). */
   const isAnyLoading = isLoading || isCheckingApproval || isApprovingMarketplace;
-  const progress = isEdit ? updateProgress : createProgress;
-  const error = isEdit ? updateError : createError;
+  const progress = isListingTxActive
+    ? txStateLabel(listingTxState.state)
+    : isEdit
+    ? updateProgress
+    : createProgress;
+  // Show typed error from lifecycle when available, fall back to hook error string
+  const hookError = isEdit ? updateError : createError;
 
   // ── Success screen ────────────────────────────────────────
 
@@ -415,6 +461,7 @@ export function ListingForm({ listing, onSuccess, onCancel }: ListingFormProps) 
                 setSubmitAttempted(false);
                 setTouched(new Set());
                 setForm({
+                  metadataCid: "",
                   collectionAddress: "",
                   nftTokenId: 0,
                   price: 10,
@@ -458,6 +505,36 @@ export function ListingForm({ listing, onSuccess, onCancel }: ListingFormProps) 
 
         <form onSubmit={handleSubmit} noValidate className="space-y-8">
           <div className="grid gap-6 sm:grid-cols-2">
+
+            {/* Metadata CID */}
+            <div className="sm:col-span-2 space-y-2">
+              <label className="block text-sm font-bold text-gray-950 uppercase tracking-wider font-inter">
+                Artwork Metadata CID *
+              </label>
+              <input
+                value={form.metadataCid}
+                onChange={(e) => setForm({ ...form, metadataCid: e.target.value })}
+                onBlur={() => markTouched("metadataCid")}
+                aria-invalid={shouldShowError("metadataCid") && !!errors.metadataCid}
+                aria-describedby={errors.metadataCid ? "err-metadata-cid" : undefined}
+                className={`w-full rounded-2xl border px-5 py-4 text-base font-mono focus:outline-none transition-all shadow-sm ${
+                  shouldShowError("metadataCid") && errors.metadataCid
+                    ? "border-red-400 bg-red-50/40 focus:border-red-500"
+                    : "border-gray-200 bg-gray-50/50 focus:border-brand-500 focus:bg-white"
+                }`}
+                placeholder="bafybeig… or Qm…"
+              />
+              {shouldShowError("metadataCid") && errors.metadataCid ? (
+                <p id="err-metadata-cid" className="text-sm text-red-600 mt-1" role="alert">
+                  {errors.metadataCid}
+                </p>
+              ) : (
+                <p className="text-xs text-gray-400 font-inter">
+                  CIDv1 starts with <code className="font-mono">b</code> (46–100 chars) or
+                  CIDv0 starts with <code className="font-mono">Qm</code> (46 chars).
+                </p>
+              )}
+            </div>
 
             {/* Collection Address */}
             <div className="sm:col-span-2 space-y-2">
@@ -763,16 +840,44 @@ export function ListingForm({ listing, onSuccess, onCancel }: ListingFormProps) 
             )}
           </div>
 
-          {/* Progress / server error */}
+          {/* Progress / lifecycle state label */}
           {isLoading && progress && (
             <div className="flex items-center gap-3 rounded-2xl bg-brand-50 px-6 py-4 text-sm font-semibold text-brand-700 animate-pulse">
               <Loader2 size={20} className="animate-spin" />
               {progress}
             </div>
           )}
-          {error && (
+
+          {/* Typed transaction error — distinguishes wallet rejection, simulation
+              failure, and chain failure with per-category recovery instructions */}
+          {listingTxState.state === "error" && listingTxState.error && (
+            <TxErrorPanel
+              error={listingTxState.error}
+              txHash={listingTxState.txHash}
+              onRetry={resetListingTx}
+              onDismiss={resetListingTx}
+            />
+          )}
+
+          {/* Tx hash recovery link — visible once hash is known */}
+          {listingTxState.txHash && listingTxState.state !== "success" && (
+            <p className="text-xs text-gray-400 text-center">
+              Transaction:{" "}
+              <Link
+                href={`/tx/${listingTxState.txHash}`}
+                className="font-mono text-blue-500 hover:underline"
+                target="_blank"
+              >
+                {listingTxState.txHash.slice(0, 12)}…
+              </Link>
+            </p>
+          )}
+
+          {/* Fallback hook error string (e.g. IPFS upload failures that happen
+              before the tx is submitted) */}
+          {hookError && listingTxState.state !== "error" && (
             <p className="rounded-2xl bg-red-50 px-6 py-4 text-sm font-bold text-red-600 border border-red-100">
-              {error}
+              {hookError}
             </p>
           )}
 

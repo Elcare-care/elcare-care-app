@@ -22,13 +22,17 @@
 #![allow(clippy::too_many_arguments, deprecated)]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Bytes, Env, String,
-    Vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Bytes, BytesN, Env,
+    String, Vec,
 };
 
 const TTL_THRESHOLD: u32 = 50_000;
 const TTL_BUMP: u32 = 100_000;
 const MAX_BPS: u32 = 10_000; // 100 % in basis points
+/// Maximum number of items accepted by any single batch call (#274).
+const MAX_BATCH_SIZE: u32 = 200;
+/// Maximum URI length in bytes (#276).
+const MAX_URI_LEN: u32 = 2048;
 
 // ─── Errors ──────────────────────────────────────────────────────────────────
 
@@ -41,19 +45,31 @@ pub enum Error {
     NotApproved = 3,
     InsufficientBalance = 4,
     LengthMismatch = 5,
-    NotCreator = 6, // kept for ABI stability; not used internally
-    /// Mint would exceed the per-token max supply.
+    NotCreator = 6,
     MaxSupplyReached = 7,
-    /// Mint would exceed the per-wallet cap.
     WalletLimitReached = 8,
-    /// Collection is paused; state-mutating calls are blocked.
     CollectionPaused = 9,
-    /// base_uri cannot be updated after metadata is frozen.
     MetadataFrozen = 10,
-    /// freeze_metadata called more than once.
     AlreadyFrozen = 11,
-    /// basis points exceed MAX_BPS (10_000).
     InvalidBps = 12,
+    /// migrate() called for a version already marked done.
+    AlreadyMigrated = 13,
+    /// Unsupported version jump.
+    UnsupportedMigration = 14,
+    /// Empty URI provided.
+    EmptyUri = 15,
+    /// URI exceeds maximum length.
+    UriTooLong = 16,
+    /// Zero amount provided.
+    ZeroAmount = 17,
+    /// Empty batch provided.
+    EmptyBatch = 18,
+    /// Batch exceeds maximum size.
+    BatchTooLarge = 19,
+    /// Token does not exist.
+    TokenNotFound = 20,
+    /// Approval expiry is in the past.
+    ApprovalExpired = 21,
 }
 
 // ─── Storage Keys ─────────────────────────────────────────────────────────────
@@ -65,6 +81,7 @@ pub enum DataKey {
     Initialized,
     Creator,
     Name,
+    CurrentWasmHash,
     NextTokenId,
     RoyaltyBps,
     RoyaltyReceiver,
@@ -76,9 +93,13 @@ pub enum DataKey {
     BaseUri,
     /// bool — permanently frozen when true.
     MetadataFrozen,
+    /// bool — per-token metadata frozen when true.
+    TokenFrozen(u64),
     // Persistent storage
     Balance(Address, u64),            // (account, token_id) → u128
     ApprovedForAll(Address, Address), // (owner, operator) → bool
+    /// Optional expiry (ledger sequence) for an operator approval.
+    ApprovedForAllExpiry(Address, Address), // (owner, operator) → u32
     TokenUri(u64),
     TotalSupply(u64), // per token_id
     /// Per-token maximum supply cap. 0 means no cap.
@@ -89,6 +110,10 @@ pub enum DataKey {
     TokenRoyaltyReceiver(u64),
     /// Per-token royalty override — bps.
     TokenRoyaltyBps(u64),
+    // ── Versioned migration registry ─────────────────────────────────────
+    MigrationDone(String),
+    MigrationCursor(String),
+    ContractVersion,
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -112,6 +137,20 @@ fn u64_to_string(env: &Env, mut n: u64) -> String {
     String::from_bytes(env, &buf[..len])
 }
 
+/// Rejects empty or oversized metadata URIs (#276). Applied to every mint
+/// path and to `set_base_uri` so boundary/malformed values are caught
+/// consistently regardless of entry point.
+fn validate_uri(uri: &String) -> Result<(), Error> {
+    let len = uri.len();
+    if len == 0 {
+        return Err(Error::EmptyUri);
+    }
+    if len > MAX_URI_LEN {
+        return Err(Error::UriTooLong);
+    }
+    Ok(())
+}
+
 // ─── Contract ─────────────────────────────────────────────────────────────────
 
 #[contract]
@@ -131,9 +170,13 @@ impl NormalNFT1155 {
         if env.storage().instance().has(&DataKey::Initialized) {
             return Err(Error::AlreadyInitialized);
         }
+        if royalty_bps > MAX_BPS {
+            return Err(Error::InvalidBps);
+        }
         env.storage().instance().set(&DataKey::Initialized, &true);
         env.storage().instance().set(&DataKey::Creator, &creator);
         env.storage().instance().set(&DataKey::Name, &name);
+        env.storage().instance().set(&DataKey::CurrentWasmHash, &BytesN::from_array(&env, &[0u8; 32]));
         env.storage().instance().set(&DataKey::NextTokenId, &0u64);
         env.storage()
             .instance()
@@ -145,10 +188,28 @@ impl NormalNFT1155 {
         Ok(())
     }
 
-    // ── Supply cap and per-wallet limit management ────────────────────────
+    // ── WASM upgrade ──────────────────────────────────────────────────────
 
-    /// Set the maximum mintable supply for a specific token_id.
-    /// Pass 0 to remove the cap.
+    /// Replace the contract WASM. Callable only by creator.
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
+        Self::only_creator(&env)?;
+        let old_wasm_hash: BytesN<32> = env
+            .storage()
+            .instance()
+            .get(&DataKey::CurrentWasmHash)
+            .unwrap_or(BytesN::from_array(&env, &[0u8; 32]));
+        env.storage()
+            .instance()
+            .set(&DataKey::CurrentWasmHash, &new_wasm_hash);
+        env.deployer().update_current_contract_wasm(new_wasm_hash.clone());
+        env.events().publish(
+            (symbol_short!("upgraded"),),
+            (old_wasm_hash, new_wasm_hash),
+        );
+        Ok(())
+    }
+
     pub fn set_token_max_supply(env: Env, token_id: u64, max_supply: u128) -> Result<(), Error> {
         Self::extend_instance_ttl(&env);
         Self::only_creator(&env)?;
@@ -237,7 +298,7 @@ impl NormalNFT1155 {
     /// Callable only by creator.
     pub fn set_base_uri(env: Env, base_uri: String) -> Result<(), Error> {
         Self::extend_instance_ttl(&env);
-        Self::only_creator(&env)?;
+        let creator = Self::only_creator(&env)?;
         if env
             .storage()
             .instance()
@@ -246,7 +307,13 @@ impl NormalNFT1155 {
         {
             return Err(Error::MetadataFrozen);
         }
+        validate_uri(&base_uri)?;
+        let old_uri: Option<String> = env.storage().instance().get(&DataKey::BaseUri);
         env.storage().instance().set(&DataKey::BaseUri, &base_uri);
+        env.events().publish(
+            (symbol_short!("meta_upd"), creator),
+            (old_uri, base_uri),
+        );
         Ok(())
     }
 
@@ -259,7 +326,7 @@ impl NormalNFT1155 {
     /// After this, `set_base_uri` reverts forever. Callable only by creator.
     pub fn freeze_metadata(env: Env) -> Result<(), Error> {
         Self::extend_instance_ttl(&env);
-        Self::only_creator(&env)?;
+        let creator = Self::only_creator(&env)?;
         if env
             .storage()
             .instance()
@@ -271,6 +338,8 @@ impl NormalNFT1155 {
         env.storage()
             .instance()
             .set(&DataKey::MetadataFrozen, &true);
+        env.events()
+            .publish((symbol_short!("meta_frz"),), creator);
         Ok(())
     }
 
@@ -279,6 +348,115 @@ impl NormalNFT1155 {
         env.storage()
             .instance()
             .get::<DataKey, bool>(&DataKey::MetadataFrozen)
+            .unwrap_or(false)
+    }
+
+    /// Permanently freeze metadata for a specific token. Can only be called once
+    /// per token; subsequent calls revert with `AlreadyFrozen`. Callable by the
+    /// collection owner or any holder of the token.
+    pub fn freeze_token(env: Env, caller: Address, token_id: u64) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
+        caller.require_auth();
+
+        // Verify token exists (has been minted)
+        if !env.storage().persistent().has(&DataKey::TokenUri(token_id)) {
+            return Err(Error::TokenNotFound);
+        }
+
+        // Allow creator or any token holder — read creator address directly
+        // without calling only_creator() which would require creator auth.
+        let creator: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Creator)
+            .ok_or(Error::NotInitialized)?;
+        let balance: u128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Balance(caller.clone(), token_id))
+            .unwrap_or(0);
+
+        if caller != creator && balance == 0 {
+            return Err(Error::NotApproved);
+        }
+
+        if env
+            .storage()
+            .persistent()
+            .get::<DataKey, bool>(&DataKey::TokenFrozen(token_id))
+            .unwrap_or(false)
+        {
+            return Err(Error::AlreadyFrozen);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::TokenFrozen(token_id), &true);
+        env.storage().persistent().extend_ttl(
+            &DataKey::TokenFrozen(token_id),
+            TTL_THRESHOLD,
+            TTL_BUMP,
+        );
+
+        env.events()
+            .publish((symbol_short!("token_frz"),), token_id);
+        Ok(())
+    }
+
+    /// Update the URI for a specific token. Reverts if either the collection
+    /// or the token's metadata is frozen. Callable only by creator.
+    pub fn set_token_uri(env: Env, token_id: u64, uri: String) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
+        let creator = Self::only_creator(&env)?;
+        
+        // Check collection-level freeze
+        if env
+            .storage()
+            .instance()
+            .get::<DataKey, bool>(&DataKey::MetadataFrozen)
+            .unwrap_or(false)
+        {
+            return Err(Error::MetadataFrozen);
+        }
+        
+        // Check token-level freeze
+        if env
+            .storage()
+            .persistent()
+            .get::<DataKey, bool>(&DataKey::TokenFrozen(token_id))
+            .unwrap_or(false)
+        {
+            return Err(Error::MetadataFrozen);
+        }
+        
+        // Verify token exists
+        if !env.storage().persistent().has(&DataKey::TokenUri(token_id)) {
+            return Err(Error::TokenNotFound);
+        }
+        
+        validate_uri(&uri)?;
+        let old_uri: Option<String> = env.storage().persistent().get(&DataKey::TokenUri(token_id));
+        env.storage()
+            .persistent()
+            .set(&DataKey::TokenUri(token_id), &uri);
+        env.storage().persistent().extend_ttl(
+            &DataKey::TokenUri(token_id),
+            TTL_THRESHOLD,
+            TTL_BUMP,
+        );
+        
+        env.events().publish(
+            (symbol_short!("meta_upd"), creator),
+            (token_id, old_uri, uri),
+        );
+        Ok(())
+    }
+
+    /// Returns `true` if a specific token's metadata has been permanently frozen.
+    pub fn is_token_frozen(env: Env, token_id: u64) -> bool {
+        env.storage()
+            .persistent()
+            .get::<DataKey, bool>(&DataKey::TokenFrozen(token_id))
             .unwrap_or(false)
     }
 
@@ -388,19 +566,26 @@ impl NormalNFT1155 {
     /// Create a brand new token type, auto-assign the next ID.
     /// Returns the new token_id.
     ///
-    /// Blocked while paused. Enforces per-wallet limit if set.
+    /// `amount` may be 0 to register a token type without minting any supply
+    /// yet (useful when setting a max supply before first mint).
+    /// Blocked while paused. Enforces per-wallet limit if amount > 0.
     pub fn mint_new(env: Env, to: Address, amount: u128, uri: String) -> Result<u64, Error> {
         Self::extend_instance_ttl(&env);
         Self::only_creator(&env)?;
         Self::require_not_paused(&env)?;
+        validate_uri(&uri)?;
         let token_id: u64 = env
             .storage()
             .instance()
             .get(&DataKey::NextTokenId)
             .unwrap_or(0);
-        Self::_check_wallet_limit(&env, &to, token_id, amount)?;
+        if amount > 0 {
+            Self::_check_wallet_limit(&env, &to, token_id, amount)?;
+        }
         Self::_mint(&env, &to, token_id, amount, &uri);
-        Self::_update_wallet_minted(&env, &to, token_id, amount);
+        if amount > 0 {
+            Self::_update_wallet_minted(&env, &to, token_id, amount);
+        }
         env.storage()
             .instance()
             .set(&DataKey::NextTokenId, &(token_id + 1));
@@ -420,6 +605,9 @@ impl NormalNFT1155 {
         Self::extend_instance_ttl(&env);
         Self::only_creator(&env)?;
         Self::require_not_paused(&env)?;
+        if amount == 0 {
+            return Err(Error::ZeroAmount);
+        }
         Self::_check_supply_cap(&env, token_id, amount)?;
         Self::_check_wallet_limit(&env, &to, token_id, amount)?;
         Self::_mint(&env, &to, token_id, amount, &uri);
@@ -445,10 +633,18 @@ impl NormalNFT1155 {
 
         let len = token_ids.len();
         if len == 0 {
-            return Ok(());
+            return Err(Error::EmptyBatch);
+        }
+        if len > MAX_BATCH_SIZE {
+            return Err(Error::BatchTooLarge);
         }
         if token_ids.len() != amounts.len() || token_ids.len() != uris.len() {
             return Err(Error::LengthMismatch);
+        }
+
+        // Validate every URI up front (#276) — before any storage mutation.
+        for uri in uris.iter() {
+            validate_uri(&uri)?;
         }
 
         // ── Invariant hardening: accumulate amounts per-id within the batch ──
@@ -462,6 +658,9 @@ impl NormalNFT1155 {
         for i in 0..len {
             let tid = token_ids.get(i).unwrap();
             let amt = amounts.get(i).unwrap();
+            if amt == 0 {
+                return Err(Error::ZeroAmount);
+            }
 
             // Find whether `tid` was already seen in this batch.
             let mut found = false;
@@ -581,7 +780,9 @@ impl NormalNFT1155 {
         Self::_transfer(&env, &from, &to, token_id, amount)
     }
 
-    /// Operator transfer on behalf of `from`. Blocked while paused.
+    /// Transfer on behalf of `from` — the owner themselves or an authorized
+    /// operator (#275: matches the owner-shortcut already used by
+    /// `batch_transfer`/`burn`, so single and batch paths behave the same).
     pub fn transfer_from(
         env: Env,
         operator: Address,
@@ -593,7 +794,7 @@ impl NormalNFT1155 {
         Self::extend_instance_ttl(&env);
         operator.require_auth();
         Self::require_not_paused(&env)?;
-        if !Self::_is_approved_for_all(&env, &operator, &from) {
+        if operator != from && !Self::_is_approved_for_all(&env, &operator, &from) {
             return Err(Error::NotApproved);
         }
         Self::_transfer_with_operator(&env, &from, &to, token_id, amount)
@@ -617,28 +818,91 @@ impl NormalNFT1155 {
             return Err(Error::NotApproved);
         }
 
+        if token_ids.is_empty() {
+            return Err(Error::EmptyBatch);
+        }
         if token_ids.len() != amounts.len() {
             return Err(Error::LengthMismatch);
+        }
+        if token_ids.len() > MAX_BATCH_SIZE {
+            return Err(Error::BatchTooLarge);
         }
 
         for i in 0..token_ids.len() {
             let id = token_ids.get(i).unwrap();
             let amount = amounts.get(i).unwrap();
+            if amount == 0 {
+                return Err(Error::ZeroAmount);
+            }
             Self::_transfer(&env, &from, &to, id, amount)?;
         }
         Ok(())
     }
 
+    /// ERC-1155 standard `safeBatchTransferFrom` — alias for `batch_transfer`.
+    /// Transfers multiple token types from `from` to `to` atomically.
+    /// Requires operator approval if caller is not the owner.
+    pub fn batch_transfer_from(
+        env: Env,
+        operator: Address,
+        from: Address,
+        to: Address,
+        ids: Vec<u64>,
+        amounts: Vec<u128>,
+        _data: Bytes,
+    ) -> Result<(), Error> {
+        Self::batch_transfer(env, operator, from, to, ids, amounts)
+    }
+
     // ── Approvals ─────────────────────────────────────────────────────────
 
-    pub fn set_approval_for_all(env: Env, owner: Address, operator: Address, approved: bool) {
+    /// Grant or revoke operator-level approval over all tokens owned by the
+    /// caller.  `expires_at` — optional ledger sequence after which this
+    /// approval is treated as absent.  A past expiry on a new grant is
+    /// rejected with `ApprovalExpired`.  Ignored when `approved` is `false`.
+    pub fn set_approval_for_all(
+        env: Env,
+        owner: Address,
+        operator: Address,
+        approved: bool,
+        expires_at: Option<u32>,
+    ) -> Result<(), Error> {
         Self::extend_instance_ttl(&env);
         owner.require_auth();
+
+        if approved {
+            if let Some(exp) = expires_at {
+                if env.ledger().sequence() >= exp {
+                    return Err(Error::ApprovalExpired);
+                }
+            }
+        }
+
         let key = DataKey::ApprovedForAll(owner.clone(), operator.clone());
+        let expiry_key = DataKey::ApprovedForAllExpiry(owner.clone(), operator.clone());
+
         env.storage().persistent().set(&key, &approved);
-        env.storage().persistent().extend_ttl(&key, 50_000, 100_000);
+        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_BUMP);
+
+        match (approved, expires_at) {
+            (true, Some(exp)) => {
+                env.storage().persistent().set(&expiry_key, &exp);
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&expiry_key, TTL_THRESHOLD, TTL_BUMP);
+            }
+            _ => {
+                env.storage().persistent().remove(&expiry_key);
+            }
+        }
+
+        env.events().publish(
+            (symbol_short!("apfa_set"), owner.clone()),
+            (operator.clone(), approved, expires_at),
+        );
         env.events()
             .publish((symbol_short!("appr_all"), owner), (operator, approved));
+        Ok(())
     }
 
     // ── Burn ──────────────────────────────────────────────────────────────
@@ -800,12 +1064,57 @@ impl NormalNFT1155 {
         Ok(())
     }
 
+    // ── Versioning & Migration ─────────────────────────────────────────────
+
+    pub fn version(env: Env) -> soroban_sdk::String {
+        soroban_sdk::String::from_str(&env, "1.0.0")
+    }
+
+    pub fn contract_version(env: Env) -> Option<String> {
+        env.storage().instance().get(&DataKey::ContractVersion)
+    }
+
+    /// Creator-guarded idempotent migration entry point.
+    /// v1.0.0: records the completion marker and on-chain version string.
+    pub fn migrate(env: Env) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
+        Self::only_creator(&env)?;
+
+        let target = String::from_str(&env, "1.0.0");
+        let done_key = DataKey::MigrationDone(target.clone());
+
+        if env
+            .storage()
+            .persistent()
+            .get::<DataKey, bool>(&done_key)
+            .unwrap_or(false)
+        {
+            return Err(Error::AlreadyMigrated);
+        }
+
+        // v1.0.0 migration body: nothing to migrate for the initial version.
+
+        env.storage().persistent().set(&done_key, &true);
+        env.storage()
+            .persistent()
+            .extend_ttl(&done_key, TTL_THRESHOLD, TTL_BUMP);
+        env.storage()
+            .instance()
+            .set(&DataKey::ContractVersion, &target);
+        env.events()
+            .publish((soroban_sdk::symbol_short!("migrated"), target), ());
+        Ok(())
+    }
+
     /// Legacy default-royalty setter. Alias for set_default_royalty without bps
     /// validation (preserved for backward compatibility). New callers should use
     /// `set_default_royalty` which validates bps ≤ MAX_BPS.
     pub fn update_royalty(env: Env, receiver: Address, bps: u32) -> Result<(), Error> {
         Self::extend_instance_ttl(&env);
         Self::only_creator(&env)?;
+        if bps > MAX_BPS {
+            return Err(Error::InvalidBps);
+        }
         env.storage()
             .instance()
             .set(&DataKey::RoyaltyReceiver, &receiver);
@@ -944,10 +1253,27 @@ impl NormalNFT1155 {
     }
 
     fn _is_approved_for_all(env: &Env, operator: &Address, owner: &Address) -> bool {
-        env.storage()
+        let approved: bool = env
+            .storage()
             .persistent()
             .get(&DataKey::ApprovedForAll(owner.clone(), operator.clone()))
-            .unwrap_or(false)
+            .unwrap_or(false);
+        if !approved {
+            return false;
+        }
+        if let Some(exp) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, u32>(&DataKey::ApprovedForAllExpiry(
+                owner.clone(),
+                operator.clone(),
+            ))
+        {
+            if env.ledger().sequence() >= exp {
+                return false;
+            }
+        }
+        true
     }
 
     fn _check_supply_cap(env: &Env, token_id: u64, amount: u128) -> Result<(), Error> {

@@ -1,6 +1,7 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, useCallback } from "react";
+import { StrKey } from "@stellar/stellar-sdk";
 import {
   useDeployCollection,
   useDeploySalt,
@@ -9,14 +10,56 @@ import {
 } from "@/hooks/useLaunchpad";
 import { useWalletContext } from "@/context/WalletContext";
 import { useToast } from "@/components/ToastProvider";
-import { Loader2, Rocket, CheckCircle, ArrowRight, ArrowLeft, Check } from "lucide-react";
+import { Loader2, Rocket, CheckCircle, ArrowRight, ArrowLeft, Check, AlertTriangle, Info, ExternalLink, Save, X } from "lucide-react";
 import { GuardButton } from "./WalletGuard";
 import { CollectionKind } from "@/lib/launchpad";
 import { DEFAULT_TOKEN } from "@/config/tokens";
 import { useSupportedTokens } from "@/hooks/useSupportedTokens";
 import { getDefaultSupportedToken } from "@/lib/token-support";
+import { config } from "@/lib/config";
+
+function isValidStellarAddress(addr: string): boolean {
+  try {
+    return StrKey.isValidEd25519PublicKey(addr.trim());
+  } catch {
+    return false;
+  }
+}
 
 const STEPS = ["Collection Kind", "Details", "Economics", "Review"] as const;
+
+const DRAFT_KEY = "elcarehub:collection-draft";
+
+interface DraftForm {
+  name: string;
+  symbol: string;
+  kind: CollectionKind;
+  maxSupply: number;
+  royaltyBps: number;
+  currencyAddress: string;
+}
+
+function loadDraft(publicKey: string | null): DraftForm | null {
+  if (!publicKey || typeof localStorage === "undefined") return null;
+  try {
+    const raw = localStorage.getItem(`${DRAFT_KEY}:${publicKey}`);
+    if (!raw) return null;
+    return JSON.parse(raw) as DraftForm;
+  } catch {
+    return null;
+  }
+}
+
+function saveDraft(publicKey: string, form: DraftForm): void {
+  if (typeof localStorage === "undefined") return;
+  // Never store royaltyReceiver — it is a wallet address the user may not want persisted
+  localStorage.setItem(`${DRAFT_KEY}:${publicKey}`, JSON.stringify(form));
+}
+
+function clearDraft(publicKey: string): void {
+  if (typeof localStorage === "undefined") return;
+  localStorage.removeItem(`${DRAFT_KEY}:${publicKey}`);
+}
 
 const KIND_OPTIONS = [
   { id: "Normal721", label: "Standard 721", desc: "Classic one-of-a-kind NFTs" },
@@ -35,6 +78,9 @@ export function CollectionForm() {
 
   const [step, setStep] = useState(0);
   const [successAddress, setSuccessAddress] = useState<string | null>(null);
+  const [successTxHash, setSuccessTxHash] = useState<string | null>(null);
+  const [draftEnabled, setDraftEnabled] = useState(true);
+  const [hasDraft, setHasDraft] = useState(false);
   const [form, setForm] = useState({
     name: "",
     symbol: "",
@@ -45,6 +91,37 @@ export function CollectionForm() {
     currencyAddress: DEFAULT_TOKEN.address,
   });
 
+  // Load saved draft on mount (opt-in: only when a wallet is connected)
+  useEffect(() => {
+    if (!publicKey) return;
+    const draft = loadDraft(publicKey);
+    if (draft) {
+      setHasDraft(true);
+    }
+  }, [publicKey]);
+
+  const restoreDraft = useCallback(() => {
+    if (!publicKey) return;
+    const draft = loadDraft(publicKey);
+    if (!draft) return;
+    setForm((prev) => ({
+      ...prev,
+      name: draft.name,
+      symbol: draft.symbol,
+      kind: draft.kind,
+      maxSupply: draft.maxSupply,
+      royaltyBps: draft.royaltyBps,
+      currencyAddress: draft.currencyAddress,
+    }));
+    setHasDraft(false);
+  }, [publicKey]);
+
+  const discardDraft = useCallback(() => {
+    if (!publicKey) return;
+    clearDraft(publicKey);
+    setHasDraft(false);
+  }, [publicKey]);
+
   useEffect(() => {
     if (supportedTokens.length === 0) return;
     if (!supportedTokens.some((token) => token.address === form.currencyAddress)) {
@@ -54,6 +131,20 @@ export function CollectionForm() {
       }));
     }
   }, [form.currencyAddress, supportedTokens]);
+
+  // Auto-save draft whenever non-sensitive form fields change
+  useEffect(() => {
+    if (!draftEnabled || !publicKey) return;
+    const draft: DraftForm = {
+      name: form.name,
+      symbol: form.symbol,
+      kind: form.kind,
+      maxSupply: form.maxSupply,
+      royaltyBps: form.royaltyBps,
+      currencyAddress: form.currencyAddress,
+    };
+    saveDraft(publicKey, draft);
+  }, [draftEnabled, publicKey, form.name, form.symbol, form.kind, form.maxSupply, form.royaltyBps, form.currencyAddress]);
 
   const is721 = form.kind.includes("721");
 
@@ -79,6 +170,39 @@ export function CollectionForm() {
   );
   const preflightBlocked = !!preflight && preflight.errors.length > 0;
 
+  const [nextAttempted, setNextAttempted] = useState(false);
+
+  // Reset validation hints whenever the wizard step changes.
+  useEffect(() => {
+    setNextAttempted(false);
+  }, [step]);
+
+  const fieldErrors = useMemo(() => {
+    const errors: Record<string, string> = {};
+    if (step === 1) {
+      if (!form.name.trim()) errors.name = "Collection name is required.";
+      if (is721) {
+        if (!form.symbol.trim()) {
+          errors.symbol = "Symbol is required for 721 collections.";
+        } else if (!/^[A-Z0-9]{1,10}$/.test(form.symbol)) {
+          errors.symbol = "Symbol must be 1–10 uppercase letters or digits (A–Z, 0–9).";
+        }
+        if (!Number.isInteger(form.maxSupply) || form.maxSupply < 1) {
+          errors.maxSupply = "Max supply must be a whole number of at least 1.";
+        }
+      }
+    }
+    if (step === 2) {
+      if (form.royaltyBps < 0 || form.royaltyBps > 10000) {
+        errors.royaltyBps = "Royalty must be between 0 and 10,000 BPS.";
+      }
+      if (form.royaltyReceiver && !isValidStellarAddress(form.royaltyReceiver)) {
+        errors.royaltyReceiver = "Must be a valid Stellar address starting with G.";
+      }
+    }
+    return errors;
+  }, [step, form, is721]);
+
   const stepValid = useMemo(() => {
     switch (step) {
       case 0:
@@ -86,10 +210,14 @@ export function CollectionForm() {
       case 1:
         if (!form.name.trim()) return false;
         if (is721 && !form.symbol.trim()) return false;
+        if (is721 && !/^[A-Z0-9]{1,10}$/.test(form.symbol)) return false;
         if (is721 && form.maxSupply < 1) return false;
         return true;
       case 2:
-        return form.royaltyBps >= 0 && form.royaltyBps <= 10000 && hasSupportedTokens;
+        if (form.royaltyBps < 0 || form.royaltyBps > 10000) return false;
+        if (!hasSupportedTokens) return false;
+        if (form.royaltyReceiver && !isValidStellarAddress(form.royaltyReceiver)) return false;
+        return true;
       case 3:
         return true;
       default:
@@ -125,6 +253,8 @@ export function CollectionForm() {
     if (addr) {
       pushToast("Collection deployed successfully!", "success");
       setSuccessAddress(addr);
+      // Draft fulfilled — clear it so the next collection starts fresh
+      if (publicKey) clearDraft(publicKey);
     } else {
       pushToast(error || "Deployment failed. Please try again.", "error");
     }
@@ -132,33 +262,160 @@ export function CollectionForm() {
 
   if (successAddress) {
     return (
-      <div className="max-w-xl mx-auto flex flex-col items-center gap-6 rounded-3xl border border-green-100 bg-white p-12 text-center shadow-2xl shadow-green-900/5">
-        <div className="rounded-full bg-green-50 p-4">
-          <CheckCircle size={56} className="text-green-500" />
-        </div>
-        <div className="space-y-2">
-          <h3 className="text-3xl font-display font-bold text-gray-900">
-            Collection Deployed!
-          </h3>
-          <p className="text-gray-500 font-inter">
-            Your collection has been successfully created on the Stellar network.
-          </p>
-          <div className="mt-4 p-4 bg-gray-50 rounded-2xl break-all font-mono text-sm text-gray-600 border border-gray-100">
+      <div className="max-w-xl mx-auto flex flex-col gap-6 rounded-3xl border border-green-100 bg-white p-10 shadow-2xl shadow-green-900/5">
+        <div className="flex flex-col items-center text-center gap-4">
+          <div className="rounded-full bg-green-50 p-4">
+            <CheckCircle size={56} className="text-green-500" />
+          </div>
+          <div>
+            <h3 className="text-3xl font-display font-bold text-gray-900">
+              Collection Deployed!
+            </h3>
+            <p className="text-gray-500 font-inter mt-1">
+              Your collection is live on the Stellar network.
+            </p>
+          </div>
+          <div className="w-full p-4 bg-gray-50 rounded-2xl break-all font-mono text-sm text-gray-600 border border-gray-100">
             {successAddress}
           </div>
+          <a
+            href={`https://stellar.expert/explorer/${config.network}/contract/${successAddress}`}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="flex items-center justify-center gap-1.5 text-xs text-brand-600 hover:text-brand-700 font-medium transition-colors"
+          >
+            <ExternalLink size={12} /> View on Stellar Explorer
+          </a>
         </div>
-        <a
-          href={`/launchpad/collections/${successAddress}`}
-          className="w-full flex items-center justify-center gap-2 rounded-2xl bg-brand-500 px-6 py-4 text-lg font-bold text-white hover:bg-brand-600 shadow-lg shadow-brand-500/20 transition-all hover:scale-[1.02] active:scale-[0.98]"
-        >
-          View Collection <ArrowRight size={20} />
-        </a>
+
+        {/* Post-deployment checklist */}
+        <div className="rounded-2xl border border-brand-100 bg-brand-50/40 p-5">
+          <h4 className="text-sm font-bold text-brand-700 uppercase tracking-wider mb-3">
+            What to do next
+          </h4>
+          <ul className="space-y-2 text-sm text-gray-700">
+            <li className="flex items-start gap-2">
+              <Check size={14} className="mt-0.5 text-green-500 shrink-0" />
+              <span>Collection address confirmed on-chain — copy it for future reference.</span>
+            </li>
+            <li className="flex items-start gap-2">
+              <Check size={14} className="mt-0.5 text-green-500 shrink-0" />
+              <span>Verify royalty receiver address matches your intended wallet before listing tokens.</span>
+            </li>
+            <li className="flex items-start gap-2">
+              <Info size={14} className="mt-0.5 text-brand-500 shrink-0" />
+              <span>
+                Name, symbol, and max supply are <strong>immutable</strong> — they cannot be changed after deployment.
+              </span>
+            </li>
+          </ul>
+        </div>
+
+        {/* Action links */}
+        <div className="flex flex-col gap-3">
+          <a
+            href={`/launchpad/collections/${successAddress}`}
+            className="flex items-center justify-center gap-2 rounded-2xl bg-brand-500 px-6 py-4 text-base font-bold text-white hover:bg-brand-600 shadow-lg shadow-brand-500/20 transition-all hover:scale-[1.02] active:scale-[0.98]"
+            data-testid="view-collection-link"
+          >
+            View Collection <ArrowRight size={18} />
+          </a>
+          <a
+            href="/launchpad/my-collections"
+            className="flex items-center justify-center gap-2 rounded-xl border border-gray-200 px-6 py-3 text-sm font-bold text-gray-700 hover:bg-gray-50 transition-all"
+          >
+            <ExternalLink size={14} />
+            My Collections
+          </a>
+          <a
+            href="/launchpad/create"
+            className="flex items-center justify-center gap-2 rounded-xl border border-gray-200 px-6 py-3 text-sm font-bold text-gray-700 hover:bg-gray-50 transition-all"
+          >
+            <Rocket size={14} />
+            Deploy Another Collection
+          </a>
+        </div>
       </div>
     );
   }
 
   return (
     <div className="max-w-3xl mx-auto px-4 py-8">
+      {/* Draft restore banner */}
+      {hasDraft && (
+        <div
+          role="alert"
+          data-testid="draft-restore-banner"
+          className="mb-6 flex items-start justify-between gap-4 rounded-2xl border border-brand-100 bg-brand-50/60 px-5 py-4"
+        >
+          <div className="flex items-start gap-3">
+            <Save size={18} className="mt-0.5 text-brand-500 shrink-0" />
+            <div>
+              <p className="text-sm font-bold text-brand-700">Unsaved draft found</p>
+              <p className="text-xs text-brand-600 mt-0.5">
+                You have a saved collection draft. Restore it or start fresh.
+              </p>
+            </div>
+          </div>
+          <div className="flex items-center gap-2 shrink-0">
+            <button
+              type="button"
+              onClick={restoreDraft}
+              className="rounded-xl bg-brand-500 px-4 py-2 text-xs font-bold text-white hover:bg-brand-600 transition-colors"
+              data-testid="restore-draft-btn"
+            >
+              Restore
+            </button>
+            <button
+              type="button"
+              onClick={discardDraft}
+              className="rounded-xl border border-gray-200 px-3 py-2 text-xs font-bold text-gray-600 hover:bg-gray-50 transition-colors"
+              data-testid="discard-draft-btn"
+            >
+              <X size={12} />
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Draft persistence notice */}
+      <div className="mb-4 flex items-center justify-between text-xs text-gray-400 font-inter">
+        <span>
+          {draftEnabled
+            ? "Draft auto-saved locally. No sensitive data is stored."
+            : "Draft saving is off."}
+        </span>
+        <button
+          type="button"
+          onClick={() => {
+            setDraftEnabled((v) => !v);
+            if (draftEnabled && publicKey) clearDraft(publicKey);
+          }}
+          className="underline hover:text-gray-600 transition-colors"
+          data-testid="toggle-draft-btn"
+        >
+          {draftEnabled ? "Disable draft" : "Enable draft"}
+        </button>
+      </div>
+
+      {/* Wallet/network preflight notice */}
+      {!publicKey && (
+        <div
+          role="alert"
+          data-testid="wallet-required-notice"
+          className="mb-6 flex items-start gap-3 rounded-2xl border border-amber-100 bg-amber-50 px-5 py-4"
+        >
+          <AlertTriangle size={18} className="mt-0.5 text-amber-500 shrink-0" />
+          <div>
+            <p className="text-sm font-bold text-amber-700">Wallet required</p>
+            <p className="text-xs text-amber-600 mt-0.5">
+              Connect your wallet before deploying. The deploying address will be
+              the collection administrator and royalty receiver by default.
+            </p>
+          </div>
+        </div>
+      )}
+
       {/* Step indicator */}
       <div className="flex items-center justify-between mb-10">
         {STEPS.map((label, i) => (
@@ -238,9 +495,21 @@ export function CollectionForm() {
             <h2 className="text-2xl font-display font-bold text-gray-900 mb-2">
               Collection Details
             </h2>
-            <p className="text-gray-500 font-inter mb-8">
+            <p className="text-gray-500 font-inter mb-4">
               Name and describe your collection.
             </p>
+            <div
+              role="note"
+              data-testid="immutable-choice-warning"
+              className="mb-6 flex items-start gap-3 rounded-xl border border-amber-100 bg-amber-50/70 px-4 py-3"
+            >
+              <AlertTriangle size={15} className="mt-0.5 text-amber-500 shrink-0" />
+              <p className="text-xs text-amber-700 font-inter leading-snug">
+                <strong>These choices are immutable.</strong> Name, symbol, and max
+                supply are written into the contract at deployment and cannot be
+                changed afterwards. Review them carefully before proceeding.
+              </p>
+            </div>
             <div className="space-y-6">
               <div className="space-y-2">
                 <label className="block text-sm font-bold text-gray-950 uppercase tracking-wider font-inter">
@@ -250,9 +519,14 @@ export function CollectionForm() {
                   required
                   value={form.name}
                   onChange={(e) => setForm({ ...form, name: e.target.value })}
-                  className="w-full rounded-2xl border border-gray-200 bg-gray-50/50 px-5 py-4 text-base focus:border-brand-500 focus:bg-white focus:outline-none transition-all shadow-sm font-inter"
+                  className={`w-full rounded-2xl border bg-gray-50/50 px-5 py-4 text-base focus:bg-white focus:outline-none transition-all shadow-sm font-inter ${nextAttempted && fieldErrors.name ? "border-red-400 focus:border-red-500" : "border-gray-200 focus:border-brand-500"}`}
                   placeholder="e.g. African Legends"
                 />
+                {nextAttempted && fieldErrors.name && (
+                  <p className="mt-1.5 flex items-center gap-1.5 text-xs font-medium text-red-600" role="alert">
+                    <AlertTriangle size={12} aria-hidden="true" />{fieldErrors.name}
+                  </p>
+                )}
               </div>
 
               {is721 && (
@@ -267,10 +541,15 @@ export function CollectionForm() {
                       onChange={(e) =>
                         setForm({ ...form, symbol: e.target.value.toUpperCase() })
                       }
-                      className="w-full rounded-2xl border border-gray-200 bg-gray-50/50 px-5 py-4 text-base focus:border-brand-500 focus:bg-white focus:outline-none transition-all shadow-sm font-inter"
+                      className={`w-full rounded-2xl border bg-gray-50/50 px-5 py-4 text-base focus:bg-white focus:outline-none transition-all shadow-sm font-inter ${nextAttempted && fieldErrors.symbol ? "border-red-400 focus:border-red-500" : "border-gray-200 focus:border-brand-500"}`}
                       placeholder="e.g. AFRL"
                       maxLength={10}
                     />
+                    {nextAttempted && fieldErrors.symbol && (
+                      <p className="mt-1.5 flex items-center gap-1.5 text-xs font-medium text-red-600" role="alert">
+                        <AlertTriangle size={12} aria-hidden="true" />{fieldErrors.symbol}
+                      </p>
+                    )}
                   </div>
                   <div className="space-y-2">
                     <label className="block text-sm font-bold text-gray-950 uppercase tracking-wider font-inter">
@@ -284,8 +563,13 @@ export function CollectionForm() {
                       onChange={(e) =>
                         setForm({ ...form, maxSupply: parseInt(e.target.value) || 1 })
                       }
-                      className="w-full rounded-2xl border border-gray-200 bg-gray-50/50 px-5 py-4 text-base focus:border-brand-500 focus:bg-white focus:outline-none transition-all shadow-sm font-inter"
+                      className={`w-full rounded-2xl border bg-gray-50/50 px-5 py-4 text-base focus:bg-white focus:outline-none transition-all shadow-sm font-inter ${nextAttempted && fieldErrors.maxSupply ? "border-red-400 focus:border-red-500" : "border-gray-200 focus:border-brand-500"}`}
                     />
+                    {nextAttempted && fieldErrors.maxSupply && (
+                      <p className="mt-1.5 flex items-center gap-1.5 text-xs font-medium text-red-600" role="alert">
+                        <AlertTriangle size={12} aria-hidden="true" />{fieldErrors.maxSupply}
+                      </p>
+                    )}
                   </div>
                 </>
               )}
@@ -326,6 +610,11 @@ export function CollectionForm() {
                 <p className="text-xs text-gray-500 font-inter">
                   Basis points: 500 = 5%, 1000 = 10%
                 </p>
+                {nextAttempted && fieldErrors.royaltyBps && (
+                  <p className="mt-1.5 flex items-center gap-1.5 text-xs font-medium text-red-600" role="alert">
+                    <AlertTriangle size={12} aria-hidden="true" />{fieldErrors.royaltyBps}
+                  </p>
+                )}
               </div>
 
               <div className="space-y-2">
@@ -358,9 +647,14 @@ export function CollectionForm() {
                 <input
                   value={form.royaltyReceiver}
                   onChange={(e) => setForm({ ...form, royaltyReceiver: e.target.value })}
-                  className="w-full rounded-2xl border border-gray-200 bg-gray-50/50 px-5 py-4 text-base focus:border-brand-500 focus:bg-white focus:outline-none transition-all shadow-sm font-inter font-mono text-sm"
+                  className={`w-full rounded-2xl border bg-gray-50/50 px-5 py-4 text-base focus:bg-white focus:outline-none transition-all shadow-sm font-inter font-mono text-sm ${nextAttempted && fieldErrors.royaltyReceiver ? "border-red-400 focus:border-red-500" : "border-gray-200 focus:border-brand-500"}`}
                   placeholder={publicKey || "G... (defaults to creator)"}
                 />
+                {nextAttempted && fieldErrors.royaltyReceiver && (
+                  <p className="mt-1.5 flex items-center gap-1.5 text-xs font-medium text-red-600" role="alert">
+                    <AlertTriangle size={12} aria-hidden="true" />{fieldErrors.royaltyReceiver}
+                  </p>
+                )}
               </div>
             </div>
           </div>
@@ -515,9 +809,16 @@ export function CollectionForm() {
           {step < STEPS.length - 1 && (
             <button
               type="button"
-              disabled={!stepValid}
-              onClick={() => setStep((s) => s + 1)}
-              className="flex items-center gap-2 px-8 py-3 rounded-xl bg-brand-500 text-white font-bold hover:bg-brand-600 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+              aria-disabled={!stepValid}
+              onClick={() => {
+                if (!stepValid) {
+                  setNextAttempted(true);
+                  return;
+                }
+                setNextAttempted(false);
+                setStep((s) => s + 1);
+              }}
+              className={`flex items-center gap-2 px-8 py-3 rounded-xl bg-brand-500 text-white font-bold hover:bg-brand-600 transition-all ${!stepValid ? "opacity-50 cursor-not-allowed" : ""}`}
             >
               Next
               <ArrowRight size={18} />

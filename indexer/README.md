@@ -26,6 +26,7 @@
 - [Re-org Handling](#re-org-handling)
 - [Redis Caching](#redis-caching)
 - [Metrics](#metrics)
+- [Logging](#logging)
 - [Testing](#testing)
 
 ---
@@ -129,6 +130,8 @@ npm run backfill -- --start=123456 --end=124999 --rpc=https://your-archival-rpc
 | `PORT` | ⬜ | `4000` | HTTP server port |
 | `POLL_INTERVAL_MS` | ⬜ | `5000` | Polling interval in milliseconds |
 | `CORS_ORIGIN` | ⬜ | — | Comma-separated list of allowed origins (see CORS section) |
+| `LOG_LEVEL` | ⬜ | `info` | Minimum log level emitted: `debug` \| `info` \| `warn` \| `error` (see [Logging](#logging)) |
+| `LOG_FORMAT` | ⬜ | `json` | `json` for machine-readable logs, `pretty` for colorized human-readable local dev output |
 
 ---
 
@@ -316,6 +319,70 @@ The indexer exposes Prometheus metrics at `GET /metrics`.
 | `network_latest_ledger` | Gauge | Current tip of the Stellar network |
 | `sync_latency_ledgers` | Gauge | Gap between network tip and indexed tip |
 | `http_request_duration_seconds` | Histogram | Request duration by route and status |
+
+---
+
+## Logging
+
+The indexer emits **structured JSON logs** (one JSON object per line) via [pino](https://getpino.io), so logs are directly parseable by log aggregators, `jq`, CloudWatch Insights, Datadog, etc. — no regex scraping required.
+
+Every log line includes:
+
+| Field | Description |
+|-------|-------------|
+| `level` | `debug` \| `info` \| `warn` \| `error` |
+| `time` | Unix epoch milliseconds |
+| `msg` | The log message |
+| `service` | Always `elcarehub-indexer` |
+| `version` | The `version` field from `package.json`, for pinning a log line to a deploy |
+| *(contextual fields)* | e.g. `ledger`, `eventType`, `listingId`, `auctionId`, `offerId`, `requestId` — whatever was passed as the second argument to the log call |
+
+Example log line:
+
+```json
+{"level":"info","time":1721912400123,"service":"elcarehub-indexer","version":"1.0.0","msg":"ARTWORK_SOLD: listing not found — sale not recorded","eventType":"ARTWORK_SOLD","listingId":"42","ledger":581920}
+```
+
+### Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `LOG_LEVEL` | `info` | Minimum level emitted. Set to `debug` locally for verbose tracing (e.g. duplicate-event skips), or `warn`/`error` in noisy environments. |
+| `LOG_FORMAT` | `json` | `json` (default) emits one-line JSON, suitable for production and log shippers. `pretty` pipes output through [`pino-pretty`](https://github.com/pinojs/pino-pretty) for colorized, human-readable lines — use this for local development (`LOG_FORMAT=pretty npm run dev`). |
+| `ALLOW_RAW_BODY_LOGGING` | `false` | Opts into unredacted request bodies / full XDR blobs for local debugging. Ignored (no-op, with a one-time warning) when `NODE_ENV=production`. See [Logging Policy](../docs/LOGGING_POLICY.md). |
+
+### Request correlation IDs
+
+Every HTTP request is tagged with a request ID (`indexer/src/api/request-id-middleware.ts`):
+
+- If the caller sends an `X-Request-Id` header, that value is reused (so IDs can be threaded through from an upstream gateway or the frontend).
+- Otherwise a new UUID is generated with `crypto.randomUUID()`.
+- The ID is echoed back as the `X-Request-Id` response header and attached to `res.locals.requestId` for any downstream handler to read.
+- Two structured log lines bracket each request — `"request started"` and `"request completed"` — both carrying `requestId`, `method`, `route`, and (on completion) `statusCode` and `durationMs`. This makes it trivial to filter a log stream down to every line produced by a single request, or to grep production logs by the request ID returned to a user reporting an issue.
+
+`/health`, `/readyz`, and `/metrics` are excluded from request logging to avoid drowning real traffic in health-check noise (they're polled every few seconds by orchestrators/Prometheus).
+
+### Redaction & privacy-safe logging
+
+Every log line is sanitized before it reaches pino (`indexer/src/log-redaction.ts`, wired in via `logger.ts`'s `wrap()`): Stellar secret keys, JWTs, `authorization`/`cookie`/`password`/`token`-shaped fields, credentials embedded in URLs (`postgres://user:pass@host` → `postgres://[REDACTED]@host`), and raw Soroban transaction XDR blobs are all redacted or truncated automatically, including inside nested objects and `Error.cause` chains. `requestId`, `statusCode`, `durationMs`, and similar diagnostic fields are never touched.
+
+Full request bodies / raw XDR are available for local debugging only via `ALLOW_RAW_BODY_LOGGING=true`, which is a hard no-op when `NODE_ENV=production`. See **[Logging Policy](../docs/LOGGING_POLICY.md)** for the full allowed/forbidden field list and the guarded-override behavior.
+
+### Log Shipping
+
+The indexer writes logs to `stdout` only — it never writes to files — so shipping is entirely a matter of how the container runtime/orchestrator collects `stdout`. Two documented paths:
+
+**AWS CloudWatch Logs.** Use Docker's built-in [`awslogs` log driver](https://docs.docker.com/engine/logging/drivers/awslogs/). A commented example is included in `docker-compose.yml` next to the `indexer` service — uncomment it and set `awslogs-region`/`awslogs-group` for your account. Requires the CloudWatch Logs group to exist and AWS credentials to be visible to the Docker daemon (e.g. an EC2 instance role or `~/.aws/credentials`). Because every line is already valid JSON, CloudWatch Logs Insights can query fields like `eventType` or `requestId` directly with no custom parser.
+
+**Datadog.** The simplest path is the [Datadog Agent's Docker log collection](https://docs.datadoghq.com/containers/docker/log/): run the Agent as a sidecar/daemon with `DD_LOGS_ENABLED=true` and `DD_LOGS_CONFIG_CONTAINER_COLLECT_ALL=true`, and it tails every container's `json-file` logs automatically (no per-service driver change needed — see the commented `json-file` + `com.datadoghq.ad.logs` label example in `docker-compose.yml`). At a high level, the Agent (or an APM-instrumented process) uses:
+
+| Variable | Description |
+|----------|-------------|
+| `DD_API_KEY` | Datadog API key used by the Agent to ship logs/metrics |
+| `DD_SERVICE` | Service name tag — set to `elcarehub-indexer` to match the `service` field already in every log line |
+| `DD_ENV` | Environment tag (`production`, `staging`, etc.) |
+
+Because pino output is already JSON with a `service`/`level`/`msg` shape, Datadog's log pipelines can parse it with the built-in JSON parser with no grok rules required.
 
 ---
 

@@ -40,6 +40,9 @@ use soroban_sdk::{
 
 const TTL_THRESHOLD: u32 = 50_000;
 const TTL_BUMP: u32 = 100_000;
+/// Maximum number of vouchers accepted by a single redeem_batch call (#274).
+const MAX_BATCH_SIZE: u32 = 100;
+const MAX_BPS: u32 = 10_000;
 
 // ─── Errors ──────────────────────────────────────────────────────────────────
 
@@ -60,8 +63,21 @@ pub enum Error {
     InvalidSignature = 10,
     NotAllowlisted = 11,
     InvalidMerkleProof = 12,
-    /// Voucher nonce has been explicitly revoked by the creator.
     VoucherRevoked = 13,
+    /// migrate() called for a version already marked done.
+    AlreadyMigrated = 14,
+    /// Unsupported version jump.
+    UnsupportedMigration = 15,
+    /// redeem_batch called with an empty items list.
+    EmptyBatch = 16,
+    /// redeem_batch called with more items than MAX_BATCH_SIZE.
+    BatchTooLarge = 17,
+    /// redeem_batch contains two items with the same voucher token_id.
+    DuplicateVoucherInBatch = 18,
+    /// set_approval_for_all called with an already-past `expires_at`.
+    ApprovalExpired = 19,
+    /// Royalty BPS exceeds 10 000 (100 %).
+    InvalidBps = 20,
 }
 
 // ─── Data types ───────────────────────────────────────────────────────────────
@@ -109,6 +125,7 @@ pub enum DataKey {
     Initialized,
     Creator,
     CreatorPubkey,
+    CurrentWasmHash,
     Name,
     Symbol,
     MaxSupply,
@@ -125,6 +142,7 @@ pub enum DataKey {
     Approved(u64),
     BalanceOf(Address),
     ApprovedForAll(Address, Address),
+    ApprovedForAllExpiry(Address, Address), // (owner, operator) → u32 ledger sequence
     UsedVoucher(u64),    // nonce → bool  (redeemed)
     RevokedVoucher(u64), // nonce → bool  (creator-revoked, per-nonce)
     MerkleRoot,          // BytesN<32> — root of allowlist Merkle tree
@@ -132,6 +150,10 @@ pub enum DataKey {
     /// Network passphrase bound at initialization.
     /// Included in the signed digest to prevent cross-network replay (#273).
     NetworkPassphrase,   // String
+    /// On-chain version string written by migrate().
+    ContractVersion,
+    /// Migration completion marker (version string → bool).
+    MigrationDone(soroban_sdk::String),
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -215,7 +237,17 @@ impl LazyMint721 {
         next_id: u64,
     ) -> Result<(), Error> {
         if voucher.valid_until != 0 && env.ledger().sequence() > voucher.valid_until as u32 {
+            env.events()
+                .publish((symbol_short!("expired"),), voucher.nonce);
             return Err(Error::VoucherExpired);
+        }
+        // URI boundary validation (#276)
+        let uri_len = voucher.uri.len();
+        if uri_len == 0 {
+            return Err(Error::EmptyUri);
+        }
+        if uri_len > MAX_URI_LEN {
+            return Err(Error::UriTooLong);
         }
         // Replay protection uses the voucher's nonce (not token_id) so the same
         // token can be covered by multiple vouchers with independent lifetimes.
@@ -345,6 +377,7 @@ impl LazyMint721 {
         }
         env.storage().instance().set(&DataKey::Initialized, &true);
         env.storage().instance().set(&DataKey::Creator, &creator);
+        env.storage().instance().set(&DataKey::CurrentWasmHash, &BytesN::from_array(&env, &[0u8; 32]));
         env.storage()
             .instance()
             .set(&DataKey::CreatorPubkey, &creator_pubkey);
@@ -372,6 +405,24 @@ impl LazyMint721 {
             .instance()
             .set(&DataKey::NetworkPassphrase, &network_passphrase);
         env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_BUMP);
+        Ok(())
+    }
+
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
+        let old_wasm_hash: BytesN<32> = env
+            .storage()
+            .instance()
+            .get(&DataKey::CurrentWasmHash)
+            .unwrap_or(BytesN::from_array(&env, &[0u8; 32]));
+        env.storage()
+            .instance()
+            .set(&DataKey::CurrentWasmHash, &new_wasm_hash);
+        env.deployer().update_current_contract_wasm(new_wasm_hash.clone());
+        env.events().publish(
+            (symbol_short!("upgraded"),),
+            (old_wasm_hash, new_wasm_hash),
+        );
         Ok(())
     }
 
@@ -464,6 +515,13 @@ impl LazyMint721 {
         Self::extend_instance_ttl(&env);
         buyer.require_auth();
 
+        if items.len() == 0 {
+            return Err(Error::EmptyBatch);
+        }
+        if items.len() > MAX_BATCH_SIZE {
+            return Err(Error::BatchTooLarge);
+        }
+
         let pubkey: BytesN<32> = env
             .storage()
             .instance()
@@ -493,8 +551,23 @@ impl LazyMint721 {
 
         // Phase 1: validate every item (all-or-nothing — no state changes yet).
         // We track supply headroom manually since NextTokenId is not yet updated.
+        //
+        // Duplicate-nonce hardening (#274): UsedVoucher(token_id) is only set
+        // during Phase 4 minting, so two items sharing the same voucher
+        // token_id would both pass validation here and get double-minted —
+        // inflating balance/total_supply from a single voucher. Reject any
+        // in-batch duplicate before any state mutation.
+        let mut seen_ids: Vec<u64> = Vec::new(&env);
         let mut supply_used: u64 = 0u64;
         for item in items.iter() {
+            let tid = item.voucher.token_id;
+            for i in 0..seen_ids.len() {
+                if seen_ids.get(i).unwrap() == tid {
+                    return Err(Error::DuplicateVoucherInBatch);
+                }
+            }
+            seen_ids.push_back(tid);
+
             Self::check_allowlist(&env, &buyer, &item.merkle_proof)?;
             let effective_next = next_id_start.saturating_add(supply_used);
             Self::check_voucher(
@@ -684,12 +757,42 @@ impl LazyMint721 {
         Ok(())
     }
 
-    pub fn set_approval_for_all(env: Env, owner: Address, operator: Address, approved: bool) {
+    pub fn set_approval_for_all(
+        env: Env,
+        owner: Address,
+        operator: Address,
+        approved: bool,
+        expires_at: Option<u32>,
+    ) -> Result<(), Error> {
         Self::extend_instance_ttl(&env);
         owner.require_auth();
+
+        if approved {
+            if let Some(exp) = expires_at {
+                if env.ledger().sequence() >= exp {
+                    return Err(Error::ApprovalExpired);
+                }
+            }
+        }
+
         let key = DataKey::ApprovedForAll(owner.clone(), operator.clone());
+        let expiry_key = DataKey::ApprovedForAllExpiry(owner.clone(), operator.clone());
+
         env.storage().persistent().set(&key, &approved);
         env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_BUMP);
+
+        match (approved, expires_at) {
+            (true, Some(exp)) => {
+                env.storage().persistent().set(&expiry_key, &exp);
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&expiry_key, TTL_THRESHOLD, TTL_BUMP);
+            }
+            _ => {
+                env.storage().persistent().remove(&expiry_key);
+            }
+        }
+        Ok(())
     }
 
     // ── View functions ────────────────────────────────────────────────────
@@ -706,6 +809,15 @@ impl LazyMint721 {
             .persistent()
             .get(&DataKey::TokenUri(token_id))
             .ok_or(Error::TokenNotFound)
+    }
+
+    /// Always `true` — a lazy-minted token's URI comes from its signed
+    /// voucher and is set once at redemption; there is no setter to change
+    /// it afterwards (#276). Exposed as a method (rather than left implicit)
+    /// so every collection type — normal and lazy — exposes the same
+    /// `is_metadata_frozen()` query for frontend/indexer consumers.
+    pub fn is_metadata_frozen(_env: Env) -> bool {
+        true
     }
 
     pub fn balance_of(env: Env, owner: Address) -> u64 {
@@ -773,10 +885,24 @@ impl LazyMint721 {
     }
 
     pub fn is_approved_for_all(env: Env, owner: Address, operator: Address) -> bool {
-        env.storage()
+        let approved: bool = env
+            .storage()
             .persistent()
-            .get(&DataKey::ApprovedForAll(owner, operator))
-            .unwrap_or(false)
+            .get(&DataKey::ApprovedForAll(owner.clone(), operator.clone()))
+            .unwrap_or(false);
+        if !approved {
+            return false;
+        }
+        if let Some(exp) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, u32>(&DataKey::ApprovedForAllExpiry(owner, operator))
+        {
+            if env.ledger().sequence() >= exp {
+                return false;
+            }
+        }
+        true
     }
 
     // ── Admin ─────────────────────────────────────────────────────────────
@@ -802,6 +928,9 @@ impl LazyMint721 {
     pub fn update_royalty(env: Env, receiver: Address, bps: u32) -> Result<(), Error> {
         Self::extend_instance_ttl(&env);
         Self::only_creator(&env)?;
+        if bps > MAX_BPS {
+            return Err(Error::InvalidBps);
+        }
         env.storage()
             .instance()
             .set(&DataKey::RoyaltyReceiver, &receiver);
@@ -841,6 +970,50 @@ impl LazyMint721 {
     /// Return the current Merkle root (None if unset).
     pub fn merkle_root(env: Env) -> Option<BytesN<32>> {
         env.storage().instance().get(&DataKey::MerkleRoot)
+    }
+
+    // ── Versioning & Migration ─────────────────────────────────────────────
+
+    pub fn version(env: Env) -> soroban_sdk::String {
+        soroban_sdk::String::from_str(&env, "1.0.0")
+    }
+
+    pub fn contract_version(env: Env) -> Option<String> {
+        env.storage().instance().get(&DataKey::ContractVersion)
+    }
+
+    /// Creator-guarded idempotent migration entry point.
+    /// v1.0.0: records the completion marker and on-chain version string.
+    pub fn migrate(env: Env) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
+        Self::only_creator(&env)?;
+
+        let target = String::from_str(&env, "1.0.0");
+        let done_key = DataKey::MigrationDone(target.clone());
+
+        if env
+            .storage()
+            .persistent()
+            .get::<DataKey, bool>(&done_key)
+            .unwrap_or(false)
+        {
+            return Err(Error::AlreadyMigrated);
+        }
+
+        // v1.0.0 migration body: nothing to migrate for the initial version.
+        // UsedVoucher entries are already in persistent storage and remain
+        // readable as-is.  RevokedVoucher entries are likewise unaffected.
+
+        env.storage().persistent().set(&done_key, &true);
+        env.storage()
+            .persistent()
+            .extend_ttl(&done_key, TTL_THRESHOLD, TTL_BUMP);
+        env.storage()
+            .instance()
+            .set(&DataKey::ContractVersion, &target);
+        env.events()
+            .publish((soroban_sdk::symbol_short!("migrated"), target), ());
+        Ok(())
     }
 
     // ── Private helpers ───────────────────────────────────────────────────
@@ -964,13 +1137,23 @@ impl LazyMint721 {
                 return Ok(());
             }
         }
-        if env
+        let all_approved: bool = env
             .storage()
             .persistent()
             .get::<DataKey, bool>(&DataKey::ApprovedForAll(from.clone(), spender.clone()))
-            .unwrap_or(false)
-        {
-            return Ok(());
+            .unwrap_or(false);
+        if all_approved {
+            let expiry: Option<u32> = env
+                .storage()
+                .persistent()
+                .get::<DataKey, u32>(&DataKey::ApprovedForAllExpiry(
+                    from.clone(),
+                    spender.clone(),
+                ));
+            let expired = expiry.map_or(false, |exp| env.ledger().sequence() >= exp);
+            if !expired {
+                return Ok(());
+            }
         }
         Err(Error::NotApproved)
     }

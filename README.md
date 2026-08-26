@@ -100,6 +100,7 @@ The platform celebrates African heritage — from Benin bronze sculptures to Tin
 - Redis caching with per-endpoint TTL
 - Server-Sent Events (SSE) for live UI updates
 - Backfill CLI for replaying missed ledger ranges
+- Tiered retention and archival for event history (see `docs/retention-archival.md`)
 
 ---
 
@@ -296,6 +297,9 @@ npm run test:e2e
 
 Base URL: `http://localhost:4000`
 
+- **OpenAPI spec**: `GET /openapi.json` (machine-readable)
+- **SSE protocol**: see `docs/sse-protocol.md`
+
 ### Listings
 
 | Method | Endpoint | Description |
@@ -438,6 +442,10 @@ ElcareHub handles on-chain value on behalf of artists and collectors. We take se
 - **Report a vulnerability:** see [SECURITY.md](SECURITY.md) for the disclosure process and SLA.
 - **Threat model:** [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) — attack surface analysis for the contract, indexer, and frontend.
 - **Incident runbook:** [docs/INCIDENT_RUNBOOK.md](docs/INCIDENT_RUNBOOK.md) — pause procedure, admin key rotation, indexer re-org recovery, and secret rotation.
+- **Operational runbooks:** [docs/runbooks/](docs/runbooks/README.md) — detailed procedures for stalled ingestion, reorgs, DB/Redis outage, compromised keys, Pinata outage, wallet issues, and deployment config errors.
+- **Secret inventory:** [docs/secret-inventory.md](docs/secret-inventory.md) — every secret classified with storage location, owner, and rotation schedule.
+- **Reliability program:** [docs/reliability/](docs/reliability/README.md) — quarterly reviews, domain owners, scored backlog, and decision records aligned with `versions.toml`.
+- **Release verification:** [docs/RELEASE_VERIFICATION.md](docs/RELEASE_VERIFICATION.md) — how contract WASM, ABI, frontend, and indexer image release artifacts are signed (GitHub build provenance + keyless cosign) and how to independently verify each one before deploying.
 
 ## Contributing
 

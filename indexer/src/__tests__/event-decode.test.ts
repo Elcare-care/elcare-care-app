@@ -143,6 +143,9 @@ describe('decodeWithSchema — LISTING_CANCELLED', () => {
 
   it('valid: only required field', () => assertOk(decodeWithSchema('LISTING_CANCELLED', LISTING_CANCELLED_SCHEMA, valid)));
   it('valid: with optional cancelled_by', () => assertOk(decodeWithSchema('LISTING_CANCELLED', LISTING_CANCELLED_SCHEMA, { ...valid, cancelled_by: 'GADMIN' })));
+  it('valid: with reason as Soroban enum object', () => assertOk(decodeWithSchema('LISTING_CANCELLED', LISTING_CANCELLED_SCHEMA, { ...valid, reason: { tag: 2 } })));
+
+  it('valid: without reason (optional)', () => assertOk(decodeWithSchema('LISTING_CANCELLED', LISTING_CANCELLED_SCHEMA, valid)));
 
   it('error: missing listing_id', () => {
     const r = assertErr(decodeWithSchema('LISTING_CANCELLED', LISTING_CANCELLED_SCHEMA, {}));
@@ -301,17 +304,27 @@ describe('decodeWithSchema — AUCTION_CANCELLED', () => {
 // ── AUCTION_EXTENDED ──────────────────────────────────────────────────────────
 
 describe('decodeWithSchema — AUCTION_EXTENDED', () => {
-  const valid = { auction_id: 11n, new_end_time: 1900000000n };
+  const valid = { auction_id: 11n, prev_end_time: 1800000000n, new_end_time: 1900000000n, extension_count: 1n };
 
   it('valid decode', () => assertOk(decodeWithSchema('AUCTION_EXTENDED', AUCTION_EXTENDED_SCHEMA, valid)));
 
   it('error: missing new_end_time', () => {
-    const r = assertErr(decodeWithSchema('AUCTION_EXTENDED', AUCTION_EXTENDED_SCHEMA, { auction_id: 11n }));
+    const r = assertErr(decodeWithSchema('AUCTION_EXTENDED', AUCTION_EXTENDED_SCHEMA, { auction_id: 11n, prev_end_time: 1800000000n, extension_count: 1n }));
     expect(r.reason).toContain('new_end_time');
   });
 
+  it('error: missing prev_end_time', () => {
+    const r = assertErr(decodeWithSchema('AUCTION_EXTENDED', AUCTION_EXTENDED_SCHEMA, { auction_id: 11n, new_end_time: 1900000000n, extension_count: 1n }));
+    expect(r.reason).toContain('prev_end_time');
+  });
+
+  it('error: missing extension_count', () => {
+    const r = assertErr(decodeWithSchema('AUCTION_EXTENDED', AUCTION_EXTENDED_SCHEMA, { auction_id: 11n, prev_end_time: 1800000000n, new_end_time: 1900000000n }));
+    expect(r.reason).toContain('extension_count');
+  });
+
   it('error: wrong type for new_end_time', () => {
-    const r = assertErr(decodeWithSchema('AUCTION_EXTENDED', AUCTION_EXTENDED_SCHEMA, { auction_id: 11n, new_end_time: 1900000000 }));
+    const r = assertErr(decodeWithSchema('AUCTION_EXTENDED', AUCTION_EXTENDED_SCHEMA, { auction_id: 11n, prev_end_time: 1800000000n, new_end_time: 1900000000, extension_count: 1n }));
     expect(r.reason).toContain('new_end_time');
   });
 });
@@ -407,19 +420,43 @@ describe('decodeWithSchema — OFFER_RECLAIMED', () => {
 // ── ROYALTY_PAID ──────────────────────────────────────────────────────────────
 
 describe('decodeWithSchema — ROYALTY_PAID', () => {
-  const valid = { recipient: 'GRECIP', amount: 50n };
+  // Per-sale breakdown shape (Issue #201): recipients is a vector of
+  // {address, amount} payouts; exactly one of listing_id / auction_id is set.
+  const valid = {
+    listing_id: 1n,
+    auction_id: null,
+    sale_price: 10_000_000n,
+    protocol_fee_amount: 500_000n,
+    token: 'CTOKEN',
+    recipients: [
+      { address: 'GARTIST', amount: 6_650_000n },
+      { address: 'GCOLLAB', amount: 2_850_000n },
+    ],
+    ledger_sequence: 42n,
+  };
 
-  it('valid decode', () => assertOk(decodeWithSchema('ROYALTY_PAID', ROYALTY_PAID_SCHEMA, valid)));
-  it('valid: with optional listing_id', () => assertOk(decodeWithSchema('ROYALTY_PAID', ROYALTY_PAID_SCHEMA, { ...valid, listing_id: 1n })));
+  it('valid decode (listing settlement)', () => assertOk(decodeWithSchema('ROYALTY_PAID', ROYALTY_PAID_SCHEMA, valid)));
 
-  it('error: missing recipient', () => {
-    const r = assertErr(decodeWithSchema('ROYALTY_PAID', ROYALTY_PAID_SCHEMA, { amount: 50n }));
-    expect(r.reason).toContain('recipient');
+  it('valid decode (auction settlement)', () =>
+    assertOk(decodeWithSchema('ROYALTY_PAID', ROYALTY_PAID_SCHEMA, {
+      ...valid, listing_id: null, auction_id: 9n,
+    })));
+
+  it('error: missing sale_price', () => {
+    const { sale_price: _p, ...d } = valid;
+    const r = assertErr(decodeWithSchema('ROYALTY_PAID', ROYALTY_PAID_SCHEMA, d));
+    expect(r.reason).toContain('sale_price');
   });
 
-  it('error: wrong type for amount', () => {
-    const r = assertErr(decodeWithSchema('ROYALTY_PAID', ROYALTY_PAID_SCHEMA, { recipient: 'GRECIP', amount: 50 }));
-    expect(r.reason).toContain('amount');
+  it('error: missing recipients', () => {
+    const { recipients: _r, ...d } = valid;
+    const r = assertErr(decodeWithSchema('ROYALTY_PAID', ROYALTY_PAID_SCHEMA, d));
+    expect(r.reason).toContain('recipients');
+  });
+
+  it('error: wrong type for protocol_fee_amount', () => {
+    const r = assertErr(decodeWithSchema('ROYALTY_PAID', ROYALTY_PAID_SCHEMA, { ...valid, protocol_fee_amount: 500_000 }));
+    expect(r.reason).toContain('protocol_fee_amount');
   });
 });
 

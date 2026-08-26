@@ -86,7 +86,9 @@ This contract manages the complete lifecycle of on-chain marketplace listings, a
 | `set_admin(new_admin)` | admin | Immediate admin transfer |
 | `propose_admin(proposed)` | admin | Step 1 of 2-step transfer |
 | `accept_admin()` | proposed | Step 2 of 2-step transfer |
-| `pause()` / `unpause()` | admin | Circuit breaker — blocks all state changes |
+| `pause()` / `unpause()` | admin | Global circuit breaker — see [Pause & Circuit Breakers](#pause--circuit-breakers) for exactly which operations it blocks (fund-recovery/cleanup ops always remain available) |
+| `pause_collection(collection)` / `unpause_collection(collection)` | admin | Per-collection circuit breaker — additive restriction layered on top of the global pause |
+| `pause_function(function_name)` / `unpause_function(function_name)` | admin | Per-function circuit breaker (`create_listing`, `buy_artwork`, `create_auction`, `place_bid`, `make_offer`) — additive restriction layered on top of the global pause |
 | `add_token(token)` / `remove_token(token)` | admin | Manage payment token whitelist |
 | `revoke_artist(artist)` / `reinstate_artist(artist)` | admin | Artist access control |
 | `set_treasury(address)` / `set_fee_bps(bps)` | admin | Update protocol fee config |
@@ -94,6 +96,81 @@ This contract manages the complete lifecycle of on-chain marketplace listings, a
 | `migrate(admin)` | admin | Idempotent storage migration for upgrades |
 | `set_price_bounds(admin, min, max)` | admin | Set global min/max listing price |
 | `get_price_bounds()` | — | Returns `(Option<i128>, Option<i128>)` |
+
+### Pause & Circuit Breakers
+
+Pausing exists to stop *new* risk exposure during an incident — it must not trap
+funds or NFTs that are already committed to the contract. There are three
+independent, additive pause axes (global, per-collection, per-function); any
+active axis blocks the operations it covers. Fund-recovery / cleanup
+operations ignore **all three** axes entirely, so users can always get their
+funds and NFTs back even while the marketplace is paused.
+
+| Blocked while paused (new exposure) | Always available (fund recovery / cleanup) |
+|---|---|
+| `create_listing` | `cancel_listing` |
+| `update_listing` | `cancel_listings` (batch) |
+| `update_listing_price` | `cancel_artist_listings` (admin revocation cleanup) |
+| `buy_artwork` | `expire_listing` |
+| `create_auction` | `cancel_auction` |
+| `place_bid` | `finalize_auction` |
+| `make_offer` | `admin_cancel_auction` |
+| `accept_offer` | `withdraw_offer` |
+| | `reject_offer` |
+| | `reclaim_offer` |
+
+All pause checks fail with the single stable `ContractPaused` (23) error
+code, so the frontend can map any pause-related rejection to one actionable
+message regardless of which axis fired.
+
+---
+
+## Role-Based Authorization (Issue #267)
+
+### Overview
+
+Privileged marketplace control was originally a single `Admin` address with unlimited authority — routine configuration, emergency pause, artist moderation, and irreversible migration all shared one key. That means a compromised or unavailable admin key blocks *every* privileged action, including the emergency pause that would otherwise contain the incident.
+
+The contract now assigns every privileged entry point to exactly one of four **roles**. A role with no explicit holder transparently falls back to whoever holds `Admin`, so **no migration is required** for existing deployments to keep working — role separation is opt-in.
+
+| Role | Scope | Entry points |
+|------|-------|--------------|
+| `ProtocolConfig` | Routine configuration | `set_price_bounds`, `set_treasury`, `set_protocol_fee`, `set_min_bid_increment`, `set_bid_history_cap`, `set_auction_extension_window`, `set_auction_extension_trigger`, `set_auction_max_extensions`, `add_token_to_whitelist`, `remove_token_from_whitelist` |
+| `EmergencyPause` | Incident response | `admin_pause`, `admin_unpause`, `pause_collection`, `unpause_collection`, `pause_function`, `unpause_function`, `admin_cancel_auction` |
+| `CollectionAdmin` | Artist/collection moderation | `revoke_artist`, `reinstate_artist`, `cancel_artist_listings` |
+| `Upgrade` | Irreversible storage/version migration | `migrate`, `migrate_step` |
+
+`Admin` itself is unchanged: it retains the pre-existing two-step `transfer_admin` / `accept_admin` / `cancel_admin_proposal` flow, and is the implicit holder of any role that hasn't been explicitly assigned.
+
+**Why `EmergencyPause` matters most:** it is deliberately kept independent so an incident responder — e.g. a fast 2-of-3 ops multisig — can still halt the marketplace even if the (potentially slower, more heavily-gated) `ProtocolConfig` authority is unavailable, under dispute, or itself the thing being investigated.
+
+**User fund recovery under pause:** cancelling a listing/auction/offer you own, reclaiming an expired offer, and withdrawing from a resolved auction all check `require_not_paused`/`require_not_paused_ctx` on the *creation* side only — they remain callable while any pause axis (global, per-collection, per-function) is active, so a pause can never trap user funds. See `EVENTS.md` and the granular-pause section above for the full per-operation matrix.
+
+### Role management API
+
+| Function | Auth | Description |
+|----------|------|-------------|
+| `get_role(role) → Address` | — | Resolves the current holder of `role` (explicit holder, or `Admin` fallback) |
+| `propose_role_transfer(current_authority, role, candidate)` | current holder of `role` | Step 1 of 2: propose a new holder (7-day expiry, mirrors `transfer_admin`) |
+| `accept_role_transfer(role, candidate)` | proposed candidate | Step 2 of 2: candidate accepts and becomes the explicit holder |
+| `cancel_role_proposal(current_authority, role)` | current holder of `role` | Cancel a still-pending proposal before acceptance/expiry |
+| `get_pending_role(role) → Option<PendingRoleProposal>` | — | View the pending proposal (candidate + `expires_at`), if any |
+| `migrate_roles(admin)` | current `Admin` | One-shot, idempotent: assigns `admin` as the explicit holder of every *unassigned* role — a documented on-ramp for deployments that want distinct role addresses recorded on-chain rather than relying on the implicit fallback |
+
+Every transition emits an event so indexers/frontends never have to poll: `role_transfer_proposed`, `role_transferred`, `role_proposal_cancelled`, `role_migrated` (see `events.rs`).
+
+### Using a multisig or managed account as a role authority
+
+Because every role authority is just a Soroban `Address`, it can be:
+- A regular Stellar account key (simplest; equivalent to today's single-admin model).
+- A **multisig account** — a Stellar account with multiple signers and a signing threshold, so `require_auth()` for that role succeeds only once enough signers co-sign the invocation.
+- A **managed authority contract** — a separate Soroban contract address that implements its own `__check_auth` policy (e.g. an on-chain timelock, an M-of-N contract-signer scheme, or a governance module), so `require_auth()` defers to that contract's custom authorization logic.
+
+**Recommended rollout for an existing single-admin deployment:**
+1. Deploy or designate the multisig/managed-account address(es) you want to hold each role (a single shared multisig for all four roles is a reasonable starting point; splitting `EmergencyPause` out to its own faster-signing multisig is recommended once you have one).
+2. `propose_role_transfer(current_admin, RoleType::EmergencyPause, emergency_multisig)`, then have the multisig call `accept_role_transfer(RoleType::EmergencyPause, emergency_multisig)`.
+3. Repeat per role, or call `migrate_roles(admin)` first to record explicit (admin-held) rows for every role, then transfer each one out individually at your own pace — both paths are safe to interleave since `migrate_roles` never touches a role that already has an explicit holder.
+4. Confirm with `get_role(role)` after each step before revoking or rotating the original admin key.
 
 ---
 
@@ -409,7 +486,8 @@ All persistent entries use `extend_ttl` on every read/write (~30-day TTL via `LE
 | `AuctionHasBids` | 30 | `cancel_auction` called on an auction with an active highest bidder |
 | `InvalidAuctionDuration` | 31 | `create_auction` `duration` < `MIN_AUCTION_DURATION` (3 600 s) |
 | `SelfBidNotAllowed` | 32 | `place_bid` called by the auction creator (shill-bid prevention) |
-| `ArithmeticOverflow` | 40 | A checked arithmetic operation overflowed while computing a settlement payout plan (royalty, protocol fee, or recipient split), or the computed plan failed the `royalty + fee + sum(recipients) == amount` conservation check. See [Settlement & Payout Rounding Policy](#settlement--payout-rounding-policy). |
+| `RoleProposalExpired` | 49 | `accept_role_transfer` called after the role proposal's `expires_at` passed |
+| `NoRoleProposalPending` | 50 | `accept_role_transfer` / `cancel_role_proposal` called with no pending proposal for that role |
 
 ---
 
@@ -536,3 +614,171 @@ For building WASM, running unit tests, and debugging contract errors, refer to:
 - 🦀 **[Contract Testing Guide](../../docs/guides/contract-testing.md)**
 - 🚀 **[Deployment Guide](../../docs/guides/deployment.md)**
 - 🛡️ **[Security Triage Guide](../../docs/guides/security-triage.md)**
+
+---
+
+## Security & Authorization (Issue #9)
+
+This section documents every privileged function, the role that governs it, and the intended governance model. Refer to this section when reviewing contract changes, planning upgrades, or responding to incidents.
+
+### Role model
+
+The contract supports four independently-assignable roles in addition to the root `Admin` key. Every role falls back to the `Admin` address when no explicit holder has been assigned, so a freshly-deployed contract works exactly as before. Operators should call `migrate_roles` (or `propose_role_transfer` / `accept_role_transfer`) to separate roles once the deployment is stable.
+
+| Role | `RoleType` variant | Purpose |
+|---|---|---|
+| **ProtocolConfig** | `RoleType::ProtocolConfig` | Protocol parameters: fees, price bounds, bid increments, auction config, token whitelist, TTL maintenance |
+| **EmergencyPause** | `RoleType::EmergencyPause` | Circuit-breakers: global pause, per-collection pause, per-function pause, admin auction cancellation |
+| **CollectionAdmin** | `RoleType::CollectionAdmin` | Artist moderation: revoke/reinstate artists, cancel artist listings in bulk |
+| **Upgrade** | `RoleType::Upgrade` | Storage migration: `migrate` / `migrate_step` entry points |
+
+All role changes follow a **two-step propose/accept** flow with a **7-day TTL** (same as the admin rotation). A proposal that is not accepted within 7 days can no longer be accepted and must be reissued.
+
+### Authorized callers by function
+
+#### ProtocolConfig role
+
+| Function | Notes |
+|---|---|
+| `set_protocol_fee(bps)` | Global fee in basis points, max 1 000 (10 %) |
+| `set_price_bounds(min, max)` | Global listing price floor and ceiling |
+| `set_treasury(address)` | Destination for collected protocol fees |
+| `set_min_bid_increment(increment)` | Minimum outbid increment in stroops |
+| `set_bid_history_cap(cap)` | Ring-buffer size per auction, 1–200 |
+| `set_auction_extension_window(secs)` | Anti-sniping extension duration |
+| `set_auction_extension_trigger(secs)` | Window before end-time that triggers extension |
+| `set_auction_max_extensions(max)` | Cap on total extensions per auction |
+| `set_collection_fee_bps(collection, bps)` | Per-collection fee override, 0–10 000 |
+| `clear_collection_fee_bps(collection)` | Remove a per-collection override |
+| `add_token_to_whitelist(admin, token)` | Approve a payment token for listings/auctions |
+| `remove_token_from_whitelist(token)` | Soft-delete a token from the whitelist |
+| `extend_active_ttls(max_items)` | Refresh TTLs for active listings/auctions |
+| `cleanup_expired_locks(listing_ids, auction_ids)` | Force-clear stuck reentrancy locks |
+
+#### EmergencyPause role
+
+| Function | Notes |
+|---|---|
+| `admin_pause()` | Global circuit-breaker — blocks all new-exposure paths |
+| `admin_unpause()` | Lifts global pause |
+| `pause_collection(collection)` | Blocks new activity for one collection |
+| `unpause_collection(collection)` | Lifts per-collection pause |
+| `pause_function(name)` | Blocks a single entry-point by name |
+| `unpause_function(name)` | Lifts per-function pause |
+| `admin_cancel_auction(auction_id)` | Emergency cancellation with bidder refund |
+
+#### CollectionAdmin role
+
+| Function | Notes |
+|---|---|
+| `revoke_artist(artist)` | Marks artist as revoked; begins cascade cancellation |
+| `reinstate_artist(artist)` | Removes revocation; clears cursors |
+| `cancel_artist_listings(artist, max_items)` | Resumable sweep to cancel a revoked artist's listings |
+
+#### Upgrade role
+
+| Function | Notes |
+|---|---|
+| `migrate(admin)` | One-shot unbounded migration to current contract version |
+| `migrate_step(admin, max_items)` | Bounded, resumable migration step |
+
+#### Admin only (root key)
+
+These functions require the `Admin` address directly and cannot be delegated to a role:
+
+| Function | Notes |
+|---|---|
+| `set_admin(admin)` | One-time initialisation; reverts if already set |
+| `transfer_admin(current, new)` | Step 1 of admin rotation |
+| `accept_admin(new)` | Step 2 of admin rotation |
+| `cancel_admin_proposal(current)` | Cancels a pending rotation |
+| `migrate_roles(admin)` | Assigns `Admin` as explicit holder of any unset roles |
+
+### Pause state matrix
+
+A pause is designed to stop **new exposure** (new escrow, new payments, new price commitments) while leaving **fund-recovery paths always open** so a paused incident never traps user funds.
+
+| Entry point | Global pause | Collection pause | Function pause |
+|---|---|---|---|
+| `create_listing` | Blocked | Blocked | Blocked (`"create_listing"`) |
+| `buy_artwork` | — | Blocked | Blocked (`"buy_artwork"`) |
+| `create_auction` | — | Blocked | Blocked (`"create_auction"`) |
+| `place_bid` | — | Blocked | Blocked (`"place_bid"`) |
+| `make_offer` | — | Blocked | Blocked (`"make_offer"`) |
+| `accept_offer` | Blocked | — | — |
+| `update_listing` | Blocked | — | — |
+| `update_listing_price` | Blocked | — | — |
+| **`cancel_listing`** | Always open | Always open | Always open |
+| **`cancel_listings`** | Always open | Always open | Always open |
+| **`finalize_auction`** | Always open | Always open | Always open |
+| **`cancel_auction`** | Always open | Always open | Always open |
+| **`admin_cancel_auction`** | Always open | Always open | Always open |
+| **`withdraw_offer`** | Always open | Always open | Always open |
+| **`reject_offer`** | Always open | Always open | Always open |
+| **`reclaim_offer`** | Always open | Always open | Always open |
+
+### Reentrancy protection
+
+Three entry-points acquire a per-resource RAII lock in Soroban **temporary storage** (`REENTRANCY_LOCK_TTL` ledgers):
+
+- `buy_artwork` — `ListingLock(listing_id)`
+- `accept_offer` — `ListingLock(listing_id)` (acquired before any state change)
+- `finalize_auction` — `AuctionLock(auction_id)`
+
+Locks are released automatically by `Drop`. A Soroban panic rolls back all writes (including the lock write), so a stuck lock is only possible in the rare case of a node crash mid-transaction. Use `cleanup_expired_locks` (ProtocolConfig role) to manually clear any that are spotted off-chain.
+
+### Emergency procedures
+
+#### Halt all new activity immediately
+
+```bash
+soroban contract invoke --id <CONTRACT> --fn admin_pause -- --admin <EMERGENCY_PAUSE_KEY>
+```
+
+#### Halt activity for one compromised collection
+
+```bash
+soroban contract invoke --id <CONTRACT> --fn pause_collection \
+  -- --admin <EMERGENCY_PAUSE_KEY> --collection <COLLECTION_ADDRESS>
+```
+
+#### Cancel an auction with a live bid
+
+```bash
+soroban contract invoke --id <CONTRACT> --fn admin_cancel_auction \
+  -- --admin <EMERGENCY_PAUSE_KEY> --auction_id <ID>
+```
+
+This refunds the current highest bidder before marking the auction cancelled.
+
+#### Revoke a bad actor artist
+
+```bash
+# Step 1: revoke (cascades up to 100 listings/auctions per call)
+soroban contract invoke --id <CONTRACT> --fn revoke_artist \
+  -- --artist <ARTIST_ADDRESS>
+
+# Step 2: continue cascade if RevocationIncompleteEvent was emitted
+soroban contract invoke --id <CONTRACT> --fn cancel_artist_listings \
+  -- --admin <COLLECTION_ADMIN_KEY> --artist <ARTIST_ADDRESS> --max_items 50
+```
+
+#### Transfer the ProtocolConfig role to a multisig
+
+```bash
+# Propose (current holder)
+soroban contract invoke --id <CONTRACT> --fn propose_role_transfer \
+  -- --current_authority <CURRENT_KEY> --role ProtocolConfig --candidate <MULTISIG_ADDRESS>
+
+# Accept (new holder, within 7 days)
+soroban contract invoke --id <CONTRACT> --fn accept_role_transfer \
+  -- --role ProtocolConfig --candidate <MULTISIG_ADDRESS>
+```
+
+### Security properties guaranteed by design
+
+1. **No single point of failure post-migration**: After `migrate_roles`, each role can be on a separate key or multisig. The `EmergencyPause` role can pause the marketplace even if `ProtocolConfig` or `Admin` keys are unavailable.
+2. **All admin/role changes are on-chain and auditable**: Every rotation emits a typed event (`RoleTransferProposedEvent`, `RoleTransferredEvent`, `AdminTransferredEvent`, etc.) that the indexer records.
+3. **Fee configuration is non-custodial**: `set_protocol_fee` only affects _future_ listings and auctions. Already-running listings snapshot the fee at creation time (`protocol_fee_bps` field on `Listing`/`Auction`), so a fee change never retroactively alters live deals.
+4. **Per-collection fee overrides require ProtocolConfig, not raw admin**: As of the Issue #9 fix, `set_collection_fee_bps` and `clear_collection_fee_bps` use `require_role(ProtocolConfig)` — the ProtocolConfig role holder can manage fees independently of the Admin key.
+5. **Token whitelist changes require ProtocolConfig**: `add_token_to_whitelist` now takes an explicit `admin: Address` parameter and calls `require_role(ProtocolConfig)`, consistent with `remove_token_from_whitelist`.

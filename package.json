@@ -8,14 +8,24 @@
     "dev:indexer": "npm run dev --prefix indexer",
     "build:frontend": "npm run build --prefix frontend/elcarehub-app",
     "build:indexer": "npm run build --prefix indexer",
+    "build:abi": "npm run build --prefix packages/contract-abi",
+    "validate:abi": "node packages/contract-abi/scripts/validate-abi.mjs",
+    "validate:contract-errors": "node scripts/contract-errors/validate-error-coverage.mjs",
+    "validate:openapi": "bash scripts/check-openapi.sh",
+    "archive": "tsx indexer/src/archive.ts",
     "test:frontend": "npm run test --prefix frontend/elcarehub-app",
     "test:indexer": "npm run test --prefix indexer",
     "test:e2e": "npm run test:e2e --prefix frontend/elcarehub-app",
+    "live-e2e:setup": "bash scripts/live-e2e/setup.sh",
+    "live-e2e:seed": "bash scripts/live-e2e/seed.sh",
+    "live-e2e:teardown": "bash scripts/live-e2e/teardown.sh",
+    "live-e2e:test": "bash -c 'set -a; source scripts/live-e2e/.env.live-e2e; set +a; npm run test:e2e:live --prefix frontend/elcarehub-app'",
     "lint:frontend": "npm run lint --prefix frontend/elcarehub-app",
     "lint:indexer": "npm run lint --prefix indexer",
     "install:all": "npm ci --prefix frontend/elcarehub-app && npm ci --prefix indexer"
   },
   "workspaces": [
+    "packages/contract-abi",
     "frontend/elcarehub-app",
     "indexer"
   ]

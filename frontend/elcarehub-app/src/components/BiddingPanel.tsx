@@ -4,18 +4,20 @@
 
 "use client";
 
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useId, useMemo } from "react";
 import { Auction, stroopsToXlm } from "@/lib/contract";
 import { useWalletContext } from "@/context/WalletContext";
 import { usePlaceBid } from "@/hooks/usePlaceBid";
 import { useFinalizeAuction } from "@/hooks/useAuctions";
 import { GuardButton } from "@/components/WalletGuard";
+import { TxErrorPanel } from "@/components/TxErrorPanel";
+import { useTxLifecycle, txStateLabel, isTxActive } from "@/hooks/useTxLifecycle";
+import Link from "next/link";
 import {
   Gavel,
   Clock,
   Trophy,
   User,
-  AlertCircle,
   CheckCircle,
   Loader2,
 } from "lucide-react";
@@ -62,9 +64,15 @@ export function BiddingPanel({
   onFinalized,
 }: BiddingPanelProps) {
   const { publicKey } = useWalletContext();
-  const { bid, isBidding, error: bidError } = usePlaceBid(publicKey);
-  const { finalize, isFinalizing, error: finalizeError } =
-    useFinalizeAuction(publicKey);
+  const { bid } = usePlaceBid(publicKey);
+  const { finalize } = useFinalizeAuction(publicKey);
+
+  // Single lifecycle instance shared by both bid and finalize actions.
+  // The duplicate-submission guard in useTxLifecycle prevents concurrent runs.
+  const { txState, isActive, run, reset } = useTxLifecycle({
+    persistKey: `biddingPanel:${auction.auction_id}`,
+    action: "Bid",
+  });
 
   const { days, hours, minutes, seconds, isExpired } = useCountdown(
     auction.end_time
@@ -72,6 +80,7 @@ export function BiddingPanel({
 
   const [bidAmount, setBidAmount] = useState("");
   const [bidSuccess, setBidSuccess] = useState(false);
+  const bidErrorId = useId();
 
   const currentBidXlm = parseFloat(stroopsToXlm(auction.highest_bid));
   const reserveXlm = parseFloat(stroopsToXlm(auction.reserve_price));
@@ -83,9 +92,12 @@ export function BiddingPanel({
     currentBidXlm > 0 ? currentBidXlm + MIN_INCREMENT_XLM : reserveXlm;
 
   const isOwn = publicKey === auction.creator;
-  const isActive = auction.status === "Active";
-  const canBid = isActive && !isExpired && !isOwn;
-  const canFinalize = isActive && isExpired;
+  const isAuctionActive = auction.status === "Active";
+  const canBid = isAuctionActive && !isExpired && !isOwn;
+  const canFinalize = isAuctionActive && isExpired;
+
+  const isBidding = isActive && txState.txHash === null;
+  const isFinalizing = isActive;
 
   // Pre-fill input with minimum next bid when the panel first becomes interactive.
   useEffect(() => {
@@ -111,7 +123,10 @@ export function BiddingPanel({
     const amount = parseFloat(bidAmount);
     if (isNaN(amount) || bidValidation) return;
 
-    const success = await bid(auction.auction_id, amount);
+    const success = await run(
+      () => bid(auction.auction_id, amount),
+      { action: "Bid" }
+    );
     if (success) {
       setBidSuccess(true);
       setBidAmount("");
@@ -120,7 +135,10 @@ export function BiddingPanel({
   };
 
   const handleFinalize = async () => {
-    const success = await finalize(auction.auction_id);
+    const success = await run(
+      () => finalize(auction.auction_id),
+      { action: "Finalize auction" }
+    );
     if (success) {
       onFinalized?.();
     }
@@ -206,7 +224,7 @@ export function BiddingPanel({
             {stroopsToXlm(auction.reserve_price)} XLM
           </span>
         </div>
-        {isActive && (
+        {isAuctionActive && (
           <div
             data-testid="minimum-next-bid"
             className="flex items-center justify-between text-brand-600"
@@ -221,23 +239,34 @@ export function BiddingPanel({
 
       {/* Bid success */}
       {bidSuccess && (
-        <div className="flex items-center gap-2 rounded-lg bg-green-100 px-3 py-2 text-sm font-medium text-green-700">
-          <CheckCircle size={16} />
+        <div role="status" className="flex items-center gap-2 rounded-lg bg-green-100 px-3 py-2 text-sm font-medium text-green-700">
+          <CheckCircle size={16} aria-hidden="true" />
           Bid placed successfully!
         </div>
       )}
 
-      {/* Errors */}
-      {bidError && (
-        <div className="flex items-center gap-2 rounded-lg bg-red-50 px-3 py-2 text-sm text-red-500">
-          <AlertCircle size={14} />
-          {bidError}
+      {/* Transaction lifecycle state label (signing / confirming / etc.) */}
+      {isActive && (
+        <div role="status" className="flex items-center gap-2 rounded-lg bg-brand-50 px-3 py-2 text-sm text-brand-700">
+          <Loader2 size={14} className="animate-spin" aria-hidden="true" />
+          {txStateLabel(txState.state)}
         </div>
       )}
-      {finalizeError && (
-        <div className="flex items-center gap-2 rounded-lg bg-red-50 px-3 py-2 text-sm text-red-500">
-          <AlertCircle size={14} />
-          {finalizeError}
+
+      {/* Typed error panel — distinguishes wallet rejection from chain failure */}
+      {txState.state === "error" && txState.error && (
+        <TxErrorPanel
+          error={txState.error}
+          txHash={txState.txHash}
+          onRetry={reset}
+          onDismiss={reset}
+        />
+      )}
+
+      {/* sr-only live region for assistive technologies */}
+      {isActive && (
+        <div role="status" className="sr-only">
+          {txStateLabel(txState.state)}
         </div>
       )}
 
@@ -245,11 +274,12 @@ export function BiddingPanel({
       {canBid && (
         <div className="space-y-3">
           <div>
-            <label className="mb-1 block text-sm font-medium text-gray-700">
+            <label htmlFor="bid-amount-input" className="mb-1 block text-sm font-medium text-gray-700">
               Your Bid (XLM)
             </label>
             <div className="relative">
               <input
+                id="bid-amount-input"
                 type="number"
                 min={minimumNextBid}
                 step="0.0000001"
@@ -259,14 +289,19 @@ export function BiddingPanel({
                   setBidSuccess(false);
                 }}
                 placeholder={`Min ${minimumNextBid.toFixed(7)} XLM`}
-                className="w-full rounded-lg border border-gray-200 px-3 py-2.5 pr-14 text-sm focus:border-brand-500 focus:outline-none"
+                aria-invalid={!!bidValidation}
+                aria-describedby={bidValidation ? bidErrorId : undefined}
+                className="w-full rounded-lg border border-gray-200 px-3 py-2.5 pr-14 text-sm focus:border-brand-500 focus:outline-none aria-[invalid=true]:border-red-400"
               />
               <span className="absolute right-3 top-1/2 -translate-y-1/2 text-sm font-medium text-gray-400">
                 XLM
               </span>
             </div>
             {bidValidation && (
-              <p className="mt-1 text-xs text-red-500">{bidValidation}</p>
+              <p id={bidErrorId} role="alert" className="mt-1 flex items-center gap-1 text-xs text-red-500">
+                <AlertCircle size={12} aria-hidden="true" />
+                {bidValidation}
+              </p>
             )}
           </div>
 
@@ -313,8 +348,21 @@ export function BiddingPanel({
         </GuardButton>
       )}
 
+      {/* Transaction hash recovery link — visible once the hash is known */}
+      {txState.txHash && (
+        <p className="text-xs text-gray-400 text-center">
+          Tx:{" "}
+          <Link
+            href={`/tx/${txState.txHash}`}
+            className="font-mono hover:underline text-blue-500"
+          >
+            {txState.txHash.slice(0, 10)}…
+          </Link>
+        </p>
+      )}
+
       {/* Own auction message */}
-      {isOwn && isActive && !isExpired && (
+      {isOwn && isAuctionActive && !isExpired && (
         <p className="text-center text-sm text-gray-400">
           This is your auction.
         </p>

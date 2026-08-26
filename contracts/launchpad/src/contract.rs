@@ -1,4 +1,4 @@
-//! Launchpad — Factory contract that deploys the 4 NFT collection types.
+//! Launchpad â€” Factory contract that deploys the 4 NFT collection types.
 //!
 //! # Deployment flow
 //!
@@ -8,25 +8,25 @@
 //!    and then calls `set_wasm_hashes` with the 4 resulting 32-byte hashes.
 //! 3. Any user can now call one of the four `deploy_*` functions to launch
 //!    their own collection.  The factory calls `initialize` on the freshly
-//!    deployed contract in the same transaction — no second call needed.
+//!    deployed contract in the same transaction â€” no second call needed.
 //!
 //! # Fee model
 //!
 //! Two distinct fees, deliberately typed apart:
-//! * `deploy_fee: i128` — a flat, token-denominated amount transferred from
+//! * `deploy_fee: i128` â€” a flat, token-denominated amount transferred from
 //!   the creator to `fee_receiver` on every `deploy_*` call.
-//! * `platform_fee_bps: u32` — a per-collection basis-point fee chosen by the
-//!   creator (≤ `MAX_FEE_BPS`), recorded in the registry and forwarded to the
+//! * `platform_fee_bps: u32` â€” a per-collection basis-point fee chosen by the
+//!   creator (â‰¤ `MAX_FEE_BPS`), recorded in the registry and forwarded to the
 //!   lazy-mint contracts so they can split redemption proceeds.
 //!
 //! # Deterministic addresses (clone-equivalent)
 //! `env.deployer().with_current_contract(salt)` gives a deterministic address
-//! from `sha256(factory_address ‖ salt)`.  Clients can pre-compute the address
+//! from `sha256(factory_address â€– salt)`.  Clients can pre-compute the address
 //! before the transaction confirms.  Pass a different `salt` for each collection.
 //!
 //! # Why this is Soroban's answer to EIP-1167 clones
 //! The collection WASM is stored once on the network (identified by hash).
-//! Every `deploy()` call shares that same WASM — no bytecode duplication.
+//! Every `deploy()` call shares that same WASM â€” no bytecode duplication.
 //! Each instance gets completely isolated storage.
 
 use soroban_sdk::{
@@ -38,13 +38,17 @@ use crate::{
     events, storage,
     types::{CollectionKind, CollectionRecord, Error, PreflightResult, WasmHashes},
 };
+use crate::types::DataKey;
 
-/// Maximum allowed platform fee (20 %) — issue #38.
+/// Semantic version â€” bump on every breaking storage change.
+const CONTRACT_VERSION: &str = "1.0.0";
+
+/// Maximum allowed platform fee (20 %) â€” issue #38.
 const MAX_FEE_BPS: u32 = 2000;
-/// Maximum allowed royalty (100 %), matching the collection contracts' own cap — issue #277.
+/// Maximum allowed royalty (100 %), matching the collection contracts' own cap â€” issue #277.
 const MAX_ROYALTY_BPS: u32 = 10_000;
 
-// ─── Cross-contract clients ───────────────────────────────────────────────────
+// â”€â”€â”€ Cross-contract clients â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 mod iface {
     use soroban_sdk::{contractclient, Address, BytesN, Env, String};
@@ -60,6 +64,7 @@ mod iface {
             royalty_bps: u32,
             royalty_receiver: Address,
         );
+        fn upgrade(env: Env, new_wasm_hash: BytesN<32>);
     }
 
     #[contractclient(name = "Normal1155Client")]
@@ -71,6 +76,7 @@ mod iface {
             royalty_bps: u32,
             royalty_receiver: Address,
         );
+        fn upgrade(env: Env, new_wasm_hash: BytesN<32>);
     }
 
     /// Issue #38: lazy mint contracts accept per-collection platform fee at init.
@@ -88,7 +94,9 @@ mod iface {
             royalty_receiver: Address,
             platform_fee_receiver: Address,
             platform_fee_bps: u32,
+            network_passphrase: String,
         );
+        fn upgrade(env: Env, new_wasm_hash: BytesN<32>);
     }
 
     #[contractclient(name = "Lazy1155Client")]
@@ -103,13 +111,15 @@ mod iface {
             royalty_receiver: Address,
             platform_fee_receiver: Address,
             platform_fee_bps: u32,
+            network_passphrase: String,
         );
+        fn upgrade(env: Env, new_wasm_hash: BytesN<32>);
     }
 }
 
 use iface::{Lazy1155Client, Lazy721Client, Normal1155Client, Normal721Client};
 
-// ─── Salt hardening ───────────────────────────────────────────────────────────
+// â”€â”€â”€ Salt hardening â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 fn make_secure_salt(env: &Env, creator: &Address, raw_salt: &BytesN<32>) -> BytesN<32> {
     let mut raw = Bytes::new(env);
     raw.append(&creator.to_xdr(env));
@@ -117,7 +127,7 @@ fn make_secure_salt(env: &Env, creator: &Address, raw_salt: &BytesN<32>) -> Byte
     env.crypto().sha256(&raw).into()
 }
 
-// ─── Shared deploy guards ─────────────────────────────────────────────────────
+// â”€â”€â”€ Shared deploy guards â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /// Transfers the flat deploy fee (if any) from `creator` to the treasury and
 /// emits `fee_coll`.  Returns the configured fee receiver so lazy deploys can
@@ -131,7 +141,7 @@ fn collect_deploy_fee(env: &Env, creator: &Address, currency: &Address) -> Addre
     receiver
 }
 
-// ─── Shared deploy validation (#277) ──────────────────────────────────────────
+// â”€â”€â”€ Shared deploy validation (#277) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 //
 // These helpers back both the mutating `deploy_*` functions and the read-only
 // `preflight_deploy_*` functions, so a creator can trust that a clean
@@ -212,7 +222,7 @@ fn validate_1155_shape(
 }
 
 /// Adds `Error::InsufficientFee` to `errors` when `creator`'s balance of
-/// `currency` cannot cover the flat `deploy_fee`. Read-only — used only by
+/// `currency` cannot cover the flat `deploy_fee`. Read-only â€” used only by
 /// the preflight path, since the real transfer in `collect_deploy_fee`
 /// already fails atomically if the balance is insufficient.
 fn check_sufficient_fee(env: &Env, creator: &Address, currency: &Address, deploy_fee: i128, errors: &mut Vec<Error>) {
@@ -222,6 +232,17 @@ fn check_sufficient_fee(env: &Env, creator: &Address, currency: &Address, deploy
             errors.push_back(Error::InsufficientFee);
         }
     }
+}
+
+/// Convert a Vec<Error> (internal type) into Vec<u32> (the public
+/// PreflightResult.errors type) so that Error's lack of SorobanArbitrary
+/// does not propagate into the contracttype-derived struct.
+fn errors_to_u32(env: &Env, errs: Vec<Error>) -> Vec<u32> {
+    let mut out: Vec<u32> = Vec::new(env);
+    for e in errs.iter() {
+        out.push_back(e as u32);
+    }
+    out
 }
 
 #[contract]
@@ -247,6 +268,131 @@ impl Launchpad {
         storage::set_admin(&env, &admin);
         storage::set_fee_config(&env, &fee_receiver, deploy_fee);
         Ok(())
+    }
+
+    // â”€â”€ Versioning & Migration â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+    /// Returns the semantic version string compiled into this WASM.
+    pub fn version(env: Env) -> soroban_sdk::String {
+        soroban_sdk::String::from_str(&env, crate::types::CONTRACT_VERSION)
+    }
+
+    /// Returns the version string last written to on-chain storage by
+    /// `migrate()`.  `None` before the first migration.
+    pub fn contract_version(env: Env) -> Option<soroban_sdk::String> {
+        storage::get_contract_version(&env)
+    }
+
+    /// Admin-guarded, idempotent storage migration entry point.
+    ///
+    /// # Idempotency
+    /// Records a per-version completion marker the first time it succeeds.
+    /// Subsequent calls for the *same* version revert with `AlreadyMigrated`.
+    ///
+    /// # Unsupported jumps
+    /// Only sequential upgrades (e.g. 1.0.0 â†’ 1.1.0) are accepted.  If no
+    /// prior version is on-chain (fresh install) any version is accepted as the
+    /// first migration.
+    ///
+    /// # 1.0.0 migration
+    /// Migrates legacy monolithic `ByCreator(Address)` Vec<CollectionRecord>
+    /// and `AllCollections` Vec<CollectionRecord> entries into the paged index
+    /// storage introduced in the current build.  Legacy keys are consumed and
+    /// deleted.  The step is idempotent â€” re-running after a crash finds the
+    /// keys absent and skips them silently.
+    pub fn migrate(env: Env, admin: Address) -> Result<(), Error> {
+        storage::extend_instance_ttl(&env);
+        let version = Self::require_pending_migration(&env, &admin)?;
+        Self::run_migration(&env, &version, u32::MAX);
+        Ok(())
+    }
+
+    /// Bounded, resumable variant of `migrate`.  Returns items still pending.
+    /// Call repeatedly until it returns `0`.
+    pub fn migrate_step(env: Env, admin: Address, max_items: u32) -> Result<u64, Error> {
+        storage::extend_instance_ttl(&env);
+        let version = Self::require_pending_migration(&env, &admin)?;
+        Ok(Self::run_migration(&env, &version, max_items))
+    }
+
+    // â”€â”€ Internal migration helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+    fn require_pending_migration(env: &Env, admin: &Address) -> Result<soroban_sdk::String, Error> {
+        admin.require_auth();
+        let stored = storage::get_admin(env).ok_or(Error::NotInitialized)?;
+        if *admin != stored {
+            return Err(Error::NotAdmin);
+        }
+        let target = soroban_sdk::String::from_str(env, crate::types::CONTRACT_VERSION);
+        if storage::is_migration_done(env, &target) {
+            return Err(Error::AlreadyMigrated);
+        }
+        Ok(target)
+    }
+
+    fn run_migration(
+        env: &Env,
+        version: &soroban_sdk::String,
+        mut budget: u32,
+    ) -> u64 {
+        let mut p = storage::get_migration_progress(env, version);
+
+        // Phase 0: migrate legacy ByCreator + AllCollections Vec entries into
+        //           the paged index introduced in v1.0.0.
+        // Each legacy ByCreator Vec<CollectionRecord> entry is read-and-deleted
+        // in one step; records are then appended to the per-address paged index.
+        while budget > 0 {
+            match p.phase {
+                0 => {
+                    // Legacy AllCollections is a single entry; consume it.
+                    let legacy_key = DataKey::AllCollections;
+                    if let Some(records) = env
+                        .storage()
+                        .persistent()
+                        .get::<DataKey, soroban_sdk::Vec<crate::types::CollectionRecord>>(
+                            &legacy_key,
+                        )
+                    {
+                        env.storage().persistent().remove(&legacy_key);
+                        let current_count = storage::collection_count(env);
+                        // Re-insert into paged keys without touching per-creator indices
+                        // (those were written by record_collection() at deploy time and
+                        //  only need to survive).
+                        for (i, rec) in records.iter().enumerate() {
+                            let global_idx = current_count + i as u64;
+                            env.storage().persistent().set(
+                                &DataKey::CollectionByIndex(global_idx),
+                                &rec,
+                            );
+                            env.storage().persistent().extend_ttl(
+                                &DataKey::CollectionByIndex(global_idx),
+                                50_000,
+                                100_000,
+                            );
+                        }
+                        let new_total = current_count + records.len() as u64;
+                        env.storage()
+                            .persistent()
+                            .set(&DataKey::CollectionCount, &new_total);
+                    }
+                    p.phase = 1;
+                    budget -= 1;
+                }
+                _ => break,
+            }
+        }
+
+        let remaining: u64 = if p.phase == 0 { 1 } else { 0 };
+
+        if remaining == 0 {
+            storage::clear_migration_progress(env, version);
+            storage::set_migration_done(env, version);
+            storage::set_contract_version(env, version);
+            events::publish_migration_completed(env, version);
+        } else {
+            storage::set_migration_progress(env, version, &p);
+        }
+        remaining
     }
 
     /// Records the four collection WASM hashes, bumps the version counter and
@@ -278,9 +424,9 @@ impl Launchpad {
         Ok(version)
     }
 
-    // ── Deploy: Normal ERC-721 ────────────────────────────────────────────
+    // â”€â”€ Deploy: Normal ERC-721 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-    /// Issue #38: `platform_fee_bps` is validated (≤ MAX_FEE_BPS) and stored in the registry.
+    /// Issue #38: `platform_fee_bps` is validated (â‰¤ MAX_FEE_BPS) and stored in the registry.
     pub fn deploy_normal_721(
         env: Env,
         creator: Address,
@@ -386,11 +532,11 @@ impl Launchpad {
             required_fee: deploy_fee,
             platform_fee_bps,
             currency,
-            errors,
+            errors: errors_to_u32(&env, errors),
         }
     }
 
-    // ── Deploy: Normal ERC-1155 ──────────────────────────────────────────
+    // â”€â”€ Deploy: Normal ERC-1155 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     pub fn deploy_normal_1155(
         env: Env,
         creator: Address,
@@ -483,11 +629,11 @@ impl Launchpad {
             required_fee: deploy_fee,
             platform_fee_bps,
             currency,
-            errors,
+            errors: errors_to_u32(&env, errors),
         }
     }
 
-    // ── Deploy: LazyMint ERC-721 ──────────────────────────────────────────
+    // â”€â”€ Deploy: LazyMint ERC-721 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     /// Issue #38: passes per-collection fee to the lazy mint contract so that
     /// fee splits are applied at voucher redemption time.
@@ -503,6 +649,7 @@ impl Launchpad {
         royalty_receiver: Address,
         platform_fee_bps: u32,
         salt: BytesN<32>,
+        network_passphrase: String,
     ) -> Result<Address, Error> {
         storage::extend_instance_ttl(&env);
         creator.require_auth();
@@ -541,6 +688,7 @@ impl Launchpad {
             &royalty_receiver,
             &platform_fee_receiver,
             &platform_fee_bps,
+            &network_passphrase,
         );
 
         storage::mark_salt_used(&env, &secure_salt);
@@ -596,11 +744,11 @@ impl Launchpad {
             required_fee: deploy_fee,
             platform_fee_bps,
             currency,
-            errors,
+            errors: errors_to_u32(&env, errors),
         }
     }
 
-    // ── Deploy: LazyMint ERC-1155 ─────────────────────────────────────────
+    // â”€â”€ Deploy: LazyMint ERC-1155 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     pub fn deploy_lazy_1155(
         env: Env,
         creator: Address,
@@ -611,6 +759,7 @@ impl Launchpad {
         royalty_receiver: Address,
         platform_fee_bps: u32,
         salt: BytesN<32>,
+        network_passphrase: String,
     ) -> Result<Address, Error> {
         storage::extend_instance_ttl(&env);
         creator.require_auth();
@@ -645,6 +794,7 @@ impl Launchpad {
             &royalty_receiver,
             &platform_fee_receiver,
             &platform_fee_bps,
+            &network_passphrase,
         );
 
         storage::mark_salt_used(&env, &secure_salt);
@@ -697,11 +847,11 @@ impl Launchpad {
             required_fee: deploy_fee,
             platform_fee_bps,
             currency,
-            errors,
+            errors: errors_to_u32(&env, errors),
         }
     }
 
-    // ── Admin management (two-step transfer) ──────────────────────────────
+    // â”€â”€ Admin management (two-step transfer) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     /// Step 1: the current admin proposes a successor.  Overwrites any
     /// previously pending proposal.  The successor must call `accept_admin`.
@@ -738,26 +888,85 @@ impl Launchpad {
         Ok(())
     }
 
-    // ── Pause ─────────────────────────────────────────────────────────────
+    // â”€â”€ Pause â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-    /// Halts all four `deploy_*` functions.
+    /// Halts all four `deploy_*` functions. Callable by the configured
+    /// `EmergencyPauser` (see `set_emergency_pauser`), or by the admin when no
+    /// separate pauser has been assigned â€” so this remains usable even if the
+    /// routine admin authority is unavailable, once a distinct pauser is set.
     pub fn pause(env: Env) -> Result<(), Error> {
         storage::extend_instance_ttl(&env);
-        let admin = storage::require_admin(&env)?;
+        let authority = storage::require_pause_authority(&env)?;
         storage::set_paused(&env, true);
-        events::publish_paused(&env, &admin, true);
+        events::publish_paused(&env, &authority, true);
         Ok(())
     }
 
     pub fn unpause(env: Env) -> Result<(), Error> {
         storage::extend_instance_ttl(&env);
-        let admin = storage::require_admin(&env)?;
+        let authority = storage::require_pause_authority(&env)?;
         storage::set_paused(&env, false);
-        events::publish_paused(&env, &admin, false);
+        events::publish_paused(&env, &authority, false);
         Ok(())
     }
 
-    // ── Fee config ────────────────────────────────────────────────────────
+    /// Assigns the `EmergencyPause` role to `pauser`, separating it from the
+    /// routine `Admin` authority (Issue #267). Admin-only. Passing the
+    /// current admin's own address restores the pre-role-separation
+    /// behaviour (admin remains the sole pauser).
+    pub fn set_emergency_pauser(env: Env, pauser: Address) -> Result<(), Error> {
+        storage::extend_instance_ttl(&env);
+        storage::require_admin(&env)?;
+        storage::set_emergency_pauser(&env, &pauser);
+        events::publish_emergency_pauser_updated(&env, &pauser);
+        Ok(())
+    }
+
+    pub fn update_collection_wasm(
+        env: Env,
+        kind: CollectionKind,
+        new_wasm_hash: BytesN<32>,
+    ) -> Result<(), Error> {
+        storage::extend_instance_ttl(&env);
+        storage::require_admin(&env)?;
+        let old_wasm = storage::get_wasm_for_kind(&env, &kind).unwrap_or_else(|| {
+            BytesN::from_array(&env, &[0u8; 32])
+        });
+        storage::set_wasm_hash_for_kind(&env, &kind, &new_wasm_hash);
+        events::publish_collection_wasm_updated(&env, &kind, &old_wasm, &new_wasm_hash);
+        Ok(())
+    }
+
+    pub fn upgrade_collection(env: Env, collection_address: Address) -> Result<(), Error> {
+        storage::extend_instance_ttl(&env);
+        storage::require_admin(&env)?;
+
+        let record = storage::get_collection_by_address(&env, &collection_address)
+            .ok_or(Error::CollectionNotFound)?;
+        let new_wasm = storage::get_wasm_for_kind(&env, &record.kind)
+            .ok_or(Error::WasmHashNotSet)?;
+        let from_wasm = new_wasm.clone();
+
+        match record.kind {
+            CollectionKind::Normal721 => {
+                Normal721Client::new(&env, &collection_address).upgrade(&new_wasm);
+            }
+            CollectionKind::Normal1155 => {
+                Normal1155Client::new(&env, &collection_address).upgrade(&new_wasm);
+            }
+            CollectionKind::LazyMint721 => {
+                Lazy721Client::new(&env, &collection_address).upgrade(&new_wasm);
+            }
+            CollectionKind::LazyMint1155 => {
+                Lazy1155Client::new(&env, &collection_address).upgrade(&new_wasm);
+            }
+        }
+
+        events::publish_collection_upgraded(&env, &collection_address, &from_wasm, &new_wasm);
+        Ok(())
+    }
+
+    // â”€â”€ Fee config â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     /// Sets both the treasury address and the flat deploy fee (token smallest
     /// unit).  Replaces the former `set_deploy_fee` / `set_treasury` /
@@ -773,7 +982,7 @@ impl Launchpad {
         Ok(())
     }
 
-    // ── View functions ────────────────────────────────────────────────────
+    // â”€â”€ View functions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     pub fn collections_by_creator(env: Env, creator: Address) -> Vec<CollectionRecord> {
         storage::collections_by_creator(&env, &creator)
@@ -809,7 +1018,13 @@ impl Launchpad {
         storage::is_paused(&env)
     }
 
-    /// (fee_receiver, deploy_fee) — the treasury and flat deployment fee.
+    /// The explicit `EmergencyPause` role holder, or `None` if unassigned
+    /// (in which case `pause`/`unpause` fall back to the admin).
+    pub fn emergency_pauser(env: Env) -> Option<Address> {
+        storage::get_emergency_pauser(&env)
+    }
+
+    /// (fee_receiver, deploy_fee) â€” the treasury and flat deployment fee.
     pub fn fee_config(env: Env) -> (Address, i128) {
         storage::get_fee_config(&env)
     }
@@ -829,4 +1044,5 @@ impl Launchpad {
     pub fn wasm_version(env: Env) -> u32 {
         storage::wasm_version(&env)
     }
+
 }

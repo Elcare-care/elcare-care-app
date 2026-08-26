@@ -8,7 +8,15 @@ import { useState, useEffect, useCallback } from "react";
 import { useParams, useRouter } from "next/navigation";
 import Image from "next/image";
 import Link from "next/link";
-import { getAuction, stroopsToXlm, Auction } from "@/lib/contract";
+import {
+  getAuction,
+  stroopsToXlm,
+  Auction,
+  blockBidder,
+  unblockBidder,
+  getBlockedBidders,
+} from "@/lib/contract";
+import { StrKey } from "@stellar/stellar-sdk";
 import { fetchMetadata, cidToGatewayUrl, ArtworkMetadata } from "@/lib/ipfs";
 import {
   subscribeToMarketplaceEvents,
@@ -17,10 +25,12 @@ import {
   type BidHistoryRecord,
 } from "@/lib/indexer";
 import { getReadableErrorMessage } from "@/lib/errors";
+import { categorizePageError, PageStateError } from "@/lib/pageState";
 import { useWalletContext } from "@/context/WalletContext";
 import { usePlaceBid } from "@/hooks/usePlaceBid";
 import { useFinalizeAuction } from "@/hooks/useAuctions";
 import { GuardButton } from "@/components/WalletGuard";
+import { ResourceState } from "@/components/PageStates";
 import { config } from "@/lib/config";
 import {
   ArrowLeft,
@@ -39,7 +49,10 @@ import {
   Flag,
   ChevronLeft,
   ChevronRight,
+  Ban,
+  X,
 } from "lucide-react";
+import { Breadcrumb } from "@/components/Breadcrumb";
 
 // ── useAuctionCountdown ──────────────────────────────────────
 //
@@ -303,6 +316,243 @@ function BidHistoryTable({ auctionId, onTotalKnown }: BidHistoryTableProps) {
   );
 }
 
+// ── Blocked Bidders section (Issue #199) ─────────────────────
+//
+// Anti-shill-bidding registry management, shown only to the auction creator.
+// Blocking bars an address from all future bids on this auction; it does not
+// evict an already-escrowed highest bid.
+
+function BlockedBiddersSection({
+  auctionId,
+  creatorPublicKey,
+}: {
+  auctionId: number;
+  creatorPublicKey: string;
+}) {
+  const [blocked, setBlocked] = useState<string[]>([]);
+  const [isLoading, setIsLoading] = useState(true);
+  const [addressInput, setAddressInput] = useState("");
+  const [pending, setPending] = useState<{
+    action: "block" | "unblock";
+    address: string;
+  } | null>(null);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [success, setSuccess] = useState<string | null>(null);
+
+  const shortAddr = (addr: string) =>
+    addr.length > 12 ? `${addr.slice(0, 6)}…${addr.slice(-4)}` : addr;
+
+  const loadBlocked = useCallback(async () => {
+    setIsLoading(true);
+    try {
+      setBlocked(await getBlockedBidders(auctionId));
+    } catch {
+      // Registry read failures are non-fatal — leave the last-known list.
+    } finally {
+      setIsLoading(false);
+    }
+  }, [auctionId]);
+
+  useEffect(() => {
+    loadBlocked();
+  }, [loadBlocked]);
+
+  const isValidAddress = (addr: string) =>
+    StrKey.isValidEd25519PublicKey(addr.trim()) ||
+    StrKey.isValidContract(addr.trim());
+
+  const requestBlock = () => {
+    const addr = addressInput.trim();
+    setError(null);
+    setSuccess(null);
+    if (!isValidAddress(addr)) {
+      setError("Enter a valid Stellar address (G… or C…).");
+      return;
+    }
+    if (addr === creatorPublicKey) {
+      setError("You cannot block your own address.");
+      return;
+    }
+    if (blocked.includes(addr)) {
+      setError("This address is already blocked.");
+      return;
+    }
+    setPending({ action: "block", address: addr });
+  };
+
+  const confirmPending = async () => {
+    if (!pending) return;
+    setIsSubmitting(true);
+    setError(null);
+    try {
+      if (pending.action === "block") {
+        await blockBidder(creatorPublicKey, auctionId, pending.address);
+        setSuccess(`Blocked ${shortAddr(pending.address)}.`);
+        setAddressInput("");
+      } else {
+        await unblockBidder(creatorPublicKey, auctionId, pending.address);
+        setSuccess(`Unblocked ${shortAddr(pending.address)}.`);
+      }
+      setPending(null);
+      await loadBlocked();
+    } catch (err) {
+      setError(
+        getReadableErrorMessage(
+          err,
+          pending.action === "block"
+            ? "Failed to block bidder"
+            : "Failed to unblock bidder"
+        )
+      );
+      setPending(null);
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  return (
+    <div className="mt-12" data-testid="blocked-bidders-section">
+      <div className="mb-4 flex items-center gap-2">
+        <Ban size={16} className="text-red-500" />
+        <h2 className="text-sm font-semibold uppercase tracking-wide text-gray-500">
+          Blocked Bidders
+        </h2>
+        {!isLoading && (
+          <span className="text-xs text-gray-400">({blocked.length}/50)</span>
+        )}
+      </div>
+
+      <div className="rounded-2xl border border-gray-100 bg-white p-5 space-y-4">
+        <p className="text-xs text-gray-500">
+          Blocked addresses cannot place bids on this auction. Blocking is not
+          retroactive — an existing highest bid stays in place.
+        </p>
+
+        {/* Add-address input */}
+        <div className="flex gap-2">
+          <input
+            type="text"
+            placeholder="G… or C… address to block"
+            value={addressInput}
+            onChange={(e) => setAddressInput(e.target.value)}
+            className="flex-1 rounded-xl border border-gray-200 bg-white px-4 py-2.5 font-mono text-xs focus:outline-none focus:ring-2 focus:ring-brand-400"
+          />
+          <button
+            onClick={requestBlock}
+            disabled={isSubmitting || !addressInput.trim()}
+            className="rounded-xl bg-red-500 px-5 py-2.5 text-sm font-bold text-white hover:bg-red-600 disabled:opacity-50 transition-all"
+          >
+            <span className="flex items-center gap-1.5">
+              <Ban size={14} /> Block
+            </span>
+          </button>
+        </div>
+
+        {error && <p className="text-xs text-red-500">{error}</p>}
+        {success && (
+          <p className="flex items-center gap-1 text-xs text-green-600">
+            <CheckCircle2 size={13} /> {success}
+          </p>
+        )}
+
+        {/* Current registry */}
+        {isLoading ? (
+          <div className="flex items-center gap-2 py-4 text-xs text-gray-400">
+            <RefreshCw size={12} className="animate-spin" /> Loading blocked
+            bidders…
+          </div>
+        ) : blocked.length === 0 ? (
+          <p className="py-2 text-xs text-gray-400">
+            No addresses are blocked for this auction.
+          </p>
+        ) : (
+          <div className="space-y-2">
+            {blocked.map((addr) => (
+              <div
+                key={addr}
+                className="flex items-center justify-between rounded-xl border border-gray-100 bg-gray-50 px-4 py-2.5"
+              >
+                <span className="truncate font-mono text-xs text-gray-700">
+                  {shortAddr(addr)}
+                </span>
+                <button
+                  onClick={() => {
+                    setError(null);
+                    setSuccess(null);
+                    setPending({ action: "unblock", address: addr });
+                  }}
+                  disabled={isSubmitting}
+                  className="text-xs font-semibold text-brand-600 hover:text-brand-700 disabled:opacity-50 transition-colors"
+                >
+                  Unblock
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* Confirmation modal */}
+      {pending && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4">
+          <div className="w-full max-w-md rounded-2xl bg-white p-6 shadow-xl">
+            <div className="flex items-start justify-between">
+              <h3 className="text-base font-bold text-gray-900">
+                {pending.action === "block" ? "Block bidder?" : "Unblock bidder?"}
+              </h3>
+              <button
+                onClick={() => setPending(null)}
+                disabled={isSubmitting}
+                className="text-gray-400 hover:text-gray-600"
+                aria-label="Close"
+              >
+                <X size={16} />
+              </button>
+            </div>
+            <p className="mt-3 text-sm text-gray-600">
+              {pending.action === "block"
+                ? "This address will no longer be able to bid on this auction:"
+                : "This address will be able to bid on this auction again:"}
+            </p>
+            <p className="mt-2 break-all rounded-xl bg-gray-50 px-3 py-2 font-mono text-xs text-gray-700">
+              {pending.address}
+            </p>
+            <div className="mt-5 flex justify-end gap-2">
+              <button
+                onClick={() => setPending(null)}
+                disabled={isSubmitting}
+                className="rounded-xl bg-gray-100 px-4 py-2 text-sm font-semibold text-gray-600 hover:bg-gray-200 disabled:opacity-50 transition-all"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={confirmPending}
+                disabled={isSubmitting}
+                className={`rounded-xl px-4 py-2 text-sm font-bold text-white disabled:opacity-50 transition-all ${
+                  pending.action === "block"
+                    ? "bg-red-500 hover:bg-red-600"
+                    : "bg-brand-500 hover:bg-brand-600"
+                }`}
+              >
+                {isSubmitting ? (
+                  <span className="flex items-center gap-1.5">
+                    <RefreshCw size={13} className="animate-spin" /> Submitting…
+                  </span>
+                ) : pending.action === "block" ? (
+                  "Block"
+                ) : (
+                  "Unblock"
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ── Page ─────────────────────────────────────────────────────
 
 export default function AuctionDetailPage() {
@@ -313,7 +563,7 @@ export default function AuctionDetailPage() {
   const [auction, setAuction] = useState<Auction | null>(null);
   const [metadata, setMetadata] = useState<ArtworkMetadata | null>(null);
   const [isLoading, setIsLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const [pageError, setPageError] = useState<PageStateError | null>(null);
   const [activeTab, setActiveTab] = useState<"details" | "bids">("details");
   const [bidAmountXlm, setBidAmountXlm] = useState("");
   const [bidSuccess, setBidSuccess] = useState(false);
@@ -334,7 +584,7 @@ export default function AuctionDetailPage() {
   const loadData = useCallback(async () => {
     if (!id) return;
     setIsLoading(true);
-    setError(null);
+    setPageError(null);
     try {
       const auctionData = await getAuction(Number(id));
       setAuction(auctionData);
@@ -343,7 +593,14 @@ export default function AuctionDetailPage() {
       const meta = await fetchMetadata(auctionData.metadata_cid).catch(() => null);
       setMetadata(meta);
     } catch (err) {
-      setError(getReadableErrorMessage(err, "Failed to load auction"));
+      // Distinguishes "this auction id doesn't exist" from "the indexer/RPC
+      // is unreachable" so an outage never masquerades as a 404.
+      setPageError(
+        categorizePageError(err, {
+          resourceLabel: "auction",
+          notFoundMessage: "This auction does not exist or has been removed.",
+        })
+      );
     } finally {
       setIsLoading(false);
     }
@@ -446,7 +703,8 @@ export default function AuctionDetailPage() {
     return (
       <div className="min-h-screen bg-gray-50 pt-24">
         <div className="mx-auto max-w-6xl px-4 sm:px-6">
-          <div className="animate-pulse grid gap-8 lg:grid-cols-2">
+          <div role="status" aria-live="polite" className="animate-pulse grid gap-8 lg:grid-cols-2">
+            <span className="sr-only">Loading auction…</span>
             <div className="aspect-square rounded-3xl bg-gray-200" />
             <div className="space-y-4 pt-4">
               <div className="h-8 w-3/4 rounded-xl bg-gray-200" />
@@ -460,38 +718,38 @@ export default function AuctionDetailPage() {
     );
   }
 
-  if (error || !auction) {
+  if (pageError || !auction) {
     return (
-      <div className="flex min-h-screen flex-col items-center justify-center gap-4 bg-gray-50 pt-24">
-        <div className="flex h-16 w-16 items-center justify-center rounded-2xl bg-red-50 text-red-500">
-          <AlertCircle size={32} />
-        </div>
-        <h2 className="text-lg font-bold text-gray-900">
-          {error ?? "Auction not found"}
-        </h2>
-        <button
-          onClick={() => router.push("/auctions")}
-          className="flex items-center gap-2 rounded-xl bg-brand-500 px-6 py-2.5 text-sm font-bold text-white hover:bg-brand-600 transition-all"
-        >
-          <ArrowLeft size={14} />
-          Back to Auctions
-        </button>
+      <div className="flex min-h-screen flex-col items-center justify-center bg-gray-50 pt-24">
+        <ResourceState
+          isLoading={false}
+          error={
+            pageError ??
+            categorizePageError(new Error("Auction not found"), {
+              resourceLabel: "auction",
+              notFoundMessage: "This auction does not exist or has been removed.",
+            })
+          }
+          onRetry={loadData}
+          notFoundAction={{ label: "Back to Auctions", href: "/auctions" }}
+        />
       </div>
     );
   }
 
+  const artworkTitle = metadata?.title ?? `Auction #${auction.auction_id}`;
+
   return (
     <div className="min-h-screen bg-gray-50">
-      {/* Back nav */}
+      {/* Back nav + Breadcrumb */}
       <div className="pt-20 pb-4">
         <div className="mx-auto max-w-6xl px-4 sm:px-6">
-          <Link
-            href="/auctions"
-            className="inline-flex items-center gap-1.5 text-sm text-gray-500 hover:text-brand-600 transition-colors"
-          >
-            <ArrowLeft size={14} />
-            All Auctions
-          </Link>
+          <Breadcrumb
+            items={[
+              { label: "Auctions", href: "/auctions" },
+              { label: artworkTitle },
+            ]}
+          />
         </div>
       </div>
 
@@ -549,6 +807,21 @@ export default function AuctionDetailPage() {
                   Time Remaining
                 </p>
                 <Countdown endTime={liveEndTime} />
+                
+                {/* Extension count display */}
+                {auction.extension_count !== undefined && auction.extension_count > 0 && (
+                  <div className="mt-3 flex items-center gap-2">
+                    <span className="text-xs text-gray-500">
+                      Extended {auction.extension_count} time{auction.extension_count !== 1 ? 's' : ''}
+                    </span>
+                    {auction.max_extensions && auction.extension_count >= auction.max_extensions && (
+                      <span className="inline-flex items-center gap-1 rounded-full bg-amber-50 px-2 py-0.5 text-xs font-medium text-amber-600">
+                        <AlertCircle size={10} />
+                        Max extensions reached
+                      </span>
+                    )}
+                  </div>
+                )}
               </div>
             )}
 
@@ -797,6 +1070,14 @@ export default function AuctionDetailPage() {
             />
           )}
         </div>
+
+        {/* Blocked Bidders — creator-only registry management (Issue #199) */}
+        {publicKey && publicKey === auction.creator && (
+          <BlockedBiddersSection
+            auctionId={auction.auction_id}
+            creatorPublicKey={publicKey}
+          />
+        )}
       </div>
     </div>
   );

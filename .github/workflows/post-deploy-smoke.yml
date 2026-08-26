@@ -1,0 +1,80 @@
+name: Post-Deploy Smoke Tests
+
+# Triggered manually after a deployment completes.
+# Also supports cron-based scheduled validation (e.g., nightly staging check).
+#
+# Usage — trigger after deploying:
+#   gh workflow run post-deploy-smoke.yml \
+#     -f indexer_url=https://indexer.yourapp.com \
+#     -f frontend_url=https://yourapp.com \
+#     -f environment=production
+#
+# Required secrets:
+#   HEALTH_DETAILS_TOKEN  — Bearer token for /health/details (if auth-protected)
+#
+# On gate failure:
+#   1. Do NOT shift traffic to the new revision.
+#   2. Check the "Health Gate Report" step output for which gate failed.
+#   3. Follow the rollback procedure in scripts/deploy/health-gate.sh.
+#   4. The full report is uploaded as an artifact for post-incident review.
+
+on:
+  workflow_dispatch:
+    inputs:
+      indexer_url:
+        description: "Indexer base URL (no trailing slash)"
+        required: true
+      frontend_url:
+        description: "Frontend base URL (no trailing slash, optional)"
+        required: false
+        default: ""
+      environment:
+        description: "Deployment environment label"
+        required: false
+        default: "staging"
+      smoke_contract_id:
+        description: "Contract ID for read-only smoke test (optional)"
+        required: false
+        default: ""
+  schedule:
+    # Nightly staging health check at 03:00 UTC
+    - cron: "0 3 * * *"
+
+jobs:
+  health-gate:
+    name: Health Gate — ${{ github.event.inputs.environment || 'staging' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Make health-gate script executable
+        run: chmod +x scripts/deploy/health-gate.sh
+
+      - name: Run health gate and smoke tests
+        id: gate
+        env:
+          INDEXER_URL: ${{ github.event.inputs.indexer_url || vars.STAGING_INDEXER_URL || '' }}
+          FRONTEND_URL: ${{ github.event.inputs.frontend_url || vars.STAGING_FRONTEND_URL || '' }}
+          HEALTH_DETAILS_TOKEN: ${{ secrets.HEALTH_DETAILS_TOKEN }}
+          GATE_TIMEOUT_SECONDS: "120"
+          SMOKE_CONTRACT_ID: ${{ github.event.inputs.smoke_contract_id || '' }}
+        run: |
+          bash scripts/deploy/health-gate.sh 2>&1 | tee /tmp/health-gate-report.txt
+          echo "exit_code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload gate report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: health-gate-report-${{ github.run_id }}
+          path: /tmp/health-gate-report.txt
+          retention-days: 30
+
+      - name: Fail job if gate failed
+        if: steps.gate.outputs.exit_code != '0'
+        run: |
+          echo "Health gate failed. Consult the uploaded report artifact and follow"
+          echo "the rollback procedure in scripts/deploy/health-gate.sh."
+          exit 1

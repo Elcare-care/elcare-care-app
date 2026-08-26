@@ -1,29 +1,17 @@
-export const SOROBAN_ERROR_MESSAGES: Record<number, string> = {
-  1: "Invalid metadata provided for this artwork.",
-  2: "The price is invalid. Please enter a positive value.",
-  3: "This listing was not found on-chain.",
-  4: "This listing is no longer active.",
-  5: "You are not authorized to perform this action.",
-  6: "You cannot buy your own listing.",
-  7: "Revenue split configuration is invalid.",
-  8: "Too many recipients were supplied for this listing.",
-  9: "This auction was not found on-chain.",
-  10: "This auction is no longer active.",
-  11: "Your bid is too low for this auction.",
-  12: "This auction has already expired.",
-  13: "This auction has not expired yet.",
-  14: "This auction is already finalized.",
-  15: "This artist account is currently revoked.",
-  16: "This offer was not found on-chain.",
-  17: "You cannot make an offer on your own listing.",
-  18: "This offer is no longer pending.",
-  19: "Offer amount is too low.",
-  20: "This listing has already been sold.",
-  21: "This listing has been cancelled.",
-  22: "The contract rejected this request for safety reasons.",
-  23: "Insufficient token balance to complete this transaction.",
-  24: "Token allowance is too low. Please approve the required amount.",
-};
+import { CONTRACT_ERROR_CATALOG } from "./contractErrors/catalog";
+
+/**
+ * Flat code → message map for the marketplace contract, derived from the
+ * authoritative catalog in lib/contractErrors/catalog.ts so this file can't
+ * silently drift out of sync with it (a prior hand-maintained copy of this
+ * map had codes 22-24 mapped to the wrong messages after the contract's
+ * error enum grew past 24 variants). New code should prefer
+ * `decodeContractError` directly; this is kept for existing callers of
+ * `getReadableErrorMessage` / `mapSorobanErrorMessage`.
+ */
+export const SOROBAN_ERROR_MESSAGES: Record<number, string> = Object.fromEntries(
+  CONTRACT_ERROR_CATALOG.marketplace.map((def) => [def.code, def.message])
+);
 
 /**
  * Phrases that indicate the user cancelled signing in their wallet extension.

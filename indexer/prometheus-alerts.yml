@@ -1,0 +1,243 @@
+groups:
+  - name: elcarehub_indexer
+    interval: 30s
+    rules:
+
+      # ── Sync health ──────────────────────────────────────────────────────────
+
+      - alert: IndexerSyncLagHigh
+        expr: elcarehub_sync_lag_ledgers > 100
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Indexer is lagging behind the network tip"
+          description: >
+            Sync lag is {{ $value }} ledgers. The indexer has not caught up
+            within 2 minutes. Check poller connectivity and Stellar RPC health.
+
+      - alert: IndexerSyncLagCritical
+        expr: elcarehub_sync_lag_ledgers > 1000
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Indexer is critically far behind the network"
+          description: >
+            Sync lag is {{ $value }} ledgers — more than 1,000 ledgers behind.
+            The indexer may be stalled or the Stellar RPC unreachable.
+
+      - alert: IndexerStalled
+        expr: indexer_stalled == 1
+        for: 3m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Indexer has stalled — no ledger progress"
+          description: >
+            The indexer stall watchdog has flagged a complete stop in ledger
+            processing for over 3 minutes. Check poller logs and RPC status.
+
+      - alert: IndexerPollerRestartHigh
+        expr: increase(elcarehub_poller_restart_total[10m]) >= 3
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Indexer poller restarted 3+ times in 10 minutes"
+          description: >
+            The stall watchdog has restarted the poller {{ $value }} times in
+            the last 10 minutes, which triggers a process exit on the next
+            failure. Investigate the root cause immediately.
+
+      # ── Event decode errors ──────────────────────────────────────────────────
+
+      - alert: HighDecodeErrorRate
+        expr: rate(indexer_decode_errors_total[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Elevated XDR event decode error rate"
+          description: >
+            More than 0.1 decode errors/second in the last 5 minutes
+            (current: {{ $value | humanize }}). This may indicate a contract
+            schema change that the indexer has not been updated to handle.
+
+      - alert: UnsupportedSchemaVersionSeen
+        expr: increase(indexer_unsupported_schema_version_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Events with unrecognised schema version detected"
+          description: >
+            The indexer skipped {{ $value }} event(s) with an unknown
+            schema_version. A contract upgrade may have shipped without a
+            matching indexer update.
+
+      # ── Dead-letter queue ────────────────────────────────────────────────────
+
+      - alert: DeadLetterQueueGrowing
+        expr: indexer_dead_letter_pending > 50
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Dead-letter queue has more than 50 unresolved events"
+          description: >
+            {{ $value }} events are stuck in dead-letter storage. Review
+            the dead-letter table and trigger a replay once the root cause
+            is fixed.
+
+      - alert: DeadLetterOldestEventStale
+        expr: indexer_dead_letter_oldest_age_seconds > 3600
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Oldest dead-letter event is more than 1 hour old"
+          description: >
+            The oldest unresolved dead-letter event is
+            {{ $value | humanizeDuration }} old. Stale events may indicate
+            a persistent parsing failure that needs manual triage.
+
+      # ── API latency & errors ─────────────────────────────────────────────────
+
+      - alert: ApiHighP99Latency
+        expr: >
+          histogram_quantile(0.99,
+            rate(elcarehub_api_request_duration_seconds_bucket[5m])
+          ) > 2
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "API P99 latency exceeds 2 seconds"
+          description: >
+            The 99th-percentile API response time is
+            {{ $value | humanizeDuration }} over the last 5 minutes.
+            Check database query performance and connection pool usage.
+
+      - alert: ApiHighErrorRate
+        expr: >
+          rate(elcarehub_tx_submission_errors_total[5m]) > 0.5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Elevated user-facing transaction error rate"
+          description: >
+            More than 0.5 transaction errors/second in the last 5 minutes
+            (current: {{ $value | humanize }}). Users may be experiencing
+            widespread failures submitting transactions.
+
+      # ── Reentrancy guard ─────────────────────────────────────────────────────
+
+      - alert: ReentrancyGuardTriggeredFrequently
+        expr: rate(elcarehub_reentrancy_guard_triggered_total[5m]) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Reentrancy guard triggered repeatedly"
+          description: >
+            The contract reentrancy guard (error #22) has been triggered
+            {{ $value | humanize }} times/second. This may indicate an
+            automated probe or exploit attempt — investigate immediately.
+
+      # ── Infrastructure health ────────────────────────────────────────────────
+
+      - alert: RpcRetryExhausted
+        expr: increase(indexer_rpc_retry_exhausted_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Stellar RPC retries exhausted"
+          description: >
+            The indexer exhausted all RPC retries {{ $value }} time(s) in
+            the last 5 minutes. The Stellar RPC endpoint may be unreachable.
+
+      - alert: ReconcilerDriftHigh
+        expr: indexer_reconciler_drift_records > 100
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Reconciler detected high on-chain drift"
+          description: >
+            {{ $value }} records showed drift in the last reconciliation run.
+            Review the reconciler logs and consider triggering a targeted repair.
+
+      # ── Financial reconciliation alerts (Issue #XXX) ─────────────────────────────
+
+      - alert: FinancialDriftCritical
+        expr: financial_drifts_open{severity="Critical"} > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Critical financial drift detected"
+          description: >
+            {{ $value }} critical financial drift(s) are currently unresolved.
+            Immediate investigation required - this may indicate missing or duplicate
+            payouts affecting protocol fees, royalties, sales, or refunds.
+
+      - alert: FinancialDriftHigh
+        expr: financial_drifts_open{severity="High"} > 5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Multiple high-severity financial drifts detected"
+          description: >
+            {{ $value }} high-severity financial drift(s) have been unresolved for
+            over 5 minutes. Review the financial reconciliation dashboard and investigate
+            the affected entities.
+
+      - alert: FinancialDriftStale
+        expr: financial_drift_oldest_age_seconds > 86400
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Financial drift unresolved for over 24 hours"
+          description: >
+            The oldest unresolved financial drift is
+            {{ $value | humanizeDuration }} old. Unresolved drifts may indicate
+            persistent reconciliation issues requiring manual intervention.
+
+      - alert: FinancialAlertRateHigh
+        expr: rate(financial_alerts_raised_total[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Elevated financial alert rate"
+          description: >
+            Financial alerts are being raised at {{ $value | humanize }} per second.
+            This may indicate a systematic issue with event processing or payout tracking.
+
+      - alert: FinancialReconcileFailed
+        expr: increase(financial_reconcile_runs_total{outcome="error"}[10m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Financial reconciliation run failed"
+          description: >
+            One or more financial reconciliation runs have failed in the last 10 minutes.
+            Check the logs for database connectivity or query execution issues.
+
+      - alert: FinancialReconcileLag
+        expr: >
+          (time() - max_over_time(financial_reconcile_runs_total{outcome="ok"}[1h]) > 3600)
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Financial reconciliation not running"
+          description: >
+            No successful financial reconciliation run has completed in the last hour.
+            The reconciliation job may be stopped or failing silently.

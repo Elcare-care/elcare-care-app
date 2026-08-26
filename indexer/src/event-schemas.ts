@@ -36,6 +36,63 @@ export interface ContractEventSchema {
   data: SchemaField[];
 }
 
+// ── Schema versioning (Issue #278) ────────────────────────────────────────────
+//
+// Some event structs on the contract side (see the versioning policy at the
+// top of `contracts/soroban-marketplace/src/events.rs`) carry an additive
+// `schema_version: u32` field. That field is declared here as an *optional*
+// `number` field (Soroban u32 decodes via scValToNative to a JS `number`, not
+// `bigint`) on the schemas below — this is what makes historical events
+// (emitted before the field existed, and therefore missing it entirely)
+// continue to decode exactly as before. Absence of `schema_version` is always
+// treated as implicit version 0, and version 0 is always supported.
+//
+// `SUPPORTED_SCHEMA_VERSIONS` records the highest schema_version each event
+// type's schema in this file has been updated to understand. If a decoded
+// event carries a `schema_version` higher than that, the shape *may* still
+// decode successfully (additive fields the older schema doesn't know about
+// are simply ignored), but the indexer cannot be sure that's safe — a future
+// version could also mean a field's *meaning* changed. `parser.ts` uses this
+// map, via `isSupportedSchemaVersion`, to flag that case distinctly (see
+// `UnsupportedSchemaVersionError`) instead of silently accepting it or
+// treating it as a generic decode failure.
+export const SUPPORTED_SCHEMA_VERSIONS: Record<string, number> = {
+  LISTING_CREATED: 1,
+  ARTWORK_SOLD: 1,
+  AUCTION_CREATED: 1,
+  AUCTION_RESOLVED: 1,
+  OFFER_MADE: 1,
+  OFFER_ACCEPTED: 1,
+  PROTOCOL_FEE_COLLECTED: 1,
+  ROYALTY_SETTLEMENT: 1,
+  AUCTION_BID_REFUNDED: 1,
+  AUCTION_ADMIN_CANCELLED: 1,
+  DEPLOY_NORMAL_721: 1,
+  DEPLOY_NORMAL_1155: 1,
+  DEPLOY_LAZY_721: 1,
+  DEPLOY_LAZY_1155: 1,
+};
+
+/**
+ * Returns true when `version` is a schema version this indexer build knows
+ * how to interpret for `eventType`.
+ *
+ * - `undefined`/`null` (field absent) is always supported — it represents a
+ *   legacy/implicit version-0 event emitted before `schema_version` existed.
+ * - Event types with no entry in `SUPPORTED_SCHEMA_VERSIONS` have never been
+ *   versioned; any value is passed through unpoliced.
+ * - Otherwise, supported iff `0 <= version <= SUPPORTED_SCHEMA_VERSIONS[eventType]`.
+ */
+export function isSupportedSchemaVersion(
+  eventType: string,
+  version: number | null | undefined
+): boolean {
+  if (version === undefined || version === null) return true;
+  const maxSupported = SUPPORTED_SCHEMA_VERSIONS[eventType];
+  if (maxSupported === undefined) return true;
+  return Number.isFinite(version) && version >= 0 && version <= maxSupported;
+}
+
 // ── Typed event payloads ──────────────────────────────────────────────────────
 
 export interface ListingCreatedData {
@@ -48,6 +105,8 @@ export interface ListingCreatedData {
   ledger_sequence?: bigint;
   recipients?: Array<{ address: string; percentage: bigint }>;
   token?: string;
+  /** Absent on events emitted before Issue #278; treated as version 0. */
+  schema_version?: number;
 }
 
 export interface ArtworkSoldData {
@@ -57,12 +116,14 @@ export interface ArtworkSoldData {
   price: bigint;
   currency?: string;
   ledger_sequence?: bigint;
+  /** Absent on events emitted before Issue #278; treated as version 0. */
+  schema_version?: number;
 }
 
 export interface ListingCancelledData {
   listing_id: bigint;
   cancelled_by?: string;
-  reason?: string | object;
+  reason?: string | { tag: number };
   ledger_sequence?: bigint;
 }
 
@@ -83,6 +144,8 @@ export interface AuctionCreatedData {
   collection: string;
   token_id: bigint;
   end_time: bigint;
+  /** Absent on events emitted before Issue #278; treated as version 0. */
+  schema_version?: number;
 }
 
 export interface BidPlacedData {
@@ -95,6 +158,32 @@ export interface AuctionFinalizedData {
   auction_id: bigint;
   winner?: string | null;
   amount: bigint;
+  /** Absent on events emitted before Issue #278; treated as version 0. */
+  schema_version?: number;
+}
+
+/** Emitted when a losing bidder's escrow is refunded (Issue #271). */
+export interface AuctionBidRefundedData {
+  auction_id: bigint;
+  bidder: string;
+  amount: bigint;
+  token: string;
+  /** Reason code: "outbid" | "cancelled" | "admin_cancel" */
+  reason?: string;
+  ledger_sequence?: bigint;
+  /** Absent on events emitted before Issue #278; treated as version 0. */
+  schema_version?: number;
+}
+
+/** Emitted when admin force-cancels an active auction (Issue #271). */
+export interface AuctionAdminCancelledData {
+  auction_id: bigint;
+  cancelled_by?: string;
+  refunded_amount: bigint;
+  token: string;
+  ledger_sequence?: bigint;
+  /** Absent on events emitted before Issue #278; treated as version 0. */
+  schema_version?: number;
 }
 
 export interface AuctionCancelledData {
@@ -104,7 +193,11 @@ export interface AuctionCancelledData {
 
 export interface AuctionExtendedData {
   auction_id: bigint;
+  /** End time before the extension was applied */
+  prev_end_time: bigint;
   new_end_time: bigint;
+  /** Which extension this is (1-based); allows consumers to detect cap proximity */
+  extension_count: bigint;
 }
 
 export interface OfferMadeData {
@@ -115,6 +208,8 @@ export interface OfferMadeData {
   token: string;
   /** Optional expiry (ledger timestamp); absent when the offer never expires. */
   expires_at?: bigint;
+  /** Absent on events emitted before Issue #278; treated as version 0. */
+  schema_version?: number;
 }
 
 export interface OfferAcceptedData {
@@ -122,6 +217,8 @@ export interface OfferAcceptedData {
   listing_id: bigint;
   offerer: string;
   amount?: bigint;
+  /** Absent on events emitted before Issue #278; treated as version 0. */
+  schema_version?: number;
 }
 
 export interface OfferRejectedData {
@@ -161,12 +258,53 @@ export interface ProtocolFeeCollectedData {
   amount: bigint;
   token: string;
   treasury: string;
+  /** Absent on events emitted before Issue #278; treated as version 0. */
+  schema_version?: number;
 }
 
-export interface RoyaltyPaidData {
-  listing_id?: bigint;
-  recipient: string;
+/** Emitted at settlement with a snapshot of normalized recipients (Issue #270). */
+export interface RoyaltySettlementData {
+  /** Listing or auction id. */
+  id: bigint;
+  recipients: Array<{ address: string; percentage: bigint }>;
+  total_amount: bigint;
+  token: string;
+  ledger_sequence?: bigint;
+  /** Absent on events emitted before Issue #278; treated as version 0. */
+  schema_version?: number;
+}
+
+/** Emitted when a token is added to the whitelist (Issue #208). */
+export interface TokenWhitelistedData {
+  token: string;
+  added_by: string;
+}
+
+/** Emitted when a token is removed from the whitelist (Issue #208). */
+export interface TokenRemovedData {
+  token: string;
+  removed_by: string;
+}
+
+/** One `{address, amount}` payout entry of a ROYALTY_PAID breakdown. */
+export interface RoyaltyRecipientPayout {
+  address: string;
   amount: bigint;
+}
+
+/**
+ * Per-sale royalty distribution breakdown (Issue #201). Exactly one of
+ * listing_id / auction_id is set. Recipient amounts sum to
+ * sale_price - protocol_fee_amount.
+ */
+export interface RoyaltyPaidData {
+  listing_id?: bigint | null;
+  auction_id?: bigint | null;
+  sale_price: bigint;
+  protocol_fee_amount: bigint;
+  token: string;
+  recipients: RoyaltyRecipientPayout[];
+  ledger_sequence?: bigint;
 }
 
 export interface ArtistRevokedData {
@@ -194,6 +332,18 @@ export interface AdminProposalCancelledData {
   cancelled_candidate: string;
 }
 
+/** Anti-shill-bidding registry (Issue #199): address barred from an auction. */
+export interface AuctionBidderBlockedData {
+  auction_id: bigint;
+  bidder: string;
+}
+
+/** Anti-shill-bidding registry (Issue #199): address removed from the registry. */
+export interface AuctionBidderUnblockedData {
+  auction_id: bigint;
+  bidder: string;
+}
+
 export interface ContractPausedData {
   paused_by?: string;
 }
@@ -202,10 +352,38 @@ export interface ContractUnpausedData {
   unpaused_by?: string;
 }
 
+/** Granular pause events (Issue #205 + narrowly-scoped pause follow-up) */
+export interface CollectionPausedData {
+  collection: string;
+}
+
+export interface CollectionUnpausedData {
+  collection: string;
+}
+
+export interface FunctionPausedData {
+  function_name: string;
+}
+
+export interface FunctionUnpausedData {
+  function_name: string;
+}
+
 /** Deploy events emit a 2-tuple [creator_address, contract_address] */
 export interface DeployData {
   0: string;
   1: string;
+}
+
+export interface LaunchpadWasmUpdateData {
+  0: string;
+  1: string;
+}
+
+export interface LaunchpadCollectionUpgradedData {
+  0: string;
+  1: string;
+  2: string;
 }
 
 // ── Decode result types ───────────────────────────────────────────────────────
@@ -240,6 +418,8 @@ export const LISTING_CREATED_SCHEMA: ContractEventSchema = {
     { name: 'ledger_sequence', type: 'bigint', optional: true },
     { name: 'token', type: 'string', optional: true },
     { name: 'recipients', type: 'array', optional: true },
+    // Issue #278: additive, absent on pre-upgrade historical events.
+    { name: 'schema_version', type: 'number', optional: true },
   ],
 };
 
@@ -252,6 +432,8 @@ export const ARTWORK_SOLD_SCHEMA: ContractEventSchema = {
     { name: 'artist', type: 'string', optional: true },
     { name: 'currency', type: 'string', optional: true },
     { name: 'ledger_sequence', type: 'bigint', optional: true },
+    // Issue #278: additive, absent on pre-upgrade historical events.
+    { name: 'schema_version', type: 'number', optional: true },
   ],
 };
 
@@ -260,7 +442,8 @@ export const LISTING_CANCELLED_SCHEMA: ContractEventSchema = {
   data: [
     { name: 'listing_id', type: 'bigint' },
     { name: 'cancelled_by', type: 'string', optional: true },
-    { name: 'reason', type: 'string', optional: true },
+    // reason can be an enum object { tag: N } OR a plain string in legacy builds
+    { name: 'reason', type: 'any', optional: true },
     { name: 'ledger_sequence', type: 'bigint', optional: true },
   ],
 };
@@ -306,6 +489,8 @@ export const AUCTION_CREATED_SCHEMA: ContractEventSchema = {
     { name: 'collection', type: 'string' },
     { name: 'token_id', type: 'bigint' },
     { name: 'end_time', type: 'bigint' },
+    // Issue #278: additive, absent on pre-upgrade historical events.
+    { name: 'schema_version', type: 'number', optional: true },
   ],
 };
 
@@ -325,6 +510,37 @@ export const AUCTION_RESOLVED_SCHEMA: ContractEventSchema = {
     { name: 'amount', type: 'bigint' },
     // winner is Option<Address> — null when no bids were placed
     { name: 'winner', type: 'string', optional: true },
+    // Issue #278: additive, absent on pre-upgrade historical events.
+    { name: 'schema_version', type: 'number', optional: true },
+  ],
+};
+
+/** Emitted when a losing bidder's escrowed funds are returned (Issue #271). */
+export const AUCTION_BID_REFUNDED_SCHEMA: ContractEventSchema = {
+  type: 'AUCTION_BID_REFUNDED',
+  data: [
+    { name: 'auction_id', type: 'bigint' },
+    { name: 'bidder', type: 'string' },
+    { name: 'amount', type: 'bigint' },
+    { name: 'token', type: 'string' },
+    { name: 'reason', type: 'string', optional: true },
+    { name: 'ledger_sequence', type: 'bigint', optional: true },
+    // Issue #278: additive, absent on pre-upgrade historical events.
+    { name: 'schema_version', type: 'number', optional: true },
+  ],
+};
+
+/** Emitted when admin force-cancels an active auction (Issue #271). */
+export const AUCTION_ADMIN_CANCELLED_SCHEMA: ContractEventSchema = {
+  type: 'AUCTION_ADMIN_CANCELLED',
+  data: [
+    { name: 'auction_id', type: 'bigint' },
+    { name: 'cancelled_by', type: 'string', optional: true },
+    { name: 'refunded_amount', type: 'bigint' },
+    { name: 'token', type: 'string' },
+    { name: 'ledger_sequence', type: 'bigint', optional: true },
+    // Issue #278: additive, absent on pre-upgrade historical events.
+    { name: 'schema_version', type: 'number', optional: true },
   ],
 };
 
@@ -340,7 +556,27 @@ export const AUCTION_EXTENDED_SCHEMA: ContractEventSchema = {
   type: 'AUCTION_EXTENDED',
   data: [
     { name: 'auction_id', type: 'bigint' },
+    { name: 'prev_end_time', type: 'bigint' },
     { name: 'new_end_time', type: 'bigint' },
+    { name: 'extension_count', type: 'bigint' },
+  ],
+};
+
+/** Emitted when a token is added to the whitelist (Issue #208). */
+export const TOKEN_WHITELISTED_SCHEMA: ContractEventSchema = {
+  type: 'TOKEN_WHITELISTED',
+  data: [
+    { name: 'token', type: 'string' },
+    { name: 'added_by', type: 'string' },
+  ],
+};
+
+/** Emitted when a token is removed from the whitelist (Issue #208). */
+export const TOKEN_REMOVED_SCHEMA: ContractEventSchema = {
+  type: 'TOKEN_REMOVED',
+  data: [
+    { name: 'token', type: 'string' },
+    { name: 'removed_by', type: 'string' },
   ],
 };
 
@@ -353,6 +589,8 @@ export const OFFER_MADE_SCHEMA: ContractEventSchema = {
     { name: 'amount', type: 'bigint' },
     { name: 'token', type: 'string' },
     { name: 'expires_at', type: 'bigint', optional: true },
+    // Issue #278: additive, absent on pre-upgrade historical events.
+    { name: 'schema_version', type: 'number', optional: true },
   ],
 };
 
@@ -363,6 +601,8 @@ export const OFFER_ACCEPTED_SCHEMA: ContractEventSchema = {
     { name: 'listing_id', type: 'bigint' },
     { name: 'offerer', type: 'string' },
     { name: 'amount', type: 'bigint', optional: true },
+    // Issue #278: additive, absent on pre-upgrade historical events.
+    { name: 'schema_version', type: 'number', optional: true },
   ],
 };
 
@@ -397,9 +637,13 @@ export const OFFER_RECLAIMED_SCHEMA: ContractEventSchema = {
 export const ROYALTY_PAID_SCHEMA: ContractEventSchema = {
   type: 'ROYALTY_PAID',
   data: [
-    { name: 'recipient', type: 'string' },
-    { name: 'amount', type: 'bigint' },
     { name: 'listing_id', type: 'bigint', optional: true },
+    { name: 'auction_id', type: 'bigint', optional: true },
+    { name: 'sale_price', type: 'bigint' },
+    { name: 'protocol_fee_amount', type: 'bigint' },
+    { name: 'token', type: 'string' },
+    { name: 'recipients', type: 'array' },
+    { name: 'ledger_sequence', type: 'bigint', optional: true },
   ],
 };
 
@@ -410,6 +654,22 @@ export const PROTOCOL_FEE_COLLECTED_SCHEMA: ContractEventSchema = {
     { name: 'amount', type: 'bigint' },
     { name: 'token', type: 'string' },
     { name: 'treasury', type: 'string' },
+    // Issue #278: additive, absent on pre-upgrade historical events.
+    { name: 'schema_version', type: 'number', optional: true },
+  ],
+};
+
+/** Emitted at settlement with a snapshot of normalized recipients (Issue #270). */
+export const ROYALTY_SETTLEMENT_SCHEMA: ContractEventSchema = {
+  type: 'ROYALTY_SETTLEMENT',
+  data: [
+    { name: 'id', type: 'bigint' },
+    { name: 'recipients', type: 'array' },
+    { name: 'total_amount', type: 'bigint' },
+    { name: 'token', type: 'string' },
+    { name: 'ledger_sequence', type: 'bigint', optional: true },
+    // Issue #278: additive, absent on pre-upgrade historical events.
+    { name: 'schema_version', type: 'number', optional: true },
   ],
 };
 
@@ -450,6 +710,22 @@ export const ADMIN_PROPOSAL_CANCELLED_SCHEMA: ContractEventSchema = {
   ],
 };
 
+export const AUCTION_BIDDER_BLOCKED_SCHEMA: ContractEventSchema = {
+  type: 'AUCTION_BIDDER_BLOCKED',
+  data: [
+    { name: 'auction_id', type: 'bigint' },
+    { name: 'bidder', type: 'string' },
+  ],
+};
+
+export const AUCTION_BIDDER_UNBLOCKED_SCHEMA: ContractEventSchema = {
+  type: 'AUCTION_BIDDER_UNBLOCKED',
+  data: [
+    { name: 'auction_id', type: 'bigint' },
+    { name: 'bidder', type: 'string' },
+  ],
+};
+
 export const CONTRACT_PAUSED_SCHEMA: ContractEventSchema = {
   type: 'CONTRACT_PAUSED',
   data: [{ name: 'paused_by', type: 'string', optional: true }],
@@ -458,6 +734,26 @@ export const CONTRACT_PAUSED_SCHEMA: ContractEventSchema = {
 export const CONTRACT_UNPAUSED_SCHEMA: ContractEventSchema = {
   type: 'CONTRACT_UNPAUSED',
   data: [{ name: 'unpaused_by', type: 'string', optional: true }],
+};
+
+export const COLLECTION_PAUSED_SCHEMA: ContractEventSchema = {
+  type: 'COLLECTION_PAUSED',
+  data: [{ name: 'collection', type: 'string' }],
+};
+
+export const COLLECTION_UNPAUSED_SCHEMA: ContractEventSchema = {
+  type: 'COLLECTION_UNPAUSED',
+  data: [{ name: 'collection', type: 'string' }],
+};
+
+export const FUNCTION_PAUSED_SCHEMA: ContractEventSchema = {
+  type: 'FUNCTION_PAUSED',
+  data: [{ name: 'function_name', type: 'string' }],
+};
+
+export const FUNCTION_UNPAUSED_SCHEMA: ContractEventSchema = {
+  type: 'FUNCTION_UNPAUSED',
+  data: [{ name: 'function_name', type: 'string' }],
 };
 
 /**
@@ -470,6 +766,40 @@ export const DEPLOY_SCHEMA: ContractEventSchema = {
   data: [
     // Positional tuple: index 0 = creator, index 1 = contract address
     // These are validated structurally in decodeWithSchema; array items don't carry names.
+  ],
+};
+
+export const LAUNCHPAD_WASM_UPDATED_SCHEMA: ContractEventSchema = {
+  type: 'LAUNCHPAD_WASM_UPDATED',
+  data: [],
+};
+
+export const LAUNCHPAD_COLLECTION_UPGRADED_SCHEMA: ContractEventSchema = {
+  type: 'LAUNCHPAD_COLLECTION_UPGRADED',
+  data: [],
+};
+
+// ── Listing ownership reconciliation (Issue #456) ────────────────────────────
+
+/** Emitted when a CollectionAdmin reconciles an inconsistent listing owner. */
+export interface ListingOwnershipReconciledData {
+  listing_id: bigint;
+  /** The owner before reconciliation; null/absent for Active listings (artist was effective owner). */
+  previous_owner?: string | null;
+  new_owner: string;
+  reconciled_by: string;
+  ledger_sequence?: bigint;
+}
+
+export const LISTING_OWNERSHIP_RECONCILED_SCHEMA: ContractEventSchema = {
+  type: 'LISTING_OWNERSHIP_RECONCILED',
+  data: [
+    { name: 'listing_id',    type: 'bigint' },
+    { name: 'new_owner',     type: 'string' },
+    { name: 'reconciled_by', type: 'string' },
+    // previous_owner is Option<Address> — absent on first-ever reconciliation
+    { name: 'previous_owner',  type: 'string',  optional: true },
+    { name: 'ledger_sequence', type: 'bigint',  optional: true },
   ],
 };
 
@@ -494,6 +824,9 @@ export const SCHEMA_REGISTRY: Map<string, ContractEventSchema> = new Map([
   ['OFFER_RECLAIMED', OFFER_RECLAIMED_SCHEMA],
   ['ROYALTY_PAID', ROYALTY_PAID_SCHEMA],
   ['PROTOCOL_FEE_COLLECTED', PROTOCOL_FEE_COLLECTED_SCHEMA],
+  ['ROYALTY_SETTLEMENT', ROYALTY_SETTLEMENT_SCHEMA],
+  ['TOKEN_WHITELISTED', TOKEN_WHITELISTED_SCHEMA],
+  ['TOKEN_REMOVED', TOKEN_REMOVED_SCHEMA],
   ['ARTIST_REVOKED', ARTIST_REVOKED_SCHEMA],
   ['ARTIST_REINSTATED', ARTIST_REINSTATED_SCHEMA],
   ['ADMIN_TRANSFER_PROPOSED', ADMIN_TRANSFER_PROPOSED_SCHEMA],
@@ -501,11 +834,17 @@ export const SCHEMA_REGISTRY: Map<string, ContractEventSchema> = new Map([
   ['ADMIN_PROPOSAL_CANCELLED', ADMIN_PROPOSAL_CANCELLED_SCHEMA],
   ['CONTRACT_PAUSED', CONTRACT_PAUSED_SCHEMA],
   ['CONTRACT_UNPAUSED', CONTRACT_UNPAUSED_SCHEMA],
+  ['AUCTION_BIDDER_BLOCKED', AUCTION_BIDDER_BLOCKED_SCHEMA],
+  ['AUCTION_BIDDER_UNBLOCKED', AUCTION_BIDDER_UNBLOCKED_SCHEMA],
   // Deploy events share a common tuple structure; each variant is registered separately.
   ['DEPLOY_NORMAL_721', DEPLOY_SCHEMA],
   ['DEPLOY_NORMAL_1155', DEPLOY_SCHEMA],
   ['DEPLOY_LAZY_721', DEPLOY_SCHEMA],
   ['DEPLOY_LAZY_1155', DEPLOY_SCHEMA],
+  ['LAUNCHPAD_WASM_UPDATED', LAUNCHPAD_WASM_UPDATED_SCHEMA],
+  ['LAUNCHPAD_COLLECTION_UPGRADED', LAUNCHPAD_COLLECTION_UPGRADED_SCHEMA],
+  // Issue #456: listing ownership reconciliation
+  ['LISTING_OWNERSHIP_RECONCILED', LISTING_OWNERSHIP_RECONCILED_SCHEMA],
 ]);
 
 // ── Schema-driven decoder ─────────────────────────────────────────────────────
@@ -532,33 +871,67 @@ export function decodeWithSchema<T = unknown>(
     eventType === 'DEPLOY_NORMAL_721' ||
     eventType === 'DEPLOY_NORMAL_1155' ||
     eventType === 'DEPLOY_LAZY_721' ||
-    eventType === 'DEPLOY_LAZY_1155'
+    eventType === 'DEPLOY_LAZY_1155' ||
+    eventType === 'LAUNCHPAD_WASM_UPDATED' ||
+    eventType === 'LAUNCHPAD_COLLECTION_UPGRADED'
   ) {
     if (!Array.isArray(nativeData)) {
       return {
         ok: false,
         eventType,
-        reason: `Deploy event data must be an array, got ${typeof nativeData}`,
+        reason: `Event data must be an array for ${eventType}`,
         raw: nativeData,
       };
     }
-    if (nativeData.length < 2) {
-      return {
-        ok: false,
-        eventType,
-        reason: `Deploy event tuple requires at least 2 elements, got ${nativeData.length}`,
-        raw: nativeData,
-      };
+
+    if (
+      eventType === 'DEPLOY_NORMAL_721' ||
+      eventType === 'DEPLOY_NORMAL_1155' ||
+      eventType === 'DEPLOY_LAZY_721' ||
+      eventType === 'DEPLOY_LAZY_1155'
+    ) {
+      if (nativeData.length < 2) {
+        return {
+          ok: false,
+          eventType,
+          reason: `Deploy event tuple requires at least 2 elements, got ${nativeData.length}`,
+          raw: nativeData,
+        };
+      }
+      if (typeof nativeData[0] !== 'string' || typeof nativeData[1] !== 'string') {
+        return {
+          ok: false,
+          eventType,
+          reason: `Deploy event tuple elements must be strings, got [${typeof nativeData[0]}, ${typeof nativeData[1]}]`,
+          raw: nativeData,
+        };
+      }
+      return { ok: true, eventType, data: nativeData as T };
     }
-    if (typeof nativeData[0] !== 'string' || typeof nativeData[1] !== 'string') {
-      return {
-        ok: false,
-        eventType,
-        reason: `Deploy event tuple elements must be strings, got [${typeof nativeData[0]}, ${typeof nativeData[1]}]`,
-        raw: nativeData,
-      };
+
+    if (eventType === 'LAUNCHPAD_WASM_UPDATED') {
+      if (nativeData.length < 2) {
+        return {
+          ok: false,
+          eventType,
+          reason: `WASM update event tuple requires 2 elements, got ${nativeData.length}`,
+          raw: nativeData,
+        };
+      }
+      return { ok: true, eventType, data: nativeData as T };
     }
-    return { ok: true, eventType, data: nativeData as T };
+
+    if (eventType === 'LAUNCHPAD_COLLECTION_UPGRADED') {
+      if (nativeData.length < 3) {
+        return {
+          ok: false,
+          eventType,
+          reason: `Collection upgrade event tuple requires 3 elements, got ${nativeData.length}`,
+          raw: nativeData,
+        };
+      }
+      return { ok: true, eventType, data: nativeData as T };
+    }
   }
 
   // ── Object path ───────────────────────────────────────────────────────────
@@ -593,7 +966,10 @@ export function decodeWithSchema<T = unknown>(
     // Validate type for present fields
     const actualType = typeof value;
 
-    if (field.type === 'array') {
+    if (field.type === 'any') {
+      // 'any' accepts any non-absent value — no further type check needed
+      continue;
+    } else if (field.type === 'array') {
       if (!Array.isArray(value)) {
         return {
           ok: false,

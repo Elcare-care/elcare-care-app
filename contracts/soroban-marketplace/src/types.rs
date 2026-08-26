@@ -1,6 +1,25 @@
 // types.rs
 use soroban_sdk::{contracterror, contracttype, Address, Symbol};
 
+/// Four independent role axes that govern privileged entry points (Issue #267).
+///
+/// Every entry point is owned by exactly one role. When no explicit holder has
+/// been assigned for a role, it falls back to the contract `Admin`, so existing
+/// single-admin deployments keep working unchanged until an operator opts in via
+/// `migrate_roles` or `propose_role_transfer`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RoleType {
+    /// Manages price bounds, treasury, fees, bid/auction config parameters.
+    ProtocolConfig,
+    /// Controls global/collection/function circuit breakers.
+    EmergencyPause,
+    /// Artist revocation, reinstatement, and collection-level listing cleanup.
+    CollectionAdmin,
+    /// Storage and version migration entry points.
+    Upgrade,
+}
+
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(u32)]
@@ -110,6 +129,95 @@ pub enum MarketplaceError {
     /// The auction has reached its `max_extensions` cap and can no longer be
     /// extended by the anti-sniping logic.
     MaxExtensionsReached = 48,
+    /// `escrow_nft` was called by an account that does not own the token.
+    NotTokenOwner = 49,
+    /// The token is already held in marketplace escrow for another listing
+    /// or auction (double-listing guard).
+    TokenAlreadyEscrowed = 50,
+    /// An anti-sniping extension would push the auction's end_time beyond
+    /// original_end_time + MAX_TOTAL_AUCTION_DURATION. The bid is still
+    /// accepted, but the extension is not applied.
+    AuctionDurationLimitReached = 51,
+    /// `accept_role_transfer` or `cancel_role_proposal` was called when no
+    /// role-transfer proposal is currently pending for this role.
+    NoRoleProposalPending = 52,
+    /// `accept_role_transfer` was called after the pending role proposal's
+    /// `expires_at` ledger timestamp has passed. The proposal must be re-issued.
+    RoleProposalExpired = 53,
+    /// `propose_role_transfer` was called with `candidate == current_authority`.
+    /// Transferring a role to its own current holder is a no-op and is rejected
+    /// so that the pending-proposal slot is not polluted with a dead proposal.
+    RoleTransferToSelf = 54,
+    /// `propose_role_transfer` was called with `candidate` equal to this
+    /// contract's own address. Assigning the contract as a role holder would
+    /// create an irrecoverable governance state (no key can sign for a contract
+    /// address in the normal Soroban auth model).
+    RoleTransferToContract = 55,
+    /// `accept_treasury` was called after the pending treasury proposal's
+    /// `expires_at` ledger timestamp has passed. The proposal must be re-issued.
+    /// (Issue #459)
+    TreasuryProposalExpired = 56,
+    /// `accept_treasury` or `cancel_treasury_proposal` was called when no
+    /// treasury proposal is currently pending. (Issue #459)
+    NoTreasuryProposalPending = 57,
+    /// `propose_treasury` was called with `candidate == current_treasury`.
+    /// Proposing the same address that is already the active treasury is a no-op
+    /// and is rejected so the pending slot is not polluted. (Issue #459)
+    TreasuryProposalSelf = 58,
+    /// A listing or auction expiry duration violates the configured
+    /// `[min_listing_duration, max_listing_duration]` bounds. (Issue #460)
+    InvalidListingDuration = 59,
+    /// The declared collection address is incompatible with the token: the token
+    /// does not belong to the given collection or the collection standard does
+    /// not match the requested quantity semantics. (Issue #458)
+    CollectionIncompatible = 60,
+    /// One item in a `create_listings` batch failed preflight validation.
+    /// The `item_index` field of the returned `BatchItemError` identifies
+    /// the zero-based position of the failing item. (Issue #457)
+    BatchItemInvalid = 61,
+    /// `reconcile_listing_owner` was called with an `expected_owner` that does
+    /// not match the current effective owner of the listing. The reconciliation
+    /// is rejected so stale or concurrent updates cannot silently overwrite
+    /// each other.
+    OwnershipMismatch = 62,
+    /// `claim_royalty` was called for a settlement whose royalty for this
+    /// recipient has already been claimed.  Prevents double-payment on retry.
+    RoyaltyAlreadyClaimed = 63,
+    /// `claim_royalty` was called for a (settlement_id, is_listing, recipient)
+    /// triple that has no corresponding claim record in storage.
+    RoyaltyClaimNotFound = 64,
+    /// `buy_artwork` was called during an active reservation window by a buyer
+    /// who is not the reserved address (`reserved_for`).
+    ReservationWindowActive = 65,
+    /// `set_listing_reservation` was called with an invalid window:
+    /// `reservation_end <= reservation_start`, or `reservation_end` is in the past.
+    InvalidReservationWindow = 66,
+}
+
+/// One pending or completed royalty claim for a single recipient.
+///
+/// Written at settlement time, updated (claimed → true) when the recipient
+/// pulls their payment via `claim_royalty`.  The separate write-before-transfer
+/// ordering means the payout status is always queryable via `get_royalty_claim`
+/// even in the hypothetical case where a future upgrade interrupts settlement
+/// mid-distribution.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoyaltyClaimRecord {
+    pub settlement_id: u64,
+    /// `true` when the settlement was a fixed-price listing or offer acceptance;
+    /// `false` when it was an auction finalization.
+    pub is_listing: bool,
+    pub recipient: Address,
+    pub token: Address,
+    pub amount: i128,
+    /// `true` once the recipient has successfully called `claim_royalty` (or the
+    /// direct transfer at settlement time succeeded and the record was auto-marked).
+    pub claimed: bool,
+    /// Ledger sequence at which the claim record was written (settlement time).
+    pub created_at: u32,
+    /// Ledger sequence at which the claim was redeemed; `None` while unclaimed.
+    pub claimed_at: Option<u32>,
 }
 
 #[contracttype]
@@ -178,20 +286,72 @@ pub struct PayoutPlan {
 
 #[contracttype]
 #[derive(Clone, Debug)]
-pub struct Listing {
-    pub listing_id: u64,
-    pub artist: Address,
+pub struct BatchCreateListingInput {
     pub price: i128,
     pub currency: Symbol,
     pub token: Address,
     pub collection: Address,
     pub token_id: u64,
+    pub quantity: u64,
+    pub recipients: soroban_sdk::Vec<Recipient>,
+    pub expires_at: Option<u64>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct BatchUpdateListingInput {
+    pub listing_id: u64,
+    pub new_price: i128,
+    pub new_token: Address,
+    pub new_recipients: soroban_sdk::Vec<Recipient>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct Listing {
+    pub listing_id: u64,
+    pub artist: Address,
+    /// Opaque base-unit amount denominated in `token` (e.g. stroops for
+    /// native XLM, or the equivalent smallest unit for a whitelisted SAC).
+    /// The contract performs no decimal scaling — see the `token` field doc
+    /// below and `Contract::validate_token_asset`. Decimal/precision policy
+    /// for display purposes lives in the off-chain token registry
+    /// (frontend `config/tokens.ts`, indexer token metadata), not on-chain.
+    pub price: i128,
+    pub currency: Symbol,
+    /// Address of the payment asset contract accepted for this listing —
+    /// either the native XLM Stellar Asset Contract or another SAC present
+    /// in the admin-managed whitelist (`get_token_whitelist`). All amounts
+    /// (`price`, bids, offer amounts) are base units of this token's own
+    /// `decimals()` (7, for both native XLM and any classic-asset SAC on
+    /// Stellar); the contract treats them as opaque i128 values and never
+    /// rescales them. Validated at write time by `is_token_whitelisted` and
+    /// `validate_token_asset` — an unsupported or obviously-wrong asset
+    /// address (e.g. equal to the collection or to this contract) is
+    /// rejected before the listing/auction/offer can ever be created, so it
+    /// can never reach settlement.
+    pub token: Address,
+    pub collection: Address,
+    pub token_id: u64,
+    /// Quantity for ERC-1155 listings (fungible editions). For ERC-721,
+    /// this is always 1 (single NFT).
+    pub quantity: u64,
     pub recipients: soroban_sdk::Vec<Recipient>,
     pub status: ListingStatus,
     pub owner: Option<Address>,
     pub created_at: u32,
     pub protocol_fee_bps: u32,
     pub expires_at: Option<u64>,
+    /// Address that has the exclusive right to purchase during the reservation
+    /// window. `None` means no reservation is active.
+    pub reserved_for: Option<Address>,
+    /// Ledger timestamp at which the reservation window opens (inclusive).
+    /// `None` means the window has already started (i.e. effective immediately).
+    pub reservation_start: Option<u64>,
+    /// Ledger timestamp at which the reservation window closes (exclusive).
+    /// Once `now >= reservation_end`, the listing is open to any buyer.
+    /// `None` means no reservation end is set.
+    pub reservation_end: Option<u64>,
 }
 
 #[contracttype]
@@ -235,6 +395,10 @@ pub struct Auction {
     pub max_extensions: u32,
     /// Running count of extensions applied so far.
     pub extension_count: u32,
+    /// Original end time set at auction creation, used to enforce the
+    /// maximum total auction duration cap. Extensions cannot push end_time
+    /// beyond original_end_time + MAX_TOTAL_AUCTION_DURATION.
+    pub original_end_time: u64,
 }
 
 #[contracttype]
@@ -265,4 +429,50 @@ pub struct Offer {
     pub status: OfferStatus,
     pub created_at: u32,
     pub expires_at: Option<u64>,
+}
+
+/// Identifies which standard a deployed collection implements.
+///
+/// Returned by collection contracts via `contract_type()` so the marketplace
+/// can enforce quantity-semantic compatibility at listing creation. (Issue #458)
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CollectionStandard {
+    /// ERC-721-equivalent single-token collection (quantity must be 1).
+    Erc721,
+    /// ERC-1155-equivalent multi-edition collection (quantity >= 1).
+    Erc1155,
+    /// Lazy-mint ERC-721 variant (quantity must be 1).
+    LazyMint721,
+    /// Lazy-mint ERC-1155 variant (quantity >= 1).
+    LazyMint1155,
+}
+
+/// Returned by `create_listings` when any item in the batch fails preflight
+/// validation.  Carries the zero-based index of the failing item so clients
+/// can surface the exact problematic entry without guessing. (Issue #457)
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchItemError {
+    /// Zero-based index of the item that failed.
+    pub item_index: u32,
+    /// The marketplace error code that describes the failure.
+    pub error_code: u32,
+}
+
+/// Snapshot of the three-axis pause state for a given (collection, function) context.
+///
+/// Returned by `get_pause_matrix` for off-chain monitoring and emergency tooling.
+/// `any_paused` is the same predicate used by `require_not_paused_ctx` internally.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PauseMatrix {
+    /// Global circuit-breaker (`admin_pause` / `admin_unpause`).
+    pub global: bool,
+    /// True when the queried collection is individually paused.
+    pub collection_paused: bool,
+    /// True when the queried function name is individually paused.
+    pub function_paused: bool,
+    /// True when ANY of the three axes is active (mirrors `require_not_paused_ctx`).
+    pub any_paused: bool,
 }

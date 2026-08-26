@@ -1,10 +1,36 @@
 use soroban_sdk::{symbol_short, Address, BytesN, Env};
 
+// ── Event Schema Versioning (Issue #278) ────────────────────────────────────
+//
+// This mirrors the policy documented at the top of
+// `contracts/soroban-marketplace/src/events.rs`: event shapes only ever
+// change additively, numeric encodings are fixed once chosen, and topics are
+// never reused for a different payload shape.
+//
+// Only `publish_deploy` is versioned today because it is the only launchpad
+// event the indexer currently decodes (`indexer/src/parser.ts` `TOPIC_MAP`
+// maps `dep_n721` / `dep_n1155` / `dep_l721` / `dep_l1155` to
+// `DEPLOY_NORMAL_721` etc.). The other events below (fee collection, admin
+// rotation, pause, wasm-hash updates) are emitted for on-chain audit history
+// but are not yet read by the indexer; if/when indexer support is added for
+// them, follow this same convention — append `EVENT_SCHEMA_VERSION` as a new
+// trailing tuple element, never insert or reorder existing elements.
+pub const EVENT_SCHEMA_VERSION: u32 = 1;
+
+/// Emitted when a new collection is deployed via the launchpad.
+///
+/// Topics: ("deploy", kind_tag)
+/// Data:   (creator: Address, deployed_address: Address, schema_version: u32)
+///
+/// `schema_version` was appended additively (Issue #278) as the 3rd tuple
+/// element; historical events emitted before this change only have 2
+/// elements, which the indexer's `DEPLOY_SCHEMA` still accepts (it validates
+/// `length >= 2` and only type-checks indices 0 and 1).
 #[allow(deprecated)]
 pub fn publish_deploy(env: &Env, tag: soroban_sdk::Symbol, creator: &Address, address: &Address) {
     env.events().publish(
         (symbol_short!("deploy"), tag),
-        (creator.clone(), address.clone()),
+        (creator.clone(), address.clone(), EVENT_SCHEMA_VERSION),
     );
 }
 
@@ -86,6 +112,17 @@ pub fn publish_paused(env: &Env, admin: &Address, paused: bool) {
         .publish((symbol_short!("paused"),), (admin.clone(), paused));
 }
 
+/// Emitted when the admin assigns the `EmergencyPause` role to a new address
+/// (Issue #267).
+///
+/// Topics: ("pauser", "set")
+/// Data:   (pauser: Address)
+#[allow(deprecated)]
+pub fn publish_emergency_pauser_updated(env: &Env, pauser: &Address) {
+    env.events()
+        .publish((symbol_short!("pauser"), symbol_short!("set")), pauser.clone());
+}
+
 /// Emitted when the admin records a new set of collection WASM hashes.
 ///
 /// Topics: ("wasm_set", version: u32)
@@ -107,5 +144,94 @@ pub fn publish_wasm_hashes_set(
             lazy_721.clone(),
             lazy_1155.clone(),
         ),
+    );
+}
+
+/// Emitted when the admin updates the WASM hash for a specific collection kind.
+///
+/// Topics: ("wasm_upd", kind_tag)
+/// Data:   (old_wasm: BytesN<32>, new_wasm: BytesN<32>)
+#[allow(deprecated)]
+pub fn publish_collection_wasm_updated(
+    env: &Env,
+    kind: &crate::types::CollectionKind,
+    old_wasm: &BytesN<32>,
+    new_wasm: &BytesN<32>,
+) {
+    use soroban_sdk::IntoVal;
+    let tag: soroban_sdk::Val = kind.clone().into_val(env);
+    env.events().publish(
+        (symbol_short!("wasm_upd"), tag),
+        (old_wasm.clone(), new_wasm.clone()),
+    );
+}
+
+/// Emitted when the admin upgrades a deployed collection to a new WASM hash.
+///
+/// Topics: ("col_upg", collection: Address)
+/// Data:   (from_wasm: BytesN<32>, to_wasm: BytesN<32>)
+#[allow(deprecated)]
+pub fn publish_collection_upgraded(
+    env: &Env,
+    collection: &Address,
+    from_wasm: &BytesN<32>,
+    to_wasm: &BytesN<32>,
+) {
+    env.events().publish(
+        (symbol_short!("col_upg"), collection.clone()),
+        (from_wasm.clone(), to_wasm.clone()),
+    );
+}
+
+/// Emitted when a versioned migration completes successfully.
+///
+/// Topics: ("migrated", version: String)
+/// Data:   ()
+#[allow(deprecated)]
+pub fn publish_migration_completed(env: &Env, version: &soroban_sdk::String) {
+    env.events().publish(
+        (soroban_sdk::symbol_short!("migrated"), version.clone()),
+        (),
+    );
+}
+
+/// Emitted when the admin updates the WASM hash for a specific collection kind.
+///
+/// Topics: ("wasm_upd", kind_tag)
+/// Data:   (old_wasm: BytesN<32>, new_wasm: BytesN<32>)
+#[allow(deprecated)]
+pub fn publish_collection_wasm_updated(
+    env: &Env,
+    kind: &crate::types::CollectionKind,
+    old_wasm: &BytesN<32>,
+    new_wasm: &BytesN<32>,
+) {
+    use soroban_sdk::symbol_short;
+    let tag = match kind {
+        crate::types::CollectionKind::Normal721    => symbol_short!("n721"),
+        crate::types::CollectionKind::Normal1155   => symbol_short!("n1155"),
+        crate::types::CollectionKind::LazyMint721  => symbol_short!("l721"),
+        crate::types::CollectionKind::LazyMint1155 => symbol_short!("l1155"),
+    };
+    env.events().publish(
+        (symbol_short!("wasm_upd"), tag),
+        (old_wasm.clone(), new_wasm.clone()),
+    );
+}
+
+/// Emitted when the admin upgrades an existing deployed collection contract.
+///
+/// Topics: ("coll_upg", collection_address)
+/// Data:   (from_wasm: BytesN<32>, to_wasm: BytesN<32>)
+#[allow(deprecated)]
+pub fn publish_collection_upgraded(
+    env: &Env,
+    collection_address: &Address,
+    from_wasm: &BytesN<32>,
+    to_wasm: &BytesN<32>,
+) {
+    env.events().publish(
+        (symbol_short!("coll_upg"), collection_address.clone()),
+        (from_wasm.clone(), to_wasm.clone()),
     );
 }

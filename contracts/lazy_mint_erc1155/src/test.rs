@@ -6,7 +6,7 @@ use crate::{
 };
 use ed25519_dalek::{Signer, SigningKey};
 use soroban_sdk::{
-    testutils::{Address as _, Ledger as _},
+    testutils::{Address as _, Events as _, Ledger as _},
     xdr::ToXdr,
     Address, Bytes, BytesN, Env, String, Vec,
 };
@@ -34,6 +34,7 @@ fn setup(fee_bps: u32) -> (Env, LazyMint1155Client<'static>, Address, Address) {
         &Address::generate(&env),
         &fee_receiver,
         &fee_bps,
+        &String::from_str(&env, "Test Network; September 2015"),
     );
     (env, client, creator, fee_receiver)
 }
@@ -114,6 +115,7 @@ fn digest_byte_layout_is_stable() {
         &Address::generate(&env),
         &Address::generate(&env),
         &0u32,
+        &String::from_str(&env, "Test Network; September 2015"),
     );
     let currency = Address::generate(&env);
     let v = MintVoucher1155 {
@@ -724,11 +726,18 @@ fn replay_check_before_sig_verification() {
             .set(&DataKey::RedeemedVoucher(nonce), &true);
     });
 
-    // Burn should succeed and write supply = 0, not amount (3).
-    client.burn(&buyer, &buyer, &token_id, &3u128);
-
-    // total_supply must be 0, not 3 (the old unwrap_or(amount) result).
-    assert_eq!(client.total_supply(&token_id), 0u128);
+    // Replay check fires before signature verification — redeemed nonce
+    // must be rejected with VoucherAlreadyRedeemed even with a junk signature.
+    let buyer = Address::generate(&env);
+    let v = make_voucher(&env, token_id, nonce);
+    let result = client.try_redeem(
+        &buyer,
+        &v,
+        &1u128,
+        &BytesN::from_array(&env, &[0u8; 64]),
+        &empty_proof(&env),
+    );
+    assert_eq!(result, Err(Ok(Error::VoucherAlreadyRedeemed)));
 }
 
 // ─── Issue #39 — Voucher nonce / replay protection tests ─────────────────────
@@ -841,4 +850,169 @@ fn persistent_balance_ttl_extended_on_transfer() {
             .has(&DataKey::Balance(buyer1.clone(), token_id))
     });
     assert!(still_has);
+}
+
+// ── Migration tests ───────────────────────────────────────────────────────────
+
+mod migration {
+    use super::*;
+
+    #[test]
+    fn fresh_install_migrate_records_version() {
+        let (env, client, _creator, _fee_receiver) = setup(0);
+
+        assert!(client.contract_version().is_none());
+        client.migrate();
+        assert_eq!(
+            client.contract_version(),
+            Some(String::from_str(&env, "1.0.0"))
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "Contract, #17")]
+    fn double_migrate_reverts() {
+        let (_env, client, _creator, _fee_receiver) = setup(0);
+        client.migrate();
+        client.migrate();
+    }
+
+    #[test]
+    fn migrate_emits_migrated_event() {
+        let (env, client, _creator, _fee_receiver) = setup(0);
+        client.migrate();
+
+        let events = env.events().all();
+        let found = events.events().iter().any(|e| {
+            use soroban_sdk::xdr::{ContractEventBody, ScVal};
+            if let ContractEventBody::V0(body) = &e.body {
+                body.topics.iter().any(|t| {
+                    if let ScVal::Symbol(s) = t {
+                        core::str::from_utf8(s.0.as_slice()).unwrap_or("") == "migrated"
+                    } else {
+                        false
+                    }
+                })
+            } else {
+                false
+            }
+        });
+        assert!(found, "expected 'migrated' event");
+    }
+
+    #[test]
+    fn edition_max_supply_readable_after_migrate() {
+        let (_env, client, _creator, _fee_receiver) = setup(0);
+
+        client.register_edition(&7u64, &1000u128);
+        client.migrate();
+
+        assert_eq!(client.edition_max_supply(&7u64), 1000u128);
+    }
+
+    #[test]
+    fn redeemed_voucher_readable_after_migrate() {
+        let (env, client, _creator, _fee_receiver) = setup(0);
+
+        // Register an edition and redeem a voucher pre-migration
+        client.register_edition(&0u64, &500u128);
+        client.set_public_phase();
+
+        let voucher = make_voucher(&env, 0u64, 1u64);
+        let sig = sign_voucher(&env, &client.address, &voucher);
+        let buyer = Address::generate(&env);
+
+        client.redeem(&buyer, &voucher, &1u128, &sig, &empty_proof(&env));
+
+        assert!(client.is_voucher_redeemed(&1u64));
+
+        client.migrate();
+
+        assert!(client.is_voucher_redeemed(&1u64));
+    }
+
+    #[test]
+    fn balance_readable_after_migrate() {
+        let (env, client, _creator, _fee_receiver) = setup(0);
+
+        client.register_edition(&0u64, &500u128);
+        client.set_public_phase();
+
+        let voucher = make_voucher(&env, 0u64, 10u64);
+        let sig = sign_voucher(&env, &client.address, &voucher);
+        let buyer = Address::generate(&env);
+
+        client.redeem(&buyer, &voucher, &5u128, &sig, &empty_proof(&env));
+        assert_eq!(client.balance_of(&buyer, &0u64), 5u128);
+
+        client.migrate();
+
+        assert_eq!(client.balance_of(&buyer, &0u64), 5u128);
+        assert_eq!(client.total_supply(&0u64), 5u128);
+    }
+
+    #[test]
+    fn revoked_voucher_readable_after_migrate() {
+        let (_env, client, _creator, _fee_receiver) = setup(0);
+
+        client.revoke_voucher(&88u64);
+        assert!(client.is_voucher_revoked(&88u64));
+
+        client.migrate();
+
+        assert!(client.is_voucher_revoked(&88u64));
+    }
+}
+
+// ── Security hardening regression tests (issue #6) ───────────────────────────
+
+#[test]
+fn set_approval_for_all_expiry_respected_lazy1155() {
+    let (env, client, _, _) = setup(0);
+    let owner = Address::generate(&env);
+    let op = Address::generate(&env);
+    client.set_approval_for_all(&owner, &op, &true, &Some(100u32));
+    assert!(client.is_approved_for_all(&owner, &op));
+    env.ledger().with_mut(|li| li.sequence_number = 200);
+    assert!(!client.is_approved_for_all(&owner, &op));
+}
+
+#[test]
+fn set_approval_for_all_past_expiry_rejected_lazy1155() {
+    let (env, client, _, _) = setup(0);
+    let owner = Address::generate(&env);
+    let op = Address::generate(&env);
+    // Ledger sequence starts at 1; expiry at 1 is already reached.
+    let result = client.try_set_approval_for_all(&owner, &op, &true, &Some(1u32));
+    assert_eq!(result, Err(Ok(Error::ApprovalExpired)));
+}
+
+#[test]
+fn update_royalty_exceeds_max_bps_lazy1155() {
+    let (env, client, _, _) = setup(0);
+    let receiver = Address::generate(&env);
+    let result = client.try_update_royalty(&receiver, &10_001u32);
+    assert_eq!(result, Err(Ok(Error::InvalidBps)));
+}
+
+#[test]
+fn batch_transfer_empty_fails_lazy1155() {
+    let (env, client, _, _) = setup(0);
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    let result = client.try_batch_transfer(&alice, &alice, &bob, &Vec::new(&env), &Vec::new(&env));
+    assert_eq!(result, Err(Ok(Error::EmptyBatch)));
+}
+
+#[test]
+fn batch_transfer_zero_amount_fails_lazy1155() {
+    let (env, client, _, _) = setup(0);
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    let mut ids: Vec<u64> = Vec::new(&env);
+    ids.push_back(0u64);
+    let mut amounts: Vec<u128> = Vec::new(&env);
+    amounts.push_back(0u128);
+    let result = client.try_batch_transfer(&alice, &alice, &bob, &ids, &amounts);
+    assert_eq!(result, Err(Ok(Error::ZeroAmount)));
 }
