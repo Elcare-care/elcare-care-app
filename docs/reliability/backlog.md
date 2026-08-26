@@ -65,3 +65,55 @@ Impact / Likelihood / Effort / Dependency: **1–5** (see [quarterly-review-proc
 - Add rows for new findings; never delete rows — move to **Retired** with rationale.
 - After each quarterly review, update **Last reviewed**, baseline `release_id`, and scores.
 - Link GitHub issues in the **Summary** cell or in the decision record when created.
+
+---
+
+## Game Day Findings Template
+
+Game day exercises generate findings that should be added to this backlog using the template below. After each game day, populate this section and move items to the appropriate domain above.
+
+**Game Day:** [Scenario Name] - [Date]  
+**RTO Achieved:** [Yes/No] - [Actual Time] vs [Target Time]  
+**RPO Achieved:** [Yes/No] - [Actual Data Loss] vs [Target Data Loss]  
+**Data Integrity:** [Yes/No] - [Discrepancies Found]  
+
+### High Priority Findings
+
+| ID | Domain | Summary | I | L | E | D | Priority | Owner | Target | Status |
+|---|---|---|---|---|---|---|---|---|---|---|
+| REL-XXX | [Domain] | [Finding from game day] | [1-5] | [1-5] | [1-5] | [1-5] | [Score] | [Owner] | [Target] | Open |
+
+### Medium Priority Findings
+
+| ID | Domain | Summary | I | L | E | D | Priority | Owner | Target | Status |
+|---|---|---|---|---|---|---|---|---|---|---|
+| REL-XXX | [Domain] | [Finding from game day] | [1-5] | [1-5] | [1-5] | [1-5] | [Score] | [Owner] | [Target] | Open |
+
+### Low Priority Findings
+
+| ID | Domain | Summary | I | L | E | D | Priority | Owner | Target | Status |
+|---|---|---|---|---|---|---|---|---|---|---|
+| REL-XXX | [Domain] | [Finding from game day] | [1-5] | [1-5] | [1-5] | [1-5] | [Score] | [Owner] | [Target] | Open |
+
+### Process Improvements Identified
+
+- [ ] [Process improvement] - Owner: [Name] - Due: [Date]
+- [ ] [Process improvement] - Owner: [Name] - Due: [Date]
+
+### Runbook Updates Required
+
+- [ ] [Runbook name] - Update: [Description] - Owner: [Name]
+- [ ] [Runbook name] - Update: [Description] - Owner: [Name]
+
+### Automation Opportunities
+
+- [ ] [Manual process identified for automation] - Estimated effort: [Low/Medium/High]
+- [ ] [Manual process identified for automation] - Estimated effort: [Low/Medium/High]
+
+---
+
+## Recent Game Day Results
+
+| Date | Scenario | RTO Target | RTO Actual | RPO Target | RPO Actual | Data Integrity | Status |
+|------|----------|------------|------------|------------|------------|----------------|--------|
+| [Date] | [Scenario Name] | [Target] | [Actual] | [Target] | [Actual] | [Yes/No] | [Pass/Fail] |

@@ -286,6 +286,10 @@ pub enum DataKey {
     /// Global maximum listing duration in seconds (Issue #460).
     /// When set, `expires_at` must be at most `now + MaxListingDuration`.
     MaxListingDuration,
+    /// Per-recipient royalty claim record (Issue #461).
+    /// Keyed by (settlement_id, is_listing, recipient_address).
+    /// Written at settlement, marked claimed after successful payout.
+    RoyaltyClaim(u64, bool, Address),
 }
 
 /// Custody record for an NFT held by the marketplace, keyed by
@@ -1143,6 +1147,30 @@ pub enum TokenWhitelistState {
     NeverAdded,
 }
 
+/// XDR-safe wrapper around `Option<TokenWhitelistEntry>`.
+///
+/// Soroban SDK 25.3.0 cannot derive XDR serialization for
+/// `Option<CustomContractType>` inside a `#[contracttype]` struct.
+/// This enum carries the same semantics with helper methods that match the
+/// `Option` API used in tests and the indexer.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub enum OptionalTokenWhitelistEntry {
+    Entry(TokenWhitelistEntry),
+    Empty,
+}
+
+impl OptionalTokenWhitelistEntry {
+    pub fn is_none(&self) -> bool { matches!(self, Self::Empty) }
+    pub fn is_some(&self) -> bool { matches!(self, Self::Entry(_)) }
+    pub fn unwrap(self) -> TokenWhitelistEntry {
+        match self {
+            Self::Entry(e) => e,
+            Self::Empty => panic!("called unwrap on OptionalTokenWhitelistEntry::Empty"),
+        }
+    }
+}
+
 /// Complete policy snapshot for one token address. Returned by the
 /// `get_token_whitelist_policy` view so operators and the indexer can query
 /// the full registry state in one call without reconstructing it client-side.
@@ -1157,8 +1185,8 @@ pub struct TokenWhitelistPolicyResult {
     /// Equivalent to `state == Active || (state == NeverAdded && count == 0)`.
     pub is_accepted: bool,
     /// The full registry entry when the token has ever been whitelisted,
-    /// `None` when `state == NeverAdded`.
-    pub entry: Option<TokenWhitelistEntry>,
+    /// `Empty` when `state == NeverAdded`.
+    pub entry: OptionalTokenWhitelistEntry,
     /// Total number of tokens ever registered (monotonically increasing).
     /// Useful context for callers building pagination UIs.
     pub total_registered: u64,
@@ -1183,11 +1211,16 @@ pub fn evaluate_token_policy(env: &Env, token: &Address) -> TokenWhitelistPolicy
         }
     };
 
+    let entry_opt = match entry {
+        Some(e) => OptionalTokenWhitelistEntry::Entry(e),
+        None => OptionalTokenWhitelistEntry::Empty,
+    };
+
     TokenWhitelistPolicyResult {
         token: token.clone(),
         state,
         is_accepted,
-        entry,
+        entry: entry_opt,
         total_registered: total,
     }
 }
@@ -1989,4 +2022,46 @@ pub fn assert_listing_duration_policy(env: &Env, expires_at: Option<u64>) {
             panic_with_error!(env, MarketplaceError::InvalidListingDuration);
         }
     }
+}
+
+// ── Royalty claim records (Issue #461) ──────────────────────────────────────
+//
+// One `RoyaltyClaimRecord` per (settlement_id, is_listing, recipient) triple.
+// Written atomically with settlement and marked `claimed = true` immediately
+// after the direct token transfer succeeds. This gives operators a queryable
+// payout status for every settlement participant and provides a safe recovery
+// path if distribution is ever interrupted by a future contract upgrade.
+//
+// TTL: same as OFFER_TTL_LEDGERS — records are operational data, not archival,
+// and the `extend_active_ttls` maintenance sweep can bump them as needed.
+
+pub fn set_royalty_claim(
+    env: &Env,
+    settlement_id: u64,
+    is_listing: bool,
+    recipient: &Address,
+    record: &crate::types::RoyaltyClaimRecord,
+) {
+    let key = DataKey::RoyaltyClaim(settlement_id, is_listing, recipient.clone());
+    env.storage().persistent().set(&key, record);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, LEDGER_TTL_THRESHOLD, OFFER_TTL_LEDGERS);
+}
+
+pub fn get_royalty_claim(
+    env: &Env,
+    settlement_id: u64,
+    is_listing: bool,
+    recipient: &Address,
+) -> Option<crate::types::RoyaltyClaimRecord> {
+    let key = DataKey::RoyaltyClaim(settlement_id, is_listing, recipient.clone());
+    let value = env
+        .storage()
+        .persistent()
+        .get::<DataKey, crate::types::RoyaltyClaimRecord>(&key);
+    if value.is_some() {
+        bump_entry_ttl(env, &key);
+    }
+    value
 }

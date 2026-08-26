@@ -9,11 +9,12 @@ import { fileURLToPath } from 'node:url';
 import yaml from 'yaml';
 import swaggerUi from 'swagger-ui-express';
 import routes, { closeSSEClients } from './api/routes.js';
+import auditRoutes from './api/audit-routes.js';
 import { startPolling, registerShutdownHook, stopPoller, gracefulShutdown } from './poller.js';
 import { rateLimiter, globalRateLimiter } from './api/rate-limit-middleware.js';
 import { metricsMiddleware, handleMetrics, requestLogger } from './metrics.js';
 import { isStalled } from './stall.js';
-import { authMiddleware } from './api/auth-middleware.js';
+import { authMiddleware, setPrismaClient } from './api/auth-middleware.js';
 import { errorHandler } from './api/errors.js';
 import { startReconciler } from './reconciler.js';
 import { validateRequiredEnv, loadKeeperConfig, loadConfig } from './config.js';
@@ -47,6 +48,9 @@ try {
 const cfg  = loadConfig();
 const app  = express();
 const PORT = process.env.PORT || 4000;
+
+// Initialize Prisma client for audit logging
+setPrismaClient(prisma);
 
 // ── CORS ──────────────────────────────────────────────────────────────────────
 const corsOrigins = parseCorsOrigins(process.env.CORS_ORIGIN);
@@ -82,6 +86,7 @@ app.use('/', docsRouter);
 
 // API routes
 app.use('/', routes);
+app.use('/', auditRoutes);
 
 // Sentry error handler must come before the custom error handler
 Sentry.setupExpressErrorHandler(app);
