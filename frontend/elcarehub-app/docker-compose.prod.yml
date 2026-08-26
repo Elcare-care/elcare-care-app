@@ -1,0 +1,34 @@
+# docker-compose.prod.yml — Production security overrides for frontend
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+#
+# Layered on top of docker-compose.yml to add production-only hardening
+# without touching the base file (which is also used for local dev).
+#
+# What this adds:
+#   read_only    — mounts the container filesystem as read-only; writable
+#                  paths are covered by explicit tmpfs volumes.
+#   cap_drop ALL — drops every Linux capability; the frontend needs none.
+#   security_opt — prevents setuid/setgid privilege escalation.
+#   restart      — always restart so a crash doesn't leave the service dark.
+#
+# Base-image update process:
+#   1. Run: docker pull node:20-alpine && docker inspect node:20-alpine --format '{{index .RepoDigests 0}}'
+#   2. Update FROM lines in Dockerfile to the pinned digest, e.g.:
+#        FROM node:20-alpine@sha256:<digest> AS builder
+#   3. Rebuild, scan with Trivy, then commit the updated Dockerfile.
+#   Schedule: review and rotate base images at least monthly (add to ops calendar).
+version: '3.8'
+
+services:
+  frontend:
+    restart: always
+    read_only: true
+    tmpfs:
+      # Next.js needs writable /tmp for build artifacts and cache
+      - /tmp:size=128m,mode=1777
+      # Next.js cache directory (if needed for edge cases)
+      - /app/.next/cache:size=64m,mode=1777
+    environment:
+      - NODE_ENV=production

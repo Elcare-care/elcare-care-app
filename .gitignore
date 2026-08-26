@@ -68,6 +68,10 @@ PR-217-TTL-Management.md
 PR-issue-215.md
 PR-issue-216.md
 PR_ISSUE_218.md
+PR_DESCRIPTION_560.md
+PR_DESCRIPTION_561.md
+PR-563-game-day-scenario.md
+PR-562-docker-hardening.md
 
 # Issue notes (local reference only)
 ISSUE_068_NOTES.md
@@ -94,3 +98,9 @@ coverage/
 *.tmp
 *.bak
 *.orig
+
+# Locally generated SBOMs (scripts/sbom/generate-all.sh) — CI generates and
+# uploads these fresh on every run; local runs are for iteration/debugging.
+/sbom-*.cdx.json
+/sbom-*.meta.json
+/cargo-metadata.json

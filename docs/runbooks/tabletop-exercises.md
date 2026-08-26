@@ -105,7 +105,41 @@ No live systems are modified during a tabletop exercise.
 | Contract Pause (Exploit) | contract-pause.md | 2027-01-01 | Pending |
 | Pinata Outage | pinata-outage.md | 2027-01-01 | Pending |
 | Wallet Incompatibility | wallet-incompatibility.md | 2027-01-01 | Pending |
-| Secret Leaked in Git | secret-inventory.md | 2027-01-01 | Pending |
+|| Secret Leaked in Git | secret-inventory.md | 2027-01-01 | Pending |
+|| Combined Infrastructure Failure | game-day-scenario-combined-failure.md | 2026-11-15 | Pending |
+
+---
+
+## Game Day Exercises
+
+Game day exercises differ from tabletop exercises by involving **live system modifications** in a staging environment. While tabletops are discussion-based, game days test actual recovery procedures with real infrastructure.
+
+**Frequency:** Quarterly  
+**Duration:** 90-120 minutes  
+**Environment:** Staging only (never production)  
+
+**Current Game Day Scenario:**
+- **[Combined Infrastructure Failure](./game-day-scenario-combined-failure.md)** — Tests simultaneous indexer loss, database restore, RPC provider change, and SSE reconnection
+
+**Game Day vs Tabletop:**
+
+| Aspect | Tabletop Exercise | Game Day Exercise |
+|--------|------------------|-------------------|
+| **Environment** | Discussion only, no system changes | Live staging environment |
+| **Duration** | 60-90 minutes | 90-120 minutes |
+| **Focus** | Decision-making and runbook familiarity | Execution speed and procedure validation |
+| **Risk** | Zero risk to systems | Staging only, production unaffected |
+| **Evidence** | Notes and findings | Metrics, logs, and system state |
+| **Outcome** | Process improvements | RTO/RPO validation, automation opportunities |
+
+**Game Day Prerequisites:**
+- Staging environment matching production configuration
+- Recent backup available for restore testing
+- Multiple RPC providers configured
+- Monitoring and alerting operational
+- All participants have required access
+
+**See [Game Day Scenario: Combined Infrastructure Failure](./game-day-scenario-combined-failure.md)** for the complete scenario including objectives, roles, success measures, and detailed implementation procedures.
 
 ---
 

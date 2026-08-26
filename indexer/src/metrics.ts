@@ -484,6 +484,77 @@ export const reconcilerSkippedTotal = new client.Counter({
   labelNames: ['reason'],
 });
 
+// ── Financial reconciliation metrics (Issue #XXX) ─────────────────────────────
+
+/** Total financial reconciliation runs completed, by outcome. */
+export const financialReconcileRunsTotal = new client.Counter({
+  name: 'financial_reconcile_runs_total',
+  help: 'Total financial reconciliation runs completed, by outcome (ok | error)',
+  labelNames: ['outcome', 'dry_run'],
+});
+
+/** Total financial drifts detected, by entity type and severity. */
+export const financialDriftsDetectedTotal = new client.Counter({
+  name: 'financial_drifts_detected_total',
+  help: 'Total financial drifts detected during reconciliation, by entity type and severity',
+  labelNames: ['entity_type', 'severity'],
+});
+
+/** Total financial alerts raised, by entity type. */
+export const financialAlertsRaisedTotal = new client.Counter({
+  name: 'financial_alerts_raised_total',
+  help: 'Total financial alerts raised during reconciliation, by entity type',
+  labelNames: ['entity_type'],
+});
+
+/** Current number of unresolved financial drifts, by severity. */
+export const financialDriftsOpenGauge = new client.Gauge({
+  name: 'financial_drifts_open',
+  help: 'Current number of unresolved financial drifts, by severity',
+  labelNames: ['severity'],
+});
+
+/** Protocol-level aggregate totals for reconciliation verification. */
+export const financialProtocolAggregateGauge = new client.Gauge({
+  name: 'financial_protocol_aggregate',
+  help: 'Protocol-level aggregate totals for financial reconciliation verification',
+  labelNames: ['metric'], // protocol_fees, royalties, sales, refunds
+});
+
+/** Per-token aggregate totals for reconciliation verification. */
+export const financialTokenAggregateGauge = new client.Gauge({
+  name: 'financial_token_aggregate',
+  help: 'Per-token aggregate totals for financial reconciliation verification',
+  labelNames: ['token', 'metric'],
+});
+
+/** Per-collection aggregate totals for reconciliation verification. */
+export const financialCollectionAggregateGauge = new client.Gauge({
+  name: 'financial_collection_aggregate',
+  help: 'Per-collection aggregate totals for financial reconciliation verification',
+  labelNames: ['collection', 'metric'],
+});
+
+/** Per-ledger aggregate totals for reconciliation verification. */
+export const financialLedgerAggregateGauge = new client.Gauge({
+  name: 'financial_ledger_aggregate',
+  help: 'Per-ledger aggregate totals for financial reconciliation verification',
+  labelNames: ['ledger_sequence', 'metric'],
+});
+
+/** Duration of financial reconciliation runs in seconds. */
+export const financialReconcileDurationSeconds = new client.Histogram({
+  name: 'financial_reconcile_duration_seconds',
+  help: 'Duration of financial reconciliation runs in seconds',
+  buckets: [1, 5, 10, 30, 60, 120, 300],
+});
+
+/** Age in seconds of the oldest unresolved financial drift. */
+export const financialDriftOldestAgeSeconds = new client.Gauge({
+  name: 'financial_drift_oldest_age_seconds',
+  help: 'Age in seconds of the oldest unresolved financial drift (0 when none)',
+});
+
 // ── Expose metrics handler ────────────────────────────────────────────────────
 
 export async function handleMetrics(req: express.Request, res: express.Response) {

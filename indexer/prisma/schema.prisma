@@ -830,68 +830,116 @@ model OperationalAudit {
   @@index([requestId])
 }
 
-// ── Privacy requests (Issue #543) ─────────────────────────────────────────────
+// ── Financial Reconciliation (Issue #XXX) ───────────────────────────────────────
 //
-// Self-service data export / deletion requests for off-chain, wallet-linked
-// application data (see docs/PRIVACY_POLICY.md sections 4, 6, 7).
-//
-// Wallet identity uses the same trust model as the rest of the "authenticated"
-// route class (X-Wallet-Address header, no signature challenge) — see
-// indexer/src/api/auth-middleware.ts. Because a wallet address is already the
-// caller's claimed identity everywhere else in this API, a PrivacyRequest is
-// considered VERIFIED as soon as it is created; there is no separate proof step.
-//
-// EXPORT requests: `exportPayload` holds the generated export document (JSON) once
-// COMPLETED — see generateExportForWallet() in indexer/src/api/privacy-routes.ts.
-// It contains only ELIGIBLE off-chain records plus a RETAINED section that lists
-// canonical on-chain-mirrored records by reference (ids / tx hashes) for
-// informational completeness; it never contains secrets or signatures.
-//
-// DELETION requests: processDeletionForWallet() removes/anonymises ELIGIBLE
-// off-chain rows for the wallet (e.g. previously generated export payloads) and
-// leaves canonical mirror tables (Listing, Auction, Offer, Bid, RoyaltyPayment,
-// MarketplaceEvent, OperationalAudit, ...) untouched. `retainedRecordsNote`
-// records a human-readable explanation of what could not be deleted and why.
-//
-// Never stored here: private keys, signatures, JWTs, or any other secret.
+// Tracks financial reconciliation for protocol fees, royalties, sales, and refunds.
+// Aggregates are computed per-ledger, per-token, per-collection, and protocol-wide.
+// Supports tolerance policies for provisional events and chain timing.
 
-enum PrivacyRequestType {
-  EXPORT
-  DELETION
+enum FinancialReconcileStatus {
+  Pending
+  Matched
+  DriftDetected
+  AlertRaised
+  Resolved
 }
 
-enum PrivacyRequestStatus {
-  PENDING     // created, not yet processed
-  VERIFIED    // wallet identity accepted (immediate, see note above)
-  PROCESSING  // export/deletion work in progress
-  COMPLETED   // work finished; see exportPayload / retainedRecordsNote
-  REJECTED    // request rejected before processing (e.g. invalid wallet)
-  FAILED      // processing was attempted but failed
+enum FinancialDriftSeverity {
+  Low
+  Medium
+  High
+  Critical
 }
 
-model PrivacyRequest {
-  /// Human-facing id, e.g. "PRIV-A1B2C3D4" — mirrors the SupportReport ("SUP-xxxxxxxx")
-  /// id convention used by the frontend support flow.
-  id                  String                @id
-  walletAddress       String
-  type                PrivacyRequestType
-  status              PrivacyRequestStatus  @default(PENDING)
-  requestedAt         DateTime              @default(now())
-  verifiedAt          DateTime?
+model FinancialReconcileRun {
+  id                  Int                     @id @default(autoincrement())
+  startedAt           DateTime                @default(now())
   completedAt         DateTime?
-  /// Generated export document for COMPLETED EXPORT requests. Null for DELETION
-  /// requests and for EXPORT requests that have not completed yet.
-  exportPayload       Json?
-  /// Human-readable explanation of canonical/legal data that was retained
-  /// (not deleted) and why. Set on COMPLETED DELETION requests.
-  retainedRecordsNote String?
-  /// Non-secret audit note (e.g. "processed via self-service flow").
-  auditNote           String?
-  createdAt           DateTime              @default(now())
-  updatedAt           DateTime              @updatedAt
+  ledgerFrom          Int
+  ledgerTo            Int
+  confirmedDepth      Int                     // confirmation depth used for this run
+  toleranceBps        Int                     @default(100) // tolerance in basis points
+  includeProvisional  Boolean                 @default(false)
+  driftsDetected      Int                     @default(0)
+  alertsRaised        Int                     @default(0)
+  dryRun              Boolean                 @default(false)
+  errorMessage        String?
+  drifts              FinancialDrift[]
+  
+  @@index([startedAt])
+  @@index([ledgerFrom, ledgerTo])
+}
 
-  @@index([walletAddress])
-  @@index([walletAddress, type])
-  @@index([status])
-  @@index([requestedAt])
+model FinancialDrift {
+  id                  Int                       @id @default(autoincrement())
+  runId               Int
+  run                 FinancialReconcileRun     @relation(fields: [runId], references: [id])
+  
+  // Entity identification
+  entityType          String                    // "protocol_fee" | "royalty" | "sale" | "refund"
+  entityId            String                    // event hash or transaction ID
+  ledgerSequence      Int
+  
+  // Scope dimensions
+  token               String?
+  collection          String?
+  
+  // Expected vs actual values
+  expectedAmount      Decimal                   @db.Decimal(32, 7)
+  actualAmount        Decimal                   @db.Decimal(32, 7)
+  driftAmount         Decimal                   @db.Decimal(32, 7)
+  driftBps            Int                       // drift in basis points
+  
+  // Classification
+  severity            FinancialDriftSeverity
+  status              FinancialReconcileStatus  @default(DriftDetected)
+  reason              String                    // e.g., "missing_payout", "duplicate_payout", "wrong_token"
+  
+  // Provisional handling
+  isProvisional       Boolean                    @default(false)
+  confirmationDepth   Int?
+  
+  // Resolution tracking
+  resolvedAt          DateTime?
+  resolvedBy          String?
+  resolutionNotes     String?
+  
+  detectedAt          DateTime                  @default(now())
+  
+  @@index([runId])
+  @@index([entityType, ledgerSequence])
+  @@index([status, severity])
+  @@index([token])
+  @@index([collection])
+  @@index([isProvisional])
+  @@index([detectedAt])
+}
+
+// Materialized view refresh tracking (managed by application, not Prisma)
+model FinancialAggregateSnapshot {
+  id                  Int                       @id @default(autoincrement())
+  snapshotType        String                    // "per_ledger" | "per_token" | "per_collection" | "protocol"
+  scopeKey            String?                   // ledger sequence, token address, or collection address
+  ledgerFrom          Int
+  ledgerTo            Int
+  
+  // Aggregated values from events
+  protocolFeesTotal   Decimal                   @default(0) @db.Decimal(32, 7)
+  royaltiesTotal      Decimal                   @default(0) @db.Decimal(32, 7)
+  salesTotal          Decimal                   @default(0) @db.Decimal(32, 7)
+  refundsTotal        Decimal                   @default(0) @db.Decimal(32, 7)
+  
+  // Counts
+  protocolFeeCount    Int                       @default(0)
+  royaltyCount        Int                       @default(0)
+  saleCount           Int                       @default(0)
+  refundCount         Int                       @default(0)
+  
+  // Confirmation state
+  confirmedOnly       Boolean                   @default(true)
+  createdAt           DateTime                  @default(now())
+  
+  @@unique([snapshotType, scopeKey, ledgerFrom, ledgerTo, confirmedOnly])
+  @@index([snapshotType, ledgerFrom, ledgerTo])
+  @@index([scopeKey])
 }
