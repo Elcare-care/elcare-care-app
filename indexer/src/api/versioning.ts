@@ -106,6 +106,12 @@ export const OfferResponseV1 = z.object({
   currency: z.string(),
   status: z.string(),
   createdAtLedger: z.number(),
+  // Issue #528: offer expiry + escrow/refund transaction provenance, and
+  // groundwork for a future counter-offer relationship (always null today).
+  expiresAt: z.string().nullable().optional(),
+  escrowTxHash: z.string().nullable().optional(),
+  refundTxHash: z.string().nullable().optional(),
+  parentOfferId: z.string().nullable().optional(),
 });
 
 export const CollectionResponseV1 = z.object({

@@ -68,6 +68,10 @@ export const offersQuerySchema = z.object({
     .string()
     .regex(/^\d+$/, 'listing_id must be a non-negative integer')
     .optional(),
+  // Issue #528: wallet-centric offer lookups ("offers I authored") need a
+  // server-side filter so the frontend can paginate instead of resolving
+  // every offer id from the contract and filtering client-side.
+  offerer: optionalStellarAddress,
   limit:  positiveInt(100).optional(),
   offset: positiveInt(10_000).optional(),
   ...cursorFields,

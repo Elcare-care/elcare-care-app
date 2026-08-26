@@ -782,10 +782,11 @@ router.get('/auctions/:id/blocked-bidders', lightRateLimiter, async (req: Reques
 // ── GET /offers ───────────────────────────────────────────────────────────────
 
 router.get('/offers', lightRateLimiter, queryCostGuard(), validateQuery(offersQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
-  const { listing_id, limit, offset, cursor_ledger, cursor_direction } = (req as any).validatedQuery;
+  const { listing_id, offerer, limit, offset, cursor_ledger, cursor_direction } = (req as any).validatedQuery;
   try {
     const where: any = {};
     if (listing_id) where.listingId = BigInt(listing_id);
+    if (offerer) where.offerer = offerer;
 
     const direction: 'asc' | 'desc' = cursor_direction ?? 'desc';
     if (cursor_ledger !== undefined) {
@@ -795,9 +796,15 @@ router.get('/offers', lightRateLimiter, queryCostGuard(), validateQuery(offersQu
     const take = limit ?? 20;
     const skip = cursor_ledger !== undefined ? 0 : (offset ?? 0);
 
+    // COUNT query mirrors the same listing_id/offerer filters, but never the
+    // cursor bound, so X-Total-Count reflects the full matching set.
+    const countWhere: any = {};
+    if (listing_id) countWhere.listingId = BigInt(listing_id);
+    if (offerer) countWhere.offerer = offerer;
+
     const [results, total] = await Promise.all([
       prisma.offer.findMany({ where, orderBy: { updatedAtLedger: direction }, take, skip }),
-      prisma.offer.count({ where: listing_id ? { listingId: BigInt(listing_id) } : {} }),
+      prisma.offer.count({ where: countWhere }),
     ]);
 
     const nextCursor = results.length === take ? String(results[results.length - 1].updatedAtLedger) : '';

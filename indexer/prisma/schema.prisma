@@ -142,12 +142,20 @@ model Offer {
   status          OfferStatus @default(Pending)
   /// Optional expiry (ledger timestamp) after which the offer can be reclaimed. Null = never expires.
   expiresAt       BigInt?
+  /// Soroban tx hash of the escrow deposit (set from the OFFER_MADE event). Null until indexed.
+  escrowTxHash    String?
+  /// Soroban tx hash of the terminal payout/refund (accept, reject, withdraw, or reclaim). Null until indexed.
+  refundTxHash    String?
+  /// Issue #528 groundwork: offerId of the offer this one counters, when the
+  /// (not-yet-built) counter-offer flow creates one. Always null today.
+  parentOfferId   BigInt?
   createdAtLedger Int
   updatedAtLedger Int
   createdAt       DateTime    @default(now())
   updatedAt       DateTime    @updatedAt
   @@index([listingId])
   @@index([listingId, updatedAtLedger])
+  @@index([parentOfferId])
 }
 
 // ── Token whitelist registry (Issue #208) ─────────────────────────────────
