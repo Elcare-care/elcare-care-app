@@ -439,7 +439,70 @@ components:
             - message
       required:
         - error
-  parameters: {}
+  # ── Conditional GET headers (Issue #508) ──────────────────────────────────
+  # Reusable header and response definitions for ETag / conditional GET support.
+  # Applied to all cacheable endpoints so clients can implement HTTP caching
+  # without guessing at the correct header names or value formats.
+  headers:
+    ETag:
+      description: >
+        Strong ETag for the response representation.
+        Computed from SHA-256(confirmedVersion + ":" + fullUrl + ":" + jsonBody).
+        The confirmedVersion component ensures ETags are invalidated on reorg
+        and on provisional-to-confirmed event transitions, even when the raw
+        payload bytes are identical.
+      schema:
+        type: string
+        example: '"a3f8c2d1e4b7a9f0c2d4e6b8a0c1d3e5"'
+    Cache-Control:
+      description: >
+        HTTP cache directive. One of:
+          - `public, max-age=30, must-revalidate` — stable data (listings, auctions, stats)
+          - `no-cache` — provisional data that can be rolled back by a reorg
+            (activity feeds, wallet events)
+          - `no-store` — SSE streams
+      schema:
+        type: string
+        example: public, max-age=30, must-revalidate
+    Vary:
+      description: >
+        Instructs CDN / proxy caches to key on Accept-Encoding in addition to
+        the URL, so compressed and uncompressed variants are stored separately.
+      schema:
+        type: string
+        example: Accept-Encoding
+  responses:
+    NotModified:
+      description: >
+        **304 Not Modified** — The requested representation has not changed
+        since the client last fetched it.
+
+        Returned when the `If-None-Match` request header matches the current
+        ETag.  The response body is empty; clients should use their locally
+        cached copy.
+
+        The ETag can become stale (and the next revalidation will return 200)
+        in three situations:
+          1. The underlying data changed (new events, price update, etc.)
+          2. A chain reorg rolled back ledgers that the cached representation
+             was built from.
+          3. Provisional events were promoted to confirmed status, changing
+             the `confirmed` field in the response body.
+      headers:
+        ETag:
+          $ref: '#/components/headers/ETag'
+  parameters:
+    IfNoneMatch:
+      name: If-None-Match
+      in: header
+      required: false
+      description: >
+        Client's cached ETag value (obtained from a previous response's `ETag`
+        header).  When the server's current ETag matches, it returns **304 Not
+        Modified** with no body instead of re-executing the query.
+      schema:
+        type: string
+        example: '"a3f8c2d1e4b7a9f0c2d4e6b8a0c1d3e5"'
 paths:
   /listings:
     get:
@@ -691,16 +754,35 @@ paths:
       tags:
         - Activity
       summary: Get the 20 most recent marketplace events
-      description: Cached for 30 s. Returns the latest cross-marketplace activity feed.
+      description: >
+        Returns the latest cross-marketplace activity feed. Cached for 30 s.
+
+        **Conditional GET** — Supports `If-None-Match` / ETag revalidation.
+        Because this endpoint includes provisional (unconfirmed) events that
+        can be rolled back by a chain reorg, the `Cache-Control` header is
+        `no-cache`: clients must revalidate on every request, but a valid
+        `If-None-Match` match still returns **304** with no body and avoids
+        the DB query.
+      parameters:
+        - $ref: '#/components/parameters/IfNoneMatch'
       responses:
         "200":
           description: Recent events
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+            Cache-Control:
+              $ref: '#/components/headers/Cache-Control'
+            Vary:
+              $ref: '#/components/headers/Vary'
           content:
             application/json:
               schema:
                 type: array
                 items:
                   $ref: "#/components/schemas/MarketplaceEvent"
+        "304":
+          $ref: '#/components/responses/NotModified'
   /collections:
     get:
       tags:
@@ -760,9 +842,15 @@ paths:
       tags:
         - Wallets
       summary: Get activity feed for a wallet
-      description: Returns events where the address is the `actor` or appears in the
+      description: >
+        Returns events where the address is the `actor` or appears in the
         event JSON payload (buyer, artist, offerer, bidder, winner, creator).
         Rate-limited to 20 req/min.
+
+        **Conditional GET** — Supports `If-None-Match` / ETag revalidation.
+        `Cache-Control: no-cache` is set because the feed contains provisional
+        events subject to reorg rollback; clients must revalidate but a
+        matching `If-None-Match` avoids the DB query and returns **304**.
       parameters:
         - schema:
             type: string
@@ -781,15 +869,25 @@ paths:
           description: Max results (default 50, max 200)
           name: limit
           in: query
+        - $ref: '#/components/parameters/IfNoneMatch'
       responses:
         "200":
           description: Wallet event feed
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+            Cache-Control:
+              $ref: '#/components/headers/Cache-Control'
+            Vary:
+              $ref: '#/components/headers/Vary'
           content:
             application/json:
               schema:
                 type: array
                 items:
                   $ref: "#/components/schemas/MarketplaceEvent"
+        "304":
+          $ref: '#/components/responses/NotModified'
   /wallets/{address}/royalty-stats:
     get:
       tags:
@@ -817,8 +915,20 @@ paths:
       tags:
         - Stats
       summary: Get marketplace statistics
-      description: Aggregate counts and volumes. Supports an optional time window via
+      description: >
+        Aggregate counts and volumes. Supports an optional time window via
         `range` shorthand or explicit `from`/`to` ISO 8601 dates.
+
+        **Conditional GET** — Supports `If-None-Match` / ETag revalidation.
+        `Cache-Control: public, max-age=30, must-revalidate` is set.
+        The ETag is query-parameter–sensitive: `?range=day` and `?range=week`
+        produce independent ETags. A matching `If-None-Match` returns **304**
+        with no body, avoiding all aggregation queries.
+
+        The ETag is automatically invalidated after:
+          - Any new marketplace event is indexed
+          - A chain reorg rolls back ledgers
+          - Provisional events are promoted to confirmed
       parameters:
         - schema:
             type: string
@@ -847,13 +957,23 @@ paths:
           description: Window end (ISO 8601). Ignored when `range` is set.
           name: to
           in: query
+        - $ref: '#/components/parameters/IfNoneMatch'
       responses:
         "200":
           description: Marketplace statistics
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+            Cache-Control:
+              $ref: '#/components/headers/Cache-Control'
+            Vary:
+              $ref: '#/components/headers/Vary'
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/Stats"
+        "304":
+          $ref: '#/components/responses/NotModified'
         "400":
           description: Invalid date format
           content:
