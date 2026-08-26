@@ -690,6 +690,8 @@ export async function fetchAuctions(options: {
 // Bid history — paginated endpoint (Feature B)
 // ─────────────────────────────────────────────────────────────
 
+export type BidRefundStatus = 'None' | 'Refundable' | 'Claimed';
+
 export interface BidHistoryRecord {
   /** Soroban ledger sequence at which the bid was placed. */
   ledger: number;
@@ -699,6 +701,8 @@ export interface BidHistoryRecord {
   amount: string;
   /** Wall-clock timestamp derived from ledger close time (ms since epoch). */
   timestamp?: number;
+  /** Refund eligibility state from indexer (Issue #466). */
+  refundStatus?: BidRefundStatus;
 }
 
 export interface BidHistoryPage {
@@ -779,6 +783,9 @@ function parseBidRecords(raw: unknown[]): BidHistoryRecord[] {
           : typeof item.ledgerTimestamp === "string"
           ? new Date(item.ledgerTimestamp).getTime()
           : undefined,
+      refundStatus: (item.refundStatus === "None" || item.refundStatus === "Refundable" || item.refundStatus === "Claimed")
+        ? (item.refundStatus as BidRefundStatus)
+        : "None",
     }));
 }
 

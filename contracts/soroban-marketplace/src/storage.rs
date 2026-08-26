@@ -290,6 +290,10 @@ pub enum DataKey {
     /// Keyed by (settlement_id, is_listing, recipient_address).
     /// Written at settlement, marked claimed after successful payout.
     RoyaltyClaim(u64, bool, Address),
+    /// Per-bidder refund claimed flag for `refund_losing_bid` idempotency (Issue #466).
+    /// Keyed by (auction_id, bidder). Written before the token transfer (CEI).
+    /// Prevents duplicate refund claims after a terminal auction.
+    BidRefundRecord(u64, Address),
 }
 
 /// Custody record for an NFT held by the marketplace, keyed by
@@ -2064,4 +2068,36 @@ pub fn get_royalty_claim(
         bump_entry_ttl(env, &key);
     }
     value
+}
+
+// ── Bid refund idempotency records (Issue #466) ────────────────────────────
+//
+// Written by `refund_losing_bid` before the token transfer (CEI order) so a
+// crash mid-transfer cannot be exploited for a double-claim on retry.  The
+// same TTL as offer data keeps these records hot for the expected query window.
+
+/// Mark the given bidder as having claimed their refund for `auction_id`.
+///
+/// Must be called (and the storage write committed) **before** the token
+/// transfer so a failed transfer does not leave the record in a claimed state.
+pub fn mark_bid_refunded(env: &Env, auction_id: u64, bidder: &Address) {
+    let key = DataKey::BidRefundRecord(auction_id, bidder.clone());
+    env.storage().persistent().set(&key, &true);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, LEDGER_TTL_THRESHOLD, OFFER_TTL_LEDGERS);
+}
+
+/// Returns `true` when the bidder has already claimed their refund for this auction.
+pub fn is_bid_refunded(env: &Env, auction_id: u64, bidder: &Address) -> bool {
+    let key = DataKey::BidRefundRecord(auction_id, bidder.clone());
+    let claimed = env
+        .storage()
+        .persistent()
+        .get::<DataKey, bool>(&key)
+        .unwrap_or(false);
+    if claimed {
+        bump_entry_ttl(env, &key);
+    }
+    claimed
 }

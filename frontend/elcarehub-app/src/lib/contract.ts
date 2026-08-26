@@ -382,6 +382,9 @@ function parseAuctionFromScVal(raw: unknown): Auction {
     status: String(obj["status"]) as AuctionStatus,
     recipients: (obj["recipients"] as any[]).map(parseRecipient),
     created_at: Number(obj["created_at"] || 0),
+    extension_count: obj["extension_count"] != null ? Number(obj["extension_count"]) : 0,
+    max_extensions: obj["max_extensions"] != null ? Number(obj["max_extensions"]) : 0,
+    original_end_time: obj["original_end_time"] != null ? Number(obj["original_end_time"]) : undefined,
   };
 }
 
@@ -934,6 +937,40 @@ export async function finalizeAuction(
   ];
 
   await invokeContract(callerPublicKey, "finalize_auction", args);
+  return true;
+}
+
+/**
+ * update_auction_reserve_price — Creator updates the reserve price of a no-bid
+ * active auction (Issue #467).
+ */
+export async function updateAuctionReservePrice(
+  creatorPublicKey: string,
+  auctionId: number,
+  newPrice: bigint
+): Promise<boolean> {
+  const args: xdr.ScVal[] = [
+    new Address(creatorPublicKey).toScVal(),
+    nativeToScVal(BigInt(auctionId), { type: "u64" }),
+    nativeToScVal(newPrice, { type: "i128" }),
+  ];
+  await invokeContract(creatorPublicKey, "update_auction_reserve_price", args);
+  return true;
+}
+
+/**
+ * refund_losing_bid — Losing bidder claims their escrowed amount from a
+ * terminal auction (Issue #466). Idempotent: second call returns a stable error.
+ */
+export async function refundLosingBid(
+  bidderPublicKey: string,
+  auctionId: number
+): Promise<boolean> {
+  const args: xdr.ScVal[] = [
+    new Address(bidderPublicKey).toScVal(),
+    nativeToScVal(BigInt(auctionId), { type: "u64" }),
+  ];
+  await invokeContract(bidderPublicKey, "refund_losing_bid", args);
   return true;
 }
 
