@@ -400,7 +400,25 @@ export function ListingForm({ listing, onSuccess, onCancel }: ListingFormProps) 
             category: currentMetadata.category ?? "",
             currentMetadata,
           }),
-        { action: "Update listing" }
+        {
+          action: "Update listing",
+          // Issue #524 — fingerprint on the listing id + the fields that
+          // actually change on-chain, so editing a *different* listing (or
+          // a different price/token on the same one) is never deduplicated
+          // against an in-flight update of this one.
+          dedupe: {
+            account: publicKey,
+            network: config.networkPassphrase,
+            contract: config.contractId,
+            args: {
+              listingId: listing.listing_id,
+              price: form.price,
+              tokenAddress: form.tokenAddress,
+              collectionAddress: form.collectionAddress,
+              nftTokenId: form.nftTokenId,
+            },
+          },
+        }
       );
       if (success) {
         setSuccessId(listing.listing_id);
@@ -416,7 +434,21 @@ export function ListingForm({ listing, onSuccess, onCancel }: ListingFormProps) 
             tokenAddress: form.tokenAddress,
             recipients: form.recipients,
           }),
-        { action: "Create listing" }
+        {
+          action: "Create listing",
+          dedupe: {
+            account: publicKey,
+            network: config.networkPassphrase,
+            contract: config.contractId,
+            args: {
+              collectionAddress: form.collectionAddress,
+              nftTokenId: form.nftTokenId,
+              price: form.price,
+              tokenAddress: form.tokenAddress,
+              recipients: form.recipients,
+            },
+          },
+        }
       );
       if (id !== null) {
         setSuccessId(id as number);

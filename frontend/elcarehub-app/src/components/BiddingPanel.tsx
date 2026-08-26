@@ -12,6 +12,7 @@ import { useFinalizeAuction } from "@/hooks/useAuctions";
 import { GuardButton } from "@/components/WalletGuard";
 import { TxErrorPanel } from "@/components/TxErrorPanel";
 import { useTxLifecycle, txStateLabel, isTxActive } from "@/hooks/useTxLifecycle";
+import { config } from "@/lib/config";
 import Link from "next/link";
 import {
   Gavel,
@@ -123,9 +124,20 @@ export function BiddingPanel({
     const amount = parseFloat(bidAmount);
     if (isNaN(amount) || bidValidation) return;
 
+    // Issue #524 — fingerprint includes the bid amount, so a genuinely
+    // different bid is never deduplicated against a pending one, while a
+    // double-click / remount with the exact same amount is.
     const success = await run(
       () => bid(auction.auction_id, amount),
-      { action: "Bid" }
+      {
+        action: "Bid",
+        dedupe: {
+          account: publicKey,
+          network: config.networkPassphrase,
+          contract: config.contractId,
+          args: { auctionId: auction.auction_id, amount },
+        },
+      }
     );
     if (success) {
       setBidSuccess(true);
@@ -137,7 +149,15 @@ export function BiddingPanel({
   const handleFinalize = async () => {
     const success = await run(
       () => finalize(auction.auction_id),
-      { action: "Finalize auction" }
+      {
+        action: "Finalize auction",
+        dedupe: {
+          account: publicKey,
+          network: config.networkPassphrase,
+          contract: config.contractId,
+          args: { auctionId: auction.auction_id },
+        },
+      }
     );
     if (success) {
       onFinalized?.();

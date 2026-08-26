@@ -14,6 +14,10 @@
 //     indexer_delay, unknown)
 //   - Duplicate-submission guard: a run() call while one is already active
 //     returns null immediately without starting a second submission
+//   - Issue #524: optional cross-remount/reload/tab intent deduplication —
+//     pass `dedupe` to fingerprint the call (action + account + network +
+//     contract + args) and short-circuit an identical in-flight submission
+//     instead of resubmitting it, even across a page reload or another tab
 //   - Cancellation: an in-progress run can be aborted via the returned abort()
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -21,6 +25,15 @@
 
 import { useCallback, useRef, useState, useEffect } from "react";
 import { lookupTxOnRpc } from "@/lib/txLookup";
+import {
+  beginIntent,
+  updateIntentStatus,
+  clearIntent,
+  getIntent,
+  subscribeToIntentChanges,
+  intentScopeKey,
+  DEFAULT_INTENT_WINDOW_MS,
+} from "@/lib/txIntentDedup";
 
 // ── State model ───────────────────────────────────────────────────────────────
 
@@ -68,6 +81,33 @@ export interface TxLifecycleState {
 
 // ── Options ───────────────────────────────────────────────────────────────────
 
+/**
+ * Issue #524 — client-side transaction intent deduplication.
+ *
+ * When supplied, `run()` fingerprints the call from `action` + `account` +
+ * `network` + `contract` + `args` before invoking `fn`. If an identical
+ * intent is already pending — in this component instance, in another
+ * mounted instance, recovered after a page reload, or in another browser
+ * tab — `fn` is never invoked a second time; the hook instead recovers the
+ * in-flight intent's known state (including its tx hash once broadcast).
+ *
+ * Different prices/accounts/assets/contracts hash differently and are never
+ * deduplicated together. A terminal outcome (success or error) clears the
+ * intent immediately so an intentional retry is never blocked.
+ */
+export interface TxIntentDedupeOptions {
+  /** Signing account (public key). Dedup is skipped when null/empty. */
+  account: string | null | undefined;
+  /** Network identifier (e.g. passphrase) that scopes the dedup registry. */
+  network: string;
+  /** Target contract id, when the action invokes one specific contract. */
+  contract?: string | null;
+  /** Distinguishing arguments — price, token id, amount, listing id, etc. */
+  args?: unknown;
+  /** Validity window in ms. Defaults to DEFAULT_INTENT_WINDOW_MS (20s). */
+  windowMs?: number;
+}
+
 export interface TxLifecycleOptions {
   /**
    * Human-readable action label used in error messages.
@@ -95,6 +135,12 @@ export interface TxLifecycleOptions {
    * Set to null to disable persistence.
    */
   persistKey?: string | null;
+
+  /**
+   * Issue #524 — intent deduplication. See {@link TxIntentDedupeOptions}.
+   * Omit or pass null to disable (default).
+   */
+  dedupe?: TxIntentDedupeOptions | null;
 }
 
 // ── Return type ───────────────────────────────────────────────────────────────
@@ -345,6 +391,17 @@ export function useTxLifecycle(
   // Resolved persist key
   const persistKeyRef = useRef<string | null>(null);
 
+  // Issue #524 — intent dedup: the scope of the intent registered by the
+  // *current* run() call (if any), so status updates and reset() know which
+  // registry entry to mirror/clear.
+  const dedupeScopeRef = useRef<{
+    network: string;
+    account: string;
+    fingerprint: string;
+  } | null>(null);
+  // Unsubscribe for the cross-tab watcher started when a duplicate is detected.
+  const dedupeWatchUnsubRef = useRef<(() => void) | null>(null);
+
   // On mount: check sessionStorage for a persisted pending hash.
   // If found and we are currently idle, restore indexer_pending state so
   // the user can see the status page and retry/refresh actions.
@@ -368,6 +425,50 @@ export function useTxLifecycle(
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []); // intentionally run only on mount
+
+  // Unsubscribe any active cross-tab dedup watcher on unmount.
+  useEffect(() => {
+    return () => {
+      dedupeWatchUnsubRef.current?.();
+      dedupeWatchUnsubRef.current = null;
+    };
+  }, []);
+
+  const clearDedupeWatch = useCallback(() => {
+    dedupeWatchUnsubRef.current?.();
+    dedupeWatchUnsubRef.current = null;
+  }, []);
+
+  // Issue #524 — while short-circuited on a duplicate intent, watch the
+  // registry (cross-tab, via BroadcastChannel/storage events) so this
+  // instance updates automatically once the in-flight intent resolves
+  // elsewhere: it recovers a newly-known tx hash, or returns to idle the
+  // moment the other submission reaches a terminal state and clears its
+  // entry, so the user can retry without needing to reload.
+  const watchDuplicateIntent = useCallback(
+    (network: string, account: string, fingerprint: string) => {
+      clearDedupeWatch();
+      const targetScope = intentScopeKey(network, account);
+      const unsub = subscribeToIntentChanges((changedScopeKey) => {
+        if (changedScopeKey !== targetScope) return;
+        const record = getIntent(network, account, fingerprint);
+        if (!record) {
+          // Resolved (or expired) elsewhere — unblock this instance.
+          clearDedupeWatch();
+          setTxState(INITIAL_STATE);
+          return;
+        }
+        setTxState((prev) => ({
+          ...prev,
+          txHash: record.txHash ?? prev.txHash,
+          state: record.txHash ? "confirming" : prev.state,
+          stateEnteredAt: Date.now(),
+        }));
+      });
+      dedupeWatchUnsubRef.current = unsub;
+    },
+    [clearDedupeWatch]
+  );
 
   const transition = useCallback(
     (next: Partial<TxLifecycleState>) => {
@@ -393,8 +494,19 @@ export function useTxLifecycle(
     abortControllerRef.current = null;
     const key = persistKeyRef.current;
     if (key !== null) clearPersistedTx(storageKey(key));
+
+    // Issue #524 — a manual reset always frees the dedup slot immediately,
+    // so the user can deliberately retry even from a non-terminal state
+    // (e.g. after abort()) instead of waiting out the validity window.
+    clearDedupeWatch();
+    if (dedupeScopeRef.current) {
+      const { network, account, fingerprint } = dedupeScopeRef.current;
+      clearIntent(network, account, fingerprint);
+      dedupeScopeRef.current = null;
+    }
+
     setTxState(INITIAL_STATE);
-  }, []);
+  }, [clearDedupeWatch]);
 
   const run = useCallback(
     async <T>(
@@ -408,12 +520,50 @@ export function useTxLifecycle(
         persistKey = defaultOpts.persistKey !== undefined
           ? defaultOpts.persistKey
           : STORAGE_KEY_PREFIX,
+        dedupe = opts.dedupe !== undefined ? opts.dedupe : defaultOpts.dedupe,
       } = opts;
 
-      // ── Duplicate-submission guard ─────────────────────────────────────────
+      // ── Duplicate-submission guard (same hook instance) ────────────────────
       // If a run is already active, return null immediately. This prevents
       // the user from clicking "Buy" twice and sending duplicate transactions.
       if (runningRef.current) return null;
+
+      // ── Issue #524: intent dedup guard (remount / reload / another tab) ────
+      // Distinct from the guard above: this catches the case where *this*
+      // hook instance is idle (e.g. after a remount, or in a second tab) but
+      // an identical intent — same action/account/network/contract/args — is
+      // already in flight elsewhere within its validity window.
+      if (dedupe && dedupe.account) {
+        const windowMs = dedupe.windowMs ?? DEFAULT_INTENT_WINDOW_MS;
+        const { duplicate, fingerprint, record } = beginIntent({
+          action,
+          account: dedupe.account,
+          network: dedupe.network,
+          contract: dedupe.contract ?? null,
+          args: dedupe.args,
+          windowMs,
+        });
+
+        if (duplicate) {
+          // fn() is intentionally never invoked here — that is the entire
+          // point of the guard. Recover the in-flight intent's known state
+          // instead (its tx hash, once broadcast) and watch for it to
+          // resolve so this instance updates automatically.
+          setTxState({
+            state: record.txHash ? "confirming" : "signing",
+            txHash: record.txHash,
+            error: null,
+            stateEnteredAt: Date.now(),
+          });
+          watchDuplicateIntent(dedupe.network, dedupe.account, fingerprint);
+          return null;
+        }
+
+        clearDedupeWatch();
+        dedupeScopeRef.current = { network: dedupe.network, account: dedupe.account, fingerprint };
+      } else {
+        dedupeScopeRef.current = null;
+      }
 
       runningRef.current = true;
       abortedRef.current = false;
@@ -424,6 +574,14 @@ export function useTxLifecycle(
 
       const resolvedPersistKey = persistKey !== null ? storageKey(persistKey) : null;
 
+      /** Issue #524 — mirrors a terminal outcome into the intent registry and
+       * frees the dedup slot so a retry is never blocked past this point. */
+      const finalizeDedupe = (status: "success" | "error", finalTxHash: string | null) => {
+        if (!dedupeScopeRef.current) return;
+        updateIntentStatus({ ...dedupeScopeRef.current, status, txHash: finalTxHash });
+        dedupeScopeRef.current = null;
+      };
+
       // ── Phase: simulating ──────────────────────────────────────────────────
       transition({ state: "simulating", txHash: null, error: null });
 
@@ -432,6 +590,7 @@ export function useTxLifecycle(
 
       if (abortedRef.current) {
         runningRef.current = false;
+        finalizeDedupe("error", null);
         transition({
           state: "error",
           error: { category: "unknown", message: `${action} cancelled by user.` },
@@ -452,6 +611,7 @@ export function useTxLifecycle(
         abortControllerRef.current = null;
 
         if (abortedRef.current) {
+          finalizeDedupe("error", null);
           transition({
             state: "error",
             error: { category: "unknown", message: `${action} cancelled by user.` },
@@ -461,6 +621,7 @@ export function useTxLifecycle(
 
         const category = classifyTxError(err);
         const message  = buildTxErrorMessage(err, action, category);
+        finalizeDedupe("error", null);
         transition({
           state: "error",
           error: { category, message, originalError: err },
@@ -471,6 +632,7 @@ export function useTxLifecycle(
       if (abortedRef.current) {
         runningRef.current = false;
         abortControllerRef.current = null;
+        finalizeDedupe("error", null);
         transition({
           state: "error",
           error: { category: "unknown", message: `${action} cancelled by user.` },
@@ -489,6 +651,12 @@ export function useTxLifecycle(
         persistTx(resolvedPersistKey, txHash);
       }
 
+      // Mirror the hash into the intent registry too, so a duplicate
+      // short-circuited in another tab (or after a remount) can recover it.
+      if (dedupeScopeRef.current && txHash) {
+        updateIntentStatus({ ...dedupeScopeRef.current, status: "pending", txHash });
+      }
+
       // ── Phase: confirming ──────────────────────────────────────────────────
       // Poll the Soroban RPC until the transaction is included in a ledger.
       transition({ state: "confirming", txHash });
@@ -503,7 +671,9 @@ export function useTxLifecycle(
         if (rpcOutcome === "aborted") {
           runningRef.current = false;
           abortControllerRef.current = null;
-          // Transaction may still be on-chain — do not clear the persisted hash
+          // Transaction may still be on-chain — do not clear the persisted hash,
+          // and leave the dedup entry pending for the same reason (it still
+          // carries the tx hash for cross-tab/reload recovery).
           return result;
         }
 
@@ -511,6 +681,7 @@ export function useTxLifecycle(
           if (resolvedPersistKey) clearPersistedTx(resolvedPersistKey);
           runningRef.current = false;
           abortControllerRef.current = null;
+          finalizeDedupe("error", txHash);
           transition({
             state: "error",
             txHash,
@@ -530,6 +701,7 @@ export function useTxLifecycle(
           // We couldn't confirm in time — surface as rpc_failure so the user
           // can check /tx/[hash] for the actual outcome.
           if (resolvedPersistKey) clearPersistedTx(resolvedPersistKey);
+          finalizeDedupe("error", txHash);
           runningRef.current = false;
           abortControllerRef.current = null;
           transition({
@@ -561,6 +733,7 @@ export function useTxLifecycle(
         abortControllerRef.current = null;
         // Transaction is already on-chain — transition to success
         if (resolvedPersistKey) clearPersistedTx(resolvedPersistKey);
+        finalizeDedupe("success", txHash);
         transition({ state: "success", txHash });
         return result;
       }
@@ -569,11 +742,12 @@ export function useTxLifecycle(
       if (resolvedPersistKey) clearPersistedTx(resolvedPersistKey);
       runningRef.current = false;
       abortControllerRef.current = null;
+      finalizeDedupe("success", txHash);
       transition({ state: "success", txHash });
 
       return result;
     },
-    [defaultOpts, transition]
+    [defaultOpts, transition, watchDuplicateIntent, clearDedupeWatch]
   );
 
   const isActive =
