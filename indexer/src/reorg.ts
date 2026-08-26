@@ -32,6 +32,8 @@
 import { logger } from './logger.js';
 import prisma from './prisma-write.js';
 import { emitSSEEvent } from './api/routes.js';
+import { bumpConfirmedVersion } from './api/etag-middleware.js';
+import { invalidateStats, invalidateAllActivity } from './cache-invalidation.js';
 
 // ── Confirmation promotion ────────────────────────────────────────────────────
 
@@ -55,6 +57,10 @@ export async function promoteConfirmedEvents(
       where: { confirmed: false },
       data: { confirmed: true },
     });
+    if (result.count > 0) {
+      bumpConfirmedVersion();
+      await Promise.all([invalidateStats(), invalidateAllActivity()]).catch(() => {});
+    }
     return result.count;
   }
 
@@ -75,6 +81,24 @@ export async function promoteConfirmedEvents(
       threshold,
       networkTip,
       confirmationDepth,
+    });
+
+    // Issue #508: provisional→confirmed transition changes the "confirmed" field
+    // in the response body, so all cached ETags derived from those representations
+    // are now stale.  Bump the global version counter so the next request produces
+    // a different ETag even when the raw DB payload bytes are identical.
+    bumpConfirmedVersion();
+
+    // Invalidate stats and activity cache keys whose responses may now include
+    // newly-confirmed events that were previously filtered or labelled provisional.
+    await Promise.all([
+      invalidateStats(),
+      invalidateAllActivity(),
+    ]).catch((err) => {
+      // Non-fatal — Redis unavailability must not stall the poller.
+      logger.warn('reorg: cache invalidation after promotion failed', {
+        err: err instanceof Error ? err.message : String(err),
+      });
     });
   }
 
@@ -165,6 +189,23 @@ export async function rollbackReorg(
   });
 
   logger.info('reorg: domain rollback complete', { safeAtLedger });
+
+  // Issue #508: every cached ETag that was computed from data at ledgers
+  // > safeAtLedger is now invalid.  Bump the confirmed-version counter so
+  // subsequent requests (even for unchanged data) receive a new ETag and
+  // clients are forced to re-validate.
+  bumpConfirmedVersion();
+
+  // Broad cache purge: stats aggregates, activity feeds, and wallet views may
+  // all reference events that were just rolled back.
+  await Promise.all([
+    invalidateStats(),
+    invalidateAllActivity(),
+  ]).catch((err) => {
+    logger.warn('reorg: cache invalidation after rollback failed', {
+      err: err instanceof Error ? err.message : String(err),
+    });
+  });
 
   // Emit SSE correction event so connected clients know to flush their state
   emitReorgSseEvent(safeAtLedger);

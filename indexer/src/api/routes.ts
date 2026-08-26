@@ -4,7 +4,7 @@ import prisma from '../db.js';
 import redis from '../redis.js';
 import { Prisma } from '@prisma/client';
 import { cacheMiddleware } from './cache-middleware.js';
-import { etagMiddleware } from './etag-middleware.js';
+import { etagMiddleware, cacheControlForPath } from './etag-middleware.js';
 import { strictRateLimiter, sseConcurrencyGuard, heavyRateLimiter, lightRateLimiter, mediumRateLimiter, operationalRateLimiter } from './rate-limit-middleware.js';
 import {
   abuseDetection,
@@ -820,6 +820,10 @@ router.get('/activity/recent', cacheMiddleware(TTL.ACTIVITY_RECENT), async (req:
       }),
       { distributed: true },
     );
+    // Issue #508: provisional data — must revalidate on every request because
+    // a reorg could roll back any of these events.
+    res.set('Cache-Control', cacheControlForPath('/activity/recent'));
+    res.set('Vary', 'Accept-Encoding');
     res.json(serialize(results));
   } catch (err) {
     next(internalError('Failed to fetch recent activity'));
@@ -986,6 +990,9 @@ router.get('/wallets/:address/activity', strictRateLimiter, queryCostGuard(), va
     const nextCursor = events.length === take ? String(events[events.length - 1].ledgerSequence) : '';
     res.setHeader('X-Next-Cursor', nextCursor);
     res.setHeader('X-Total-Count', String(total));
+    // Issue #508: wallet activity contains provisional events; must revalidate.
+    res.set('Cache-Control', cacheControlForPath('/wallets/activity'));
+    res.set('Vary', 'Accept-Encoding');
     res.json(serialize(events));
   } catch (err) {
     next(internalError('Failed to fetch wallet activity'));
@@ -1138,6 +1145,7 @@ router.get('/stats', lightRateLimiter, queryCostGuard({ isAggregation: true }), 
     if (hasTimeFilter) salesFilter.ledgerTimestamp = eventTimeFilter;
     const totalSales = await prisma.marketplaceEvent.count({ where: salesFilter });
 
+    res.set('Vary', 'Accept-Encoding');
     res.json({
       totalListings,
       activeListings,
@@ -1852,6 +1860,7 @@ router.get('/search', mediumRateLimiter, queryCostGuard(), validateQuery(searchQ
       }
     }
 
+    res.set('Vary', 'Accept-Encoding');
     res.json(result);
   } catch (err) {
     next(internalError('Failed to execute search'));
