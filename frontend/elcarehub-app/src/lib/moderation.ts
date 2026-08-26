@@ -242,6 +242,14 @@ export function setModerationState(
 }
 
 /**
+ * Returns all moderation records currently in the store.
+ * Used by the admin moderation queue UI and the /api/moderation/queue endpoint.
+ */
+export function getAllRecords(): ModerationRecord[] {
+  return Array.from(_store.values());
+}
+
+/**
  * Returns all audit log entries for a given CID.
  */
 export function getAuditLog(cid?: string): ModerationAuditEntry[] {
@@ -251,4 +259,42 @@ export function getAuditLog(cid?: string): ModerationAuditEntry[] {
 
 function _appendAudit(entry: ModerationAuditEntry): void {
   _auditLog.push(entry);
+}
+
+// ── Development / demo seed data ─────────────────────────────
+//
+// Pre-populates the in-memory store with a few records so the
+// admin moderation queue isn't empty on first load in dev/demo.
+// These are no-ops in tests that reset the module between runs.
+
+if (process.env.NODE_ENV !== "test") {
+  // 1. A freshly uploaded image awaiting review
+  registerUpload("bafybeig000pending", "IMAGE", "GARTIST1AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+
+  // 2. A metadata CID that has received a user report
+  const reported = registerUpload(
+    "bafybeig001reported",
+    "METADATA",
+    "GARTIST2AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+  );
+  applyReport({
+    cid: reported.cid,
+    kind: "METADATA",
+    category: "MISLEADING_METADATA",
+    description: "Title does not match the artwork",
+    reporterAddress: "GREPORTER1AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+  });
+
+  // 3. An image that was manually quarantined by an admin
+  registerUpload(
+    "bafybeig002quarantined",
+    "IMAGE",
+    "GARTIST3AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+  );
+  setModerationState(
+    "bafybeig002quarantined",
+    "QUARANTINED",
+    "admin",
+    "Contains prohibited content pending full review"
+  );
 }

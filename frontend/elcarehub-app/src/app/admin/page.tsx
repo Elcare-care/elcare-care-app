@@ -10,6 +10,7 @@ import { useWallet } from "@/hooks/useWallet";
 import { useAdminStats, useModeration, useTokenManagement, useAdminCheck, useAdminTransfer, usePauseControls, useAuctionConfig, useListingOversight, PAUSABLE_FUNCTIONS, type PausableFunction } from "@/hooks/useAdmin";
 import { useAdminSession } from "@/hooks/useAdminSession";
 import { AdminConfirmationModal } from "@/components/AdminConfirmationModal";
+import ModerationQueue from "@/components/ModerationQueue";
 import {
     Users,
     Palette,
@@ -575,6 +576,11 @@ export default function AdminPage() {
                                 </div>
                             </div>
                         )}
+                    </section>
+
+                    {/* Content Moderation Queue (Issue #534) */}
+                    <section className="lg:col-span-2 rounded-3xl">
+                        <ModerationQueue />
                     </section>
 
                     {/* Treasury Balances */}
