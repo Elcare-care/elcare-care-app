@@ -199,6 +199,10 @@ model MarketplaceEvent {
   /// behind the network tip.  On reorg, events past the safe ledger are
   /// hard-deleted (provisional by definition).
   confirmed       Boolean  @default(false)
+  /// Issue #532: position of this event within its ledger transaction, used
+  /// for deterministic same-ledger ordering in the provenance timeline.
+  /// NULL for legacy rows ingested before this field was introduced.
+  eventIndex      Int?
   @@index([actor])
   @@index([eventType])
   @@index([listingId])
@@ -207,6 +211,8 @@ model MarketplaceEvent {
   @@index([contractId])
   @@index([actor, ledgerSequence])
   @@index([contractId, ledgerSequence])
+  // Issue #532: composite index for provenance timeline ordering
+  @@index([ledgerSequence, eventIndex])
   @@unique([listingId, eventType, ledgerSequence])
 }
 

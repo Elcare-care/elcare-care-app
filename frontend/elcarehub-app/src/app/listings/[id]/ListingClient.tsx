@@ -102,6 +102,8 @@ export default function ListingDetailPage({ id }: ListingClientProps) {
         error: historyError,
         hasMore,
         loadMore,
+        refresh: refreshHistory,
+        reorgDetected,
     } = useListingHistory(id ? Number(id) : null);
 
     // Price history (for sparkline chart)
@@ -426,6 +428,8 @@ export default function ListingDetailPage({ id }: ListingClientProps) {
                                     error={historyError}
                                     hasMore={hasMore}
                                     onLoadMore={loadMore}
+                                    reorgDetected={reorgDetected}
+                                    onRefresh={refreshHistory}
                                 />
                             </div>
                         )}

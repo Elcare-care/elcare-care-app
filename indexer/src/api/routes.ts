@@ -544,6 +544,24 @@ router.get('/listings/:id', lightRateLimiter, cacheMiddleware(TTL.LISTING_DETAIL
 });
 
 // ── GET /listings/:id/history ─────────────────────────────────────────────────
+//
+// Issue #532: Enhanced provenance timeline endpoint.
+// Returns a normalized NormalizedEvent[] ordered by (ledgerSequence, eventIndex)
+// so same-ledger events appear in their on-chain submission order.
+//
+// Response shape: { events: NormalizedEvent[], total: number, hasMore: boolean }
+//
+// NormalizedEvent fields:
+//   id              – string  – "evt_<db id>"
+//   eventType       – string  – raw event type from MarketplaceEvent
+//   actor           – string  – address that triggered the event
+//   data            – object  – raw JSON data blob
+//   ledgerSequence  – number  – ledger the event was recorded in
+//   ledgerTimestamp – string  – ISO-8601 timestamp (or null for legacy rows)
+//   confirmed       – boolean – true once CONFIRMATION_DEPTH ledgers behind tip
+//   txHash          – string  – from data.tx_hash, data.txHash, or "ledger_<seq>"
+//   contractId      – string  – source contract address
+//   eventIndex      – number | null – intra-ledger position (null for legacy rows)
 
 router.get('/listings/:id/history', heavyRateLimiter, abuseDetection('tx-lookup'), async (req: Request, res: Response, next: NextFunction) => {
   const id = req.params.id as string;
@@ -569,21 +587,58 @@ router.get('/listings/:id/history', heavyRateLimiter, abuseDetection('tx-lookup'
 
   try {
     const where: any = { listingId: BigInt(id) };
+
     // Issue #286: optional filter for confirmed-only events
     const confirmedOnly = (req.query as any).confirmed === 'true';
     if (confirmedOnly) {
       where.confirmed = true;
     }
+
     const [results, total] = await Promise.all([
       prisma.marketplaceEvent.findMany({
         where,
-        orderBy: { ledgerSequence: 'asc' },
+        // Issue #532: primary sort by ledger, secondary by eventIndex for
+        // deterministic same-ledger ordering.  Rows without eventIndex (legacy)
+        // sort after rows that have it within the same ledger.
+        orderBy: [
+          { ledgerSequence: 'asc' },
+          { eventIndex: { sort: 'asc', nulls: 'last' } },
+        ],
         take: limit,
         skip: offset,
       }),
       prisma.marketplaceEvent.count({ where }),
     ]);
-    res.json({ events: serialize(results), total });
+
+    // Normalize each row into the provenance timeline shape
+    const events = results.map((row: any) => {
+      const data = (row.data as Record<string, unknown>) ?? {};
+      // Prefer an explicit tx_hash stored in the data blob; fall back to a
+      // synthetic ledger-scoped identifier so TxLink still renders usefully.
+      const txHash =
+        (typeof data.tx_hash  === 'string' && data.tx_hash)  ||
+        (typeof data.txHash   === 'string' && data.txHash)   ||
+        `ledger_${row.ledgerSequence}`;
+
+      return {
+        id: `evt_${row.id}`,
+        eventType: row.eventType,
+        actor: row.actor,
+        data,
+        ledgerSequence: row.ledgerSequence,
+        ledgerTimestamp: row.ledgerTimestamp
+          ? row.ledgerTimestamp instanceof Date
+            ? row.ledgerTimestamp.toISOString()
+            : String(row.ledgerTimestamp)
+          : null,
+        confirmed: row.confirmed,
+        txHash,
+        contractId: row.contractId ?? '',
+        eventIndex: row.eventIndex ?? null,
+      };
+    });
+
+    res.json({ events, total, hasMore: offset + events.length < total });
   } catch (err) {
     next(internalError('Failed to fetch listing history'));
   }
