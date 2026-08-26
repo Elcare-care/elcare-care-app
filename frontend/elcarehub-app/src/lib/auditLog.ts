@@ -49,7 +49,10 @@ export type AuditAction =
   // Session lifecycle
   | "session.start"
   | "session.end"
-  | "session.expired";
+  | "session.expired"
+  // Content moderation (Issue #542)
+  | "moderation.decision"
+  | "moderation.appeal_decision";
 
 export type AuditOutcome = "success" | "rejected" | "failed" | "initiated";
 

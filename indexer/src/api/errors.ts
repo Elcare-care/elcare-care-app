@@ -1,5 +1,6 @@
 import { Request, Response, NextFunction } from 'express';
 import { logger } from '../logger.js';
+import { redact, redactString } from '../redact.js';
 
 export const ErrorCode = {
   BAD_REQUEST:  'BAD_REQUEST',
@@ -8,6 +9,7 @@ export const ErrorCode = {
   UNAUTHORIZED: 'UNAUTHORIZED',
   FORBIDDEN:    'FORBIDDEN',
   RATE_LIMITED: 'RATE_LIMIT_EXCEEDED',
+  QUERY_TOO_EXPENSIVE: 'QUERY_TOO_EXPENSIVE',
 } as const;
 
 export type ErrorCode = (typeof ErrorCode)[keyof typeof ErrorCode];
@@ -115,7 +117,9 @@ export function errorHandler(
   const body: ErrorBody = {
     error: {
       code:    apiErr.code,
-      message: apiErr.message,
+      // Redacted so a secret shape (Stellar key, DB URL, Pinata token, ...)
+      // accidentally interpolated into an error message never reaches the client.
+      message: redactString(apiErr.message),
       class:   errorClass,
       // Include correlation ID so clients can reference it when reporting issues.
       ...(requestId ? { requestId } : {}),
@@ -124,7 +128,7 @@ export function errorHandler(
 
   // Surface structured validation details for 4xx but never for 5xx (leak prevention).
   if (apiErr.statusCode < 500 && apiErr.details !== undefined) {
-    body.error.details = apiErr.details;
+    body.error.details = redact(apiErr.details);
   }
 
   res.status(apiErr.statusCode).json(body);

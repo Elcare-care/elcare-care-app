@@ -18,6 +18,7 @@
 import React from "react";
 import { ShieldCheck, Clock, AlertTriangle, Ban, Flag } from "lucide-react";
 import type { ModerationState } from "@/lib/moderation";
+import { MODERATION_POLICY_URL } from "@/lib/moderation";
 
 interface ModerationBadgeProps {
   state: ModerationState;
@@ -117,6 +118,14 @@ export function ModerationBlockedOverlay({ state }: { state: ModerationState }) 
           ? "This content has been permanently removed from the platform and cannot be minted or traded."
           : "This content is temporarily hidden while our team reviews a report. If you believe this is an error, please contact support."}
       </p>
+      <a
+        href={MODERATION_POLICY_URL}
+        target="_blank"
+        rel="noreferrer"
+        className="mt-3 text-xs font-semibold text-white/40 underline hover:text-white/70"
+      >
+        Read our moderation policy
+      </a>
     </div>
   );
 }

@@ -26,6 +26,7 @@ import { ProvenanceTimeline } from "@/components/ProvenanceTimeline";
 import { OfferPanel } from "@/components/OfferPanel";
 import { PriceHistoryChart } from "@/components/PriceHistoryChart";
 import { SocialShare } from "@/components/SocialShare";
+import { ReportContentButton } from "@/components/ReportContentButton";
 import { GuardButton } from "@/components/WalletGuard";
 import { ResourceState } from "@/components/PageStates";
 import { Breadcrumb } from "@/components/Breadcrumb";
@@ -101,6 +102,8 @@ export default function ListingDetailPage({ id }: ListingClientProps) {
         error: historyError,
         hasMore,
         loadMore,
+        refresh: refreshHistory,
+        reorgDetected,
     } = useListingHistory(id ? Number(id) : null);
 
     // Price history (for sparkline chart)
@@ -425,6 +428,8 @@ export default function ListingDetailPage({ id }: ListingClientProps) {
                                     error={historyError}
                                     hasMore={hasMore}
                                     onLoadMore={loadMore}
+                                    reorgDetected={reorgDetected}
+                                    onRefresh={refreshHistory}
                                 />
                             </div>
                         )}
@@ -626,6 +631,14 @@ export default function ListingDetailPage({ id }: ListingClientProps) {
                                         <AlertCircle size={14} />
                                         <span className="hidden sm:inline">Report Issue</span>
                                     </a>
+                                    {/* Formal moderation report — see docs/MODERATION_POLICY.md (Issue #542) */}
+                                    {(listing?.metadata_cid || auction?.metadata_cid) && (
+                                        <ReportContentButton
+                                            cid={(listing?.metadata_cid || auction?.metadata_cid) as string}
+                                            kind="METADATA"
+                                            reporterAddress={publicKey ?? undefined}
+                                        />
+                                    )}
                                 </div>
                             </div>
                         </div>

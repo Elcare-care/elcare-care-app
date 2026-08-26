@@ -14,6 +14,7 @@
 - [Contract Functions](#contract-functions)
 - [Contract Versioning & Migration](#contract-versioning--migration)
 - [Price Bounds](#price-bounds)
+- [Settlement & Payout Rounding Policy](#settlement--payout-rounding-policy)
 - [Data Types](#data-types)
 - [Storage Layout](#storage-layout)
 - [Error Codes](#error-codes)
@@ -55,6 +56,7 @@ This contract manages the complete lifecycle of on-chain marketplace listings, a
 | `get_listing(listing_id)` | — | Returns full `Listing` struct |
 | `get_total_listings()` | — | Total listing count |
 | `get_artist_listings(artist)` | — | `Vec<u64>` of artist's listing IDs |
+| `simulate_payout(amount, collection, seller, recipients, fee_bps)` | — | Read-only: returns the exact `PayoutPlan` a real settlement for `amount` would produce, using the same rounding policy as `buy_artwork` / `finalize_auction` / `accept_offer`. See [Settlement & Payout Rounding Policy](#settlement--payout-rounding-policy). |
 
 ### Auctions
 
@@ -298,6 +300,54 @@ Violations revert with `PriceOutOfBounds` (#30).
 
 ---
 
+## Settlement & Payout Rounding Policy
+
+_Issue #269 — hardens settlement arithmetic against rounding and overflow edge cases._
+
+All settlement (`buy_artwork`, `accept_offer`, `finalize_auction`) routes through a single, centralized helper — `calculate_payout_plan` in `contract.rs` — that returns a complete, validated `PayoutPlan` **before any token transfer starts**. `distribute_payout` (the real transfer path) and `simulate_payout` (the read-only preview below) both call this same helper, so the frontend fee display can reproduce the exact on-chain split.
+
+**There is exactly one deterministic rounding policy**, applied in this fixed order:
+
+1. **Royalty** — `royalty_amt = floor(amount * royalty_bps / 10_000)`, computed via checked multiply-then-divide. Skipped when `royalty_bps == 0` or the royalty receiver is the seller. `royalty_bps` is read from the collection contract's `royalty_info()` and is bounds-checked (`<= 10_000`); a misbehaving/malicious collection reporting a higher value reverts with `InvalidRoyalty` (#24) instead of being allowed to compute `royalty_amt > amount`.
+2. **Protocol fee** — `fee_amt = floor(remaining * fee_bps / 10_000)`, where `remaining = amount - royalty_amt`, computed independently via checked multiply-then-divide. If no treasury is configured, `fee_amt` is `0` regardless of `fee_bps` (there is nowhere to send it, so none is deducted).
+3. **Recipients** — every recipient except the **last** gets `floor(remaining * percentage / 10_000)` (`remaining` after subtracting the fee). **The last recipient in the input list receives whatever is left**: `remaining - sum(previous recipients)`.
+
+**Truncation from basis-point division is deterministically absorbed by the last recipient in insertion order.** Royalty and protocol-fee amounts are computed independently via checked division and are never adjusted for remainder — only the final recipient split absorbs sub-unit truncation. This guarantees `royalty + fee + sum(recipient amounts) == amount` exactly for every input. The last recipient (rather than the seller, creator, or treasury) absorbs the remainder because `recipients: Vec<Recipient>` preserves insertion order from listing/auction creation, so "last recipient" is a stable, deterministic choice requiring no extra state — the same recipient absorbs the remainder every time a given listing/auction settles.
+
+### Worked examples
+
+| Scenario | Inputs | Result |
+|----------|--------|--------|
+| Small price | `amount=3`, `fee_bps=250` (2.5%), 1 recipient at 10 000 bps, no royalty | `fee = floor(3*250/10000) = 0`; recipient (last) gets `3 - 0 = 3`. Total = `3`. |
+| High basis points | `amount=1_000_000`, `royalty_bps=1_000` (10%), `fee_bps=500` (5%), 1 recipient at 9 500 bps | `royalty = 100_000`; `remaining = 900_000`; `fee = 45_000`; `remaining = 855_000`; recipient (last) gets `855_000`. Total = `100_000+45_000+855_000 = 1_000_000`. |
+| Multiple recipients | `amount=100`, `fee_bps=0`, no royalty, 3 recipients at 3 334 / 3 333 / 3 333 bps | Recipient 0 = `33`, recipient 1 = `33`, recipient 2 (last) = `100-33-33 = 34` (absorbs remainder). Total = `100`. |
+
+### Overflow and validity guarantees
+
+- Every multiplication/division/addition/subtraction in the payout path uses `checked_*` arithmetic and reverts with `ArithmeticOverflow` (#40) instead of silently wrapping — this includes the protocol-fee computation, which previously used unchecked `*`/`/` and has been hardened to match the royalty/recipient paths.
+- `recipients` and `fee_bps` are validated (`validate_recipients`: no zero-bps recipients, no duplicate addresses, `sum(recipient bps) + fee_bps <= 10_000`) both at listing/auction creation time **and again** inside `calculate_payout_plan`, so an invalid combination can never reach the transfer phase regardless of call path.
+- Before returning, `calculate_payout_plan` asserts `royalty_amt + fee_amt + sum(recipient amounts) == amount` exactly and reverts with `ArithmeticOverflow` if that ever fails — unreachable given the checked math above, but it is the enforced last line of defense: **no transfer starts from a plan that does not conserve the input amount.**
+
+### `simulate_payout(amount, collection, seller, recipients, fee_bps) → PayoutPlan`
+
+Read-only entry point. Fetches `royalty_info()` from `collection` exactly as the real settlement path does, then runs the same `calculate_payout_plan` helper and returns the resulting plan — no storage mutation, no token transfers. Use this from the frontend to render fee breakdowns that are guaranteed to match what a real purchase would produce.
+
+```rust
+pub struct PayoutLeg {
+    pub address: Address,
+    pub amount:  i128,
+}
+
+pub struct PayoutPlan {
+    pub royalty:    Option<PayoutLeg>, // None when no royalty applies
+    pub fee:        i128,
+    pub recipients: Vec<PayoutLeg>,    // last entry absorbs the truncation remainder
+    pub total:      i128,              // always == amount
+}
+```
+
+---
+
 ## Data Types
 
 ```rust
@@ -345,6 +395,19 @@ pub struct BidRecord {
     pub bidder: Address,   // Account that placed this bid
     pub amount: i128,      // Bid amount in payment-token stroops
     pub ledger: u32,       // Ledger sequence number when the bid was recorded
+}
+
+/// See "Settlement & Payout Rounding Policy" above.
+pub struct PayoutLeg {
+    pub address: Address,
+    pub amount:  i128,
+}
+
+pub struct PayoutPlan {
+    pub royalty:    Option<PayoutLeg>,
+    pub fee:        i128,
+    pub recipients: Vec<PayoutLeg>,
+    pub total:      i128,
 }
 ```
 

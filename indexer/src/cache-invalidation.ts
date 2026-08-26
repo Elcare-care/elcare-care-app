@@ -162,6 +162,18 @@ export async function invalidateConfig(): Promise<void> {
   });
 }
 
+/**
+ * Invalidate ALL activity cache keys.
+ * Used after a reorg or mass confirmation promotion where the affected wallet
+ * set is unknown.  Over-invalidation is safe; under-invalidation is not.
+ */
+export async function invalidateAllActivity(): Promise<void> {
+  await applyInvalidation({
+    kind: 'activity',
+    extraPatterns: ['cache:/activity*', 'cache:/wallets/*/activity*'],
+  });
+}
+
 // ── Composite helpers (Issue #443) ────────────────────────────────────────────
 //
 // These helpers invalidate all keys that are logically affected by a single

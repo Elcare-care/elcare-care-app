@@ -199,6 +199,10 @@ model MarketplaceEvent {
   /// behind the network tip.  On reorg, events past the safe ledger are
   /// hard-deleted (provisional by definition).
   confirmed       Boolean  @default(false)
+  /// Issue #532: position of this event within its ledger transaction, used
+  /// for deterministic same-ledger ordering in the provenance timeline.
+  /// NULL for legacy rows ingested before this field was introduced.
+  eventIndex      Int?
   @@index([actor])
   @@index([eventType])
   @@index([listingId])
@@ -207,6 +211,8 @@ model MarketplaceEvent {
   @@index([contractId])
   @@index([actor, ledgerSequence])
   @@index([contractId, ledgerSequence])
+  // Issue #532: composite index for provenance timeline ordering
+  @@index([ledgerSequence, eventIndex])
   @@unique([listingId, eventType, ledgerSequence])
 }
 
@@ -821,11 +827,125 @@ model OperationalAudit {
   ipAddress       String?       // client IP address
   userAgent       String?       // client user agent
   createdAt       DateTime      @default(now())
-  
+
   @@index([actor])
   @@index([actionType])
   @@index([createdAt])
   @@index([actor, actionType])
   @@index([actionType, createdAt])
   @@index([requestId])
+}
+
+// ── Financial Reconciliation (Issue #XXX) ───────────────────────────────────────
+//
+// Tracks financial reconciliation for protocol fees, royalties, sales, and refunds.
+// Aggregates are computed per-ledger, per-token, per-collection, and protocol-wide.
+// Supports tolerance policies for provisional events and chain timing.
+
+enum FinancialReconcileStatus {
+  Pending
+  Matched
+  DriftDetected
+  AlertRaised
+  Resolved
+}
+
+enum FinancialDriftSeverity {
+  Low
+  Medium
+  High
+  Critical
+}
+
+model FinancialReconcileRun {
+  id                  Int                     @id @default(autoincrement())
+  startedAt           DateTime                @default(now())
+  completedAt         DateTime?
+  ledgerFrom          Int
+  ledgerTo            Int
+  confirmedDepth      Int                     // confirmation depth used for this run
+  toleranceBps        Int                     @default(100) // tolerance in basis points
+  includeProvisional  Boolean                 @default(false)
+  driftsDetected      Int                     @default(0)
+  alertsRaised        Int                     @default(0)
+  dryRun              Boolean                 @default(false)
+  errorMessage        String?
+  drifts              FinancialDrift[]
+  
+  @@index([startedAt])
+  @@index([ledgerFrom, ledgerTo])
+}
+
+model FinancialDrift {
+  id                  Int                       @id @default(autoincrement())
+  runId               Int
+  run                 FinancialReconcileRun     @relation(fields: [runId], references: [id])
+  
+  // Entity identification
+  entityType          String                    // "protocol_fee" | "royalty" | "sale" | "refund"
+  entityId            String                    // event hash or transaction ID
+  ledgerSequence      Int
+  
+  // Scope dimensions
+  token               String?
+  collection          String?
+  
+  // Expected vs actual values
+  expectedAmount      Decimal                   @db.Decimal(32, 7)
+  actualAmount        Decimal                   @db.Decimal(32, 7)
+  driftAmount         Decimal                   @db.Decimal(32, 7)
+  driftBps            Int                       // drift in basis points
+  
+  // Classification
+  severity            FinancialDriftSeverity
+  status              FinancialReconcileStatus  @default(DriftDetected)
+  reason              String                    // e.g., "missing_payout", "duplicate_payout", "wrong_token"
+  
+  // Provisional handling
+  isProvisional       Boolean                    @default(false)
+  confirmationDepth   Int?
+  
+  // Resolution tracking
+  resolvedAt          DateTime?
+  resolvedBy          String?
+  resolutionNotes     String?
+  
+  detectedAt          DateTime                  @default(now())
+  
+  @@index([runId])
+  @@index([entityType, ledgerSequence])
+  @@index([status, severity])
+  @@index([token])
+  @@index([collection])
+  @@index([isProvisional])
+  @@index([detectedAt])
+}
+
+// Materialized view refresh tracking (managed by application, not Prisma)
+model FinancialAggregateSnapshot {
+  id                  Int                       @id @default(autoincrement())
+  snapshotType        String                    // "per_ledger" | "per_token" | "per_collection" | "protocol"
+  scopeKey            String?                   // ledger sequence, token address, or collection address
+  ledgerFrom          Int
+  ledgerTo            Int
+  
+  // Aggregated values from events
+  protocolFeesTotal   Decimal                   @default(0) @db.Decimal(32, 7)
+  royaltiesTotal      Decimal                   @default(0) @db.Decimal(32, 7)
+  salesTotal          Decimal                   @default(0) @db.Decimal(32, 7)
+  refundsTotal        Decimal                   @default(0) @db.Decimal(32, 7)
+  
+  // Counts
+  protocolFeeCount    Int                       @default(0)
+  royaltyCount        Int                       @default(0)
+  saleCount           Int                       @default(0)
+  refundCount         Int                       @default(0)
+  
+  // Confirmation state
+  confirmedOnly       Boolean                   @default(true)
+  createdAt           DateTime                  @default(now())
+  
+  @@unique([snapshotType, scopeKey, ledgerFrom, ledgerTo, confirmedOnly])
+  @@index([snapshotType, ledgerFrom, ledgerTo])
+  @@index([scopeKey])
 }

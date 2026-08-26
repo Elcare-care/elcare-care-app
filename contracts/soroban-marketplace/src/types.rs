@@ -247,6 +247,43 @@ pub struct Recipient {
     pub percentage: u32,
 }
 
+/// One resolved leg of a settlement payout: who gets paid and the exact
+/// amount (in the payment token's smallest unit) they receive.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PayoutLeg {
+    pub address: Address,
+    pub amount: i128,
+}
+
+/// A fully-computed settlement breakdown for a single sale/settlement amount.
+///
+/// Produced by `MarketplaceContract::calculate_payout_plan` (see the doc
+/// comment there for the rounding policy) and returned as-is by the
+/// `simulate_payout` read-only entry point so off-chain callers — including
+/// the frontend fee display — can reproduce the exact on-chain split without
+/// performing a real purchase.
+///
+/// Invariant, enforced before this value is ever returned or acted upon:
+/// `royalty.amount (if any) + fee + sum(recipients[i].amount) == total == amount`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PayoutPlan {
+    /// `None` when no royalty applies (zero bps, or the royalty receiver is
+    /// the seller themselves — see `calculate_payout_plan` for details).
+    pub royalty: Option<PayoutLeg>,
+    /// Protocol fee amount. `0` when no treasury is configured or `fee_bps`
+    /// is `0`.
+    pub fee: i128,
+    /// One leg per input recipient, in the same order as the input
+    /// `recipients` list (insertion order from listing/auction creation).
+    /// The last leg absorbs the basis-point division's truncation remainder.
+    pub recipients: soroban_sdk::Vec<PayoutLeg>,
+    /// Total amount accounted for by this plan. Always exactly equal to the
+    /// `amount` passed into `calculate_payout_plan`.
+    pub total: i128,
+}
+
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct BatchCreateListingInput {

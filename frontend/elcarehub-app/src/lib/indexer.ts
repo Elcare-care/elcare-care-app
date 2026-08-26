@@ -451,6 +451,12 @@ function mapListingHistoryEvent(
   const price = priceField != null ? String(priceField) : "0";
   const artist = addrString(data.artist);
   const buyer = addrString(data.buyer);
+  // Use txHash from the normalized endpoint response when present,
+  // fall back to a synthetic ledger identifier for backwards compatibility.
+  const txHash =
+    (ev as any).txHash ||
+    addrString(data.tx_hash) ||
+    `ledger_${ev.ledgerSequence}`;
 
   return {
     id: `lst_${ev.id}`,
@@ -461,8 +467,15 @@ function mapListingHistoryEvent(
     timestamp: ts,
     from: artist || ev.actor,
     to: buyer || config.contractId,
-    tx_hash: `ledger_${ev.ledgerSequence}`,
-  };
+    tx_hash: txHash,
+    // Pass through confirmation state and ledger info for the timeline component
+    ...(typeof (ev as any).confirmed === "boolean" && {
+      confirmed: (ev as any).confirmed,
+    }),
+    ...(typeof ev.ledgerSequence === "number" && {
+      ledgerSequence: ev.ledgerSequence,
+    }),
+  } as ActivityEvent & { confirmed?: boolean; ledgerSequence?: number };
 }
 
 /**

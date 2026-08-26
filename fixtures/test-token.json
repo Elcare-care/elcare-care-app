@@ -1,0 +1,32 @@
+{
+  "$schema": "./test-token.schema.json",
+  "description": "Disposable testnet payment token profile for onboarding drills and CI. Never use production secrets or mainnet addresses here.",
+  "symbol": "TEST",
+  "name": "Test Payment Token",
+  "address": "CAS3J7GYLGXGR6AK3VTQBDG2YZQOEFV2TKEBKH6A76EABR76W3G6AB7C",
+  "network": "testnet",
+  "decimals": 7,
+  "issuerVerification": {
+    "status": "test-fixture-only",
+    "verifiedBy": null,
+    "evidenceUrl": null,
+    "notes": "Replace with real issuer evidence before mainnet onboarding."
+  },
+  "treasury": {
+    "feeRecipientCanHold": true,
+    "notes": "Confirm treasury wallet displays SAC balance in Freighter before go-live."
+  },
+  "onboardingChecklist": {
+    "eligibilityReviewed": false,
+    "preflightPassed": false,
+    "frontendMetadataMerged": false,
+    "indexerDecimalsConfigured": false,
+    "onChainTxHash": null,
+    "communicationsSent": false
+  },
+  "revocationDrill": {
+    "expectedListingBehavior": "Active listings remain on-chain; frontend blocks purchase via assertSupportedTokenAddress",
+    "expectedAuctionBehavior": "New bids rejected; existing state preserved until expiry",
+    "emergencyPauseRecommended": false
+  }
+}
