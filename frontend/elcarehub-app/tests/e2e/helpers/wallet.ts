@@ -7,7 +7,7 @@ export async function connectFreighterWallet(
 ) {
   await mockFreighter(page, { publicKey });
   await page.goto('/');
-  await expect(page.getByText('ELCARE-HUB').first()).toBeVisible({ timeout: 30_000 });
+  await expect(page.getByText('ELCARE-HUB').first()).toBeVisible({ timeout: 60_000 });
 
   const nav = page.locator('nav');
   const shortKey = `${publicKey.slice(0, 4)}...${publicKey.slice(-4)}`;

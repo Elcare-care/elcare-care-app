@@ -14,7 +14,8 @@
     "test:a11y": "jest --testPathPatterns=a11y --passWithNoTests",
     "test:e2e": "playwright test",
     "test:e2e:ui": "playwright test --ui",
-    "test:e2e:live": "playwright test -c playwright.live.config.ts"
+    "test:e2e:live": "playwright test -c playwright.live.config.ts",
+    "test:e2e:wallet-matrix": "playwright test tests/e2e/wallet-failure-matrix.spec.ts"
   },
   "dependencies": {
     "@lobstrco/signer-extension-api": "^2.0.0",
