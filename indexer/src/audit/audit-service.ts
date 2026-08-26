@@ -26,7 +26,14 @@ export interface AuditOptions {
   userAgent?: string;
 }
 
-// Fields that should always be redacted from audit context
+// Fields that should always be redacted from audit context.
+//
+// This list is specific to the audit trail's persisted `redactedContext`
+// column. The general application logger (indexer/src/logger.ts) uses a
+// generalized version of this same approach — see
+// `indexer/src/log-redaction.ts` (issue #541) — which additionally handles
+// nested Error/cause chains, JWTs, credentialed URLs, and XDR blobs. Keep
+// the two lists conceptually aligned when adding a new sensitive field name.
 const SENSITIVE_FIELDS = [
   'secret',
   'password',

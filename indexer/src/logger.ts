@@ -52,6 +52,15 @@ const baseOptions: pino.LoggerOptions = {
   formatters: {
     level: (label) => ({ level: label }),
   },
+  // Defense-in-depth: static glob-path redaction for well-known sensitive
+  // field shapes (see log-redaction.ts). This is a backstop, not the primary
+  // guard — arbitrary/dynamic keys (e.g. a full request body object) are
+  // caught by `sanitizeFields` in `wrap()` below, which pino's static paths
+  // can't anticipate.
+  redact: {
+    paths: PINO_REDACT_PATHS,
+    censor: '[REDACTED]',
+  },
 };
 
 const pinoInstance: pino.Logger =

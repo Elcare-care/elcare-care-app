@@ -4,8 +4,16 @@ import prisma from '../db.js';
 import redis from '../redis.js';
 import { Prisma } from '@prisma/client';
 import { cacheMiddleware } from './cache-middleware.js';
-import { etagMiddleware } from './etag-middleware.js';
+import { etagMiddleware, cacheControlForPath } from './etag-middleware.js';
 import { strictRateLimiter, sseConcurrencyGuard, heavyRateLimiter, lightRateLimiter, mediumRateLimiter, operationalRateLimiter } from './rate-limit-middleware.js';
+import {
+  abuseDetection,
+  blockKey,
+  unblockKey,
+  listBlocklist,
+  isBlocked,
+  ABUSE_BLOCK_DURATION_SECONDS,
+} from './abuse-detection.js';
 import { badRequest, notFound, internalError } from './errors.js';
 import {
   versioningMiddleware,
@@ -205,13 +213,58 @@ const OFFER_MONEY_FIELDS = [['amount', 'token']] as const;
 
 const serializeListing = (row: any) => withDecimalAmounts(serialize(row), LISTING_MONEY_FIELDS);
 const serializeListings = (rows: any[]) => serialize(rows).map((row: any) => withDecimalAmounts(row, LISTING_MONEY_FIELDS));
+
+// ── Moderation overlay for listing responses (Issue #542) ─────────────────────
+//
+// Listings are never deleted or rewritten when moderated — moderation is a
+// pure overlay looked up by ModerationCase.listingId. `moderationState` is
+// null when no case exists (the common case). Hidden states are excluded
+// from default public listing paths (list/search) but a listing is still
+// fetchable by id so the frontend can render the "moderated" overlay.
+const HIDDEN_MODERATION_STATES = new Set(['QUARANTINED', 'REJECTED']);
+
+async function attachModerationState<T extends { listingId: bigint | number | string }>(
+  rows: T[]
+): Promise<Array<T & { moderationState: string | null }>> {
+  if (rows.length === 0) return [];
+  try {
+    const ids = rows.map((r) => BigInt(r.listingId as any));
+    const cases = await prisma.moderationCase.findMany({
+      where: { listingId: { in: ids } },
+      select: { listingId: true, state: true },
+    });
+    const stateByListing = new Map(cases.map((c) => [c.listingId!.toString(), c.state as string]));
+    return rows.map((r) => ({ ...r, moderationState: stateByListing.get(String(r.listingId)) ?? null }));
+  } catch {
+    // Moderation lookup is best-effort — never fail a listing read because
+    // of it.
+    return rows.map((r) => ({ ...r, moderationState: null }));
+  }
+}
+
+async function getModerationStateForListing(listingId: bigint): Promise<string | null> {
+  try {
+    const moderationCase = await prisma.moderationCase.findFirst({
+      where: { listingId },
+      select: { state: true },
+    });
+    return moderationCase?.state ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** Excludes QUARANTINED/REJECTED rows from a default public listing response. */
+function excludeModerated<T extends { moderationState: string | null }>(rows: T[]): T[] {
+  return rows.filter((r) => !HIDDEN_MODERATION_STATES.has(r.moderationState ?? ''));
+}
 const serializeAuction = (row: any) => withDecimalAmounts(serialize(row), AUCTION_MONEY_FIELDS);
 const serializeAuctions = (rows: any[]) => serialize(rows).map((row: any) => withDecimalAmounts(row, AUCTION_MONEY_FIELDS));
 const serializeOffers = (rows: any[]) => serialize(rows).map((row: any) => withDecimalAmounts(row, OFFER_MONEY_FIELDS));
 
 // ── GET /events (SSE) ─────────────────────────────────────────────────────────
 
-router.get('/events', sseConcurrencyGuard, validateQuery(eventsQuerySchema), (req: Request, res: Response) => {
+router.get('/events', abuseDetection('sse'), sseConcurrencyGuard, validateQuery(eventsQuerySchema), (req: Request, res: Response) => {
   if (sseClients.size >= MAX_SSE_CONNECTIONS) {
     return res.status(503).json({ error: { code: 'SERVICE_UNAVAILABLE', message: 'Too many SSE connections', class: 'CLIENT_ERROR' } });
   }
@@ -401,9 +454,16 @@ router.get('/listings', lightRateLimiter, cacheMiddleware(TTL.LISTINGS_LIST), qu
         ? String(results[results.length - 1].updatedAtLedger)
         : '';
 
+      // Moderation overlay: QUARANTINED/REJECTED listings are excluded from
+      // this default public search result (still fetchable via /listings/:id).
+      // Note: `count` above is a raw-SQL count and is not adjusted for the
+      // moderation exclusion below — an acceptable approximation for a public
+      // listing count that avoids an extra full-table scan per request.
+      const withModeration = excludeModerated(await attachModerationState(results));
+
       res.setHeader('X-Next-Cursor', nextCursor);
       res.setHeader('X-Total-Count', String(count));
-      return res.json({ listings: serialize(results), total: Number(count) });
+      return res.json({ listings: serialize(withModeration), total: Number(count) });
     }
 
     // ── Short-term ILIKE fallback (<3 chars) or no search ────────────────
@@ -433,20 +493,24 @@ router.get('/listings', lightRateLimiter, cacheMiddleware(TTL.LISTINGS_LIST), qu
     res.setHeader('X-Next-Cursor', nextCursor);
     res.setHeader('X-Total-Count', String(total));
 
+    // Moderation overlay — see comment on the FTS branch above. `total` is
+    // not adjusted for the exclusion below.
+    const withModeration = excludeModerated(await attachModerationState(results));
+
     // When search is active always return { listings, total } shape
     // (consistent with the FTS path above).
     if (search) {
-      return res.json({ listings: serialize(results), total });
+      return res.json({ listings: serialize(withModeration), total });
     }
 
     if (limit !== undefined || offset !== undefined || cursor_ledger !== undefined) {
       const validated = validateResponse(z.object({ listings: ListingResponseV1.array(), total: z.number() }), {
-        listings: serialize(results),
+        listings: serialize(withModeration),
         total: Number(total),
       });
       return ok(res, validated);
     }
-    const validated = validateResponse(ListingResponseV1.array(), serialize(results));
+    const validated = validateResponse(ListingResponseV1.array(), serialize(withModeration));
     return ok(res, validated);
   } catch (err) {
     next(internalError('Failed to fetch listings'));
@@ -468,7 +532,12 @@ router.get('/listings/:id', lightRateLimiter, cacheMiddleware(TTL.LISTING_DETAIL
       ? await (prisma as any).ipfsMetadata.findUnique({ where: { cid: listing.token } }).catch(() => null)
       : null;
 
-    return res.json(serializeListing({ ...listing, ipfsMetadata: ipfsMetadata ?? null }));
+    // Moderation is an overlay, never a delete — a QUARANTINED/REJECTED listing
+    // is still fetchable by id so the frontend can render the moderated
+    // overlay (see ModerationBlockedOverlay in the frontend).
+    const moderationState = await getModerationStateForListing(listing.listingId);
+
+    return res.json(serializeListing({ ...listing, ipfsMetadata: ipfsMetadata ?? null, moderationState }));
   } catch (err) {
     next(internalError('Failed to fetch listing details'));
   }
@@ -476,7 +545,7 @@ router.get('/listings/:id', lightRateLimiter, cacheMiddleware(TTL.LISTING_DETAIL
 
 // ── GET /listings/:id/history ─────────────────────────────────────────────────
 
-router.get('/listings/:id/history', heavyRateLimiter, async (req: Request, res: Response, next: NextFunction) => {
+router.get('/listings/:id/history', heavyRateLimiter, abuseDetection('tx-lookup'), async (req: Request, res: Response, next: NextFunction) => {
   const id = req.params.id as string;
   if (!/^\d+$/.test(id)) {
     return next(badRequest('Invalid ID format'));
@@ -751,6 +820,10 @@ router.get('/activity/recent', cacheMiddleware(TTL.ACTIVITY_RECENT), async (req:
       }),
       { distributed: true },
     );
+    // Issue #508: provisional data — must revalidate on every request because
+    // a reorg could roll back any of these events.
+    res.set('Cache-Control', cacheControlForPath('/activity/recent'));
+    res.set('Vary', 'Accept-Encoding');
     res.json(serialize(results));
   } catch (err) {
     next(internalError('Failed to fetch recent activity'));
@@ -917,6 +990,9 @@ router.get('/wallets/:address/activity', strictRateLimiter, queryCostGuard(), va
     const nextCursor = events.length === take ? String(events[events.length - 1].ledgerSequence) : '';
     res.setHeader('X-Next-Cursor', nextCursor);
     res.setHeader('X-Total-Count', String(total));
+    // Issue #508: wallet activity contains provisional events; must revalidate.
+    res.set('Cache-Control', cacheControlForPath('/wallets/activity'));
+    res.set('Vary', 'Accept-Encoding');
     res.json(serialize(events));
   } catch (err) {
     next(internalError('Failed to fetch wallet activity'));
@@ -925,7 +1001,7 @@ router.get('/wallets/:address/activity', strictRateLimiter, queryCostGuard(), va
 
 // ── GET /wallets/:address/royalty-stats ───────────────────────────────────────
 
-router.get('/wallets/:address/royalty-stats', strictRateLimiter, async (req: Request, res: Response, next: NextFunction) => {
+router.get('/wallets/:address/royalty-stats', strictRateLimiter, abuseDetection('wallet-activity'), async (req: Request, res: Response, next: NextFunction) => {
   // Ensure rate-limit header is always present on this endpoint for ISSUE-068
   res.setHeader('RateLimit-Limit', String(20));
   const { address } = req.params;
@@ -1069,6 +1145,7 @@ router.get('/stats', lightRateLimiter, queryCostGuard({ isAggregation: true }), 
     if (hasTimeFilter) salesFilter.ledgerTimestamp = eventTimeFilter;
     const totalSales = await prisma.marketplaceEvent.count({ where: salesFilter });
 
+    res.set('Vary', 'Accept-Encoding');
     res.json({
       totalListings,
       activeListings,
@@ -1422,6 +1499,82 @@ router.delete('/admin/contracts/:id', operationalRateLimiter, authMiddleware('op
   }
 });
 
+// ── Abuse detection operator workflow (Issue #539) ───────────────────────────
+//
+// Temporary blocklist for keys (wallet:<address> or ip:<hash>, matching the
+// key format abuse-detection.ts uses internally) identified as abusive.
+// Gated by the same operator-token auth (`authMiddleware('operator')`) as
+// the other /admin/* routes above. Blocks are TTL-bound in Redis — there is
+// no permanent ban list here, by design: temporary friction discourages
+// abuse without requiring a human to remember to lift a block, and without
+// permanently penalizing a wallet/IP that may later be reused legitimately.
+
+// ── POST /admin/abuse/block ───────────────────────────────────────────────────
+// Body: { key: string, durationSeconds?: number, reason?: string }
+// `key` must be the exact abuse-detection key, e.g. "wallet:G..." or "ip:<hash>".
+
+router.post('/admin/abuse/block', operationalRateLimiter, authMiddleware('operator'), async (req: Request, res: Response, next: NextFunction) => {
+  const { key, durationSeconds, reason } = req.body ?? {};
+
+  if (!key || typeof key !== 'string' || key.trim() === '') {
+    return next(badRequest('key is required (e.g. "wallet:G..." or "ip:<hash>")'));
+  }
+  const duration = durationSeconds !== undefined ? Number(durationSeconds) : ABUSE_BLOCK_DURATION_SECONDS;
+  if (!Number.isFinite(duration) || duration <= 0 || duration > 30 * 24 * 60 * 60) {
+    return next(badRequest('durationSeconds must be a positive number of seconds (max 30 days)'));
+  }
+
+  try {
+    await blockKey(key.trim(), duration, typeof reason === 'string' && reason.trim() ? reason.trim() : 'operator_block');
+    res.status(201).json({ key: key.trim(), blocked: true, durationSeconds: duration });
+  } catch (err) {
+    next(internalError('Failed to add abuse blocklist entry'));
+  }
+});
+
+// ── DELETE /admin/abuse/block/:key ────────────────────────────────────────────
+// :key is URL-encoded, e.g. /admin/abuse/block/wallet%3AG...
+
+router.delete('/admin/abuse/block/:key', operationalRateLimiter, authMiddleware('operator'), async (req: Request, res: Response, next: NextFunction) => {
+  const key = decodeURIComponent(req.params.key || '');
+  if (!key) return next(badRequest('key is required'));
+
+  try {
+    await unblockKey(key);
+    res.json({ key, blocked: false });
+  } catch (err) {
+    next(internalError('Failed to remove abuse blocklist entry'));
+  }
+});
+
+// ── GET /admin/abuse/blocklist ────────────────────────────────────────────────
+// Lists all currently-active temporary blocks with remaining TTL.
+
+router.get('/admin/abuse/blocklist', operationalRateLimiter, authMiddleware('operator'), async (_req: Request, res: Response, next: NextFunction) => {
+  try {
+    const entries = await listBlocklist();
+    res.json({ entries, total: entries.length });
+  } catch (err) {
+    next(internalError('Failed to list abuse blocklist'));
+  }
+});
+
+// ── GET /admin/abuse/block/:key ───────────────────────────────────────────────
+// Checks whether a single key is currently blocked (used by operators to
+// verify a block took effect without listing the entire blocklist).
+
+router.get('/admin/abuse/block/:key', operationalRateLimiter, authMiddleware('operator'), async (req: Request, res: Response, next: NextFunction) => {
+  const key = decodeURIComponent(req.params.key || '');
+  if (!key) return next(badRequest('key is required'));
+
+  try {
+    const result = await isBlocked(key);
+    res.json({ key, blocked: result.blocked, ttlSeconds: result.ttlSeconds });
+  } catch (err) {
+    next(internalError('Failed to check abuse blocklist status'));
+  }
+});
+
 // ── GET /tokens ───────────────────────────────────────────────────────────────
 // Returns the list of whitelisted payment tokens.
 // Optional ?active=true filters to only active tokens.
@@ -1444,7 +1597,7 @@ router.get('/tokens', lightRateLimiter, async (req: Request, res: Response, next
 // ── GET /tokens/:address/history ──────────────────────────────────────────────
 // Returns the whitelist event history for a specific token address.
 
-router.get('/tokens/:address/history', lightRateLimiter, async (req: Request, res: Response, next: NextFunction) => {
+router.get('/tokens/:address/history', lightRateLimiter, abuseDetection('tx-lookup'), async (req: Request, res: Response, next: NextFunction) => {
   const address = req.params.address as string;
   const limitRaw  = req.query.limit  as string | undefined;
   const offsetRaw = req.query.offset as string | undefined;
@@ -1611,7 +1764,10 @@ router.get('/search', mediumRateLimiter, queryCostGuard(), validateQuery(searchQ
            WHERE "searchVector" @@ plainto_tsquery('english', $1)`,
           sanitised,
         );
-        result.listings = { items: serialize(rows), total: Number(count) };
+        // Moderation overlay — QUARANTINED/REJECTED listings excluded from
+        // this default public search result (still fetchable by id).
+        const withModeration = excludeModerated(await attachModerationState(rows));
+        result.listings = { items: serialize(withModeration), total: Number(count) };
       } else {
         // Short term — ILIKE fallback
         const [rows, total] = await Promise.all([
@@ -1638,7 +1794,8 @@ router.get('/search', mediumRateLimiter, queryCostGuard(), validateQuery(searchQ
             },
           }),
         ]);
-        result.listings = { items: serialize(rows), total };
+        const withModeration = excludeModerated(await attachModerationState(rows));
+        result.listings = { items: serialize(withModeration), total };
       }
     }
 
@@ -1703,6 +1860,7 @@ router.get('/search', mediumRateLimiter, queryCostGuard(), validateQuery(searchQ
       }
     }
 
+    res.set('Vary', 'Accept-Encoding');
     res.json(result);
   } catch (err) {
     next(internalError('Failed to execute search'));
@@ -1754,8 +1912,8 @@ router.get('/admin/query-cost', operationalRateLimiter, authMiddleware('operator
 import notificationRouter from './notification-routes.js';
 router.use(notificationRouter);
 
-// ── Privacy routes (Issue #543) ────────────────────────────────────────────────
-import privacyRouter from './privacy-routes.js';
-router.use(privacyRouter);
+// ── Moderation routes (Issue #542) ────────────────────────────────────────────
+import moderationRouter from './moderation-routes.js';
+router.use(moderationRouter);
 
 export default router;

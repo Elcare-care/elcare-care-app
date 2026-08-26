@@ -12,10 +12,27 @@
  * This separation keeps the middleware simple and correct:
  *   - Middleware: HTTP caching (Cache-Control semantics, cacheHit flag)
  *   - getCached:  DB coalescing + distributed lock for thundering-herd
+ *
+ * Issue #508 — Conditional GET short-circuit
+ * ------------------------------------------
+ * On a Redis cache HIT, we already have the response payload in memory.
+ * We compute the ETag from the cached payload (using the same algorithm as
+ * etag-middleware so the values are consistent) and check If-None-Match
+ * immediately.  When they match we return 304 with no body and without
+ * calling any downstream handler — the expensive DB query never runs.
+ *
+ * This works because:
+ *   1. The ETag encodes the confirmed-version counter, so a reorg or
+ *      provisional→confirmed promotion bumps the counter and the next
+ *      request will miss the If-None-Match check even if the raw payload
+ *      bytes are identical.
+ *   2. Redis expiry already handles TTL-based staleness; the ETag check is
+ *      an additional fast path on top of it, not a replacement.
  */
 
 import { Request, Response, NextFunction } from 'express';
 import redisClient from '../redis.js';
+import { computeETag } from './etag-middleware.js';
 
 export function isRedisReady(client: any): boolean {
   if (typeof client?.isReady === 'boolean') return client.isReady;
@@ -45,6 +62,23 @@ export const cacheMiddleware = (ttl: number) => {
       const cachedData = await client.get(cacheKey);
       if (cachedData) {
         res.locals.cacheHit = true;
+
+        // ── Conditional GET short-circuit (Issue #508) ──────────────────
+        // If the client sent If-None-Match and it matches the ETag we would
+        // compute for this cached payload, return 304 immediately — no body,
+        // no downstream handler, no DB query.
+        const clientEtag = req.get('If-None-Match');
+        if (clientEtag) {
+          const fullUrl = req.originalUrl || req.url;
+          const etag = computeETag(cachedData, fullUrl);
+          if (clientEtag === etag) {
+            res.set('ETag', etag);
+            res.removeHeader('Content-Type');
+            res.removeHeader('Content-Length');
+            return res.status(304).end();
+          }
+        }
+
         return res.json(JSON.parse(cachedData));
       }
 
