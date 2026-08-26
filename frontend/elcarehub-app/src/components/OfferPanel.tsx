@@ -38,6 +38,9 @@ import { GuardButton } from "@/components/WalletGuard";
 import { useAcceptOffer, useRejectOffer } from "@/hooks/useOffers";
 import { useModalA11y } from "@/hooks/useModalA11y";
 import { StatusAnnouncer } from "@/components/a11y/StatusAnnouncer";
+import { TxErrorPanel } from "@/components/TxErrorPanel";
+import { useTxLifecycle, txStateLabel } from "@/hooks/useTxLifecycle";
+import Link from "next/link";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -355,6 +358,16 @@ function OwnerOfferList({
   const { accept, isAccepting, error: acceptError } = useAcceptOffer(ownerPublicKey);
   const { reject, isRejecting, error: rejectError } = useRejectOffer(ownerPublicKey);
 
+  // Typed lifecycle for accept/reject actions — gives TxErrorPanel and a
+  // tx hash recovery link. Shared across the list so only one action runs
+  // at a time (duplicate-submission guard).
+  const {
+    txState: offerTxState,
+    isActive: isOfferTxActive,
+    run: runOfferTx,
+    reset: resetOfferTx,
+  } = useTxLifecycle({ persistKey: `ownerOffers:${ownerPublicKey}` });
+
   // Tick every second for live expiry countdowns
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
@@ -373,8 +386,43 @@ function OwnerOfferList({
 
   return (
     <div className="space-y-3" data-testid="owner-offer-list">
-      {/* Error banners */}
-      {(acceptError || rejectError) && (
+      {/* Typed transaction error panel */}
+      {offerTxState.state === "error" && offerTxState.error && (
+        <TxErrorPanel
+          error={offerTxState.error}
+          txHash={offerTxState.txHash}
+          onRetry={resetOfferTx}
+          onDismiss={resetOfferTx}
+        />
+      )}
+
+      {/* Lifecycle state label while a tx is in-flight */}
+      {isOfferTxActive && (
+        <div
+          role="status"
+          className="flex items-center gap-2 rounded-xl border border-brand-500/20 bg-brand-500/10 px-4 py-3 text-xs text-brand-400"
+        >
+          <Loader2 size={13} className="animate-spin" aria-hidden="true" />
+          {txStateLabel(offerTxState.state)}
+        </div>
+      )}
+
+      {/* Tx hash recovery link */}
+      {offerTxState.txHash && !isOfferTxActive && offerTxState.state !== "success" && (
+        <p className="text-[10px] text-white/30 text-center">
+          Tx:{" "}
+          <Link
+            href={`/tx/${offerTxState.txHash}`}
+            className="font-mono text-brand-400 hover:underline"
+            target="_blank"
+          >
+            {offerTxState.txHash.slice(0, 10)}…
+          </Link>
+        </p>
+      )}
+
+      {/* Legacy string errors from the underlying hooks (connection issues etc.) */}
+      {(acceptError || rejectError) && offerTxState.state !== "error" && (
         <div className="flex items-center gap-2 rounded-xl border border-terracotta-500/20 bg-terracotta-500/10 px-4 py-3 text-xs text-terracotta-400">
           <AlertCircle size={14} />
           {acceptError || rejectError}
@@ -466,20 +514,23 @@ function OwnerOfferList({
                       </div>
                     )}
 
-                    {/* Accept / Reject — disabled for non-actionable states */}
+                    {/* Accept / Reject — disabled for non-actionable states or while a tx is active */}
                     <div className="flex items-center gap-2 shrink-0">
                       <button
                         data-testid={`accept-offer-btn-${offer.offer_id}`}
                         onClick={async () => {
-                          const ok = await accept(offer.offer_id);
+                          const ok = await runOfferTx(
+                            () => accept(offer.offer_id),
+                            { action: "Accept offer" }
+                          );
                           if (ok) onRefresh();
                         }}
-                        disabled={!isActionable || isAccepting || isRejecting}
+                        disabled={!isActionable || isOfferTxActive || isAccepting || isRejecting}
                         aria-disabled={!isActionable}
                         className="flex items-center gap-1.5 rounded-xl bg-mint-500/20 hover:bg-mint-500/30 px-4 py-2.5 text-xs font-bold text-mint-400 border border-mint-500/30 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
                         aria-label={`Accept offer ${offer.offer_id}`}
                       >
-                        {isAccepting ? (
+                        {isOfferTxActive && isAccepting ? (
                           <Loader2 size={13} className="animate-spin" />
                         ) : (
                           <CheckCircle size={13} />
@@ -489,15 +540,18 @@ function OwnerOfferList({
                       <button
                         data-testid={`reject-offer-btn-${offer.offer_id}`}
                         onClick={async () => {
-                          const ok = await reject(offer.offer_id);
+                          const ok = await runOfferTx(
+                            () => reject(offer.offer_id),
+                            { action: "Reject offer" }
+                          );
                           if (ok) onRefresh();
                         }}
-                        disabled={!isActionable || isAccepting || isRejecting}
+                        disabled={!isActionable || isOfferTxActive || isAccepting || isRejecting}
                         aria-disabled={!isActionable}
                         className="flex items-center gap-1.5 rounded-xl bg-white/5 hover:bg-terracotta-500/20 px-4 py-2.5 text-xs font-bold text-white/50 hover:text-terracotta-400 border border-white/10 hover:border-terracotta-500/30 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
                         aria-label={`Reject offer ${offer.offer_id}`}
                       >
-                        {isRejecting ? (
+                        {isOfferTxActive && isRejecting ? (
                           <Loader2 size={13} className="animate-spin" />
                         ) : (
                           <XCircle size={13} />

@@ -9,6 +9,7 @@
 import {
   Contract,
   SorobanRpc,
+  Transaction,
   TransactionBuilder,
   xdr,
   nativeToScVal,
@@ -20,6 +21,14 @@ import { config } from "./config";
 import { getConnectedPublicKey, signWithFreighter } from "./freighter";
 import { mapSorobanErrorMessage } from "./errors";
 import { assertWritePreflight } from "./preflight";
+import {
+  buildTransactionIntent,
+  assertIntentsMatch,
+  intentsMatch,
+  TransactionIntent,
+  TxIntentMismatchError,
+} from "./tx-intent";
+import { walletTelemetry } from "./wallet-telemetry";
 import {
   isE2eMockChain,
   e2eMockCreateListing,
@@ -143,7 +152,17 @@ export async function invokeContract(
   method: string,
   args: xdr.ScVal[],
   readonly = false,
-  contractId: string = config.contractId
+  contractId: string = config.contractId,
+  /**
+   * Optional canonical intent the confirmation UI actually displayed to the
+   * user before they clicked "confirm". When provided, it is compared
+   * against the intent re-derived from the transaction that is actually
+   * about to be handed to the wallet (Issue #536) — any mismatch aborts
+   * signing. Omit for write flows that don't yet have a dedicated
+   * confirmation UI; the self-consistency check below still applies to
+   * every write call regardless.
+   */
+  expectedIntent?: TransactionIntent
 ): Promise<xdr.ScVal> {
   const readableError = (raw: string, fallback: string): Error => {
     const mapped = mapSorobanErrorMessage(raw);
@@ -215,6 +234,73 @@ export async function invokeContract(
   // Assemble the transaction with the real resource fee.
   const preparedTx = SorobanRpc.assembleTransaction(tx, simResult).build();
   const txXdr = preparedTx.toXDR();
+
+  // ── Transaction-substitution guard (Issue #536) ─────────────────────────
+  // The preflight guard above checks network + contract identity before we
+  // even build a transaction. This guard checks the transaction itself,
+  // right at the boundary where it is handed to the wallet.
+  //
+  // We independently re-derive the canonical intent twice:
+  //   1. From `preparedTx` — the in-memory object we just assembled.
+  //   2. From `txXdr` — the literal XDR string about to be passed into
+  //      `signWithFreighter` (the wallet adapter call). Re-parsing it from
+  //      scratch (rather than trusting `preparedTx` was not mutated after
+  //      assembly) is what makes this a check of the exact bytes the wallet
+  //      will see, not just the object we happened to build a moment ago.
+  //
+  // If those two disagree, something altered the transaction between
+  // "assembled" and "about to sign" — a compromised bundle, a malicious
+  // extension shim wrapping our signing call, or similar tampering — and we
+  // must not ask the wallet to sign it.
+  //
+  // When the calling UI supplied `expectedIntent` (the intent it actually
+  // rendered to the user, e.g. CheckoutModal), that is compared too — this
+  // is the literal "confirmation summary vs. exact args sent to the wallet"
+  // check the threat model calls for.
+  const assembledIntent = buildTransactionIntent(preparedTx);
+  let verifiedIntent: TransactionIntent;
+  try {
+    const reparsedTx = TransactionBuilder.fromXDR(txXdr, getNetworkPassphrase());
+    verifiedIntent = buildTransactionIntent(reparsedTx as Transaction);
+  } catch {
+    walletTelemetry.txIntentMismatch(
+      "pre_sign_xdr_decode",
+      method,
+      contractId,
+      ["xdr_decode_failed"]
+    );
+    throw new TxIntentMismatchError(
+      "Transaction verification failed: could not re-verify the transaction immediately before signing. " +
+        "For your safety, signing has been stopped.",
+      ["xdr_decode_failed"]
+    );
+  }
+
+  const selfCheck = intentsMatch(assembledIntent, verifiedIntent);
+  if (!selfCheck.matches) {
+    walletTelemetry.txIntentMismatch(
+      "pre_sign_self_check",
+      method,
+      contractId,
+      selfCheck.mismatchedFields
+    );
+    throw new TxIntentMismatchError(
+      "Transaction verification failed: the transaction about to be signed does not match the transaction " +
+        "that was just built. For your safety, signing has been stopped before your wallet was asked to sign.",
+      selfCheck.mismatchedFields
+    );
+  }
+
+  if (expectedIntent) {
+    try {
+      assertIntentsMatch(expectedIntent, verifiedIntent, "confirmation_ui_vs_signing_tx");
+    } catch (mismatchErr) {
+      const fields =
+        mismatchErr instanceof TxIntentMismatchError ? mismatchErr.mismatchedFields : ["unknown"];
+      walletTelemetry.txIntentMismatch("confirmation_ui_vs_signing_tx", method, contractId, fields);
+      throw mismatchErr;
+    }
+  }
 
   // Sign via Freighter.
   const signedXdr = await signWithFreighter(txXdr, getNetworkPassphrase());
@@ -357,10 +443,19 @@ export async function createListing(
 
 /**
  * buy_artwork — Buyer purchases a listed artwork.
+ *
+ * @param expectedIntent  Optional canonical intent (Issue #536) built by the
+ *                         confirmation UI (see `buildExpectedBuyArtworkIntent`
+ *                         in lib/tx-intent.ts) from the same buyer/listing
+ *                         the user confirmed. When supplied, it is verified
+ *                         against the transaction actually about to be
+ *                         signed — any mismatch aborts before the wallet is
+ *                         asked to sign.
  */
 export async function buyArtwork(
   buyerPublicKey: string,
-  listingId: number
+  listingId: number,
+  expectedIntent?: TransactionIntent
 ): Promise<boolean> {
   if (isE2eMockChain()) {
     if (typeof window !== "undefined") registerE2eMockListingsOnWindow();
@@ -372,7 +467,7 @@ export async function buyArtwork(
     nativeToScVal(BigInt(listingId), { type: "u64" }),
   ];
 
-  await invokeContract(buyerPublicKey, "buy_artwork", args);
+  await invokeContract(buyerPublicKey, "buy_artwork", args, false, config.contractId, expectedIntent);
   return true;
 }
 

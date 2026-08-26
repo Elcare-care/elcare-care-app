@@ -830,135 +830,116 @@ model OperationalAudit {
   @@index([requestId])
 }
 
-// ── Content moderation (Issue #542) ───────────────────────────────────────────
+// ── Financial Reconciliation (Issue #XXX) ───────────────────────────────────────
 //
-// Implements the state model and workflow documented in docs/MODERATION_POLICY.md.
-// A ModerationCase tracks one uploaded asset (image or metadata CID) through the
-// PENDING → APPROVED / REPORTED → QUARANTINED → REJECTED lifecycle. Reports,
-// decisions, and appeals are append-only children so moderators can always trace
-// how a case reached its current state.
-//
-// IMPORTANT: moderation is an overlay on top of Listing rows, never a rewrite.
-// A QUARANTINED/REJECTED case never deletes or mutates the associated Listing —
-// see routes.ts, which joins ModerationCase by listingId to surface a
-// `moderationState` flag without touching provenance fields.
+// Tracks financial reconciliation for protocol fees, royalties, sales, and refunds.
+// Aggregates are computed per-ledger, per-token, per-collection, and protocol-wide.
+// Supports tolerance policies for provisional events and chain timing.
 
-enum ModerationState {
-  PENDING
-  APPROVED
-  REPORTED
-  QUARANTINED
-  REJECTED
+enum FinancialReconcileStatus {
+  Pending
+  Matched
+  DriftDetected
+  AlertRaised
+  Resolved
 }
 
-enum ModerationAssetKind {
-  IMAGE
-  METADATA
+enum FinancialDriftSeverity {
+  Low
+  Medium
+  High
+  Critical
 }
 
-enum ReportCategory {
-  PROHIBITED_CONTENT
-  INTELLECTUAL_PROPERTY
-  MISLEADING_METADATA
-  SPAM
-  MALWARE_SUSPECTED
-  OTHER
+model FinancialReconcileRun {
+  id                  Int                     @id @default(autoincrement())
+  startedAt           DateTime                @default(now())
+  completedAt         DateTime?
+  ledgerFrom          Int
+  ledgerTo            Int
+  confirmedDepth      Int                     // confirmation depth used for this run
+  toleranceBps        Int                     @default(100) // tolerance in basis points
+  includeProvisional  Boolean                 @default(false)
+  driftsDetected      Int                     @default(0)
+  alertsRaised        Int                     @default(0)
+  dryRun              Boolean                 @default(false)
+  errorMessage        String?
+  drifts              FinancialDrift[]
+  
+  @@index([startedAt])
+  @@index([ledgerFrom, ledgerTo])
 }
 
-enum AppealStatus {
-  PENDING
-  UNDER_REVIEW
-  UPHELD
-  OVERTURNED
+model FinancialDrift {
+  id                  Int                       @id @default(autoincrement())
+  runId               Int
+  run                 FinancialReconcileRun     @relation(fields: [runId], references: [id])
+  
+  // Entity identification
+  entityType          String                    // "protocol_fee" | "royalty" | "sale" | "refund"
+  entityId            String                    // event hash or transaction ID
+  ledgerSequence      Int
+  
+  // Scope dimensions
+  token               String?
+  collection          String?
+  
+  // Expected vs actual values
+  expectedAmount      Decimal                   @db.Decimal(32, 7)
+  actualAmount        Decimal                   @db.Decimal(32, 7)
+  driftAmount         Decimal                   @db.Decimal(32, 7)
+  driftBps            Int                       // drift in basis points
+  
+  // Classification
+  severity            FinancialDriftSeverity
+  status              FinancialReconcileStatus  @default(DriftDetected)
+  reason              String                    // e.g., "missing_payout", "duplicate_payout", "wrong_token"
+  
+  // Provisional handling
+  isProvisional       Boolean                    @default(false)
+  confirmationDepth   Int?
+  
+  // Resolution tracking
+  resolvedAt          DateTime?
+  resolvedBy          String?
+  resolutionNotes     String?
+  
+  detectedAt          DateTime                  @default(now())
+  
+  @@index([runId])
+  @@index([entityType, ledgerSequence])
+  @@index([status, severity])
+  @@index([token])
+  @@index([collection])
+  @@index([isProvisional])
+  @@index([detectedAt])
 }
 
-model ModerationCase {
-  id              Int                 @id @default(autoincrement())
-  /// IPFS CID of the asset (image or metadata) this case tracks.
-  cid             String              @unique
-  kind            ModerationAssetKind
-  state           ModerationState     @default(PENDING)
-  reportCount     Int                 @default(0)
-  uploaderAddress String?
-  /// Optional link to the marketplace Listing this asset belongs to. Nullable
-  /// because a case can exist for an asset before/without a listing (e.g. an
-  /// upload that is never minted). Never used to cascade-delete the listing.
-  listingId       BigInt?
-  /// Internal-only free text reason for the current state; never exposed publicly.
-  reason          String?
-  /// Actor (wallet address or "system") that set the current state.
-  reviewedBy      String?
-  createdAt       DateTime            @default(now())
-  updatedAt       DateTime            @updatedAt
-
-  reports         ModerationReport[]
-  decisions       ModerationDecision[]
-  appeals         ModerationAppeal[]
-
-  @@index([state])
-  @@index([listingId])
-  @@index([uploaderAddress])
-  @@index([kind])
-}
-
-model ModerationReport {
-  id              Int             @id @default(autoincrement())
-  caseId          Int
-  /// Denormalised CID so reports can be queried without a join.
-  cid             String
-  category        ReportCategory
-  /// Evidence text supplied by the reporter, capped at 1000 chars by the API.
-  /// Visible to operators only — never returned from a public endpoint.
-  description     String?
-  /// Reporter wallet address. Nullable (anonymous reports allowed). Never
-  /// exposed in any public-facing response — operator-only.
-  reporterAddress String?
-  createdAt       DateTime        @default(now())
-
-  case            ModerationCase  @relation(fields: [caseId], references: [id])
-
-  // Dedupe reports from the same reporter against the same CID. Anonymous
-  // (NULL reporterAddress) reports are exempt — Postgres treats NULLs as
-  // distinct for uniqueness purposes, so duplicate-anonymous-report handling
-  // is intentionally left to rate limiting rather than this constraint.
-  @@unique([cid, reporterAddress])
-  @@index([caseId])
-  @@index([cid])
-}
-
-/// Audit trail of every state transition a moderator makes on a case.
-/// Distinct from OperationalAudit — this is domain-specific and joined
-/// directly to ModerationCase for the operator triage UI.
-model ModerationDecision {
-  id            Int             @id @default(autoincrement())
-  caseId        Int
-  previousState ModerationState
-  newState      ModerationState
-  /// Admin/operator wallet address. Pseudonymised in any public output.
-  actor         String
-  /// Internal-only justification — never shown to uploaders or the public.
-  reason        String?
-  createdAt     DateTime        @default(now())
-
-  case          ModerationCase  @relation(fields: [caseId], references: [id])
-
-  @@index([caseId])
-  @@index([createdAt])
-}
-
-model ModerationAppeal {
-  id               Int            @id @default(autoincrement())
-  caseId           Int
-  appellantAddress String
-  statement        String
-  status           AppealStatus   @default(PENDING)
-  decidedBy        String?
-  decisionReason   String?
-  createdAt        DateTime       @default(now())
-  decidedAt        DateTime?
-
-  case             ModerationCase @relation(fields: [caseId], references: [id])
-
-  @@index([caseId])
-  @@index([status])
+// Materialized view refresh tracking (managed by application, not Prisma)
+model FinancialAggregateSnapshot {
+  id                  Int                       @id @default(autoincrement())
+  snapshotType        String                    // "per_ledger" | "per_token" | "per_collection" | "protocol"
+  scopeKey            String?                   // ledger sequence, token address, or collection address
+  ledgerFrom          Int
+  ledgerTo            Int
+  
+  // Aggregated values from events
+  protocolFeesTotal   Decimal                   @default(0) @db.Decimal(32, 7)
+  royaltiesTotal      Decimal                   @default(0) @db.Decimal(32, 7)
+  salesTotal          Decimal                   @default(0) @db.Decimal(32, 7)
+  refundsTotal        Decimal                   @default(0) @db.Decimal(32, 7)
+  
+  // Counts
+  protocolFeeCount    Int                       @default(0)
+  royaltyCount        Int                       @default(0)
+  saleCount           Int                       @default(0)
+  refundCount         Int                       @default(0)
+  
+  // Confirmation state
+  confirmedOnly       Boolean                   @default(true)
+  createdAt           DateTime                  @default(now())
+  
+  @@unique([snapshotType, scopeKey, ledgerFrom, ledgerTo, confirmedOnly])
+  @@index([snapshotType, ledgerFrom, ledgerTo])
+  @@index([scopeKey])
 }
