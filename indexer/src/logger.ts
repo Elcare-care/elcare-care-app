@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { redact, redactString } from './redact.js';
+import { PINO_REDACT_PATHS } from './log-redaction.js';
 
 // ── Service metadata ─────────────────────────────────────────────────────────
 //
