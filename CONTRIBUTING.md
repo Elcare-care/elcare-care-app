@@ -347,3 +347,69 @@ Run `cargo clippy -- -D warnings` locally to see the exact lint. Most warnings h
 
 ### "Integration test fails with DB connection error"
 The integration suite requires Docker. Run `docker info` to confirm the daemon is running, then `npm run test:integration` again. The `globalSetup.ts` in `src/__tests__/integration/` starts and tears down containers automatically.
+
+---
+
+---
+
+## Pull request templates
+
+This repository provides two PR templates based on the risk level of your change:
+
+### Standard Template (Default)
+
+Use for most changes: bug fixes, refactors, documentation, frontend UI updates, tests, and infrastructure config changes that don't touch high-risk paths.
+
+### High-Risk Change Template
+
+Use when your PR modifies contracts, financial calculations, wallet signing, parser logic, migrations, or operational controls. The high-risk template includes comprehensive checklists for:
+
+- Contract entry points, storage, or events
+- Authorization or role-based access control
+- Arithmetic (settlement amounts, royalties, fees)
+- Signature validation or replay protection
+- Database migrations
+- Event schema changes
+
+The high-risk template includes checklists for:
+- Authorization & access control
+- Replay protection & signature safety
+- Arithmetic & financial calculations
+- Event schema & compatibility
+- Reorg behavior & idempotency
+- Secrets management
+- Database migrations
+- Tests & documentation
+
+**When to use the high-risk template:**
+- Your PR touches `contracts/`, `indexer/src/event-parser.ts`, or `prisma/schema.prisma`
+- Your PR modifies wallet signing, transaction simulation, or contract deployment
+- Your PR changes authorization, role-based access, or admin controls
+- Your PR modifies financial settlement logic, arithmetic, or escrow refunds
+- You are unsure if your change is high-risk (use the template and skip irrelevant sections)
+
+**How to select the template:**
+
+When opening a PR on GitHub, add `?template=high_risk_change.md` to the URL:
+```
+https://github.com/ORG/REPO/compare/main...your-branch?template=high_risk_change.md
+```
+
+Or, after opening a standard PR, replace the description with the high-risk template content from [`.github/PULL_REQUEST_TEMPLATE/high_risk_change.md`](../.github/PULL_REQUEST_TEMPLATE/high_risk_change.md).
+
+See [`.github/PULL_REQUEST_TEMPLATE/high_risk_change.md`](../.github/PULL_REQUEST_TEMPLATE/high_risk_change.md) for the full checklist.
+
+---
+
+## Support request template
+
+Users experiencing transaction failures, wallet issues, indexer lag, or other problems can open a support request using the **[Support Request Issue Template](../.github/ISSUE_TEMPLATE/support_request.md)**.
+
+The template guides users to provide:
+- Transaction hash, network, wallet type, and timestamp
+- Error codes and messages (safe to share)
+- Reproduction steps and diagnostic context
+
+**Security notice:** The template explicitly warns users NOT to share private keys, seed phrases, or credential-bearing URLs. Support engineers can investigate using public transaction hashes and error codes alone.
+
+For support response guidance, safe diagnostic collection, severity classification, and escalation paths, see **[Support Triage Guide](../docs/guides/support-triage.md)**.
