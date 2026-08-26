@@ -1,8 +1,19 @@
 ﻿// components/ConnectWalletModal.tsx — Wallet chooser: Freighter · Lobstr · Magic
-// Upgraded with typed per-error-kind guidance (Issue #86)
+//
+// A11y + network-mismatch pass:
+//   - useModalA11y already provides focus trap + Escape key
+//   - Focus returns to the trigger element on close (caller's responsibility;
+//     WalletGuard and GuardButton pass a ref-based onClose for this)
+//   - WalletRow button has aria-label, aria-busy, aria-describedby wired to
+//     its error panel
+//   - WRONG_NETWORK surfaces NetworkSwitchPanel inline inside the row with a
+//     post-switch re-simulate step
+//   - StatusAnnouncer covers all live-region announcements (connect, error,
+//     account-change) — one region per dialog
+//   - Connected state announces the public key to screen readers via sr-only
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, useCallback, useId } from "react";
 import { useWalletContext } from "@/context/WalletContext";
 import {
   X, Wallet, ExternalLink, ShieldCheck,
@@ -15,9 +26,10 @@ import { StatusAnnouncer } from "@/components/a11y/StatusAnnouncer";
 import { WalletErrorDisplay } from "@/components/WalletErrorDisplay";
 import { normalizeWalletError } from "@/lib/wallet-adapter";
 import type { WalletAdapterError } from "@/lib/wallet-adapter";
+import type { WalletProviderName } from "@/lib/networkStatus";
 import posthog from "posthog-js";
 
-// ─── types ───────────────────────────────────────────────────────────────────
+// ── Types ─────────────────────────────────────────────────────────────────────
 
 interface ConnectWalletModalProps {
   isOpen: boolean;
@@ -28,11 +40,11 @@ type Choosing = "idle" | "freighter" | "lobstr" | "magic";
 
 interface ProviderErrors {
   freighter: WalletAdapterError | null;
-  lobstr: WalletAdapterError | null;
-  magic: WalletAdapterError | null;
+  lobstr:    WalletAdapterError | null;
+  magic:     WalletAdapterError | null;
 }
 
-// ─── tiny Lobstr SVG ─────────────────────────────────────────────────────────
+// ── Lobstr SVG ────────────────────────────────────────────────────────────────
 
 function LobstrLogo({ size = 26 }: { size?: number }) {
   return (
@@ -48,23 +60,30 @@ function LobstrLogo({ size = 26 }: { size?: number }) {
   );
 }
 
-// ─── WalletRow sub-component ──────────────────────────────────────────────────
-// Three visual modes: not-installed · connecting · ready (+ optional error panel)
+// ── WalletRow ─────────────────────────────────────────────────────────────────
+//
+// Three visual modes:
+//   not-installed  → install link (not a submit button)
+//   connecting     → spinner + "Check your wallet…" hint
+//   ready / error  → connect button + optional error panel
 
 interface WalletRowProps {
-  name: string;
-  tagline: string;
-  icon: React.ReactNode;
-  isInstalled: boolean;
-  isConnecting: boolean;
-  disabled: boolean;
-  installHref: string;
-  installHint: string;
-  error: WalletAdapterError | null;
-  accent: "brand" | "amber";
-  onConnect: () => void;
-  onRetry: () => void;
+  name:           string;
+  tagline:        string;
+  icon:           React.ReactNode;
+  isInstalled:    boolean;
+  isConnecting:   boolean;
+  disabled:       boolean;
+  installHref:    string;
+  installHint:    string;
+  error:          WalletAdapterError | null;
+  accent:         "brand" | "amber";
+  provider:       WalletProviderName;
+  onConnect:      () => void;
+  onRetry:        () => void;
   onSwitchNetwork: () => void;
+  onReadyToResimulate?: () => void;
+  isCheckingNetwork?: boolean;
   "data-testid"?: string;
 }
 
@@ -72,20 +91,33 @@ function WalletRow({
   name, tagline, icon,
   isInstalled, isConnecting, disabled,
   installHref, installHint,
-  error, accent,
-  onConnect, onRetry, onSwitchNetwork,
+  error, accent, provider,
+  onConnect, onRetry, onSwitchNetwork, onReadyToResimulate,
+  isCheckingNetwork,
   "data-testid": tid,
 }: WalletRowProps) {
-  const border   = accent === "brand" ? "hover:border-brand-300 hover:bg-brand-50/30"   : "hover:border-amber-300 hover:bg-amber-50/30";
-  const iconHov  = accent === "brand" ? "group-hover:bg-brand-500 group-hover:text-white" : "group-hover:bg-[#0B1E3E]";
-  const arrHov   = accent === "brand" ? "group-hover:text-brand-500" : "group-hover:text-amber-500";
-  const iconBg   = accent === "brand" ? "bg-brand-100 text-brand-600" : "bg-[#0B1E3E]/10 text-[#0B1E3E]";
+  // Each row gets a stable id for aria-describedby linking
+  const errorPanelId = useId();
+
+  const border  = accent === "brand"
+    ? "hover:border-brand-300 hover:bg-brand-50/30"
+    : "hover:border-amber-300 hover:bg-amber-50/30";
+  const iconHov = accent === "brand"
+    ? "group-hover:bg-brand-500 group-hover:text-white"
+    : "group-hover:bg-[#0B1E3E]";
+  const arrHov  = accent === "brand"
+    ? "group-hover:text-brand-500"
+    : "group-hover:text-amber-500";
+  const iconBg  = accent === "brand"
+    ? "bg-brand-100 text-brand-600"
+    : "bg-[#0B1E3E]/10 text-[#0B1E3E]";
 
   if (!isInstalled) {
     return (
       <div data-testid={tid}
         className="rounded-2xl border-2 border-gray-100 p-4 flex items-center gap-4">
-        <div className={`flex h-12 w-12 items-center justify-center rounded-xl bg-gray-100 text-gray-400 flex-shrink-0`}>
+        <div className="flex h-12 w-12 items-center justify-center rounded-xl bg-gray-100 text-gray-400 flex-shrink-0"
+          aria-hidden="true">
           {icon}
         </div>
         <div className="flex-1 min-w-0">
@@ -94,8 +126,8 @@ function WalletRow({
           <p className="text-[11px] text-gray-400 mt-0.5 leading-tight">{installHint}</p>
         </div>
         <a href={installHref} target="_blank" rel="noopener noreferrer"
-          className="shrink-0 flex items-center gap-1 text-xs font-bold text-brand-500 hover:underline"
-          aria-label={`Install ${name}`}>
+          className="shrink-0 flex items-center gap-1 text-xs font-bold text-brand-500 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-400 focus-visible:ring-offset-1 rounded"
+          aria-label={`Install ${name} wallet extension (opens in new tab)`}>
           Install <ExternalLink size={12} aria-hidden="true" />
         </a>
       </div>
@@ -104,11 +136,25 @@ function WalletRow({
 
   return (
     <div className="space-y-2">
-      <button type="button" onClick={onConnect} disabled={disabled}
+      <button
+        type="button"
+        onClick={onConnect}
+        disabled={disabled}
         data-testid={tid}
-        className={`group relative flex w-full items-center gap-4 rounded-2xl border-2 p-4 text-left transition-all duration-300 disabled:opacity-60
-          ${error ? "border-red-200 bg-red-50/20" : `border-gray-100 ${border}`}`}>
-        <div className={`flex h-12 w-12 items-center justify-center rounded-xl flex-shrink-0 transition-colors ${iconBg} ${iconHov}`}>
+        aria-label={
+          isConnecting
+            ? `Connecting to ${name}…`
+            : error
+            ? `${name}: ${error.message} — click to retry`
+            : `Connect with ${name}`
+        }
+        aria-busy={isConnecting || undefined}
+        aria-describedby={error ? errorPanelId : undefined}
+        className={`group relative flex w-full items-center gap-4 rounded-2xl border-2 p-4 text-left transition-all duration-300 disabled:opacity-60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-400 focus-visible:ring-offset-2
+          ${error ? "border-red-200 bg-red-50/20" : `border-gray-100 ${border}`}`}
+      >
+        <div className={`flex h-12 w-12 items-center justify-center rounded-xl flex-shrink-0 transition-colors ${iconBg} ${iconHov}`}
+          aria-hidden="true">
           {isConnecting
             ? <Loader2 size={24} className="animate-spin" aria-hidden="true" />
             : icon}
@@ -117,7 +163,7 @@ function WalletRow({
           <p className="font-bold text-midnight-900">{name}</p>
           <p className="text-xs text-gray-500">{tagline}</p>
           {isConnecting && (
-            <p className="text-xs text-gray-400 mt-0.5">
+            <p className="text-xs text-gray-400 mt-0.5" aria-live="polite">
               Check your wallet for an approval prompt…
             </p>
           )}
@@ -127,18 +173,28 @@ function WalletRow({
       </button>
 
       {error && (
-        <WalletErrorDisplay
-          error={error}
-          onRetry={["USER_REJECTED","SIGN_FAILED","UNKNOWN","ACCOUNT_UNAVAILABLE"].includes(error.kind) ? onRetry : undefined}
-          onSwitchNetwork={error.kind === "WRONG_NETWORK" ? onSwitchNetwork : undefined}
-          onDismiss={onRetry}
-        />
+        <div id={errorPanelId}>
+          <WalletErrorDisplay
+            error={error}
+            provider={provider}
+            onRetry={
+              ["USER_REJECTED","SIGN_FAILED","UNKNOWN","ACCOUNT_UNAVAILABLE"].includes(error.kind)
+                ? onRetry
+                : undefined
+            }
+            onSwitchNetwork={error.kind === "WRONG_NETWORK" ? onSwitchNetwork : undefined}
+            onReadyToResimulate={onReadyToResimulate}
+            isCheckingNetwork={isCheckingNetwork}
+            onDismiss={onRetry}
+            autoFocusPrimary
+          />
+        </div>
       )}
     </div>
   );
 }
 
-// ─── Main modal ───────────────────────────────────────────────────────────────
+// ── Main modal ────────────────────────────────────────────────────────────────
 
 export function ConnectWalletModal({ isOpen, onClose }: ConnectWalletModalProps) {
   const { dialogRef, titleId } = useModalA11y(isOpen, onClose);
@@ -146,22 +202,28 @@ export function ConnectWalletModal({ isOpen, onClose }: ConnectWalletModalProps)
     isConnected, publicKey, refresh,
     freighter, lobstr, magic,
     connectFreighter, connectLobstr,
-    clearAllWalletErrors,
+    clearAllWalletErrors, clearStaleDraft,
+    walletType,
+    networkPassphrase,
   } = useWalletContext();
 
-  const [choosing, setChoosing]       = useState<Choosing>("idle");
-  const [showMagic, setShowMagic]     = useState(false);
-  const [errors, setErrors]           = useState<ProviderErrors>({ freighter: null, lobstr: null, magic: null });
+  const [choosing, setChoosing]   = useState<Choosing>("idle");
+  const [showMagic, setShowMagic] = useState(false);
+  const [errors, setErrors]       = useState<ProviderErrors>({
+    freighter: null, lobstr: null, magic: null,
+  });
+  const [isCheckingNetwork, setIsCheckingNetwork] = useState(false);
 
   // Reset on open
   useEffect(() => {
     if (isOpen) {
       setChoosing("idle");
       setErrors({ freighter: null, lobstr: null, magic: null });
+      setIsCheckingNetwork(false);
     }
   }, [isOpen]);
 
-  // Auto-close on success
+  // Auto-close on success with sr announcement delay
   useEffect(() => {
     if (isConnected && choosing !== "idle") {
       posthog.capture("wallet_connected", { provider: choosing, surface: "connect_modal" });
@@ -172,7 +234,7 @@ export function ConnectWalletModal({ isOpen, onClose }: ConnectWalletModalProps)
 
   if (!isOpen) return null;
 
-  // ── handlers ──────────────────────────────────────────────
+  // ── Handlers ───────────────────────────────────────────────────────────────
 
   const handleFreighter = async () => {
     setChoosing("freighter");
@@ -204,9 +266,23 @@ export function ConnectWalletModal({ isOpen, onClose }: ConnectWalletModalProps)
     setShowMagic(true);
   };
 
-  const handleClose = () => { clearAllWalletErrors(); onClose(); };
+  const handleClose = () => {
+    clearAllWalletErrors();
+    onClose();
+  };
 
-  // ── derived ───────────────────────────────────────────────
+  const handleSwitchNetwork = useCallback(async () => {
+    setIsCheckingNetwork(true);
+    await refresh();
+    setIsCheckingNetwork(false);
+  }, [refresh]);
+
+  const handleReadyToResimulate = useCallback(() => {
+    clearStaleDraft();
+    onClose();
+  }, [clearStaleDraft, onClose]);
+
+  // ── Derived ────────────────────────────────────────────────────────────────
 
   const freighterConnecting = choosing === "freighter" && freighter.isConnecting;
   const lobstrConnecting    = choosing === "lobstr"    && lobstr.isConnecting;
@@ -215,13 +291,23 @@ export function ConnectWalletModal({ isOpen, onClose }: ConnectWalletModalProps)
   const freighterErr: WalletAdapterError | null =
     errors.freighter ??
     (freighter.isWrongNetwork
-      ? { kind: "WRONG_NETWORK", message: `Freighter is on the wrong network. Switch to "${config.networkPassphrase}".`, expected: config.networkPassphrase, detected: freighter.networkPassphrase }
+      ? {
+          kind: "WRONG_NETWORK",
+          message: `Freighter is on the wrong network. Switch to "${config.networkPassphrase}".`,
+          expected: config.networkPassphrase,
+          detected: freighter.networkPassphrase,
+        }
       : null);
 
   const lobstrErr: WalletAdapterError | null =
     errors.lobstr ??
     (lobstr.isWrongNetwork
-      ? { kind: "WRONG_NETWORK", message: `Lobstr is on the wrong network. Switch to "${config.networkPassphrase}".`, expected: config.networkPassphrase, detected: lobstr.networkPassphrase }
+      ? {
+          kind: "WRONG_NETWORK",
+          message: `Lobstr is on the wrong network. Switch to "${config.networkPassphrase}".`,
+          expected: config.networkPassphrase,
+          detected: lobstr.networkPassphrase,
+        }
       : null);
 
   const magicErr: WalletAdapterError | null =
@@ -232,55 +318,92 @@ export function ConnectWalletModal({ isOpen, onClose }: ConnectWalletModalProps)
     choosing === "lobstr"    ? lobstrErr    :
     choosing === "magic"     ? magicErr     : null;
 
+  // Live region message — assertive for errors, polite for progress/success
   const liveMsg =
-    isConnected    ? "Wallet connected successfully." :
-    activeErr      ? activeErr.message :
-    anyConnecting  ? "Connecting to wallet…" : "";
+    isConnected        ? `Wallet connected. Address: ${publicKey ?? ""}` :
+    activeErr          ? activeErr.message :
+    anyConnecting      ? "Connecting to wallet…" : "";
+  const livePoliteness =
+    activeErr && !anyConnecting ? "assertive" : "polite";
 
-  // ── render ────────────────────────────────────────────────
+  // ── Render ─────────────────────────────────────────────────────────────────
 
   return (
     <>
-      <MagicWalletModal isOpen={showMagic} onClose={() => {
-        setShowMagic(false);
-        if (!magic.isConnected) setChoosing("idle");
-      }} />
+      <MagicWalletModal
+        isOpen={showMagic}
+        onClose={() => {
+          setShowMagic(false);
+          if (!magic.isConnected) setChoosing("idle");
+        }}
+      />
 
       <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 sm:p-6">
-        <div className="absolute inset-0 bg-midnight-950/80 backdrop-blur-md animate-fade-in"
-          onClick={handleClose} aria-hidden="true" />
+        {/* Backdrop — click closes, but focus trap prevents accidental close via Tab */}
+        <div
+          className="absolute inset-0 bg-midnight-950/80 backdrop-blur-md animate-fade-in"
+          onClick={handleClose}
+          aria-hidden="true"
+        />
 
-        <div ref={dialogRef} role="dialog" aria-modal="true" aria-labelledby={titleId}
-          data-testid="connect-wallet-modal" tabIndex={-1}
-          className="relative w-full max-w-md overflow-hidden rounded-3xl bg-white shadow-2xl shadow-black/50 animate-scale-in outline-none">
+        <div
+          ref={dialogRef}
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby={titleId}
+          data-testid="connect-wallet-modal"
+          tabIndex={-1}
+          className="relative w-full max-w-md overflow-hidden rounded-3xl bg-white shadow-2xl shadow-black/50 animate-scale-in outline-none"
+        >
+          {/* Single StatusAnnouncer covers all live announcements for this dialog */}
+          <StatusAnnouncer message={liveMsg} politeness={livePoliteness} />
 
-          <StatusAnnouncer message={liveMsg}
-            politeness={activeErr && !anyConnecting ? "assertive" : "polite"} />
           <div className="tribal-strip h-2" aria-hidden="true" />
 
-          {/* header */}
+          {/* Header */}
           <div className="flex items-center justify-between p-6 pb-0">
-            <h2 id={titleId} className="font-display text-2xl font-bold text-midnight-900">
+            <h2
+              id={titleId}
+              className="font-display text-2xl font-bold text-midnight-900"
+            >
               Connect <span className="text-brand-500">Wallet</span>
             </h2>
-            <button type="button" onClick={handleClose}
+            <button
+              type="button"
+              onClick={handleClose}
               aria-label="Close wallet connection dialog"
-              className="rounded-full p-2 text-gray-700 hover:bg-gray-100 hover:text-midnight-900 transition-colors">
+              className="rounded-full p-2 text-gray-700 hover:bg-gray-100 hover:text-midnight-900 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-400 focus-visible:ring-offset-1"
+            >
               <X size={20} aria-hidden="true" />
             </button>
           </div>
 
           <div className="p-6 pt-4 max-h-[82vh] overflow-y-auto space-y-3">
 
-            {/* connected */}
+            {/* Connected state */}
             {isConnected ? (
-              <div className="rounded-2xl border-2 border-mint-100 bg-mint-50/30 p-8 text-center animate-fade-in">
+              <div
+                role="status"
+                aria-live="polite"
+                className="rounded-2xl border-2 border-mint-100 bg-mint-50/30 p-8 text-center animate-fade-in"
+              >
                 <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-mint-100 text-mint-600">
                   <CheckCircle2 size={32} aria-hidden="true" />
                 </div>
-                <h3 className="font-display font-bold text-midnight-900 text-xl">Connected!</h3>
-                <p className="mt-2 text-sm text-mint-800">Your wallet is connected to ELCARE-HUB.</p>
-                <p className="mt-3 font-mono text-[10px] text-mint-700/60 break-all px-4">{publicKey}</p>
+                <h3 className="font-display font-bold text-midnight-900 text-xl">
+                  Connected!
+                </h3>
+                <p className="mt-2 text-sm text-mint-800">
+                  Your wallet is connected to ELCARE-HUB.
+                </p>
+                {/* sr-only so AT reads the full key without visual noise */}
+                <p className="sr-only">Wallet address: {publicKey}</p>
+                <p
+                  className="mt-3 font-mono text-[10px] text-mint-700/60 break-all px-4"
+                  aria-hidden="true"
+                >
+                  {publicKey}
+                </p>
               </div>
             ) : (
               <>
@@ -290,7 +413,8 @@ export function ConnectWalletModal({ isOpen, onClose }: ConnectWalletModalProps)
 
                 {/* Freighter */}
                 <WalletRow
-                  name="Freighter" tagline="Official Stellar Wallet"
+                  name="Freighter"
+                  tagline="Official Stellar Wallet"
                   icon={<Wallet size={24} aria-hidden="true" />}
                   isInstalled={freighter.isInstalled}
                   isConnecting={freighterConnecting}
@@ -299,15 +423,22 @@ export function ConnectWalletModal({ isOpen, onClose }: ConnectWalletModalProps)
                   installHint="Free browser extension by Stellar Development Foundation."
                   error={freighterErr}
                   accent="brand"
+                  provider="freighter"
                   onConnect={handleFreighter}
-                  onRetry={() => { setErrors(p => ({ ...p, freighter: null })); handleFreighter(); }}
-                  onSwitchNetwork={refresh}
+                  onRetry={() => {
+                    setErrors(p => ({ ...p, freighter: null }));
+                    handleFreighter();
+                  }}
+                  onSwitchNetwork={handleSwitchNetwork}
+                  onReadyToResimulate={handleReadyToResimulate}
+                  isCheckingNetwork={isCheckingNetwork}
                   data-testid="wallet-option-freighter"
                 />
 
                 {/* Lobstr */}
                 <WalletRow
-                  name="Lobstr" tagline="Popular Stellar Wallet & Exchange"
+                  name="Lobstr"
+                  tagline="Popular Stellar Wallet & Exchange"
                   icon={<LobstrLogo size={24} />}
                   isInstalled={lobstr.isInstalled}
                   isConnecting={lobstrConnecting}
@@ -316,37 +447,57 @@ export function ConnectWalletModal({ isOpen, onClose }: ConnectWalletModalProps)
                   installHint="Browser extension by the Lobstr team."
                   error={lobstrErr}
                   accent="amber"
+                  provider="lobstr"
                   onConnect={handleLobstr}
-                  onRetry={() => { setErrors(p => ({ ...p, lobstr: null })); handleLobstr(); }}
-                  onSwitchNetwork={refresh}
+                  onRetry={() => {
+                    setErrors(p => ({ ...p, lobstr: null }));
+                    handleLobstr();
+                  }}
+                  onSwitchNetwork={handleSwitchNetwork}
+                  onReadyToResimulate={handleReadyToResimulate}
+                  isCheckingNetwork={isCheckingNetwork}
                   data-testid="wallet-option-lobstr"
                 />
 
                 {/* Magic */}
                 <div className="space-y-2">
-                  <button type="button" onClick={handleMagic} disabled={anyConnecting}
+                  <button
+                    type="button"
+                    onClick={handleMagic}
+                    disabled={anyConnecting}
                     data-testid="wallet-option-magic"
-                    className="group relative flex w-full items-center gap-4 rounded-2xl border-2 border-gray-100 p-4 text-left hover:border-purple-300 hover:bg-purple-50/30 transition-all duration-300 disabled:opacity-60">
-                    <div className="flex h-12 w-12 items-center justify-center rounded-xl bg-purple-100 text-purple-600 group-hover:bg-purple-500 group-hover:text-white transition-colors flex-shrink-0">
+                    aria-label="Connect with Magic Wallet using email or passkey"
+                    aria-busy={magic.isConnecting || undefined}
+                    className="group relative flex w-full items-center gap-4 rounded-2xl border-2 border-gray-100 p-4 text-left hover:border-purple-300 hover:bg-purple-50/30 transition-all duration-300 disabled:opacity-60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-purple-400 focus-visible:ring-offset-2"
+                  >
+                    <div className="flex h-12 w-12 items-center justify-center rounded-xl bg-purple-100 text-purple-600 group-hover:bg-purple-500 group-hover:text-white transition-colors flex-shrink-0"
+                      aria-hidden="true">
                       <Mail size={24} aria-hidden="true" />
                     </div>
                     <div>
                       <p className="font-bold text-midnight-900">Magic Wallet</p>
-                      <p className="text-xs text-gray-500">Email or Passkey — no extension needed</p>
+                      <p className="text-xs text-gray-500">
+                        Email or Passkey — no extension needed
+                      </p>
                     </div>
                     <ArrowRight size={18} aria-hidden="true"
                       className="absolute right-4 text-gray-300 group-hover:text-purple-500 group-hover:translate-x-1 transition-all" />
                   </button>
+
                   {choosing === "magic" && magicErr && (
                     <WalletErrorDisplay
                       error={magicErr}
-                      onRetry={() => { setErrors(p => ({ ...p, magic: null })); setShowMagic(true); }}
+                      provider="magic"
+                      onRetry={() => {
+                        setErrors(p => ({ ...p, magic: null }));
+                        setShowMagic(true);
+                      }}
                       onDismiss={() => setErrors(p => ({ ...p, magic: null }))}
                     />
                   )}
                 </div>
 
-                {/* divider */}
+                {/* Divider */}
                 <div className="relative py-1">
                   <div className="absolute inset-0 flex items-center" aria-hidden="true">
                     <div className="w-full border-t border-gray-100" />
@@ -356,7 +507,7 @@ export function ConnectWalletModal({ isOpen, onClose }: ConnectWalletModalProps)
                   </div>
                 </div>
 
-                {/* security note */}
+                {/* Security note */}
                 <div className="rounded-2xl bg-gray-50 p-4 flex items-start gap-3">
                   <ShieldCheck size={18} className="text-mint-500 mt-0.5 flex-shrink-0" aria-hidden="true" />
                   <p className="text-xs text-gray-600 leading-relaxed">
@@ -368,10 +519,11 @@ export function ConnectWalletModal({ isOpen, onClose }: ConnectWalletModalProps)
             )}
           </div>
 
-          {/* footer */}
+          {/* Footer */}
           <div className="bg-gray-50 p-4 text-center">
             <p className="text-[10px] text-gray-400 uppercase tracking-widest font-semibold flex items-center justify-center gap-2">
-              Authenticated by Stellar Consensus <ShieldCheck size={10} aria-hidden="true" />
+              Authenticated by Stellar Consensus{" "}
+              <ShieldCheck size={10} aria-hidden="true" />
             </p>
           </div>
         </div>

@@ -103,7 +103,15 @@ export function CheckoutModal({
   // Checkout flow state
   const [step, setStep] = useState<CheckoutStep>("preview");
   const [conflictMessage, setConflictMessage] = useState<string | null>(null);
-  const [purchaseError, setPurchaseError] = useState<string | null>(null);
+
+  // Typed transaction lifecycle — replaces the ad-hoc purchaseError string and
+  // isBuyingCrypto flag. The duplicate-submission guard prevents double-clicks.
+  const { txState, isActive: isTxRunning, run: runTx, reset: resetTx } = useTxLifecycle({
+    persistKey: `checkout:${listing.listing_id}`,
+    action: "Purchase",
+  });
+
+  const isBuying = isTxRunning || isBuyingCrypto;
 
   // Preflight hook
   const { preflight, isChecking: isPreflighting, conflict, freshListing, reset: resetPreflight } = useFreshListing();
@@ -114,10 +122,10 @@ export function CheckoutModal({
       setStep("preview");
       setConflictMessage(null);
       setPreviewError(null);
-      setPurchaseError(null);
+      resetTx();
       resetPreflight();
     }
-  }, [isOpen, resetPreflight]);
+  }, [isOpen, resetPreflight, resetTx]);
 
   // ── Initialise tokens + preview ───────────────────────────
   useEffect(() => {
@@ -206,8 +214,8 @@ export function CheckoutModal({
       }
 
       setStep("processing");
-      setPurchaseError(null);
-      const success = await onCryptoPurchase();
+      resetTx();
+      const success = await runTx(() => onCryptoPurchase(), { action: "Purchase" });
       if (success) {
         posthog.capture("Purchase Successful", {
           listing_id: listing.listing_id,
@@ -219,35 +227,37 @@ export function CheckoutModal({
         onClose();
         setStep("preview");
       } else {
-        setPurchaseError("Purchase could not be completed. Check your wallet for a rejected or failed signature, then try again.");
+        // success is null — lifecycle transitioned to error; let TxErrorPanel render
         setStep("confirm");
       }
     }
-  }, [preview, selectedToken, step, listing, preflight, conflict, freshListing, onCryptoPurchase, onPurchased, onClose]);
+  }, [preview, selectedToken, step, listing, preflight, conflict, freshListing, runTx, resetTx, onCryptoPurchase, onPurchased, onClose]);
 
   if (!isOpen || !selectedToken) return null;
 
   const statusMessage = conflictMessage
     ? `Conflict: ${conflictMessage}`
-    : purchaseError
-    ? `Error: ${purchaseError}`
+    : txState.state === "error"
+    ? `Error: ${txState.error?.message ?? "Purchase failed"}`
     : previewError
     ? `Error: ${previewError}`
     : isPreflighting
     ? "Verifying listing is still available…"
-    : step === "processing" || isBuyingCrypto
-    ? "Processing your purchase. Please check your wallet for a signature request."
+    : isBuying
+    ? txStateLabel(txState.state) || "Processing your purchase. Please check your wallet for a signature request."
     : "";
   const statusPoliteness =
-    (conflictMessage || purchaseError || previewError) && !isPreflighting ? "assertive" : "polite";
+    (conflictMessage || txState.state === "error" || previewError) && !isPreflighting
+      ? "assertive"
+      : "polite";
 
   const buttonLabel = () => {
-    if (step === "processing" || isBuyingCrypto) return "Processing…";
+    if (isBuying) return txStateLabel(txState.state) || "Processing…";
     if (step === "confirm") return `Confirm & Pay ${preview?.buyerTotalDisplay ?? ""} ${selectedToken.symbol}`;
     return `Review & Pay ${preview?.itemPriceDisplay ?? ""} ${selectedToken.symbol}`;
   };
 
-  const isButtonDisabled = step === "processing" || isBuyingCrypto || isPreflighting || !!previewError || blocksAction;
+  const isButtonDisabled = isBuying || isPreflighting || !!previewError || blocksAction;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
@@ -317,12 +327,28 @@ export function CheckoutModal({
             </div>
           )}
 
-          {/* Purchase failure */}
-          {purchaseError && (
-            <div role="alert" className="flex items-start gap-3 rounded-xl border border-red-200 bg-red-50 p-4">
-              <AlertTriangle size={18} className="text-red-600 shrink-0 mt-0.5" aria-hidden="true" />
-              <p className="text-sm text-red-800">{purchaseError}</p>
-            </div>
+          {/* Typed transaction error — distinguishes wallet rejection from chain failure */}
+          {txState.state === "error" && txState.error && (
+            <TxErrorPanel
+              error={txState.error}
+              txHash={txState.txHash}
+              onRetry={() => { resetTx(); setStep("confirm"); }}
+              onDismiss={() => { resetTx(); setStep("preview"); }}
+            />
+          )}
+
+          {/* Tx hash recovery link — shown once the hash is known */}
+          {txState.txHash && txState.state !== "success" && (
+            <p className="text-xs text-gray-400 text-center">
+              Transaction:{" "}
+              <Link
+                href={`/tx/${txState.txHash}`}
+                className="font-mono text-blue-500 hover:underline"
+                target="_blank"
+              >
+                {txState.txHash.slice(0, 12)}…
+              </Link>
+            </p>
           )}
 
           {/* Token selection */}
@@ -546,10 +572,10 @@ export function CheckoutModal({
               disabled={isButtonDisabled}
               className="mt-1 flex w-full items-center justify-center gap-2 rounded-2xl bg-brand-500 py-5 font-bold text-white shadow-lg shadow-brand-500/20 hover:bg-brand-600 transition-all disabled:opacity-50"
             >
-              {step === "processing" || isBuyingCrypto ? (
+              {isBuying ? (
                 <>
                   <Loader2 className="animate-spin" size={18} aria-hidden="true" />
-                  Processing…
+                  {txStateLabel(txState.state) || "Processing…"}
                 </>
               ) : (
                 buttonLabel()

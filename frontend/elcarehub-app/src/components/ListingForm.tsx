@@ -17,6 +17,9 @@ import { ensureTokenOption, getDefaultSupportedToken } from "@/lib/token-support
 import posthog from "posthog-js";
 import { isValidStellarAddress } from "@/lib/validation";
 import { config } from "@/lib/config";
+import { useTxLifecycle, txStateLabel } from "@/hooks/useTxLifecycle";
+import { TxErrorPanel } from "@/components/TxErrorPanel";
+import Link from "next/link";
 
 export const ART_CATEGORIES = [
   "Painting",
@@ -176,6 +179,20 @@ export function ListingForm({ listing, onSuccess, onCancel }: ListingFormProps) 
     useCreateListing(publicKey);
   const { update, isUpdating, progress: updateProgress, error: updateError } =
     useUpdateListing(publicKey);
+
+  // Typed lifecycle — surfaces wallet-rejection vs chain-failure in TxErrorPanel
+  // and provides a tx hash recovery link after submission.
+  const {
+    txState: listingTxState,
+    isActive: isListingTxActive,
+    run: runListingTx,
+    reset: resetListingTx,
+  } = useTxLifecycle({
+    persistKey: isEdit
+      ? `updateListing:${listing?.listing_id}`
+      : "createListing",
+    action: isEdit ? "Update listing" : "Create listing",
+  });
 
   const [form, setForm] = useState<FormState>({
     metadataCid: "",
@@ -363,46 +380,62 @@ export function ListingForm({ listing, onSuccess, onCancel }: ListingFormProps) 
     // can create a listing (it needs to call transfer_from at escrow time).
     if (!isEdit && approvalStatus === false) return;
 
+    // Reset any previous lifecycle error before starting a new submission.
+    resetListingTx();
+
     if (isEdit && listing && currentMetadata) {
-      const success = await update({
-        listingId: listing.listing_id,
-        originalTokenAddress: listing.token,
-        collectionAddress: form.collectionAddress,
-        nftTokenId: form.nftTokenId,
-        price: form.price,
-        tokenAddress: form.tokenAddress,
-        title: currentMetadata.title ?? "",
-        description: currentMetadata.description ?? "",
-        artistName: currentMetadata.artist ?? "",
-        year: currentMetadata.year ?? "",
-        category: currentMetadata.category ?? "",
-        currentMetadata,
-      });
+      const success = await runListingTx(
+        () =>
+          update({
+            listingId: listing.listing_id,
+            originalTokenAddress: listing.token,
+            collectionAddress: form.collectionAddress,
+            nftTokenId: form.nftTokenId,
+            price: form.price,
+            tokenAddress: form.tokenAddress,
+            title: currentMetadata.title ?? "",
+            description: currentMetadata.description ?? "",
+            artistName: currentMetadata.artist ?? "",
+            year: currentMetadata.year ?? "",
+            category: currentMetadata.category ?? "",
+            currentMetadata,
+          }),
+        { action: "Update listing" }
+      );
       if (success) {
         setSuccessId(listing.listing_id);
         onSuccess?.(listing.listing_id);
       }
     } else if (!isEdit) {
-      const id = await create({
-        collectionAddress: form.collectionAddress,
-        nftTokenId: form.nftTokenId,
-        price: form.price,
-        tokenAddress: form.tokenAddress,
-        recipients: form.recipients,
-      });
+      const id = await runListingTx(
+        () =>
+          create({
+            collectionAddress: form.collectionAddress,
+            nftTokenId: form.nftTokenId,
+            price: form.price,
+            tokenAddress: form.tokenAddress,
+            recipients: form.recipients,
+          }),
+        { action: "Create listing" }
+      );
       if (id !== null) {
-        setSuccessId(id);
+        setSuccessId(id as number);
         posthog.capture("Listing Created", { listing_id: id, price_xlm: form.price });
-        onSuccess?.(id);
+        onSuccess?.(id as number);
       }
     }
   };
 
-  const isLoading = isCreating || isUpdating || isFetchingMetadata;
+  const isLoading = isCreating || isUpdating || isFetchingMetadata || isListingTxActive;
   /** True when any async operation is in flight (including approval). */
   const isAnyLoading = isLoading || isCheckingApproval || isApprovingMarketplace;
-  const progress = isEdit ? updateProgress : createProgress;
-  const error = isEdit ? updateError : createError;
+  const progress = isListingTxActive
+    ? txStateLabel(listingTxState.state)
+    : isEdit
+    ? updateProgress
+    : createProgress;
+  // Show typed error from lifecycle when available, fall back to hook error string
+  const hookError = isEdit ? updateError : createError;
 
   // ── Success screen ────────────────────────────────────────
 
@@ -807,16 +840,44 @@ export function ListingForm({ listing, onSuccess, onCancel }: ListingFormProps) 
             )}
           </div>
 
-          {/* Progress / server error */}
+          {/* Progress / lifecycle state label */}
           {isLoading && progress && (
             <div className="flex items-center gap-3 rounded-2xl bg-brand-50 px-6 py-4 text-sm font-semibold text-brand-700 animate-pulse">
               <Loader2 size={20} className="animate-spin" />
               {progress}
             </div>
           )}
-          {error && (
+
+          {/* Typed transaction error — distinguishes wallet rejection, simulation
+              failure, and chain failure with per-category recovery instructions */}
+          {listingTxState.state === "error" && listingTxState.error && (
+            <TxErrorPanel
+              error={listingTxState.error}
+              txHash={listingTxState.txHash}
+              onRetry={resetListingTx}
+              onDismiss={resetListingTx}
+            />
+          )}
+
+          {/* Tx hash recovery link — visible once hash is known */}
+          {listingTxState.txHash && listingTxState.state !== "success" && (
+            <p className="text-xs text-gray-400 text-center">
+              Transaction:{" "}
+              <Link
+                href={`/tx/${listingTxState.txHash}`}
+                className="font-mono text-blue-500 hover:underline"
+                target="_blank"
+              >
+                {listingTxState.txHash.slice(0, 12)}…
+              </Link>
+            </p>
+          )}
+
+          {/* Fallback hook error string (e.g. IPFS upload failures that happen
+              before the tx is submitted) */}
+          {hookError && listingTxState.state !== "error" && (
             <p className="rounded-2xl bg-red-50 px-6 py-4 text-sm font-bold text-red-600 border border-red-100">
-              {error}
+              {hookError}
             </p>
           )}
 
