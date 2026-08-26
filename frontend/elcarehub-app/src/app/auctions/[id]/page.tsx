@@ -32,6 +32,8 @@ import { useFinalizeAuction } from "@/hooks/useAuctions";
 import { GuardButton } from "@/components/WalletGuard";
 import { ResourceState } from "@/components/PageStates";
 import { config } from "@/lib/config";
+import { getTokenConfigByAddress, getNativeTokenConfig } from "@/config/tokens";
+import { validateAmountInput, baseToDisplay } from "@/lib/amount";
 import {
   ArrowLeft,
   Clock,
@@ -566,6 +568,7 @@ export default function AuctionDetailPage() {
   const [pageError, setPageError] = useState<PageStateError | null>(null);
   const [activeTab, setActiveTab] = useState<"details" | "bids">("details");
   const [bidAmountXlm, setBidAmountXlm] = useState("");
+  const [bidValidationError, setBidValidationError] = useState<string | null>(null);
   const [bidSuccess, setBidSuccess] = useState(false);
   const [finalizeSuccess, setFinalizeSuccess] = useState(false);
 
@@ -662,8 +665,24 @@ export default function AuctionDetailPage() {
 
   const handleBid = async () => {
     if (!auction) return;
-    const amountXlm = parseFloat(bidAmountXlm);
-    if (!amountXlm || amountXlm <= 0) return;
+
+    // Bigint-safe parse/validate (Issue #521) instead of a bare `parseFloat`
+    // — rejects malformed input, excess decimal precision, and below-minimum
+    // bids in one pass, mirroring the shared BiddingPanel component.
+    const bidToken = getTokenConfigByAddress(auction.token) ?? getNativeTokenConfig();
+    const minimumNextBidBase =
+      auction.highest_bid > 0n ? auction.highest_bid + 1n : auction.reserve_price;
+    const result = validateAmountInput(bidAmountXlm, bidToken, minimumNextBidBase);
+    if (!result.valid || result.baseUnits === null) {
+      setBidValidationError(result.message);
+      return;
+    }
+    setBidValidationError(null);
+
+    // Re-express as a JS number only at the boundary of the existing
+    // numeric `bid()` hook API — the parse/validate step above never
+    // touches floating-point arithmetic.
+    const amountXlm = Number(baseToDisplay(result.baseUnits, bidToken));
     const ok = await bid(auction.auction_id, amountXlm);
     if (ok) {
       setBidSuccess(true);
@@ -867,7 +886,10 @@ export default function AuctionDetailPage() {
                     step="0.0000001"
                     placeholder={`Min. ${reserveXlm} XLM`}
                     value={bidAmountXlm}
-                    onChange={(e) => setBidAmountXlm(e.target.value)}
+                    onChange={(e) => {
+                      setBidAmountXlm(e.target.value);
+                      setBidValidationError(null);
+                    }}
                     className="flex-1 rounded-xl border border-gray-200 bg-white px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-brand-400"
                   />
                   <GuardButton
@@ -884,8 +906,8 @@ export default function AuctionDetailPage() {
                     )}
                   </GuardButton>
                 </div>
-                {bidError && (
-                  <p className="text-xs text-red-500">{bidError}</p>
+                {(bidValidationError || bidError) && (
+                  <p className="text-xs text-red-500">{bidValidationError || bidError}</p>
                 )}
                 {bidSuccess && (
                   <p className="flex items-center gap-1 text-xs text-green-600">

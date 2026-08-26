@@ -33,7 +33,8 @@ import {
 } from "lucide-react";
 import { clsx } from "clsx";
 import { Offer, stroopsToXlm, deriveOfferUIStatus, OfferUIStatus } from "@/lib/contract";
-import { SUPPORTED_TOKENS, TokenConfig } from "@/config/tokens";
+import { SUPPORTED_TOKENS, TokenConfig, getTokenConfigByAddress, getNativeTokenConfig } from "@/config/tokens";
+import { validateAmountInput, baseToDisplay } from "@/lib/amount";
 import { GuardButton } from "@/components/WalletGuard";
 import { useAcceptOffer, useRejectOffer } from "@/hooks/useOffers";
 import { useModalA11y } from "@/hooks/useModalA11y";
@@ -133,11 +134,20 @@ function MakeOfferModal({
     e.preventDefault();
     setLocalError(null);
 
-    const amountNum = Number(amount);
-    if (!amount || !Number.isFinite(amountNum) || amountNum <= 0) {
-      setLocalError("Please enter a valid offer amount.");
+    // Bigint-safe parse/validate (Issue #521) — rejects malformed input,
+    // negative amounts, and excess decimal precision for the selected
+    // token instead of a bare `Number(amount)` check (which also silently
+    // accepted exponent notation like "1e5").
+    const token = getTokenConfigByAddress(tokenAddress) ?? getNativeTokenConfig();
+    const result = validateAmountInput(amount, token);
+    if (!result.valid || result.baseUnits === null) {
+      setLocalError(result.message ?? "Please enter a valid offer amount.");
       return;
     }
+    // Re-express as a JS number only at the boundary of the existing
+    // numeric `onSubmit` API — the parse/validate step above never
+    // touches floating-point arithmetic.
+    const amountNum = Number(baseToDisplay(result.baseUnits, token));
 
     let expiryTs: number | undefined;
     if (expiryDate) {

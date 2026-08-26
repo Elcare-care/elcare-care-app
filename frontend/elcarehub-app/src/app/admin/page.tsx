@@ -44,6 +44,8 @@ import {
     ExternalLink,
 } from "lucide-react";
 import { stroopsToXlm } from "@/lib/contract";
+import { getNativeTokenConfig } from "@/config/tokens";
+import { validateAmountInput } from "@/lib/amount";
 
 // ── Admin key rotation helpers (Issue #202) ───────────────────────────────────
 
@@ -809,10 +811,12 @@ export default function AdminPage() {
                                         disabled={isAuctionConfigProcessing}
                                         onClick={async () => {
                                             const input = document.getElementById('min-bid-input') as HTMLInputElement;
-                                            const value = parseFloat(input.value);
-                                            if (isNaN(value) || value <= 0) return;
-                                            const stroops = Math.floor(value * 10_000_000);
-                                            await setMinBid(BigInt(stroops));
+                                            // Bigint-safe parse (Issue #521) — the previous
+                                            // `Math.floor(value * 10_000_000)` was literal
+                                            // floating-point arithmetic on the submitted amount.
+                                            const result = validateAmountInput(input.value, getNativeTokenConfig());
+                                            if (!result.valid || result.baseUnits === null) return;
+                                            await setMinBid(result.baseUnits);
                                             input.value = '';
                                         }}
                                         className="mt-5 flex items-center gap-2 rounded-xl bg-purple-600 px-5 py-2.5 text-sm font-bold text-white transition-all hover:bg-purple-700 disabled:opacity-50 shadow-md shadow-purple-200"

@@ -10,11 +10,12 @@ import { useCreateAuction } from "@/hooks/useAuctions";
 import { useWalletContext } from "@/context/WalletContext";
 import { Upload, CheckCircle, Loader2 } from "lucide-react";
 import { GuardButton } from "./WalletGuard";
-import { DEFAULT_TOKEN } from "@/config/tokens";
+import { DEFAULT_TOKEN, TokenConfig } from "@/config/tokens";
 import { useSupportedTokens } from "@/hooks/useSupportedTokens";
 import { getDefaultSupportedToken } from "@/lib/token-support";
 import { ART_CATEGORIES } from "./ListingForm";
 import { validateIpfsCid } from "@/lib/validation";
+import { validateAmountInput, baseToDisplay } from "@/lib/amount";
 
 interface AuctionFormProps {
   onSuccess?: (auctionId: number) => void;
@@ -30,6 +31,7 @@ export function AuctionForm({ onSuccess, onCancel }: AuctionFormProps) {
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [successId, setSuccessId] = useState<number | null>(null);
   const [cidError, setCidError] = useState<string | null>(null);
+  const [reservePriceError, setReservePriceError] = useState<string | null>(null);
   const [form, setForm] = useState({
     title: "",
     description: "",
@@ -70,6 +72,31 @@ export function AuctionForm({ onSuccess, onCancel }: AuctionFormProps) {
     if (file && file.type.startsWith("image/")) handleFile(file);
   };
 
+  /**
+   * Parses the raw reserve-price input using bigint arithmetic (lib/amount.ts)
+   * instead of a bare `parseFloat`, rejecting malformed input and excess
+   * decimal precision for the selected token up front.
+   */
+  const handleReservePriceChange = (raw: string, token: TokenConfig) => {
+    if (raw.trim() === "") {
+      setReservePriceError(null);
+      setForm((cur) => ({ ...cur, reservePriceXlm: NaN }));
+      return;
+    }
+
+    const result = validateAmountInput(raw, token);
+    if (result.valid && result.baseUnits !== null) {
+      setReservePriceError(null);
+      setForm((cur) => ({
+        ...cur,
+        reservePriceXlm: Number(baseToDisplay(result.baseUnits!, token)),
+      }));
+    } else {
+      setReservePriceError(result.message);
+      setForm((cur) => ({ ...cur, reservePriceXlm: NaN }));
+    }
+  };
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!selectedFile) return;
@@ -78,6 +105,11 @@ export function AuctionForm({ onSuccess, onCancel }: AuctionFormProps) {
     const err = validateIpfsCid(form.metadataCid);
     setCidError(err);
     if (err) return;
+
+    if (reservePriceError || !Number.isFinite(form.reservePriceXlm) || form.reservePriceXlm <= 0) {
+      setReservePriceError(reservePriceError ?? "Enter a valid reserve price.");
+      return;
+    }
 
     const id = await create({ ...form, imageFile: selectedFile });
     if (id !== null) {
@@ -296,19 +328,27 @@ export function AuctionForm({ onSuccess, onCancel }: AuctionFormProps) {
                   type="number"
                   min={0.0000001}
                   step="any"
-                  value={form.reservePriceXlm}
+                  value={Number.isNaN(form.reservePriceXlm) ? "" : form.reservePriceXlm}
                   onChange={(e) =>
-                    setForm({
-                      ...form,
-                      reservePriceXlm: parseFloat(e.target.value),
-                    })
+                    handleReservePriceChange(e.target.value, selectedToken ?? defaultToken)
                   }
-                  className="w-full rounded-2xl border border-gray-200 bg-gray-50/50 px-5 py-4 pr-16 text-base focus:border-brand-500 focus:bg-white focus:outline-none transition-all shadow-sm font-inter"
+                  aria-invalid={!!reservePriceError}
+                  aria-describedby={reservePriceError ? "err-reserve-price" : undefined}
+                  className={`w-full rounded-2xl border px-5 py-4 pr-16 text-base focus:outline-none transition-all shadow-sm font-inter ${
+                    reservePriceError
+                      ? "border-red-400 bg-red-50/40 focus:border-red-500"
+                      : "border-gray-200 bg-gray-50/50 focus:border-brand-500 focus:bg-white"
+                  }`}
                 />
                 <span className="absolute right-5 top-1/2 -translate-y-1/2 text-sm font-bold text-brand-600">
                   {selectedToken?.symbol ?? ""}
                 </span>
               </div>
+              {reservePriceError && (
+                <p id="err-reserve-price" className="text-sm text-red-600 mt-1" role="alert">
+                  {reservePriceError}
+                </p>
+              )}
             </div>
 
             {/* Token address selector — the key addition for this issue */}
@@ -382,7 +422,15 @@ export function AuctionForm({ onSuccess, onCancel }: AuctionFormProps) {
             )}
             <GuardButton
               type="submit"
-              disabled={isCreating || !hasTokenOptions || !selectedFile || !!cidError}
+              disabled={
+                isCreating ||
+                !hasTokenOptions ||
+                !selectedFile ||
+                !!cidError ||
+                !!reservePriceError ||
+                !Number.isFinite(form.reservePriceXlm) ||
+                form.reservePriceXlm <= 0
+              }
               actionName="to create your auction"
               className="flex-[2] flex items-center justify-center gap-3 rounded-2xl bg-brand-500 py-5 text-xl font-bold text-white shadow-2xl shadow-brand-500/30 hover:bg-brand-600 hover:scale-[1.01] transition-all active:scale-[0.98] disabled:opacity-50 disabled:hover:scale-100"
             >

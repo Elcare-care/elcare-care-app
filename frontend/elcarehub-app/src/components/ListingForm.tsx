@@ -11,9 +11,10 @@ import { Upload, CheckCircle, Loader2, Save, Plus, Trash2, ShieldCheck, ShieldAl
 import { GuardButton } from "./WalletGuard";
 import { ArtworkMetadata, fetchMetadata } from "@/lib/ipfs";
 import { Listing, stroopsToXlm, checkAndApproveMarketplace, isApprovedForAll } from "@/lib/contract";
-import { DEFAULT_TOKEN } from "@/config/tokens";
+import { DEFAULT_TOKEN, TokenConfig } from "@/config/tokens";
 import { useSupportedTokens } from "@/hooks/useSupportedTokens";
 import { ensureTokenOption, getDefaultSupportedToken } from "@/lib/token-support";
+import { validateAmountInput, baseToDisplay } from "@/lib/amount";
 import posthog from "posthog-js";
 import { isValidStellarAddress } from "@/lib/validation";
 import { config } from "@/lib/config";
@@ -203,6 +204,10 @@ export function ListingForm({ listing, onSuccess, onCancel }: ListingFormProps) 
     recipients: [{ address: publicKey ?? "", percentage: 100 }],
   });
   const [touched, setTouched] = useState<Set<string>>(new Set());
+  // Set by the price field's onChange when the raw string fails bigint-safe
+  // parsing (e.g. more decimal places than the token supports) — surfaced
+  // in preference to the generic numeric bound message from `errors.price`.
+  const [priceInputError, setPriceInputError] = useState<string | null>(null);
   const [submitAttempted, setSubmitAttempted] = useState(false);
   const [successId, setSuccessId] = useState<number | null>(null);
   const [currentMetadata, setCurrentMetadata] = useState<ArtworkMetadata | null>(null);
@@ -340,6 +345,32 @@ export function ListingForm({ listing, onSuccess, onCancel }: ListingFormProps) 
     return submitAttempted || touched.has(field);
   }
 
+  /**
+   * Parses the raw price input using bigint arithmetic (lib/amount.ts)
+   * instead of a bare `parseFloat`. This rejects malformed input and
+   * excess decimal precision (e.g. more places than the selected token
+   * supports) up front rather than silently rounding at submission time.
+   * The canonical, bigint-validated value is re-expressed as a JS number
+   * for `form.price` so the existing contract-bound bound checks in
+   * `validateListingForm` (MIN/MAX_PRICE_XLM) keep applying unchanged.
+   */
+  function handlePriceChange(raw: string, token: TokenConfig) {
+    if (raw.trim() === "") {
+      setPriceInputError(null);
+      setForm((cur) => ({ ...cur, price: NaN }));
+      return;
+    }
+
+    const result = validateAmountInput(raw, token);
+    if (result.valid && result.baseUnits !== null) {
+      setPriceInputError(null);
+      setForm((cur) => ({ ...cur, price: Number(baseToDisplay(result.baseUnits!, token)) }));
+    } else {
+      setPriceInputError(result.message);
+      setForm((cur) => ({ ...cur, price: NaN }));
+    }
+  }
+
   // ── Recipients helpers ────────────────────────────────────
 
   function addRecipient() {
@@ -460,6 +491,7 @@ export function ListingForm({ listing, onSuccess, onCancel }: ListingFormProps) 
                 setSuccessId(null);
                 setSubmitAttempted(false);
                 setTouched(new Set());
+                setPriceInputError(null);
                 setForm({
                   metadataCid: "",
                   collectionAddress: "",
@@ -657,15 +689,13 @@ export function ListingForm({ listing, onSuccess, onCancel }: ListingFormProps) 
                   min={MIN_PRICE_XLM}
                   max={MAX_PRICE_XLM}
                   step="any"
-                  value={form.price}
-                  onChange={(e) =>
-                    setForm({ ...form, price: parseFloat(e.target.value) })
-                  }
+                  value={Number.isNaN(form.price) ? "" : form.price}
+                  onChange={(e) => handlePriceChange(e.target.value, selectedToken)}
                   onBlur={() => markTouched("price")}
-                  aria-invalid={shouldShowError("price") && !!errors.price}
-                  aria-describedby={errors.price ? "err-price" : undefined}
+                  aria-invalid={shouldShowError("price") && !!(priceInputError || errors.price)}
+                  aria-describedby={priceInputError || errors.price ? "err-price" : undefined}
                   className={`w-full rounded-2xl border px-5 py-4 pr-16 text-base focus:outline-none transition-all shadow-sm font-inter ${
-                    shouldShowError("price") && errors.price
+                    shouldShowError("price") && (priceInputError || errors.price)
                       ? "border-red-400 bg-red-50/40 focus:border-red-500"
                       : "border-gray-200 bg-gray-50/50 focus:border-brand-500 focus:bg-white"
                   }`}
@@ -674,9 +704,9 @@ export function ListingForm({ listing, onSuccess, onCancel }: ListingFormProps) 
                   {selectedToken.symbol}
                 </span>
               </div>
-              {shouldShowError("price") && errors.price && (
+              {shouldShowError("price") && (priceInputError || errors.price) && (
                 <p id="err-price" className="text-sm text-red-600 mt-1" role="alert">
-                  {errors.price}
+                  {priceInputError || errors.price}
                 </p>
               )}
             </div>
@@ -898,6 +928,7 @@ export function ListingForm({ listing, onSuccess, onCancel }: ListingFormProps) 
               disabled={
                 isAnyLoading ||
                 !hasTokenOptions ||
+                !!priceInputError ||
                 (submitAttempted && !formIsValid) ||
                 (!isEdit && approvalStatus === false)
               }
