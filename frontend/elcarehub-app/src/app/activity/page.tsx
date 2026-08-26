@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import Link from "next/link";
 import {
   Activity as ActivityIcon,
@@ -14,11 +14,14 @@ import {
   WifiOff,
   TrendingUp,
   AlertCircle,
+  ExternalLink,
 } from "lucide-react";
 import { Breadcrumb } from "@/components/Breadcrumb";
 import { useActivityFeed } from "@/hooks/useActivityFeed";
+import { useIndexerFreshness } from "@/hooks/useIndexerFreshness";
 import { ActivityFeedEvent } from "@/lib/indexer";
 import { formatRelativeTime } from "@/lib/format";
+import { StaleBanner } from "@/components/StaleBanner";
 
 // ── Event type icon mapping ───────────────────────────────────────────────────
 
@@ -119,6 +122,20 @@ function ActivityRow({ event }: { event: ActivityFeedEvent }) {
               <span className="font-mono">ledger {event.ledgerSequence.toLocaleString()}</span>
             </>
           )}
+          {event.txHash && (
+            <>
+              <span>·</span>
+              {/* Issue #522 — direct on-chain verification path, independent
+                  of whether the indexer's view of this event is current. */}
+              <Link
+                href={`/tx/${event.txHash}`}
+                className="inline-flex items-center gap-0.5 text-brand-400 hover:text-brand-300 transition-colors"
+              >
+                Verify on-chain
+                <ExternalLink size={9} />
+              </Link>
+            </>
+          )}
         </div>
       </div>
     </div>
@@ -157,6 +174,19 @@ function matchesDomainFilter(event: ActivityFeedEvent, filter: DomainFilter): bo
 export default function ActivityPage() {
   const [domainFilter, setDomainFilter] = useState<DomainFilter>("all");
   const { events, isLoading, error, sseConnected, refresh } = useActivityFeed(50);
+
+  // Issue #522 — indexer freshness/health for the wallet/platform activity
+  // feed. This is a transaction-critical view (users decide whether to
+  // trust a sale/bid/offer as settled), so retry + reorg handling matters
+  // here even though useActivityFeed already has its own SSE + poll fallback.
+  const freshness = useIndexerFreshness({
+    resourceType: "default",
+    onRefresh: refresh,
+  });
+  useEffect(() => {
+    if (events.length > 0) freshness.markUpdated();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [events]);
 
   const visible = events.filter((e) => matchesDomainFilter(e, domainFilter));
 
@@ -211,6 +241,19 @@ export default function ActivityPage() {
             </button>
           </div>
         </div>
+
+        {/* Issue #522 — non-blocking indexer freshness indicator */}
+        {freshness.status !== "healthy" && (
+          <div className="mb-4">
+            <StaleBanner
+              freshness={freshness.freshness}
+              status={freshness.status}
+              reorg={freshness.reorg}
+              onRefresh={freshness.refresh}
+              isRefreshing={freshness.isRefreshing}
+            />
+          </div>
+        )}
 
         {/* Domain filter tabs */}
         <div className="flex gap-1 mb-4 flex-wrap" role="tablist" aria-label="Filter by domain">

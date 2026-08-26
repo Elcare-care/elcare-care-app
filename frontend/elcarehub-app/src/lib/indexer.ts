@@ -146,6 +146,13 @@ interface RawMarketplaceEvent {
   data: Record<string, unknown>;
   ledgerSequence: number;
   ledgerTimestamp?: string;
+  /** Real Stellar transaction hash, when the indexer captured one. */
+  txHash?: string | null;
+}
+
+/** True for a well-formed 64-hex-character Stellar transaction hash. */
+function isRealTxHash(v: unknown): v is string {
+  return typeof v === "string" && /^[0-9a-fA-F]{64}$/.test(v);
 }
 
 function sleep(ms: number) {
@@ -327,7 +334,7 @@ function mapWalletEventToActivity(
     timestamp: ts,
     from: from || "—",
     to: to || "—",
-    tx_hash: `ledger_${ev.ledgerSequence}`,
+    tx_hash: isRealTxHash(ev.txHash) ? ev.txHash : `ledger_${ev.ledgerSequence}`,
   };
 }
 
@@ -461,7 +468,7 @@ function mapListingHistoryEvent(
     timestamp: ts,
     from: artist || ev.actor,
     to: buyer || config.contractId,
-    tx_hash: `ledger_${ev.ledgerSequence}`,
+    tx_hash: isRealTxHash(ev.txHash) ? ev.txHash : `ledger_${ev.ledgerSequence}`,
   };
 }
 
@@ -1370,6 +1377,9 @@ export interface ActivityFeedEvent {
   data: Record<string, unknown>;
   ledgerSequence: number;
   ledgerTimestamp: string | null;
+  /** Real Stellar transaction hash, when the indexer captured one — usable
+   *  as a direct link to /tx/[hash] for on-chain verification. */
+  txHash?: string | null;
   /** Human-readable summary generated client-side */
   summary?: string;
 }
@@ -1396,6 +1406,7 @@ export async function fetchRecentActivity(limit = 20): Promise<ActivityFeedEvent
           : {},
         ledgerSequence: typeof item.ledgerSequence === "number" ? item.ledgerSequence : 0,
         ledgerTimestamp: typeof item.ledgerTimestamp === "string" ? item.ledgerTimestamp : null,
+        txHash: isRealTxHash(item.txHash) ? item.txHash : null,
       }));
   } catch (e) {
     console.warn("[indexer] fetchRecentActivity:", e instanceof Error ? e.message : e);

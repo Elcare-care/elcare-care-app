@@ -22,6 +22,7 @@ import { useListingOffers, useMakeOffer } from "@/hooks/useOffers";
 import { useListingActivity } from "@/hooks/useUserActivity";
 import { useListingHistory } from "@/hooks/useListingHistory";
 import { getListingPriceHistory, PriceHistoryPoint } from "@/lib/indexer";
+import { useIndexerFreshness } from "@/hooks/useIndexerFreshness";
 import { ProvenanceTimeline } from "@/components/ProvenanceTimeline";
 import { OfferPanel } from "@/components/OfferPanel";
 import { PriceHistoryChart } from "@/components/PriceHistoryChart";
@@ -30,6 +31,7 @@ import { ReportContentButton } from "@/components/ReportContentButton";
 import { GuardButton } from "@/components/WalletGuard";
 import { ResourceState } from "@/components/PageStates";
 import { Breadcrumb } from "@/components/Breadcrumb";
+import { StaleBanner } from "@/components/StaleBanner";
 import { categorizePageError, PageStateError } from "@/lib/pageState";
 import {
     ArrowLeft,
@@ -174,6 +176,23 @@ export default function ListingDetailPage({ id }: ListingClientProps) {
         loadData();
     }, [loadData]);
 
+    // Issue #522 — indexer freshness/health for this listing or auction.
+    // Retrying re-checks indexer health and re-runs loadData() together.
+    const freshness = useIndexerFreshness({
+        resourceType: listing ? "listing" : auction ? "auction" : "default",
+        onRefresh: loadData,
+    });
+    useEffect(() => {
+        if (listing || auction) freshness.markUpdated();
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [listing, auction]);
+
+    // Direct-chain verification link: point at the most recent event on this
+    // listing that carries a real (non-placeholder) transaction hash.
+    const verifiableTxHash = historyEvents.find(
+        (e) => e.tx_hash && !e.tx_hash.startsWith("ledger_")
+    )?.tx_hash;
+
     const handleBuy = async () => {
         if (!listing) return;
         const success = await buy(listing.listing_id);
@@ -277,6 +296,20 @@ export default function ListingDetailPage({ id }: ListingClientProps) {
                 ]}
                 className="mb-8"
             />
+
+            {/* Issue #522 — non-blocking indexer freshness indicator */}
+            {freshness.status !== "healthy" && (
+                <div className="mb-8">
+                    <StaleBanner
+                        freshness={freshness.freshness}
+                        status={freshness.status}
+                        reorg={freshness.reorg}
+                        onRefresh={freshness.refresh}
+                        isRefreshing={freshness.isRefreshing}
+                        verifyHref={verifiableTxHash ? `/tx/${verifiableTxHash}` : undefined}
+                    />
+                </div>
+            )}
 
             <div className="grid gap-12 lg:grid-cols-2 lg:items-start">
                 {/* LEFT COLUMN: Media, Tabs & Description */}
