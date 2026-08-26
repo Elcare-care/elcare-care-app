@@ -8,6 +8,7 @@ import {
   useCallback,
   useEffect,
   useState,
+  useRef,
 } from "react";
 import { useWallet, WalletState, WalletStatus } from "@/hooks/useWallet";
 import { useMagicWallet, MagicWalletState } from "@/hooks/useMagicWallet";
@@ -30,6 +31,12 @@ import {
   resolveProviderError,
   type WalletErrorState,
 } from "@/hooks/useWalletState";
+import {
+  getNetworkStatus,
+  useNetworkPoller,
+  type NetworkStatus,
+  type NetworkChangeEvent,
+} from "@/lib/networkStatus";
 
 export type WalletType = "freighter" | "lobstr" | "magic" | null;
 
@@ -97,6 +104,58 @@ export interface UnifiedWalletState {
 
   /** Clear all error planes (called on disconnect, modal close, or retry). */
   clearAllWalletErrors(): void;
+
+  // ── Network status ────────────────────────────────────────────────────────
+
+  /**
+   * Typed network status for the active wallet.
+   * Derived from isConnected + networkPassphrase; never null.
+   *
+   *   not_connected  — no wallet connected
+   *   connecting     — connection attempt in progress
+   *   correct        — connected, passphrase matches config
+   *   wrong_network  — connected, passphrase does NOT match config
+   *   unknown        — connected but passphrase unavailable (Magic)
+   */
+  networkStatus: NetworkStatus;
+
+  /**
+   * True when the network or account changed after a transaction draft was
+   * started.  Any pending simulation must be discarded and re-run before
+   * the user is allowed to sign.
+   */
+  staleNetworkDraft: boolean;
+
+  /**
+   * Snapshot the current network/account generation for draft tracking.
+   * Returns an opaque number; pass it to isDraftStale() before signing.
+   */
+  snapshotDraft(): number;
+
+  /**
+   * Returns true when the network or account changed since snapshotId was taken.
+   */
+  isDraftStale(snapshotId: number): boolean;
+
+  /**
+   * Explicitly mark the current draft as stale (e.g. when a WRONG_NETWORK
+   * error is surfaced mid-flow).  Clears automatically after invalidateDraft()
+   * is called or when the user re-simulates.
+   */
+  invalidateDraft(): void;
+
+  /**
+   * Clear the stale-draft flag after the caller has discarded the old draft
+   * and started a fresh simulation.
+   */
+  clearStaleDraft(): void;
+
+  /**
+   * Register a callback to be notified when the wallet's network or account
+   * changes mid-session.  Useful for modals that need to discard state.
+   * Returns an unsubscribe function.
+   */
+  onNetworkChange(cb: (event: NetworkChangeEvent) => void): () => void;
 }
 
 const WalletContext = createContext<UnifiedWalletState | null>(null);
@@ -118,6 +177,54 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     clearAllErrors: clearAllWalletErrors,
     clearConnectionError,
   } = useWalletErrorState();
+
+  // ── Stale-draft tracking ─────────────────────────────────────────────────
+  // The generation counter increments on every detected network or account
+  // change so any in-flight simulation can be detected as stale before signing.
+  const draftGenerationRef  = useRef(0);
+  const [staleNetworkDraft, setStaleNetworkDraft] = useState(false);
+
+  // Subscriber registry for onNetworkChange()
+  const networkChangeListenersRef = useRef<Set<(event: NetworkChangeEvent) => void>>(
+    new Set()
+  );
+
+  const handleNetworkOrAccountChange = useCallback(
+    (event: NetworkChangeEvent) => {
+      // Bump generation so any live StaleDraftToken becomes stale
+      draftGenerationRef.current += 1;
+      // Mark the draft stale so components can show a warning
+      setStaleNetworkDraft(true);
+      // Notify all subscribers
+      networkChangeListenersRef.current.forEach((cb) => cb(event));
+    },
+    []
+  );
+
+  const snapshotDraft = useCallback((): number => {
+    return draftGenerationRef.current;
+  }, []);
+
+  const isDraftStale = useCallback((snapshotId: number): boolean => {
+    return draftGenerationRef.current !== snapshotId;
+  }, []);
+
+  const invalidateDraft = useCallback(() => {
+    draftGenerationRef.current += 1;
+    setStaleNetworkDraft(true);
+  }, []);
+
+  const clearStaleDraft = useCallback(() => {
+    setStaleNetworkDraft(false);
+  }, []);
+
+  const onNetworkChange = useCallback(
+    (cb: (event: NetworkChangeEvent) => void): (() => void) => {
+      networkChangeListenersRef.current.add(cb);
+      return () => networkChangeListenersRef.current.delete(cb);
+    },
+    []
+  );
 
   // ── Auto-reconnect on mount ────────────────────────────────────────────────
   useEffect(() => {
@@ -186,6 +293,35 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     ? "MAGIC_CONNECTED"
     : "DISCONNECTED";
 
+  // ── Typed network status ───────────────────────────────────────────────────
+  const networkPassphraseActive = activeWallet?.networkPassphrase ?? null;
+
+  const networkStatus: NetworkStatus = getNetworkStatus(
+    freighter.isConnected || lobstr.isConnected || magic.isConnected,
+    freighter.isConnecting || lobstr.isConnecting || magic.isConnecting,
+    // Magic does not expose passphrase — pass null so status becomes "unknown"
+    walletType === "magic" ? null : networkPassphraseActive,
+    config.networkPassphrase
+  );
+
+  // ── Network/account change polling ─────────────────────────────────────────
+  // Observes the publicKey and networkPassphrase that flow through context
+  // and fires handleNetworkOrAccountChange when either changes mid-session.
+  useNetworkPoller({
+    publicKey,
+    networkPassphrase: networkPassphraseActive,
+    onNetworkChange: handleNetworkOrAccountChange,
+    enabled: !!(freighter.isConnected || lobstr.isConnected),
+  });
+
+  // When a wrong-network state is detected, also invalidate any in-flight draft
+  // so write flows that were simulated on the old network are blocked.
+  useEffect(() => {
+    if (networkStatus === "wrong_network") {
+      invalidateDraft();
+    }
+  }, [networkStatus, invalidateDraft]);
+
   // ── Sync provider string errors → structured connection error ──────────────
   // This runs on every render but is guarded by the reducer's identity check
   // so it only dispatches when something actually changes.
@@ -248,7 +384,9 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     if (magic.isConnected) magic.logout().catch(console.error);
     clearWalletState();
     clearAllWalletErrors();
-  }, [freighter, lobstr, magic, clearAllWalletErrors]);
+    clearStaleDraft();
+    draftGenerationRef.current += 1; // invalidate any in-flight drafts
+  }, [freighter, lobstr, magic, clearAllWalletErrors, clearStaleDraft]);
 
   const refresh = useCallback(async () => {
     await Promise.all([freighter.refresh(), lobstr.refresh()]);
@@ -325,7 +463,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       isConnecting:
         freighter.isConnecting || lobstr.isConnecting || magic.isConnecting,
       isWrongNetwork: activeWallet?.isWrongNetwork ?? false,
-      networkPassphrase: activeWallet?.networkPassphrase ?? null,
+      networkPassphrase: networkPassphraseActive,
       isInstalled: freighter.isInstalled || lobstr.isInstalled,
       // Legacy string error (back-compat)
       error: legacyError,
@@ -347,6 +485,14 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       setSigningError,
       setTransactionError,
       clearAllWalletErrors,
+      // Network status
+      networkStatus,
+      staleNetworkDraft,
+      snapshotDraft,
+      isDraftStale,
+      invalidateDraft,
+      clearStaleDraft,
+      onNetworkChange,
     }),
     [
       walletType,
@@ -355,6 +501,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       isLoadingBalance,
       status,
       activeWallet,
+      networkPassphraseActive,
       legacyError,
       freighter,
       lobstr,
@@ -372,6 +519,13 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       setSigningError,
       setTransactionError,
       clearAllWalletErrors,
+      networkStatus,
+      staleNetworkDraft,
+      snapshotDraft,
+      isDraftStale,
+      invalidateDraft,
+      clearStaleDraft,
+      onNetworkChange,
     ]
   );
 

@@ -484,47 +484,75 @@ export const reconcilerSkippedTotal = new client.Counter({
   labelNames: ['reason'],
 });
 
-// ── Abuse / anomaly detection metrics (Issue #539) ────────────────────────────
-//
-// route_family: 'search' | 'sse' | 'wallet-activity' | 'tx-lookup'
-// key_type:     'wallet' | 'ip_hash' — the label is always the KIND of key,
-//               never the raw wallet address or IP itself, so metric labels
-//               never become a long-lived per-user identity log. A wallet
-//               address is a public blockchain identifier, not verified
-//               identity — see indexer/src/api/abuse-detection.ts.
+// ── Financial reconciliation metrics (Issue #XXX) ─────────────────────────────
 
-/** Total requests rejected for exceeding a per-route-family abuse quota. */
-export const abuseQuotaExceededTotal = new client.Counter({
-  name: 'elcarehub_abuse_quota_exceeded_total',
-  help: 'Total requests rejected for exceeding a per-route-family abuse quota, by route family and key type',
-  labelNames: ['route_family', 'key_type'],
+/** Total financial reconciliation runs completed, by outcome. */
+export const financialReconcileRunsTotal = new client.Counter({
+  name: 'financial_reconcile_runs_total',
+  help: 'Total financial reconciliation runs completed, by outcome (ok | error)',
+  labelNames: ['outcome', 'dry_run'],
 });
 
-/** Total abuse anomaly signals detected (quota breaches, blocklist hits, etc). */
-export const abuseAnomalyDetectedTotal = new client.Counter({
-  name: 'elcarehub_abuse_anomaly_detected_total',
-  help: 'Total abuse anomaly signals detected, by route family, key type, and reason',
-  labelNames: ['route_family', 'key_type', 'reason'],
+/** Total financial drifts detected, by entity type and severity. */
+export const financialDriftsDetectedTotal = new client.Counter({
+  name: 'financial_drifts_detected_total',
+  help: 'Total financial drifts detected during reconciliation, by entity type and severity',
+  labelNames: ['entity_type', 'severity'],
 });
 
-/** Total requests rejected because the key was on the temporary abuse blocklist. */
-export const abuseBlockedRequestsTotal = new client.Counter({
-  name: 'elcarehub_abuse_blocked_requests_total',
-  help: 'Total requests rejected because the key was on the temporary abuse blocklist, by route family and key type',
-  labelNames: ['route_family', 'key_type'],
+/** Total financial alerts raised, by entity type. */
+export const financialAlertsRaisedTotal = new client.Counter({
+  name: 'financial_alerts_raised_total',
+  help: 'Total financial alerts raised during reconciliation, by entity type',
+  labelNames: ['entity_type'],
 });
 
-/** Current number of keys (wallet or IP hash) on the temporary abuse blocklist. */
-export const abuseBlocklistActiveGauge = new client.Gauge({
-  name: 'elcarehub_abuse_blocklist_active',
-  help: 'Current number of keys (wallet or IP hash) on the temporary abuse blocklist',
+/** Current number of unresolved financial drifts, by severity. */
+export const financialDriftsOpenGauge = new client.Gauge({
+  name: 'financial_drifts_open',
+  help: 'Current number of unresolved financial drifts, by severity',
+  labelNames: ['severity'],
 });
 
-/** Total times abuse detection failed open because Redis was unavailable. */
-export const abuseDetectionRedisFailureTotal = new client.Counter({
-  name: 'elcarehub_abuse_detection_redis_failures_total',
-  help: 'Total times abuse detection failed open (request allowed) because Redis was unavailable, by operation',
-  labelNames: ['operation'],
+/** Protocol-level aggregate totals for reconciliation verification. */
+export const financialProtocolAggregateGauge = new client.Gauge({
+  name: 'financial_protocol_aggregate',
+  help: 'Protocol-level aggregate totals for financial reconciliation verification',
+  labelNames: ['metric'], // protocol_fees, royalties, sales, refunds
+});
+
+/** Per-token aggregate totals for reconciliation verification. */
+export const financialTokenAggregateGauge = new client.Gauge({
+  name: 'financial_token_aggregate',
+  help: 'Per-token aggregate totals for financial reconciliation verification',
+  labelNames: ['token', 'metric'],
+});
+
+/** Per-collection aggregate totals for reconciliation verification. */
+export const financialCollectionAggregateGauge = new client.Gauge({
+  name: 'financial_collection_aggregate',
+  help: 'Per-collection aggregate totals for financial reconciliation verification',
+  labelNames: ['collection', 'metric'],
+});
+
+/** Per-ledger aggregate totals for reconciliation verification. */
+export const financialLedgerAggregateGauge = new client.Gauge({
+  name: 'financial_ledger_aggregate',
+  help: 'Per-ledger aggregate totals for financial reconciliation verification',
+  labelNames: ['ledger_sequence', 'metric'],
+});
+
+/** Duration of financial reconciliation runs in seconds. */
+export const financialReconcileDurationSeconds = new client.Histogram({
+  name: 'financial_reconcile_duration_seconds',
+  help: 'Duration of financial reconciliation runs in seconds',
+  buckets: [1, 5, 10, 30, 60, 120, 300],
+});
+
+/** Age in seconds of the oldest unresolved financial drift. */
+export const financialDriftOldestAgeSeconds = new client.Gauge({
+  name: 'financial_drift_oldest_age_seconds',
+  help: 'Age in seconds of the oldest unresolved financial drift (0 when none)',
 });
 
 // ── Expose metrics handler ────────────────────────────────────────────────────

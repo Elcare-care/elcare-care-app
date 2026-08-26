@@ -55,6 +55,4 @@ Out of scope:
 
 - [Threat Model](docs/THREAT_MODEL.md) — attack surface analysis
 - [Incident Runbook](docs/INCIDENT_RUNBOOK.md) — response procedures
-- [API Abuse Detection & Quotas](docs/ABUSE_DETECTION.md) — layered
-  route-family quotas, hashed-IP/wallet keying, and the operator
-  block/unblock workflow for distributed API abuse
+- [SBOM & Dependency Provenance](docs/SBOM.md) — CycloneDX SBOMs, build metadata, and how a package traces back to its lockfile and image layer

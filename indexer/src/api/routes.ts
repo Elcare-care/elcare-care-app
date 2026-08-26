@@ -40,6 +40,7 @@ import {
   artistMetricsQuerySchema,
   royaltyBreakdownQuerySchema,
   searchQuerySchema,
+  eventsQuerySchema,
 } from './query-schemas.js';
 import { isValidStellarAddress, STELLAR_ADDRESS_ERROR } from '../stellar-address.js';
 import {
@@ -53,7 +54,9 @@ import { rpc } from '@stellar/stellar-sdk';
 import { apiRequestDurationHistogram } from '../metrics.js';
 import { TTL } from '../cache-warmer.js';
 import { withDecimalAmounts } from '../token-metadata.js';
-import { authMiddleware, classifyRoute } from './auth-middleware.js';
+import { authMiddleware } from './auth-middleware.js';
+import { queryCostGuard, handleQueryCostDiagnostics } from './query-cost.js';
+import { getCached as getCachedService } from './cache-service.js';
 import { logger } from '../logger.js';
 
 
@@ -175,20 +178,18 @@ router.use(apiDurationMiddleware);
 
 const CACHE_TTL_SECONDS = parseInt(process.env.REDIS_CACHE_TTL_SECONDS || '30');
 
-async function getCached<T>(key: string, ttl: number, fetcher: () => Promise<T>): Promise<T> {
-  try {
-    const cached = await redis.get(key);
-    if (cached) return JSON.parse(cached) as T;
-  } catch {
-    // Redis unavailable — fall through to DB
-  }
-  const result = await fetcher();
-  try {
-    await (redis as any).setEx(key, ttl, JSON.stringify(result));
-  } catch {
-    // ignore cache write failures
-  }
-  return result;
+/**
+ * getCached — thin wrapper over the cache-service that adds thundering-herd
+ * protection. Popular keys (stats, recent activity) benefit from the
+ * distributed lock option.
+ */
+async function getCached<T>(
+  key: string,
+  ttl: number,
+  fetcher: () => Promise<T>,
+  opts: { distributed?: boolean } = {},
+): Promise<T> {
+  return getCachedService(key, ttl, fetcher, opts);
 }
 
 const serialize = (obj: any) =>
@@ -212,6 +213,51 @@ const OFFER_MONEY_FIELDS = [['amount', 'token']] as const;
 
 const serializeListing = (row: any) => withDecimalAmounts(serialize(row), LISTING_MONEY_FIELDS);
 const serializeListings = (rows: any[]) => serialize(rows).map((row: any) => withDecimalAmounts(row, LISTING_MONEY_FIELDS));
+
+// ── Moderation overlay for listing responses (Issue #542) ─────────────────────
+//
+// Listings are never deleted or rewritten when moderated — moderation is a
+// pure overlay looked up by ModerationCase.listingId. `moderationState` is
+// null when no case exists (the common case). Hidden states are excluded
+// from default public listing paths (list/search) but a listing is still
+// fetchable by id so the frontend can render the "moderated" overlay.
+const HIDDEN_MODERATION_STATES = new Set(['QUARANTINED', 'REJECTED']);
+
+async function attachModerationState<T extends { listingId: bigint | number | string }>(
+  rows: T[]
+): Promise<Array<T & { moderationState: string | null }>> {
+  if (rows.length === 0) return [];
+  try {
+    const ids = rows.map((r) => BigInt(r.listingId as any));
+    const cases = await prisma.moderationCase.findMany({
+      where: { listingId: { in: ids } },
+      select: { listingId: true, state: true },
+    });
+    const stateByListing = new Map(cases.map((c) => [c.listingId!.toString(), c.state as string]));
+    return rows.map((r) => ({ ...r, moderationState: stateByListing.get(String(r.listingId)) ?? null }));
+  } catch {
+    // Moderation lookup is best-effort — never fail a listing read because
+    // of it.
+    return rows.map((r) => ({ ...r, moderationState: null }));
+  }
+}
+
+async function getModerationStateForListing(listingId: bigint): Promise<string | null> {
+  try {
+    const moderationCase = await prisma.moderationCase.findFirst({
+      where: { listingId },
+      select: { state: true },
+    });
+    return moderationCase?.state ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** Excludes QUARANTINED/REJECTED rows from a default public listing response. */
+function excludeModerated<T extends { moderationState: string | null }>(rows: T[]): T[] {
+  return rows.filter((r) => !HIDDEN_MODERATION_STATES.has(r.moderationState ?? ''));
+}
 const serializeAuction = (row: any) => withDecimalAmounts(serialize(row), AUCTION_MONEY_FIELDS);
 const serializeAuctions = (rows: any[]) => serialize(rows).map((row: any) => withDecimalAmounts(row, AUCTION_MONEY_FIELDS));
 const serializeOffers = (rows: any[]) => serialize(rows).map((row: any) => withDecimalAmounts(row, OFFER_MONEY_FIELDS));
@@ -309,7 +355,7 @@ function sanitiseTsQuery(raw: string): string {
   return raw.replace(/[&|!:<>()]/g, ' ').trim();
 }
 
-router.get('/listings', lightRateLimiter, cacheMiddleware(TTL.LISTINGS_LIST), validateQuery(listingsQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
+router.get('/listings', lightRateLimiter, cacheMiddleware(TTL.LISTINGS_LIST), queryCostGuard(), validateQuery(listingsQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
   const { artist, owner, status, limit, offset, minPrice, maxPrice, search, cursor_ledger, cursor_direction } =
     (req as any).validatedQuery;
   try {
@@ -408,9 +454,16 @@ router.get('/listings', lightRateLimiter, cacheMiddleware(TTL.LISTINGS_LIST), va
         ? String(results[results.length - 1].updatedAtLedger)
         : '';
 
+      // Moderation overlay: QUARANTINED/REJECTED listings are excluded from
+      // this default public search result (still fetchable via /listings/:id).
+      // Note: `count` above is a raw-SQL count and is not adjusted for the
+      // moderation exclusion below — an acceptable approximation for a public
+      // listing count that avoids an extra full-table scan per request.
+      const withModeration = excludeModerated(await attachModerationState(results));
+
       res.setHeader('X-Next-Cursor', nextCursor);
       res.setHeader('X-Total-Count', String(count));
-      return res.json({ listings: serialize(results), total: Number(count) });
+      return res.json({ listings: serialize(withModeration), total: Number(count) });
     }
 
     // ── Short-term ILIKE fallback (<3 chars) or no search ────────────────
@@ -440,20 +493,24 @@ router.get('/listings', lightRateLimiter, cacheMiddleware(TTL.LISTINGS_LIST), va
     res.setHeader('X-Next-Cursor', nextCursor);
     res.setHeader('X-Total-Count', String(total));
 
+    // Moderation overlay — see comment on the FTS branch above. `total` is
+    // not adjusted for the exclusion below.
+    const withModeration = excludeModerated(await attachModerationState(results));
+
     // When search is active always return { listings, total } shape
     // (consistent with the FTS path above).
     if (search) {
-      return res.json({ listings: serialize(results), total });
+      return res.json({ listings: serialize(withModeration), total });
     }
 
     if (limit !== undefined || offset !== undefined || cursor_ledger !== undefined) {
       const validated = validateResponse(z.object({ listings: ListingResponseV1.array(), total: z.number() }), {
-        listings: serialize(results),
+        listings: serialize(withModeration),
         total: Number(total),
       });
       return ok(res, validated);
     }
-    const validated = validateResponse(ListingResponseV1.array(), serialize(results));
+    const validated = validateResponse(ListingResponseV1.array(), serialize(withModeration));
     return ok(res, validated);
   } catch (err) {
     next(internalError('Failed to fetch listings'));
@@ -462,7 +519,7 @@ router.get('/listings', lightRateLimiter, cacheMiddleware(TTL.LISTINGS_LIST), va
 
 // ── GET /listings/:id ─────────────────────────────────────────────────────────
 
-router.get('/listings/:id', lightRateLimiter, cacheMiddleware(TTL.LISTING_DETAIL), async (req: Request, res: Response, next: NextFunction) => {
+router.get('/listings/:id', lightRateLimiter, cacheMiddleware(TTL.LISTING_DETAIL), queryCostGuard({ hasJoin: true }), async (req: Request, res: Response, next: NextFunction) => {
   const { id } = req.params;
   try {
     const listing = await prisma.listing.findUnique({
@@ -475,7 +532,12 @@ router.get('/listings/:id', lightRateLimiter, cacheMiddleware(TTL.LISTING_DETAIL
       ? await (prisma as any).ipfsMetadata.findUnique({ where: { cid: listing.token } }).catch(() => null)
       : null;
 
-    return res.json(serializeListing({ ...listing, ipfsMetadata: ipfsMetadata ?? null }));
+    // Moderation is an overlay, never a delete — a QUARANTINED/REJECTED listing
+    // is still fetchable by id so the frontend can render the moderated
+    // overlay (see ModerationBlockedOverlay in the frontend).
+    const moderationState = await getModerationStateForListing(listing.listingId);
+
+    return res.json(serializeListing({ ...listing, ipfsMetadata: ipfsMetadata ?? null, moderationState }));
   } catch (err) {
     next(internalError('Failed to fetch listing details'));
   }
@@ -626,7 +688,7 @@ router.get('/ipfs/:cid', mediumRateLimiter, cacheMiddleware(300), async (req: Re
 
 // ── GET /auctions ─────────────────────────────────────────────────────────────
 
-router.get('/auctions', lightRateLimiter, cacheMiddleware(TTL.AUCTIONS_LIST), validateQuery(auctionsQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
+router.get('/auctions', lightRateLimiter, cacheMiddleware(TTL.AUCTIONS_LIST), queryCostGuard(), validateQuery(auctionsQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
   const { creator, status, limit, offset, cursor_ledger, cursor_direction } = (req as any).validatedQuery;
   try {
     const where: any = {};
@@ -657,7 +719,7 @@ router.get('/auctions', lightRateLimiter, cacheMiddleware(TTL.AUCTIONS_LIST), va
 
 // ── GET /auctions/:id ─────────────────────────────────────────────────────────
 
-router.get('/auctions/:id', lightRateLimiter, cacheMiddleware(TTL.AUCTION_DETAIL), async (req: Request, res: Response, next: NextFunction) => {
+router.get('/auctions/:id', lightRateLimiter, cacheMiddleware(TTL.AUCTION_DETAIL), queryCostGuard({ hasJoin: true }), async (req: Request, res: Response, next: NextFunction) => {
   const id = req.params.id as string;
   if (!/^\d+$/.test(id)) {
     return next(badRequest('Invalid ID format'));
@@ -719,7 +781,7 @@ router.get('/auctions/:id/blocked-bidders', lightRateLimiter, async (req: Reques
 
 // ── GET /offers ───────────────────────────────────────────────────────────────
 
-router.get('/offers', lightRateLimiter, validateQuery(offersQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
+router.get('/offers', lightRateLimiter, queryCostGuard(), validateQuery(offersQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
   const { listing_id, limit, offset, cursor_ledger, cursor_direction } = (req as any).validatedQuery;
   try {
     const where: any = {};
@@ -755,7 +817,8 @@ router.get('/activity/recent', cacheMiddleware(TTL.ACTIVITY_RECENT), async (req:
       prisma.marketplaceEvent.findMany({
         take: 20,
         orderBy: { ledgerSequence: 'desc' },
-      })
+      }),
+      { distributed: true },
     );
     res.json(serialize(results));
   } catch (err) {
@@ -765,7 +828,7 @@ router.get('/activity/recent', cacheMiddleware(TTL.ACTIVITY_RECENT), async (req:
 
 // ── GET /collections ──────────────────────────────────────────────────────────
 
-router.get('/collections', lightRateLimiter, cacheMiddleware(TTL.COLLECTIONS), validateQuery(collectionsQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
+router.get('/collections', lightRateLimiter, cacheMiddleware(TTL.COLLECTIONS), queryCostGuard(), validateQuery(collectionsQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
   const { kind, creator, limit, offset, cursor_ledger, cursor_direction } = (req as any).validatedQuery;
   try {
     const where: any = {};
@@ -891,7 +954,7 @@ router.get('/creators/:address/collections', lightRateLimiter, validateQuery(cre
 
 // ── GET /wallets/:address/activity ────────────────────────────────────────────
 
-router.get('/wallets/:address/activity', strictRateLimiter, abuseDetection('wallet-activity'), validateQuery(walletActivityQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
+router.get('/wallets/:address/activity', strictRateLimiter, queryCostGuard(), validateQuery(walletActivityQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
   const address = req.params.address as string;
   const { limit, offset, cursor_ledger, cursor_direction } = (req as any).validatedQuery;
   const take = Math.min(limit ?? 50, 200);
@@ -976,7 +1039,7 @@ router.get('/wallets/:address/royalty-stats', strictRateLimiter, abuseDetection(
 // the given recipient address, newest-first, optionally bounded to the
 // inclusive ledger-sequence window [from, to]. Cached for 60 seconds.
 
-router.get('/wallets/:address/royalty-breakdown', lightRateLimiter, abuseDetection('wallet-activity'), cacheMiddleware(60), validateQuery(royaltyBreakdownQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
+router.get('/wallets/:address/royalty-breakdown', lightRateLimiter, cacheMiddleware(60), queryCostGuard(), validateQuery(royaltyBreakdownQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
   const address = req.params.address as string;
   if (!isValidStellarAddress(address)) {
     return next(badRequest(STELLAR_ADDRESS_ERROR));
@@ -1016,7 +1079,7 @@ router.get('/wallets/:address/royalty-breakdown', lightRateLimiter, abuseDetecti
 
 // ── GET /stats ────────────────────────────────────────────────────────────────
 
-router.get('/stats', lightRateLimiter, validateQuery(statsQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
+router.get('/stats', lightRateLimiter, queryCostGuard({ isAggregation: true }), validateQuery(statsQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
   const { from, to, range } = (req as any).validatedQuery;
   try {
     let dateFrom: Date | undefined;
@@ -1098,7 +1161,7 @@ router.get('/stats', lightRateLimiter, validateQuery(statsQuerySchema), async (r
 // Returns mints-over-time, volume-over-time, and conversion rate aggregates
 // for a given artist, scoped by an optional ?range=day|week|month query param.
 
-router.get('/artists/:address/metrics', lightRateLimiter, cacheMiddleware(60), validateQuery(artistMetricsQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
+router.get('/artists/:address/metrics', lightRateLimiter, cacheMiddleware(60), queryCostGuard({ isAggregation: true }), validateQuery(artistMetricsQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
   const address = req.params.address as string;
   const { range } = (req as any).validatedQuery;
 
@@ -1663,7 +1726,7 @@ router.get('/stats/top-artists', lightRateLimiter, async (req: Request, res: Res
 // }
 // Entity buckets not requested in ?types= are omitted from the response.
 
-router.get('/search', mediumRateLimiter, abuseDetection('search'), validateQuery(searchQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
+router.get('/search', mediumRateLimiter, queryCostGuard(), validateQuery(searchQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
   const { q, types, limit } = (req as any).validatedQuery as {
     q: string;
     types: Array<'listings' | 'auctions' | 'collections'>;
@@ -1693,7 +1756,10 @@ router.get('/search', mediumRateLimiter, abuseDetection('search'), validateQuery
            WHERE "searchVector" @@ plainto_tsquery('english', $1)`,
           sanitised,
         );
-        result.listings = { items: serialize(rows), total: Number(count) };
+        // Moderation overlay — QUARANTINED/REJECTED listings excluded from
+        // this default public search result (still fetchable by id).
+        const withModeration = excludeModerated(await attachModerationState(rows));
+        result.listings = { items: serialize(withModeration), total: Number(count) };
       } else {
         // Short term — ILIKE fallback
         const [rows, total] = await Promise.all([
@@ -1720,7 +1786,8 @@ router.get('/search', mediumRateLimiter, abuseDetection('search'), validateQuery
             },
           }),
         ]);
-        result.listings = { items: serialize(rows), total };
+        const withModeration = excludeModerated(await attachModerationState(rows));
+        result.listings = { items: serialize(withModeration), total };
       }
     }
 
@@ -1826,8 +1893,18 @@ router.get('/config/auction', cacheMiddleware(60), async (req: Request, res: Res
   }
 });
 
+// ── GET /admin/query-cost ─────────────────────────────────────────────────────
+// Operator-only diagnostics: returns cost weights and budget limits.
+// No DB access — safe to call frequently for observability.
+
+router.get('/admin/query-cost', operationalRateLimiter, authMiddleware('operator'), handleQueryCostDiagnostics);
+
 // ── Notification routes (Issue #8) ────────────────────────────────────────────
 import notificationRouter from './notification-routes.js';
 router.use(notificationRouter);
+
+// ── Moderation routes (Issue #542) ────────────────────────────────────────────
+import moderationRouter from './moderation-routes.js';
+router.use(moderationRouter);
 
 export default router;

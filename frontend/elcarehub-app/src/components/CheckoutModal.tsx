@@ -39,6 +39,8 @@ import { useModalA11y } from "@/hooks/useModalA11y";
 import { StatusAnnouncer } from "@/components/a11y/StatusAnnouncer";
 import { ActionDisclosure } from "@/components/ActionDisclosure";
 import { useDisclosure } from "@/hooks/useDisclosure";
+import { buildExpectedBuyArtworkIntent } from "@/lib/tx-intent";
+import { getNetworkLabel } from "@/lib/preflight";
 
 interface CheckoutModalProps {
   isOpen: boolean;
@@ -47,6 +49,14 @@ interface CheckoutModalProps {
   onCryptoPurchase: () => Promise<boolean>;
   onPurchased?: () => void;
   isBuyingCrypto: boolean;
+  /**
+   * Connected buyer's public key, when known (Issue #536). Used only to
+   * render the "Transaction Details" panel from the same canonical intent
+   * that will be verified against the transaction actually sent to the
+   * wallet — passed as a prop (rather than read from wallet context here)
+   * so this component has no hard dependency on a wallet provider.
+   */
+  buyerPublicKey?: string | null;
 }
 
 type CheckoutStep = "preview" | "confirm" | "processing";
@@ -57,6 +67,7 @@ export function CheckoutModal({
   listing,
   onCryptoPurchase,
   onPurchased,
+  buyerPublicKey,
   isBuyingCrypto,
 }: CheckoutModalProps) {
   const { dialogRef, titleId } = useModalA11y(isOpen, onClose);
@@ -73,11 +84,34 @@ export function CheckoutModal({
   const [preview, setPreview] = useState<SettlementPreview | null>(null);
   const [previewError, setPreviewError] = useState<string | null>(null);
   const [showRecipients, setShowRecipients] = useState(false);
+  const [showTxDetails, setShowTxDetails] = useState(false);
+
+  // Issue #536 — canonical transaction intent.
+  //
+  // This is the single source of truth for "what is actually about to be
+  // signed": the exact method + args `buyArtwork()` will use to build the
+  // real transaction. The confirmation UI below renders this object
+  // directly (not a separately hand-rolled summary) and the identical
+  // helper is used again, independently, by ListingCard when it kicks off
+  // the purchase — the pre-sign guard in lib/contract.ts compares whichever
+  // one the caller supplied against the transaction actually about to be
+  // handed to the wallet, and aborts signing on any mismatch.
+  const expectedIntent = buyerPublicKey
+    ? buildExpectedBuyArtworkIntent(listing.listing_id, buyerPublicKey)
+    : null;
 
   // Checkout flow state
   const [step, setStep] = useState<CheckoutStep>("preview");
   const [conflictMessage, setConflictMessage] = useState<string | null>(null);
-  const [purchaseError, setPurchaseError] = useState<string | null>(null);
+
+  // Typed transaction lifecycle — replaces the ad-hoc purchaseError string and
+  // isBuyingCrypto flag. The duplicate-submission guard prevents double-clicks.
+  const { txState, isActive: isTxRunning, run: runTx, reset: resetTx } = useTxLifecycle({
+    persistKey: `checkout:${listing.listing_id}`,
+    action: "Purchase",
+  });
+
+  const isBuying = isTxRunning || isBuyingCrypto;
 
   // Preflight hook
   const { preflight, isChecking: isPreflighting, conflict, freshListing, reset: resetPreflight } = useFreshListing();
@@ -88,10 +122,10 @@ export function CheckoutModal({
       setStep("preview");
       setConflictMessage(null);
       setPreviewError(null);
-      setPurchaseError(null);
+      resetTx();
       resetPreflight();
     }
-  }, [isOpen, resetPreflight]);
+  }, [isOpen, resetPreflight, resetTx]);
 
   // ── Initialise tokens + preview ───────────────────────────
   useEffect(() => {
@@ -180,8 +214,8 @@ export function CheckoutModal({
       }
 
       setStep("processing");
-      setPurchaseError(null);
-      const success = await onCryptoPurchase();
+      resetTx();
+      const success = await runTx(() => onCryptoPurchase(), { action: "Purchase" });
       if (success) {
         posthog.capture("Purchase Successful", {
           listing_id: listing.listing_id,
@@ -193,35 +227,37 @@ export function CheckoutModal({
         onClose();
         setStep("preview");
       } else {
-        setPurchaseError("Purchase could not be completed. Check your wallet for a rejected or failed signature, then try again.");
+        // success is null — lifecycle transitioned to error; let TxErrorPanel render
         setStep("confirm");
       }
     }
-  }, [preview, selectedToken, step, listing, preflight, conflict, freshListing, onCryptoPurchase, onPurchased, onClose]);
+  }, [preview, selectedToken, step, listing, preflight, conflict, freshListing, runTx, resetTx, onCryptoPurchase, onPurchased, onClose]);
 
   if (!isOpen || !selectedToken) return null;
 
   const statusMessage = conflictMessage
     ? `Conflict: ${conflictMessage}`
-    : purchaseError
-    ? `Error: ${purchaseError}`
+    : txState.state === "error"
+    ? `Error: ${txState.error?.message ?? "Purchase failed"}`
     : previewError
     ? `Error: ${previewError}`
     : isPreflighting
     ? "Verifying listing is still available…"
-    : step === "processing" || isBuyingCrypto
-    ? "Processing your purchase. Please check your wallet for a signature request."
+    : isBuying
+    ? txStateLabel(txState.state) || "Processing your purchase. Please check your wallet for a signature request."
     : "";
   const statusPoliteness =
-    (conflictMessage || purchaseError || previewError) && !isPreflighting ? "assertive" : "polite";
+    (conflictMessage || txState.state === "error" || previewError) && !isPreflighting
+      ? "assertive"
+      : "polite";
 
   const buttonLabel = () => {
-    if (step === "processing" || isBuyingCrypto) return "Processing…";
+    if (isBuying) return txStateLabel(txState.state) || "Processing…";
     if (step === "confirm") return `Confirm & Pay ${preview?.buyerTotalDisplay ?? ""} ${selectedToken.symbol}`;
     return `Review & Pay ${preview?.itemPriceDisplay ?? ""} ${selectedToken.symbol}`;
   };
 
-  const isButtonDisabled = step === "processing" || isBuyingCrypto || isPreflighting || !!previewError || blocksAction;
+  const isButtonDisabled = isBuying || isPreflighting || !!previewError || blocksAction;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
@@ -291,12 +327,28 @@ export function CheckoutModal({
             </div>
           )}
 
-          {/* Purchase failure */}
-          {purchaseError && (
-            <div role="alert" className="flex items-start gap-3 rounded-xl border border-red-200 bg-red-50 p-4">
-              <AlertTriangle size={18} className="text-red-600 shrink-0 mt-0.5" aria-hidden="true" />
-              <p className="text-sm text-red-800">{purchaseError}</p>
-            </div>
+          {/* Typed transaction error — distinguishes wallet rejection from chain failure */}
+          {txState.state === "error" && txState.error && (
+            <TxErrorPanel
+              error={txState.error}
+              txHash={txState.txHash}
+              onRetry={() => { resetTx(); setStep("confirm"); }}
+              onDismiss={() => { resetTx(); setStep("preview"); }}
+            />
+          )}
+
+          {/* Tx hash recovery link — shown once the hash is known */}
+          {txState.txHash && txState.state !== "success" && (
+            <p className="text-xs text-gray-400 text-center">
+              Transaction:{" "}
+              <Link
+                href={`/tx/${txState.txHash}`}
+                className="font-mono text-blue-500 hover:underline"
+                target="_blank"
+              >
+                {txState.txHash.slice(0, 12)}…
+              </Link>
+            </p>
           )}
 
           {/* Token selection */}
@@ -428,6 +480,57 @@ export function CheckoutModal({
             </div>
           )}
 
+          {/* Transaction details — Issue #536: rendered directly from the
+              canonical intent that will be verified against the actual
+              signed transaction before your wallet is asked to sign. */}
+          {expectedIntent && (
+            <div className="space-y-2">
+              <button
+                type="button"
+                onClick={() => setShowTxDetails((v) => !v)}
+                className="flex w-full justify-between items-center text-xs font-bold uppercase tracking-wider text-gray-500 hover:text-gray-700 transition"
+                data-testid="tx-details-toggle"
+              >
+                <span>Transaction Details</span>
+                {showTxDetails ? <ChevronUp size={13} aria-hidden="true" /> : <ChevronDown size={13} aria-hidden="true" />}
+              </button>
+              {showTxDetails && (
+                <div
+                  className="rounded-2xl bg-gray-50 p-4 space-y-1.5 text-xs text-gray-500"
+                  data-testid="tx-details-panel"
+                >
+                  <div className="flex justify-between">
+                    <span>Method</span>
+                    <span className="font-mono text-gray-700">{expectedIntent.method}</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span>Contract</span>
+                    <span className="font-mono text-gray-700" title={expectedIntent.contractId}>
+                      {expectedIntent.contractId.slice(0, 8)}…{expectedIntent.contractId.slice(-6)}
+                    </span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span>Network</span>
+                    <span className="text-gray-700">{getNetworkLabel(expectedIntent.networkPassphrase)}</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span>Buyer</span>
+                    <span className="font-mono text-gray-700" title={expectedIntent.sourceAccount}>
+                      {expectedIntent.sourceAccount.slice(0, 8)}…{expectedIntent.sourceAccount.slice(-6)}
+                    </span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span>Listing ID</span>
+                    <span className="text-gray-700">{listing.listing_id}</span>
+                  </div>
+                  <p className="pt-1 text-[10px] text-gray-400">
+                    Verified against the exact transaction sent to your wallet before signing.
+                  </p>
+                </div>
+              )}
+            </div>
+          )}
+
           {/* Payment method */}
           <div className="space-y-3">
             <h3 className="text-xs font-bold uppercase tracking-wider text-gray-500">Payment Method</h3>
@@ -469,10 +572,10 @@ export function CheckoutModal({
               disabled={isButtonDisabled}
               className="mt-1 flex w-full items-center justify-center gap-2 rounded-2xl bg-brand-500 py-5 font-bold text-white shadow-lg shadow-brand-500/20 hover:bg-brand-600 transition-all disabled:opacity-50"
             >
-              {step === "processing" || isBuyingCrypto ? (
+              {isBuying ? (
                 <>
                   <Loader2 className="animate-spin" size={18} aria-hidden="true" />
-                  Processing…
+                  {txStateLabel(txState.state) || "Processing…"}
                 </>
               ) : (
                 buttonLabel()

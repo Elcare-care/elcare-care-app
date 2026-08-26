@@ -14,7 +14,16 @@
 export const ANALYTICS_CONSENT_KEY = "elcarehub:analytics_consent";
 export const AUDIT_LOG_KEY_PREFIX = "elcarehub:audit";
 
-/** Fields that must never appear in logs or telemetry. */
+/**
+ * Fields that must never appear in logs or telemetry.
+ *
+ * Kept in sync (conceptually, not code-shared — see issue #541) with the
+ * indexer's forbidden-field list in `indexer/src/log-redaction.ts` and the
+ * audit trail's `SENSITIVE_FIELDS` in `indexer/src/audit/audit-service.ts`.
+ * If you add a field here, consider whether the indexer-side lists need the
+ * same addition (and vice versa) — unifying them into a shared package is
+ * out of scope for now.
+ */
 const REDACTED_FIELDS = new Set([
   "authorization",
   "cookie",
