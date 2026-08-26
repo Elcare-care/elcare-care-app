@@ -10,6 +10,7 @@ import { renderHook, act } from "@testing-library/react";
 import {
   useTxLifecycle,
   classifyTxError,
+  buildTxErrorMessage,
   extractTxHash,
   txStateLabel,
   isTxTerminal,
@@ -75,6 +76,30 @@ describe("classifyTxError", () => {
     expect(classifyTxError(new Error("some random error"))).toBe("unknown");
     expect(classifyTxError(null)).toBe("unknown");
     expect(classifyTxError(undefined)).toBe("unknown");
+  });
+
+  // Issue #536: the transaction-substitution guard in lib/contract.ts throws
+  // a `TxIntentMismatchError` (named error, not a message-content match) —
+  // it must always be classified as "intent_mismatch" and never fall
+  // through to "unknown" or get mis-bucketed as a simulation/rpc failure.
+  it("classifies TxIntentMismatchError as intent_mismatch regardless of message wording", () => {
+    class TxIntentMismatchError extends Error {
+      constructor(message: string) {
+        super(message);
+        this.name = "TxIntentMismatchError";
+      }
+    }
+    expect(
+      classifyTxError(new TxIntentMismatchError("Transaction verification failed: mismatched fields: contractId."))
+    ).toBe("intent_mismatch");
+
+    const message = buildTxErrorMessage(
+      new TxIntentMismatchError("mismatch"),
+      "Purchase",
+      "intent_mismatch"
+    );
+    expect(message).toMatch(/stopped/i);
+    expect(message).toMatch(/wallet/i);
   });
 });
 

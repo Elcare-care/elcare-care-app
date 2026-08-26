@@ -39,6 +39,8 @@ import { useModalA11y } from "@/hooks/useModalA11y";
 import { StatusAnnouncer } from "@/components/a11y/StatusAnnouncer";
 import { ActionDisclosure } from "@/components/ActionDisclosure";
 import { useDisclosure } from "@/hooks/useDisclosure";
+import { buildExpectedBuyArtworkIntent } from "@/lib/tx-intent";
+import { getNetworkLabel } from "@/lib/preflight";
 
 interface CheckoutModalProps {
   isOpen: boolean;
@@ -47,6 +49,14 @@ interface CheckoutModalProps {
   onCryptoPurchase: () => Promise<boolean>;
   onPurchased?: () => void;
   isBuyingCrypto: boolean;
+  /**
+   * Connected buyer's public key, when known (Issue #536). Used only to
+   * render the "Transaction Details" panel from the same canonical intent
+   * that will be verified against the transaction actually sent to the
+   * wallet — passed as a prop (rather than read from wallet context here)
+   * so this component has no hard dependency on a wallet provider.
+   */
+  buyerPublicKey?: string | null;
 }
 
 type CheckoutStep = "preview" | "confirm" | "processing";
@@ -57,6 +67,7 @@ export function CheckoutModal({
   listing,
   onCryptoPurchase,
   onPurchased,
+  buyerPublicKey,
   isBuyingCrypto,
 }: CheckoutModalProps) {
   const { dialogRef, titleId } = useModalA11y(isOpen, onClose);
@@ -73,6 +84,21 @@ export function CheckoutModal({
   const [preview, setPreview] = useState<SettlementPreview | null>(null);
   const [previewError, setPreviewError] = useState<string | null>(null);
   const [showRecipients, setShowRecipients] = useState(false);
+  const [showTxDetails, setShowTxDetails] = useState(false);
+
+  // Issue #536 — canonical transaction intent.
+  //
+  // This is the single source of truth for "what is actually about to be
+  // signed": the exact method + args `buyArtwork()` will use to build the
+  // real transaction. The confirmation UI below renders this object
+  // directly (not a separately hand-rolled summary) and the identical
+  // helper is used again, independently, by ListingCard when it kicks off
+  // the purchase — the pre-sign guard in lib/contract.ts compares whichever
+  // one the caller supplied against the transaction actually about to be
+  // handed to the wallet, and aborts signing on any mismatch.
+  const expectedIntent = buyerPublicKey
+    ? buildExpectedBuyArtworkIntent(listing.listing_id, buyerPublicKey)
+    : null;
 
   // Checkout flow state
   const [step, setStep] = useState<CheckoutStep>("preview");
@@ -425,6 +451,57 @@ export function CheckoutModal({
                   <span>{preview.sellerProceedsDisplay} {selectedToken.symbol}</span>
                 </div>
               </div>
+            </div>
+          )}
+
+          {/* Transaction details — Issue #536: rendered directly from the
+              canonical intent that will be verified against the actual
+              signed transaction before your wallet is asked to sign. */}
+          {expectedIntent && (
+            <div className="space-y-2">
+              <button
+                type="button"
+                onClick={() => setShowTxDetails((v) => !v)}
+                className="flex w-full justify-between items-center text-xs font-bold uppercase tracking-wider text-gray-500 hover:text-gray-700 transition"
+                data-testid="tx-details-toggle"
+              >
+                <span>Transaction Details</span>
+                {showTxDetails ? <ChevronUp size={13} aria-hidden="true" /> : <ChevronDown size={13} aria-hidden="true" />}
+              </button>
+              {showTxDetails && (
+                <div
+                  className="rounded-2xl bg-gray-50 p-4 space-y-1.5 text-xs text-gray-500"
+                  data-testid="tx-details-panel"
+                >
+                  <div className="flex justify-between">
+                    <span>Method</span>
+                    <span className="font-mono text-gray-700">{expectedIntent.method}</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span>Contract</span>
+                    <span className="font-mono text-gray-700" title={expectedIntent.contractId}>
+                      {expectedIntent.contractId.slice(0, 8)}…{expectedIntent.contractId.slice(-6)}
+                    </span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span>Network</span>
+                    <span className="text-gray-700">{getNetworkLabel(expectedIntent.networkPassphrase)}</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span>Buyer</span>
+                    <span className="font-mono text-gray-700" title={expectedIntent.sourceAccount}>
+                      {expectedIntent.sourceAccount.slice(0, 8)}…{expectedIntent.sourceAccount.slice(-6)}
+                    </span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span>Listing ID</span>
+                    <span className="text-gray-700">{listing.listing_id}</span>
+                  </div>
+                  <p className="pt-1 text-[10px] text-gray-400">
+                    Verified against the exact transaction sent to your wallet before signing.
+                  </p>
+                </div>
+              )}
             </div>
           )}
 
