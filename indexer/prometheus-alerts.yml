@@ -241,3 +241,199 @@ groups:
           description: >
             No successful financial reconciliation run has completed in the last hour.
             The reconciliation job may be stopped or failing silently.
+
+      # ── Data quality — canonicality ──────────────────────────────────────────
+
+      - alert: OrphanListingEventsDetected
+        expr: dq_orphan_listing_events > 0
+        for: 10m
+        labels:
+          severity: warning
+          owner: indexer-team
+          runbook: https://github.com/elcarehub/elcare-care-app/wiki/Runbook-Data-Quality#orphan-listing-events
+        annotations:
+          summary: "Orphan MarketplaceEvent rows detected (listing)"
+          description: >
+            {{ $value }} listing-type event(s) reference a listingId with no
+            corresponding Listing row. This indicates a canonicality failure —
+            events were written but the projection was never applied.
+            Runbook: https://github.com/elcarehub/elcare-care-app/wiki/Runbook-Data-Quality#orphan-listing-events
+
+      - alert: OrphanAuctionEventsDetected
+        expr: dq_orphan_auction_events > 0
+        for: 10m
+        labels:
+          severity: warning
+          owner: indexer-team
+          runbook: https://github.com/elcarehub/elcare-care-app/wiki/Runbook-Data-Quality#orphan-auction-events
+        annotations:
+          summary: "Orphan MarketplaceEvent rows detected (auction)"
+          description: >
+            {{ $value }} auction-type event(s) reference a listingId with no
+            corresponding Auction row. Check the event-idempotency and
+            processEvent logic for auction creation paths.
+
+      - alert: OrphanRoyaltyPaymentsDetected
+        expr: dq_orphan_royalty_payments > 0
+        for: 10m
+        labels:
+          severity: warning
+          owner: indexer-team
+          runbook: https://github.com/elcarehub/elcare-care-app/wiki/Runbook-Data-Quality#orphan-royalty-payments
+        annotations:
+          summary: "RoyaltyPayment rows without a parent ROYALTY_PAID event"
+          description: >
+            {{ $value }} RoyaltyPayment row(s) have no matching ROYALTY_PAID
+            MarketplaceEvent. This breaks the royalty audit trail and may
+            indicate a write outside the normal event-application path.
+
+      # ── Data quality — completeness ──────────────────────────────────────────
+
+      - alert: ListingsMissingRoyaltyBps
+        expr: dq_listings_missing_royalty_bps > 0
+        for: 30m
+        labels:
+          severity: warning
+          owner: indexer-team
+          runbook: https://github.com/elcarehub/elcare-care-app/wiki/Runbook-Data-Quality#missing-royalty-bps
+        annotations:
+          summary: "Active listings missing royaltyBps have ROYALTY_PAID events"
+          description: >
+            {{ $value }} active listing(s) have royaltyBps = 0 but at least one
+            ROYALTY_PAID event. The royalty basis-points field was likely not
+            populated during ingestion. Run the projection rebuild tool to fix.
+
+      - alert: ListingsMissingIpfs
+        expr: dq_listings_missing_ipfs > 50
+        for: 15m
+        labels:
+          severity: warning
+          owner: indexer-team
+          runbook: https://github.com/elcarehub/elcare-care-app/wiki/Runbook-Data-Quality#missing-ipfs
+        annotations:
+          summary: "Active listings with uncached IPFS metadata"
+          description: >
+            {{ $value }} active listing(s) have an IPFS CID token but no
+            cached IpfsMetadata row. The IPFS worker may be lagging or
+            a gateway is unreachable. Search quality will be degraded.
+
+      - alert: OffersMissingListing
+        expr: dq_offers_missing_listing > 0
+        for: 10m
+        labels:
+          severity: warning
+          owner: indexer-team
+          runbook: https://github.com/elcarehub/elcare-care-app/wiki/Runbook-Data-Quality#offers-missing-listing
+        annotations:
+          summary: "Offer rows reference a non-existent Listing"
+          description: >
+            {{ $value }} Offer row(s) have a listingId that does not match
+            any Listing row. These offers cannot be displayed or expired
+            correctly.
+
+      # ── Data quality — freshness ─────────────────────────────────────────────
+
+      - alert: SyncCursorStale
+        expr: dq_sync_cursor_age_seconds > 300
+        for: 5m
+        labels:
+          severity: warning
+          owner: indexer-team
+          runbook: https://github.com/elcarehub/elcare-care-app/wiki/Runbook-Data-Quality#sync-cursor-stale
+        annotations:
+          summary: "SyncState has not advanced in over 5 minutes (DB-sourced)"
+          description: >
+            The SyncState.updatedAt timestamp in the database has not changed
+            for {{ $value | humanizeDuration }}. The DB-sourced cursor age
+            complements the in-memory stall gauge. Check poller health.
+
+      # ── Data quality — projection drift ─────────────────────────────────────
+
+      - alert: ActiveListingsCountDrift
+        expr: dq_active_listings_count_drift > 5
+        for: 5m
+        labels:
+          severity: warning
+          owner: indexer-team
+          runbook: https://github.com/elcarehub/elcare-care-app/wiki/Runbook-Data-Quality#projection-drift
+        annotations:
+          summary: "Active-listings Prometheus gauge differs from DB by > 5"
+          description: >
+            The in-memory active-listings gauge differs from the DB COUNT by
+            {{ $value }}. The projection was updated asynchronously (best-effort)
+            and may have missed increments after an error. Use the projection
+            rebuild tool to resync.
+
+      - alert: PendingOffersExpired
+        expr: dq_pending_offers_expired > 0
+        for: 15m
+        labels:
+          severity: warning
+          owner: indexer-team
+          runbook: https://github.com/elcarehub/elcare-care-app/wiki/Runbook-Data-Quality#expired-pending-offers
+        annotations:
+          summary: "Pending Offer rows past their expiresAt"
+          description: >
+            {{ $value }} Offer(s) are still Pending but their expiresAt has
+            already passed. The keeper's OFFER_RECLAIMED path may be behind
+            or stalled. These offers appear claimable to artists but cannot
+            be settled.
+
+      - alert: DataQualityChecksFailing
+        expr: increase(dq_checks_total{outcome="error"}[10m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          owner: indexer-team
+        annotations:
+          summary: "Data-quality check cycle errored"
+          description: >
+            The data-quality scheduler encountered an error during its last
+            check cycle. Quality gauges may be stale. Check the indexer logs
+            for database connectivity issues.
+
+      # ── Backup health (pushed from db-backup.yml via Pushgateway) ────────────
+
+      - alert: BackupRestoreFailed
+        expr: backup_restore_success == 0
+        for: 0m
+        labels:
+          severity: critical
+          owner: ops-team
+          runbook: https://github.com/elcarehub/elcare-care-app/wiki/Runbook-Backup#restore-failed
+        annotations:
+          summary: "Automated DB restore verification failed"
+          description: >
+            The last automated restore verification reported failure.
+            The most recent backup artifact may be unrestorable.
+            Immediate investigation required before this backup can be
+            relied upon for disaster recovery.
+            Runbook: https://github.com/elcarehub/elcare-care-app/wiki/Runbook-Backup#restore-failed
+
+      - alert: BackupArtifactStale
+        expr: backup_age_seconds > 90000
+        for: 0m
+        labels:
+          severity: warning
+          owner: ops-team
+          runbook: https://github.com/elcarehub/elcare-care-app/wiki/Runbook-Backup#stale-backup
+        annotations:
+          summary: "Most recent backup is more than 25 hours old"
+          description: >
+            The backup artifact used in the last restore verification is
+            {{ $value | humanizeDuration }} old. The daily backup job may
+            have failed silently. Check the db-backup workflow run history.
+
+      - alert: BackupRestoreDurationHigh
+        expr: backup_restore_duration_seconds > 1800
+        for: 0m
+        labels:
+          severity: warning
+          owner: ops-team
+        annotations:
+          summary: "DB restore verification took more than 30 minutes"
+          description: >
+            The restore verification completed in {{ $value | humanizeDuration }}.
+            This exceeds the 30-minute threshold and may indicate the backup
+            artifact has grown too large for the current restore budget, or
+            that the ephemeral restore environment is under-resourced.

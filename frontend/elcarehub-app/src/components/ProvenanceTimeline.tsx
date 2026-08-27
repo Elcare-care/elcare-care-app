@@ -3,14 +3,18 @@
  *
  * Renders events chronologically (oldest → newest) with:
  *  - Event icon and human-readable action label
+ *  - Confirmation state badge (Pending / Confirmed)
  *  - Actor address linked to their profile page
  *  - Transaction hash linked to the blockchain explorer
+ *  - Ledger sequence number for traceability
  *  - Relative and absolute timestamps
+ *  - Reorg notification banner with refresh prompt
  *  - "Load more" pagination
  *
- * Supported event types:
+ * Supported event types (Issue #532):
  *   LISTED, OFFER_SUBMITTED, OFFER_ACCEPTED, PURCHASE, SALE,
- *   ROYALTY, CANCELLED, TRANSFER
+ *   ROYALTY, CANCELLED, TRANSFER, MINT, AUCTION_CREATED,
+ *   AUCTION_BID, AUCTION_FINALIZED, METADATA_UPDATED, PRICE_UPDATED
  *
  * Pagination:
  *   The component fetches 20 events per page. A "Load more" button
@@ -30,9 +34,18 @@ import {
   History,
   ExternalLink,
   Loader2,
+  Sparkles,
+  Gavel,
+  FileEdit,
+  DollarSign,
+  AlertTriangle,
+  RefreshCw,
+  Shield,
+  Clock,
 } from "lucide-react";
 import { ActivityEvent } from "@/lib/indexer";
 import { config } from "@/lib/config";
+import { formatLedgerTime } from "@/lib/format";
 
 // ── Explorer URL builder ───────────────────────────────────────────────────────
 
@@ -55,7 +68,16 @@ interface EventMeta {
   iconColor: string;
 }
 
-function getEventMeta(type: ActivityEvent["type"]): EventMeta {
+type ExtendedEventType =
+  | ActivityEvent["type"]
+  | "MINT"
+  | "AUCTION_CREATED"
+  | "AUCTION_BID"
+  | "AUCTION_FINALIZED"
+  | "METADATA_UPDATED"
+  | "PRICE_UPDATED";
+
+function getEventMeta(type: ExtendedEventType): EventMeta {
   switch (type) {
     case "LISTED":
       return {
@@ -63,6 +85,13 @@ function getEventMeta(type: ActivityEvent["type"]): EventMeta {
         icon: <Tag size={14} />,
         iconBg: "bg-brand-500/20",
         iconColor: "text-brand-400",
+      };
+    case "MINT":
+      return {
+        label: "Minted artwork",
+        icon: <Sparkles size={14} />,
+        iconBg: "bg-brand-500/30",
+        iconColor: "text-brand-300",
       };
     case "OFFER_SUBMITTED":
       return {
@@ -113,9 +142,44 @@ function getEventMeta(type: ActivityEvent["type"]): EventMeta {
         iconBg: "bg-brand-500/20",
         iconColor: "text-brand-400",
       };
+    case "AUCTION_CREATED":
+      return {
+        label: "Auction started",
+        icon: <Gavel size={14} />,
+        iconBg: "bg-brand-500/20",
+        iconColor: "text-brand-400",
+      };
+    case "AUCTION_BID":
+      return {
+        label: "Bid placed",
+        icon: <Gavel size={14} />,
+        iconBg: "bg-white/10",
+        iconColor: "text-white/80",
+      };
+    case "AUCTION_FINALIZED":
+      return {
+        label: "Auction finalized",
+        icon: <Gavel size={14} />,
+        iconBg: "bg-mint-500/20",
+        iconColor: "text-mint-400",
+      };
+    case "METADATA_UPDATED":
+      return {
+        label: "Metadata updated",
+        icon: <FileEdit size={14} />,
+        iconBg: "bg-white/10",
+        iconColor: "text-white/50",
+      };
+    case "PRICE_UPDATED":
+      return {
+        label: "Price updated",
+        icon: <DollarSign size={14} />,
+        iconBg: "bg-brand-500/10",
+        iconColor: "text-brand-300",
+      };
     default:
       return {
-        label: type,
+        label: type as string,
         icon: <History size={14} />,
         iconBg: "bg-white/10",
         iconColor: "text-white/50",
@@ -129,13 +193,6 @@ function shortAddr(addr: string): string {
   if (!addr || addr === "—") return "—";
   if (addr.length <= 12) return addr;
   return `${addr.slice(0, 6)}…${addr.slice(-4)}`;
-}
-
-function formatTimestamp(ts: number): string {
-  return new Date(ts).toLocaleString(undefined, {
-    dateStyle: "medium",
-    timeStyle: "short",
-  });
 }
 
 // ── Sub-components ─────────────────────────────────────────────────────────────
@@ -172,6 +229,72 @@ function TxLink({ txHash }: { txHash: string }) {
   );
 }
 
+/** Badge showing whether an event is confirmed on-chain or provisional. */
+function ConfirmationBadge({ confirmed }: { confirmed?: boolean }) {
+  if (confirmed === undefined) return null;
+  return confirmed ? (
+    <span
+      className="inline-flex items-center gap-0.5 text-[9px] font-bold uppercase tracking-wider text-mint-400 bg-mint-500/10 rounded px-1 py-0.5"
+      title="This event is confirmed on-chain"
+      data-testid="badge-confirmed"
+    >
+      <Shield size={8} />
+      Confirmed
+    </span>
+  ) : (
+    <span
+      className="inline-flex items-center gap-0.5 text-[9px] font-bold uppercase tracking-wider text-amber-400 bg-amber-500/10 rounded px-1 py-0.5"
+      title="This event is provisional and may be rolled back"
+      data-testid="badge-pending"
+    >
+      <Clock size={8} />
+      Pending
+    </span>
+  );
+}
+
+/** Ledger badge — shows the ledger sequence for traceability. */
+function LedgerBadge({ ledger }: { ledger?: number }) {
+  if (!ledger) return null;
+  return (
+    <span className="text-[9px] font-mono text-white/20" title="Ledger sequence">
+      #{ledger}
+    </span>
+  );
+}
+
+// ── Reorg notification banner ──────────────────────────────────────────────────
+
+interface ReorgBannerProps {
+  onRefresh: () => void;
+}
+
+function ReorgBanner({ onRefresh }: ReorgBannerProps) {
+  return (
+    <div
+      className="flex items-center gap-3 rounded-lg bg-amber-500/10 border border-amber-500/20 p-3 mb-4"
+      role="alert"
+      data-testid="reorg-banner"
+    >
+      <AlertTriangle size={16} className="text-amber-400 shrink-0" />
+      <div className="flex-1 min-w-0">
+        <p className="text-xs font-bold text-amber-300">Chain reorganization detected</p>
+        <p className="text-[11px] text-amber-400/70 mt-0.5">
+          Some provisional entries may have been removed. Refresh for the latest confirmed history.
+        </p>
+      </div>
+      <button
+        onClick={onRefresh}
+        className="flex items-center gap-1.5 text-xs font-bold text-amber-300 hover:text-amber-200 shrink-0 transition-colors"
+        data-testid="reorg-refresh-btn"
+      >
+        <RefreshCw size={12} />
+        Refresh
+      </button>
+    </div>
+  );
+}
+
 // ── Main component ─────────────────────────────────────────────────────────────
 
 export interface ProvenanceTimelineProps {
@@ -181,6 +304,9 @@ export interface ProvenanceTimelineProps {
   error: string | null;
   hasMore: boolean;
   onLoadMore: () => void;
+  /** When true, show the reorg notification banner */
+  reorgDetected?: boolean;
+  onRefresh?: () => void;
 }
 
 export function ProvenanceTimeline({
@@ -190,6 +316,8 @@ export function ProvenanceTimeline({
   error,
   hasMore,
   onLoadMore,
+  reorgDetected = false,
+  onRefresh,
 }: ProvenanceTimelineProps) {
   if (isLoading) {
     return (
@@ -228,10 +356,18 @@ export function ProvenanceTimeline({
 
   return (
     <div data-testid="timeline-root">
+      {/* Reorg notification banner */}
+      {reorgDetected && onRefresh && (
+        <ReorgBanner onRefresh={onRefresh} />
+      )}
+
       <ol className="space-y-0" aria-label="Provenance history">
         {events.map((evt, idx) => {
-          const meta = getEventMeta(evt.type);
+          const meta = getEventMeta(evt.type as ExtendedEventType);
           const isLast = idx === events.length - 1 && !hasMore;
+          // confirmed field may be present on extended event objects
+          const confirmed = (evt as any).confirmed as boolean | undefined;
+          const ledgerSequence = (evt as any).ledgerSequence as number | undefined;
 
           return (
             <li
@@ -258,12 +394,18 @@ export function ProvenanceTimeline({
               {/* Content */}
               <div className="flex-1 pb-6 min-w-0">
                 <div className="flex flex-wrap items-center justify-between gap-2 mb-1">
-                  <span className="text-xs font-bold uppercase tracking-widest text-white">
-                    {meta.label}
-                  </span>
-                  <span className="text-[10px] text-white/30 font-mono shrink-0">
-                    {formatTimestamp(evt.timestamp)}
-                  </span>
+                  <div className="flex items-center gap-2 min-w-0">
+                    <span className="text-xs font-bold uppercase tracking-widest text-white">
+                      {meta.label}
+                    </span>
+                    <ConfirmationBadge confirmed={confirmed} />
+                  </div>
+                  <div className="flex items-center gap-2 shrink-0">
+                    <LedgerBadge ledger={ledgerSequence} />
+                    <span className="text-[10px] text-white/30 font-mono">
+                      {formatLedgerTime(evt.timestamp)}
+                    </span>
+                  </div>
                 </div>
 
                 {/* Actor row */}

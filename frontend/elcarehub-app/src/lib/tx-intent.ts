@@ -118,7 +118,7 @@ export class TxIntentMismatchError extends Error {
 // `arg_<n>` labels.
 
 const METHOD_ARG_LABELS: Record<string, string[]> = {
-  create_listing: ["artist", "price", "currency", "asset", "collection", "listing_token_id", "recipients"],
+  create_listing: ["artist", "price", "currency", "asset", "collection", "listing_token_id", "quantity", "recipients", "expires_at"],
   buy_artwork: ["buyer", "listing_id"],
   cancel_listing: ["artist", "listing_id"],
   create_listings: ["artist", "requests"],

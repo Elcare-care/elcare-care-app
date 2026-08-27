@@ -9,7 +9,7 @@ import { placeBid } from "@/lib/contract";
 import { useTxToast } from "./useTxToast";
 
 export function usePlaceBid(bidderPublicKey: string | null) {
-  const { run, isRunning: isBidding } = useTxToast();
+  const { run, isRunning: isBidding, txHash } = useTxToast();
 
   const bid = useCallback(
     async (auctionId: number, amountXlm: number): Promise<boolean> => {
@@ -23,5 +23,7 @@ export function usePlaceBid(bidderPublicKey: string | null) {
     [bidderPublicKey, run],
   );
 
-  return { bid, isBidding, error: null };
+  // Issue #520: expose the real transaction hash once known so callers can
+  // key a provisional/optimistic UI update against it (see useReconciliation).
+  return { bid, isBidding, error: null, txHash };
 }

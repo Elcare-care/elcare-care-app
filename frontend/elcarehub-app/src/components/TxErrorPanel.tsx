@@ -46,7 +46,7 @@ function getCategoryConfig(category: TxErrorCategory): CategoryConfig {
         explanation:
           "You declined the signing request in your wallet. Your transaction was not submitted and nothing was charged.",
         instruction:
-          "Click "Try Again" and when your wallet opens, click "Approve" or "Accept" to authorise the transaction.",
+          'Click "Try Again" and when your wallet opens, click "Approve" or "Accept" to authorise the transaction.',
         primaryLabel: "Try Again",
         severity: "info",
       };

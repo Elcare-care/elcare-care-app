@@ -83,6 +83,16 @@ export interface UseTxToastResult {
 
   /** Current lifecycle phase (legacy alias). */
   phase: TxLifecyclePhase;
+
+  /**
+   * The real transaction hash once known (set as soon as broadcasting
+   * succeeds — before on-chain/indexer confirmation). Issue #520: callers
+   * that track provisional/optimistic state (useReconciliation) should key
+   * their pending mutation on this value once it's non-null, rather than
+   * relying solely on a locally-generated id, so the mutation can be
+   * reconciled against the real transaction identity end-to-end.
+   */
+  txHash: string | null;
 }
 
 // ── Explorer URL helper ───────────────────────────────────────
@@ -191,6 +201,7 @@ export function useTxToast(): UseTxToastResult {
     run,
     isRunning: txState.state !== "idle" && txState.state !== "success" && txState.state !== "error",
     phase: toPhase(txState.state),
+    txHash: txState.txHash,
   };
 }
 

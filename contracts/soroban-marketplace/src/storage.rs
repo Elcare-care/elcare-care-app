@@ -290,10 +290,18 @@ pub enum DataKey {
     /// Keyed by (settlement_id, is_listing, recipient_address).
     /// Written at settlement, marked claimed after successful payout.
     RoyaltyClaim(u64, bool, Address),
-    /// Per-bidder refund claimed flag for `refund_losing_bid` idempotency (Issue #466).
-    /// Keyed by (auction_id, bidder). Written before the token transfer (CEI).
-    /// Prevents duplicate refund claims after a terminal auction.
-    BidRefundRecord(u64, Address),
+    /// Parent offer ID for a counter-offer (Issue #471).
+    /// `CounterOfferParent(counter_offer_id)` → parent_offer_id.
+    CounterOfferParent(u64),
+    /// Counter-offer ID that superseded a parent offer (Issue #471).
+    /// `OfferSupersededBy(parent_offer_id)` → counter_offer_id.
+    OfferSupersededBy(u64),
+    /// Monotonically increasing counter for governance proposal IDs (Issue #472).
+    GovernanceProposalCount,
+    /// One governance proposal record (Issue #472).
+    GovernanceProposal(u64),
+    /// Ordered list of approver addresses for a governance proposal (Issue #472).
+    GovernanceApprovals(u64),
 }
 
 /// Custody record for an NFT held by the marketplace, keyed by
@@ -2070,34 +2078,97 @@ pub fn get_royalty_claim(
     value
 }
 
-// ── Bid refund idempotency records (Issue #466) ────────────────────────────
-//
-// Written by `refund_losing_bid` before the token transfer (CEI order) so a
-// crash mid-transfer cannot be exploited for a double-claim on retry.  The
-// same TTL as offer data keeps these records hot for the expected query window.
+// ── Counter-offer link storage (Issue #471) ──────────────────────────────────
 
-/// Mark the given bidder as having claimed their refund for `auction_id`.
-///
-/// Must be called (and the storage write committed) **before** the token
-/// transfer so a failed transfer does not leave the record in a claimed state.
-pub fn mark_bid_refunded(env: &Env, auction_id: u64, bidder: &Address) {
-    let key = DataKey::BidRefundRecord(auction_id, bidder.clone());
-    env.storage().persistent().set(&key, &true);
-    env.storage()
-        .persistent()
-        .extend_ttl(&key, LEDGER_TTL_THRESHOLD, OFFER_TTL_LEDGERS);
+/// Record that `counter_offer_id` was created as a counter to `parent_offer_id`.
+pub fn set_counter_offer_parent(env: &Env, counter_offer_id: u64, parent_offer_id: u64) {
+    let key = DataKey::CounterOfferParent(counter_offer_id);
+    env.storage().persistent().set(&key, &parent_offer_id);
+    bump_entry_ttl(env, &key);
 }
 
-/// Returns `true` when the bidder has already claimed their refund for this auction.
-pub fn is_bid_refunded(env: &Env, auction_id: u64, bidder: &Address) -> bool {
-    let key = DataKey::BidRefundRecord(auction_id, bidder.clone());
-    let claimed = env
-        .storage()
-        .persistent()
-        .get::<DataKey, bool>(&key)
-        .unwrap_or(false);
-    if claimed {
+/// Return the parent offer id for a counter-offer, or `None` if the offer is
+/// not a counter-offer (i.e. it was created via `make_offer`).
+pub fn get_counter_offer_parent(env: &Env, counter_offer_id: u64) -> Option<u64> {
+    let key = DataKey::CounterOfferParent(counter_offer_id);
+    let value = env.storage().persistent().get::<DataKey, u64>(&key);
+    if value.is_some() {
         bump_entry_ttl(env, &key);
     }
-    claimed
+    value
+}
+
+/// Record that `parent_offer_id` was superseded by `counter_offer_id`.
+pub fn set_offer_superseded_by(env: &Env, parent_offer_id: u64, counter_offer_id: u64) {
+    let key = DataKey::OfferSupersededBy(parent_offer_id);
+    env.storage().persistent().set(&key, &counter_offer_id);
+    bump_entry_ttl(env, &key);
+}
+
+/// Return the counter-offer id that superseded `parent_offer_id`, or `None`.
+pub fn get_offer_superseded_by(env: &Env, parent_offer_id: u64) -> Option<u64> {
+    let key = DataKey::OfferSupersededBy(parent_offer_id);
+    let value = env.storage().persistent().get::<DataKey, u64>(&key);
+    if value.is_some() {
+        bump_entry_ttl(env, &key);
+    }
+    value
+}
+
+// ── Governance quorum storage (Issue #472) ───────────────────────────────────
+
+pub fn get_governance_proposal_count(env: &Env) -> u64 {
+    env.storage()
+        .persistent()
+        .get::<DataKey, u64>(&DataKey::GovernanceProposalCount)
+        .unwrap_or(0)
+}
+
+pub fn increment_governance_proposal_count(env: &Env) -> u64 {
+    let count = get_governance_proposal_count(env) + 1;
+    env.storage()
+        .persistent()
+        .set(&DataKey::GovernanceProposalCount, &count);
+    bump_entry_ttl(env, &DataKey::GovernanceProposalCount);
+    count
+}
+
+pub fn save_governance_proposal(env: &Env, proposal: &crate::types::GovernanceProposal) {
+    let key = DataKey::GovernanceProposal(proposal.proposal_id);
+    env.storage().persistent().set(&key, proposal);
+    bump_entry_ttl(env, &key);
+}
+
+pub fn load_governance_proposal(
+    env: &Env,
+    proposal_id: u64,
+) -> Option<crate::types::GovernanceProposal> {
+    let key = DataKey::GovernanceProposal(proposal_id);
+    let value = env
+        .storage()
+        .persistent()
+        .get::<DataKey, crate::types::GovernanceProposal>(&key);
+    if value.is_some() {
+        bump_entry_ttl(env, &key);
+    }
+    value
+}
+
+pub fn load_governance_approvals(env: &Env, proposal_id: u64) -> Vec<Address> {
+    let key = DataKey::GovernanceApprovals(proposal_id);
+    let value = env
+        .storage()
+        .persistent()
+        .get::<DataKey, Vec<Address>>(&key)
+        .unwrap_or_else(|| Vec::new(env));
+    if !value.is_empty() {
+        bump_entry_ttl(env, &key);
+    }
+    value
+}
+
+pub fn save_governance_approvals(env: &Env, proposal_id: u64, approvals: &Vec<Address>) {
+    let key = DataKey::GovernanceApprovals(proposal_id);
+    env.storage().persistent().set(&key, approvals);
+    bump_entry_ttl(env, &key);
 }

@@ -192,6 +192,29 @@ pub enum MarketplaceError {
     /// `set_listing_reservation` was called with an invalid window:
     /// `reservation_end <= reservation_start`, or `reservation_end` is in the past.
     InvalidReservationWindow = 66,
+    /// The referenced governance proposal does not exist in persistent storage. (Issue #472)
+    GovernanceProposalNotFound = 67,
+    /// `execute_governance_action` was called before the proposal reached its
+    /// approval threshold. (Issue #472)
+    GovernanceThresholdNotMet = 68,
+    /// `approve_governance_action` was called by a signer that has already
+    /// approved this proposal. (Issue #472)
+    GovernanceAlreadyApproved = 69,
+    /// `approve_governance_action` or `execute_governance_action` was called
+    /// after the proposal's `expires_at` deadline passed. (Issue #472)
+    GovernanceProposalExpired = 70,
+    /// `execute_governance_action` was called on a proposal that has already
+    /// been executed (replay protection). (Issue #472)
+    GovernanceProposalAlreadyExecuted = 71,
+    /// `execute_governance_action` or `approve_governance_action` was called
+    /// on a proposal that was cancelled. (Issue #472)
+    GovernanceProposalCancelled = 72,
+    /// `approve_governance_action` was called by an address not in the
+    /// proposal's signer set. (Issue #472)
+    GovernanceSignerNotAuthorized = 73,
+    /// `counter_offer` was called on an offer that is not in Pending state,
+    /// or `accept_counter_offer` was called on a non-counter-offer ID. (Issue #471)
+    NotCounterOffer = 74,
 }
 
 /// One pending or completed royalty claim for a single recipient.
@@ -239,6 +262,19 @@ pub enum CancelReason {
     AdminRevoked = 3,
 }
 
+/// Typed reason carried in AuctionCancelledEvent (Issue #469).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum AuctionCancelReason {
+    /// Creator cancelled a no-bid auction voluntarily.
+    Owner = 1,
+    /// Admin/ProtocolConfig role cancelled an auction with bids outstanding.
+    Admin = 2,
+    /// EmergencyPause role performed an emergency cancellation.
+    Emergency = 3,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Recipient {
@@ -256,6 +292,17 @@ pub struct PayoutLeg {
     pub amount: i128,
 }
 
+/// `Option<PayoutLeg>` substitute for use inside `#[contracttype]` structs.
+///
+/// Soroban XDR encoding does not support `Option<T>` when T is itself a
+/// custom `#[contracttype]`. This enum provides the same semantics.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum OptionalPayoutLeg {
+    Some(PayoutLeg),
+    None,
+}
+
 /// A fully-computed settlement breakdown for a single sale/settlement amount.
 ///
 /// Produced by `MarketplaceContract::calculate_payout_plan` (see the doc
@@ -270,7 +317,7 @@ pub struct PayoutLeg {
 pub struct PayoutPlan {
     /// `None` when no royalty applies (zero bps, or the royalty receiver is
     /// the seller themselves — see `calculate_payout_plan` for details).
-    pub royalty: Option<PayoutLeg>,
+    pub royalty: OptionalPayoutLeg,
     /// Protocol fee amount. `0` when no treasury is configured or `fee_bps`
     /// is `0`.
     pub fee: i128,
@@ -415,6 +462,8 @@ pub enum OfferStatus {
     Accepted,
     Rejected,
     Withdrawn,
+    /// Auto-swept after expiry by `sweep_expired_offers` (Issue #470).
+    Expired,
 }
 
 #[contracttype]
@@ -457,6 +506,55 @@ pub struct BatchItemError {
     pub item_index: u32,
     /// The marketplace error code that describes the failure.
     pub error_code: u32,
+}
+
+/// Operation types that require multi-approval quorum governance (Issue #472).
+///
+/// Low-risk operations continue to use single-role authorization. Only the
+/// three high-impact types below require a quorum of signers to approve before
+/// execution.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GovernanceProposalType {
+    /// Rotate the treasury destination address (high-value fund flow change).
+    TreasuryRotation,
+    /// Increase the protocol fee (fee-extracting change).
+    FeeIncrease,
+    /// Toggle the global circuit-breaker pause (market-halting change).
+    GlobalPause,
+}
+
+/// An on-chain multi-approval proposal for a high-risk governance action (Issue #472).
+///
+/// Created by `propose_governance_action`; signers call `approve_governance_action`
+/// until the `threshold` is met; then `execute_governance_action` carries out the
+/// underlying operation.  `cancelled` and `executed` are mutually exclusive terminal
+/// states; both prevent further approvals or execution (replay protection).
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct GovernanceProposal {
+    pub proposal_id: u64,
+    pub proposal_type: GovernanceProposalType,
+    pub proposed_by: Address,
+    /// Ordered, deduplicated set of addresses authorized to approve this proposal.
+    pub signers: soroban_sdk::Vec<Address>,
+    /// Minimum number of distinct signer approvals required before execution.
+    pub threshold: u32,
+    /// Absolute ledger timestamp after which the proposal cannot be approved or
+    /// executed — forces re-proposal of stale governance actions.
+    pub expires_at: u64,
+    /// Ledger sequence at proposal creation.
+    pub created_at: u32,
+    /// `true` once `execute_governance_action` has succeeded (replay guard).
+    pub executed: bool,
+    /// `true` once `cancel_governance_action` has been called.
+    pub cancelled: bool,
+    /// Payload for `TreasuryRotation`: the proposed new treasury address.
+    pub payload_address: Option<Address>,
+    /// Payload for `FeeIncrease`: the proposed new fee in basis points.
+    pub payload_u32: Option<u32>,
+    /// Payload for `GlobalPause`: `true` = pause, `false` = unpause.
+    pub payload_bool: Option<bool>,
 }
 
 /// Snapshot of the three-axis pause state for a given (collection, function) context.

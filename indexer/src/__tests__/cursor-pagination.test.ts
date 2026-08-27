@@ -105,7 +105,9 @@ describe('GET /listings — cursor pagination', () => {
 
     const res = await request(app).get('/listings?limit=3');
     expect(res.status).toBe(200);
-    expect(res.headers['x-next-cursor']).toBe('480');
+    // X-Next-Cursor is now an opaque base64url token (not the raw ledger number).
+    expect(res.headers['x-next-cursor']).toBeTruthy();
+    expect(res.headers['x-next-cursor']).not.toBe('480'); // opaque, not raw int
     expect(res.headers['x-total-count']).toBe('50');
   });
 
