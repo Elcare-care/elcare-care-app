@@ -123,6 +123,15 @@ export interface CreateAuctionInput {
   durationHours: number;
   royaltyBps?: number;
   tokenAddress?: string;
+  /**
+   * Issue #530 — when the caller has already run the image + metadata
+   * through the validated/verified upload pipeline (see useIpfsUpload),
+   * pass the resulting CIDs here to skip re-uploading. This guarantees the
+   * on-chain auction is only ever created with a metadata CID that has
+   * already been confirmed to resolve to the intended content — a failed
+   * or unverified upload never reaches this point.
+   */
+  verifiedMetadataCid?: string;
 }
 
 export function useCreateAuction(creatorPublicKey: string | null) {
@@ -143,23 +152,32 @@ export function useCreateAuction(creatorPublicKey: string | null) {
       setError(null);
 
       try {
-        // Step 1: Upload image to IPFS.
-        setProgress("Uploading image to IPFS…");
-        const imageResult = await uploadImageToIPFS(input.imageFile, input.title);
+        // Issue #530: when the caller (AuctionForm) has already run the
+        // upload through the validated/verified pipeline (useIpfsUpload),
+        // reuse that CID instead of re-uploading. Otherwise fall back to
+        // uploading here directly (legacy/simple callers).
+        let metadataCid = input.verifiedMetadataCid;
 
-        // Step 2: Build metadata JSON.
-        const metadata: ArtworkMetadata = {
-          title: input.title,
-          description: input.description,
-          artist: input.artistName,
-          image: `ipfs://${imageResult.cid}`,
-          year: input.year,
-          category: input.category,
-        };
+        if (!metadataCid) {
+          // Step 1: Upload image to IPFS.
+          setProgress("Uploading image to IPFS…");
+          const imageResult = await uploadImageToIPFS(input.imageFile, input.title);
 
-        // Step 3: Upload metadata to IPFS.
-        setProgress("Uploading metadata to IPFS…");
-        const metadataResult = await uploadMetadataToIPFS(metadata, input.title);
+          // Step 2: Build metadata JSON.
+          const metadata: ArtworkMetadata = {
+            title: input.title,
+            description: input.description,
+            artist: input.artistName,
+            image: `ipfs://${imageResult.cid}`,
+            year: input.year,
+            category: input.category,
+          };
+
+          // Step 3: Upload metadata to IPFS.
+          setProgress("Uploading metadata to IPFS…");
+          const metadataResult = await uploadMetadataToIPFS(metadata, input.title);
+          metadataCid = metadataResult.cid;
+        }
 
         // Step 4: Validate token and call the Soroban contract via useTxToast.
         setProgress("Creating on-chain auction…");
@@ -172,7 +190,7 @@ export function useCreateAuction(creatorPublicKey: string | null) {
           () =>
             createAuction(
               creatorPublicKey,
-              metadataResult.cid,
+              metadataCid as string,
               input.reservePriceXlm,
               durationSeconds,
               input.royaltyBps,
