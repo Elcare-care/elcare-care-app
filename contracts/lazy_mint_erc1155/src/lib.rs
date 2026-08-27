@@ -38,6 +38,9 @@ use soroban_sdk::{
     xdr::ToXdr, Address, Bytes, BytesN, Env, Map, String, Vec,
 };
 
+/// Shared metadata validation rules (Issue #476).
+pub mod metadata;
+
 const TTL_THRESHOLD: u32 = 50_000;
 const TTL_BUMP: u32 = 100_000;
 /// Maximum number of vouchers accepted by a single redeem_batch call (#274).
@@ -88,6 +91,10 @@ pub enum Error {
     ApprovalExpired = 25,
     /// Royalty BPS exceeds 10 000 (100 %).
     InvalidBps = 26,
+    /// Collection name is empty (Issue #476).
+    EmptyName = 27,
+    /// Collection name exceeds maximum length (Issue #476).
+    NameTooLong = 28,
 }
 
 // ─── Data types ───────────────────────────────────────────────────────────────
@@ -417,6 +424,9 @@ impl LazyMint1155 {
         if env.storage().instance().has(&DataKey::Initialized) {
             return Err(Error::AlreadyInitialized);
         }
+        // Issue #476: apply shared metadata validation rules before writing state.
+        metadata::validate_name(&name, Error::EmptyName, Error::NameTooLong)?;
+        metadata::validate_royalty_bps(royalty_bps, Error::InvalidBps)?;
         env.storage().instance().set(&DataKey::Initialized, &true);
         env.storage().instance().set(&DataKey::Creator, &creator);
         env.storage().instance().set(&DataKey::CurrentWasmHash, &BytesN::from_array(&env, &[0u8; 32]));

@@ -112,3 +112,78 @@ export function validateIpfsCid(cid: string): string | null {
   }
   return "Invalid CID: must start with 'b' (CIDv1 base32) or 'Qm' (CIDv0 base58).";
 }
+
+// ── Collection metadata validation (Issue #476) ───────────────────────────────
+//
+// These constraints mirror the on-chain rules in contracts/*/src/metadata.rs
+// exactly. Changing either side without updating the other will cause the
+// preflight to pass while the transaction rejects (or vice versa).
+
+/** Maximum collection name length in UTF-8 bytes (mirrors metadata.rs MAX_NAME_LEN). */
+export const COLLECTION_NAME_MAX_BYTES = 64;
+/** Maximum collection symbol length in UTF-8 bytes (mirrors metadata.rs MAX_SYMBOL_LEN). */
+export const COLLECTION_SYMBOL_MAX_BYTES = 16;
+/** Maximum per-token or base URI length in bytes (mirrors MAX_URI_LEN). */
+export const COLLECTION_URI_MAX_BYTES = 2048;
+/** Maximum max_supply value accepted at initialise (mirrors MAX_SUPPLY_LIMIT). */
+export const COLLECTION_MAX_SUPPLY_LIMIT = 1_000_000_000;
+
+/**
+ * Validates a collection name.
+ * @returns `null` when valid, or a human-readable error string.
+ */
+export function validateCollectionName(name: string): string | null {
+  if (!name || name.trim().length === 0) {
+    return "Collection name cannot be empty.";
+  }
+  const byteLen = new TextEncoder().encode(name).length;
+  if (byteLen > COLLECTION_NAME_MAX_BYTES) {
+    return `Collection name is too long (${byteLen} bytes). Maximum is ${COLLECTION_NAME_MAX_BYTES} bytes.`;
+  }
+  return null;
+}
+
+/**
+ * Validates a collection symbol (721-shaped collections only).
+ * @returns `null` when valid, or a human-readable error string.
+ */
+export function validateCollectionSymbol(symbol: string): string | null {
+  if (!symbol || symbol.trim().length === 0) {
+    return "Collection symbol cannot be empty.";
+  }
+  const byteLen = new TextEncoder().encode(symbol).length;
+  if (byteLen > COLLECTION_SYMBOL_MAX_BYTES) {
+    return `Collection symbol is too long (${byteLen} bytes). Maximum is ${COLLECTION_SYMBOL_MAX_BYTES} bytes.`;
+  }
+  return null;
+}
+
+/**
+ * Validates a collection max_supply value.
+ * @returns `null` when valid, or a human-readable error string.
+ */
+export function validateCollectionMaxSupply(maxSupply: number | string): string | null {
+  const val = typeof maxSupply === "string" ? parseInt(maxSupply, 10) : maxSupply;
+  if (!Number.isFinite(val) || val <= 0) {
+    return "Max supply must be greater than zero.";
+  }
+  if (val > COLLECTION_MAX_SUPPLY_LIMIT) {
+    return `Max supply cannot exceed ${COLLECTION_MAX_SUPPLY_LIMIT.toLocaleString()}.`;
+  }
+  return null;
+}
+
+/**
+ * Validates a token URI or base URI string.
+ * @returns `null` when valid, or a human-readable error string.
+ */
+export function validateCollectionUri(uri: string): string | null {
+  if (!uri || uri.length === 0) {
+    return "URI cannot be empty.";
+  }
+  const byteLen = new TextEncoder().encode(uri).length;
+  if (byteLen > COLLECTION_URI_MAX_BYTES) {
+    return `URI is too long (${byteLen} bytes). Maximum is ${COLLECTION_URI_MAX_BYTES} bytes.`;
+  }
+  return null;
+}

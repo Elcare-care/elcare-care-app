@@ -479,6 +479,42 @@ pub struct Offer {
     pub expires_at: Option<u64>,
 }
 
+// ── Role inventory types (Issue #473) ────────────────────────────────────────
+
+/// One row in the role inventory: the current holder of a single role axis
+/// and any pending rotation proposal.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct RoleEntry {
+    pub role: RoleType,
+    /// Current effective holder (either the explicit Role(role) storage value,
+    /// or the fallback Admin when no explicit holder is set).
+    pub holder: Address,
+    /// Candidate address if a rotation proposal is currently pending.
+    pub pending_candidate: Option<Address>,
+    /// Expiry ledger timestamp of the pending proposal (seconds since epoch).
+    pub pending_expires_at: Option<u64>,
+}
+
+/// Full read-only snapshot returned by `get_role_inventory`.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct RoleInventory {
+    /// Current admin address, or None if the contract is not yet initialised.
+    pub admin: Option<Address>,
+    /// Candidate for the admin role if a proposal is pending.
+    pub pending_admin_candidate: Option<Address>,
+    /// Expiry timestamp of the pending admin proposal.
+    pub pending_admin_expires_at: Option<u64>,
+    /// One entry per role axis (ProtocolConfig, EmergencyPause,
+    /// CollectionAdmin, Upgrade).
+    pub roles: soroban_sdk::Vec<RoleEntry>,
+    /// Ledger sequence at which this snapshot was taken.
+    pub ledger_sequence: u32,
+    /// Ledger timestamp (seconds since Unix epoch) at which this snapshot was taken.
+    pub ledger_timestamp: u64,
+}
+
 /// Identifies which standard a deployed collection implements.
 ///
 /// Returned by collection contracts via `contract_type()` so the marketplace

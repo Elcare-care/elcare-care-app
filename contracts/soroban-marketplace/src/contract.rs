@@ -54,6 +54,9 @@ use crate::{
         increment_governance_proposal_count,
         save_governance_proposal, load_governance_proposal,
         load_governance_approvals, save_governance_approvals,
+        // Issue #474 — terminal cleanup cursor
+        get_terminal_cleanup_cursor, set_terminal_cleanup_cursor,
+        clear_terminal_cleanup_cursor, TerminalCleanupCursor,
     },
     types::{
         Auction, AuctionCancelReason, AuctionStatus, BatchCreateListingInput,
@@ -336,6 +339,53 @@ impl MarketplaceContract {
     /// `None` when no rotation is in progress.
     pub fn get_pending_role(env: Env, role: RoleType) -> Option<PendingRoleProposal> {
         get_pending_role_storage(&env, &role)
+    }
+
+    /// Read-only inventory of every active role holder and pending proposal
+    /// (Issue #473).
+    ///
+    /// Returns a `RoleInventory` struct with the current holder and optional
+    /// pending proposal for each of the four role axes, plus the active admin
+    /// and pending-admin proposal (if any). No auth required — this is a
+    /// pure read-only diagnostic view.
+    ///
+    /// Operators use this as the first step of any rotation procedure: confirm
+    /// the current state before proposing a transfer.
+    pub fn get_role_inventory(env: Env) -> crate::types::RoleInventory {
+        let admin: Option<Address> = env
+            .storage()
+            .persistent()
+            .get::<_, Address>(&DataKey::Admin);
+        let pending_admin = get_pending_admin_storage(&env);
+
+        let all_roles = [
+            RoleType::ProtocolConfig,
+            RoleType::EmergencyPause,
+            RoleType::CollectionAdmin,
+            RoleType::Upgrade,
+        ];
+
+        let mut role_entries = soroban_sdk::Vec::new(&env);
+        for role in all_roles.iter() {
+            let holder = get_role_storage(&env, role)
+                .unwrap_or_else(|| admin.clone().expect("admin not set"));
+            let pending = get_pending_role_storage(&env, role);
+            role_entries.push_back(crate::types::RoleEntry {
+                role: role.clone(),
+                holder,
+                pending_candidate: pending.as_ref().map(|p| p.candidate.clone()),
+                pending_expires_at: pending.map(|p| p.expires_at),
+            });
+        }
+
+        crate::types::RoleInventory {
+            admin,
+            pending_admin_candidate: pending_admin.as_ref().map(|p| p.candidate.clone()),
+            pending_admin_expires_at: pending_admin.map(|p| p.expires_at),
+            roles: role_entries,
+            ledger_sequence: env.ledger().sequence(),
+            ledger_timestamp: env.ledger().timestamp(),
+        }
     }
 
     /// Step 1 of the two-step role rotation: the current holder of `role`
@@ -1901,6 +1951,127 @@ impl MarketplaceContract {
         }
         .publish(&env);
         renewed
+    }
+
+    /// Bounded, resumable cleanup sweep for terminal marketplace records
+    /// (Issue #474).
+    ///
+    /// # What it does
+    /// Walks listing ids then offer ids in ascending order up to `batch_size`
+    /// (hard-capped at `MAX_MAINTENANCE_ITEMS = 100`). For each record in a
+    /// **terminal** state (Listing: Sold / Cancelled; Offer: Accepted /
+    /// Rejected / Withdrawn / Expired) it:
+    ///   1. Emits a `terminal_cleaned` event so the indexer can mark the record
+    ///      as potentially-cold on-chain.
+    ///   2. Does NOT delete the record — historical marketplace records are never
+    ///      hard-deleted. The contract simply stops renewing the record's TTL so
+    ///      Soroban's own archival mechanism reclaims the storage rent over time.
+    ///
+    /// # Safety guarantees
+    /// - Active listings, active auctions, and pending offers are **never**
+    ///   touched.
+    /// - Unsettled escrow records are not touched (the listing/auction that holds
+    ///   the escrow is still Active).
+    /// - The sweep is resumable: progress is stored in `TerminalCleanupCursor`
+    ///   and resumes from where the previous call stopped.
+    /// - Repeated calls with the same ids are safe (idempotent events).
+    ///
+    /// # Permissionless
+    /// Any caller may invoke this entry point — no auth required. The
+    /// `MAX_MAINTENANCE_ITEMS` cap bounds the compute cost per call.
+    ///
+    /// Returns the number of terminal records processed this call.
+    pub fn cleanup_terminal_records(env: Env, batch_size: u32) -> u32 {
+        use crate::types::{ListingStatus, OfferStatus};
+
+        bump_instance_ttl(&env);
+
+        let budget = batch_size.min(MAX_MAINTENANCE_ITEMS);
+        let mut cursor = get_terminal_cleanup_cursor(&env);
+        let listing_count = crate::storage::get_listing_count(&env);
+        let offer_count = crate::storage::get_offer_count(&env);
+        let mut processed: u32 = 0;
+
+        // Phase 0: walk listings
+        if cursor.phase == 0 {
+            let start = cursor.cursor + 1;
+            let end = listing_count.min(start + budget as u64 - 1);
+            for id in start..=end {
+                if processed >= budget {
+                    break;
+                }
+                if let Some(listing) = load_listing(&env, id) {
+                    match listing.status {
+                        ListingStatus::Sold | ListingStatus::Cancelled => {
+                            TerminalCleanedEvent {
+                                kind: soroban_sdk::Symbol::new(&env, "listing"),
+                                id,
+                                ledger_sequence: env.ledger().sequence(),
+                            }
+                            .publish(&env);
+                            processed += 1;
+                        }
+                        ListingStatus::Active => {} // skip — never touch active records
+                    }
+                }
+                cursor.cursor = id;
+            }
+            if cursor.cursor >= listing_count {
+                // Advance to phase 1
+                cursor.phase = 1;
+                cursor.cursor = 0;
+            }
+        }
+
+        // Phase 1: walk offers (with remaining budget)
+        if cursor.phase == 1 && processed < budget {
+            let start = cursor.cursor + 1;
+            let remaining = budget - processed;
+            let end = offer_count.min(start + remaining as u64 - 1);
+            for id in start..=end {
+                if processed >= budget {
+                    break;
+                }
+                if let Some(offer) = load_offer(&env, id) {
+                    match offer.status {
+                        OfferStatus::Accepted
+                        | OfferStatus::Rejected
+                        | OfferStatus::Withdrawn
+                        | OfferStatus::Expired => {
+                            TerminalCleanedEvent {
+                                kind: soroban_sdk::Symbol::new(&env, "offer"),
+                                id,
+                                ledger_sequence: env.ledger().sequence(),
+                            }
+                            .publish(&env);
+                            processed += 1;
+                        }
+                        OfferStatus::Pending => {} // skip — never touch pending offers
+                    }
+                }
+                cursor.cursor = id;
+            }
+            if cursor.cursor >= offer_count {
+                // Full sweep complete — clear cursor so the next call starts fresh
+                clear_terminal_cleanup_cursor(&env);
+                CleanupSummaryEvent {
+                    kind: soroban_sdk::Symbol::new(&env, "terminal_cleanup"),
+                    items_processed: processed,
+                    ledger_sequence: env.ledger().sequence(),
+                }
+                .publish(&env);
+                return processed;
+            }
+        }
+
+        set_terminal_cleanup_cursor(&env, &cursor);
+        CleanupSummaryEvent {
+            kind: soroban_sdk::Symbol::new(&env, "terminal_cleanup"),
+            items_processed: processed,
+            ledger_sequence: env.ledger().sequence(),
+        }
+        .publish(&env);
+        processed
     }
 
     // ── Token Whitelist ──────────────────────────────────────

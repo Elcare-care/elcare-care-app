@@ -26,6 +26,9 @@ use soroban_sdk::{
     String, Vec,
 };
 
+/// Shared metadata validation rules (Issue #476).
+pub mod metadata;
+
 const TTL_THRESHOLD: u32 = 50_000;
 const TTL_BUMP: u32 = 100_000;
 const MAX_BPS: u32 = 10_000; // 100 % in basis points
@@ -70,6 +73,10 @@ pub enum Error {
     TokenNotFound = 20,
     /// Approval expiry is in the past.
     ApprovalExpired = 21,
+    /// Collection name is empty (Issue #476).
+    EmptyName = 22,
+    /// Collection name exceeds maximum length (Issue #476).
+    NameTooLong = 23,
 }
 
 // ─── Storage Keys ─────────────────────────────────────────────────────────────
@@ -173,6 +180,9 @@ impl NormalNFT1155 {
         if royalty_bps > MAX_BPS {
             return Err(Error::InvalidBps);
         }
+        // Issue #476: apply shared metadata validation rules.
+        metadata::validate_name(&name, Error::EmptyName, Error::NameTooLong)?;
+        metadata::validate_royalty_bps(royalty_bps, Error::InvalidBps)?;
         env.storage().instance().set(&DataKey::Initialized, &true);
         env.storage().instance().set(&DataKey::Creator, &creator);
         env.storage().instance().set(&DataKey::Name, &name);

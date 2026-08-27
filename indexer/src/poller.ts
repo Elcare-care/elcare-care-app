@@ -1021,10 +1021,14 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
           kind: kindMap[eventType],
           creator: creatorAddr,
           deployedAtLedger: ledgerSequence,
+          // Issue #476: collections deployed via the updated launchpad have
+          // passed the shared metadata validation rules.
+          metadataStatus: 'valid',
         },
         update: {
           creator: creatorAddr,
           deployedAtLedger: ledgerSequence,
+          metadataStatus: 'valid',
         },
       });
       // Invalidate collections cache

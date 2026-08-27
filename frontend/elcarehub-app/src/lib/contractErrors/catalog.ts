@@ -99,6 +99,31 @@ const MARKETPLACE_ERRORS: ContractErrorDefinition[] = [
   { code: 48, name: "MaxExtensionsReached", message: "This auction has reached its maximum number of extensions.", retryable: false, action: "none" },
   { code: 49, name: "NotTokenOwner", message: "You do not own this token.", retryable: false, action: "reconnect_wallet" },
   { code: 50, name: "TokenAlreadyEscrowed", message: "This token is already listed or in an active auction.", retryable: false, action: "refresh_and_retry" },
+  // Codes 51–74 added in this release (Issues #459–#476)
+  { code: 51, name: "AuctionDurationLimitReached", message: "The auction cannot be extended further — its maximum total duration has been reached.", retryable: false, action: "none" },
+  { code: 52, name: "NoRoleProposalPending", message: "There is no pending role-transfer proposal for this role.", retryable: false, action: "refresh_and_retry" },
+  { code: 53, name: "RoleProposalExpired", message: "The pending role-transfer proposal has expired and must be re-issued.", retryable: false, action: "refresh_and_retry" },
+  { code: 54, name: "RoleTransferToSelf", message: "The proposed new role holder is already the current holder.", retryable: false, action: "adjust_input" },
+  { code: 55, name: "RoleTransferToContract", message: "A role cannot be assigned to a contract address.", retryable: false, action: "adjust_input" },
+  { code: 56, name: "TreasuryProposalExpired", message: "The pending treasury proposal has expired and must be re-issued.", retryable: false, action: "refresh_and_retry" },
+  { code: 57, name: "NoTreasuryProposalPending", message: "There is no pending treasury proposal to accept or cancel.", retryable: false, action: "refresh_and_retry" },
+  { code: 58, name: "TreasuryProposalSelf", message: "The proposed treasury address is already the active treasury.", retryable: false, action: "adjust_input" },
+  { code: 59, name: "InvalidListingDuration", message: "The listing duration is outside the allowed range.", retryable: false, action: "adjust_input" },
+  { code: 60, name: "CollectionIncompatible", message: "The token does not belong to the specified collection, or the collection type is incompatible with the requested quantity.", retryable: false, action: "adjust_input" },
+  { code: 61, name: "BatchItemInvalid", message: "One item in the batch failed validation. Check the item at the indicated index.", retryable: false, action: "adjust_input" },
+  { code: 62, name: "OwnershipMismatch", message: "The expected owner does not match the current on-chain owner.", retryable: false, action: "refresh_and_retry" },
+  { code: 63, name: "RoyaltyAlreadyClaimed", message: "This royalty payment has already been claimed.", retryable: false, action: "refresh_and_retry" },
+  { code: 64, name: "RoyaltyClaimNotFound", message: "No royalty claim record was found for this settlement and recipient.", retryable: false, action: "refresh_and_retry" },
+  { code: 65, name: "ReservationWindowActive", message: "This listing is currently reserved for another buyer. Try again after the reservation window ends.", retryable: false, action: "refresh_and_retry" },
+  { code: 66, name: "InvalidReservationWindow", message: "The reservation window is invalid — end must be after start and in the future.", retryable: false, action: "adjust_input" },
+  { code: 67, name: "GovernanceProposalNotFound", message: "The referenced governance proposal does not exist.", retryable: false, action: "refresh_and_retry" },
+  { code: 68, name: "GovernanceThresholdNotMet", message: "This governance action has not yet reached the required approval threshold.", retryable: false, action: "none" },
+  { code: 69, name: "GovernanceAlreadyApproved", message: "You have already approved this governance proposal.", retryable: false, action: "none" },
+  { code: 70, name: "GovernanceProposalExpired", message: "This governance proposal has expired.", retryable: false, action: "refresh_and_retry" },
+  { code: 71, name: "GovernanceProposalAlreadyExecuted", message: "This governance proposal has already been executed.", retryable: false, action: "refresh_and_retry" },
+  { code: 72, name: "GovernanceProposalCancelled", message: "This governance proposal has been cancelled.", retryable: false, action: "refresh_and_retry" },
+  { code: 73, name: "GovernanceSignerNotAuthorized", message: "Your address is not authorised to approve this governance proposal.", retryable: false, action: "reconnect_wallet" },
+  { code: 74, name: "NotCounterOffer", message: "This operation requires a counter-offer, but the referenced offer is not one.", retryable: false, action: "refresh_and_retry" },
 ];
 
 const LAUNCHPAD_ERRORS: ContractErrorDefinition[] = [
@@ -117,6 +142,11 @@ const LAUNCHPAD_ERRORS: ContractErrorDefinition[] = [
   { code: 13, name: "EmptySymbol", message: "The collection symbol cannot be empty.", retryable: false, action: "adjust_input" },
   { code: 14, name: "InvalidMaxSupply", message: "Max supply must be greater than zero.", retryable: false, action: "adjust_input" },
   { code: 15, name: "InsufficientFee", message: "Your balance is insufficient to cover the deployment fee.", retryable: false, action: "adjust_input" },
+  { code: 16, name: "AlreadyMigrated", message: "This contract has already been migrated to the current version.", retryable: false, action: "none" },
+  { code: 17, name: "CollectionNotFound", message: "No collection record was found for this address.", retryable: false, action: "refresh_and_retry" },
+  { code: 18, name: "NameTooLong", message: "The collection name exceeds the maximum allowed length of 64 characters.", retryable: false, action: "adjust_input" },
+  { code: 19, name: "SymbolTooLong", message: "The collection symbol exceeds the maximum allowed length of 16 characters.", retryable: false, action: "adjust_input" },
+  { code: 20, name: "MaxSupplyTooLarge", message: "Max supply cannot exceed 1,000,000,000.", retryable: false, action: "adjust_input" },
 ];
 
 const COLLECTION_NFT_ERC721_ERRORS: ContractErrorDefinition[] = [
@@ -135,6 +165,15 @@ const COLLECTION_NFT_ERC721_ERRORS: ContractErrorDefinition[] = [
   { code: 13, name: "ApprovalExpired", message: "This approval has expired. Please request a new one.", retryable: false, action: "refresh_and_retry" },
   { code: 14, name: "AlreadyMigrated", message: "This collection has already been migrated to the current version.", retryable: false, action: "none" },
   { code: 15, name: "UnsupportedMigration", message: "This migration path isn't supported — upgrades must be sequential.", retryable: false, action: "contact_support" },
+  { code: 16, name: "EmptyUri", message: "A token URI cannot be empty.", retryable: false, action: "adjust_input" },
+  { code: 17, name: "UriTooLong", message: "The token URI exceeds the maximum allowed length of 2048 bytes.", retryable: false, action: "adjust_input" },
+  { code: 18, name: "EmptyBatch", message: "Batch cannot be empty.", retryable: false, action: "adjust_input" },
+  { code: 19, name: "BatchTooLarge", message: "Batch exceeds the maximum allowed size. Please split into smaller batches.", retryable: false, action: "adjust_input" },
+  { code: 20, name: "EmptyName", message: "The collection name cannot be empty.", retryable: false, action: "adjust_input" },
+  { code: 21, name: "NameTooLong", message: "The collection name exceeds the maximum allowed length of 64 characters.", retryable: false, action: "adjust_input" },
+  { code: 22, name: "EmptySymbol", message: "The collection symbol cannot be empty.", retryable: false, action: "adjust_input" },
+  { code: 23, name: "SymbolTooLong", message: "The collection symbol exceeds the maximum allowed length of 16 characters.", retryable: false, action: "adjust_input" },
+  { code: 24, name: "InvalidMaxSupply", message: "Max supply must be greater than zero and cannot exceed 1,000,000,000.", retryable: false, action: "adjust_input" },
 ];
 
 const COLLECTION_NFT_ERC1155_ERRORS: ContractErrorDefinition[] = [
@@ -158,6 +197,9 @@ const COLLECTION_NFT_ERC1155_ERRORS: ContractErrorDefinition[] = [
   { code: 18, name: "EmptyBatch", message: "Batch cannot be empty.", retryable: false, action: "adjust_input" },
   { code: 19, name: "BatchTooLarge", message: "Batch exceeds the maximum allowed size. Please split into smaller batches.", retryable: false, action: "adjust_input" },
   { code: 20, name: "TokenNotFound", message: "This token was not found in this collection.", retryable: false, action: "refresh_and_retry" },
+  { code: 21, name: "ApprovalExpired", message: "This approval has expired. Please request a new one.", retryable: false, action: "refresh_and_retry" },
+  { code: 22, name: "EmptyName", message: "The collection name cannot be empty.", retryable: false, action: "adjust_input" },
+  { code: 23, name: "NameTooLong", message: "The collection name exceeds the maximum allowed length of 64 characters.", retryable: false, action: "adjust_input" },
 ];
 
 const LAZY_MINT_ERC721_ERRORS: ContractErrorDefinition[] = [
@@ -176,6 +218,16 @@ const LAZY_MINT_ERC721_ERRORS: ContractErrorDefinition[] = [
   { code: 13, name: "VoucherRevoked", message: "This mint voucher has been revoked by the creator.", retryable: false, action: "none" },
   { code: 14, name: "AlreadyMigrated", message: "This collection has already been migrated to the current version.", retryable: false, action: "none" },
   { code: 15, name: "UnsupportedMigration", message: "This migration path isn't supported — upgrades must be sequential.", retryable: false, action: "contact_support" },
+  { code: 16, name: "EmptyBatch", message: "Batch cannot be empty.", retryable: false, action: "adjust_input" },
+  { code: 17, name: "BatchTooLarge", message: "Batch exceeds the maximum allowed size. Please split into smaller batches.", retryable: false, action: "adjust_input" },
+  { code: 18, name: "DuplicateVoucherInBatch", message: "The batch contains two vouchers with the same token ID.", retryable: false, action: "adjust_input" },
+  { code: 19, name: "ApprovalExpired", message: "This approval has expired. Please request a new one.", retryable: false, action: "refresh_and_retry" },
+  { code: 20, name: "InvalidBps", message: "The royalty basis-points value is invalid.", retryable: false, action: "adjust_input" },
+  { code: 21, name: "EmptyName", message: "The collection name cannot be empty.", retryable: false, action: "adjust_input" },
+  { code: 22, name: "NameTooLong", message: "The collection name exceeds the maximum allowed length of 64 characters.", retryable: false, action: "adjust_input" },
+  { code: 23, name: "EmptySymbol", message: "The collection symbol cannot be empty.", retryable: false, action: "adjust_input" },
+  { code: 24, name: "SymbolTooLong", message: "The collection symbol exceeds the maximum allowed length of 16 characters.", retryable: false, action: "adjust_input" },
+  { code: 25, name: "InvalidMaxSupply", message: "Max supply must be greater than zero and cannot exceed 1,000,000,000.", retryable: false, action: "adjust_input" },
 ];
 
 const LAZY_MINT_ERC1155_ERRORS: ContractErrorDefinition[] = [
@@ -197,6 +249,16 @@ const LAZY_MINT_ERC1155_ERRORS: ContractErrorDefinition[] = [
   { code: 16, name: "VoucherRevoked", message: "This mint voucher has been revoked by the creator.", retryable: false, action: "none" },
   { code: 17, name: "AlreadyMigrated", message: "This collection has already been migrated to the current version.", retryable: false, action: "none" },
   { code: 18, name: "UnsupportedMigration", message: "This migration path isn't supported — upgrades must be sequential.", retryable: false, action: "contact_support" },
+  { code: 19, name: "EmptyUri", message: "A token URI cannot be empty.", retryable: false, action: "adjust_input" },
+  { code: 20, name: "UriTooLong", message: "The token URI exceeds the maximum allowed length of 2048 bytes.", retryable: false, action: "adjust_input" },
+  { code: 21, name: "ZeroAmount", message: "Amount must be greater than zero.", retryable: false, action: "adjust_input" },
+  { code: 22, name: "EmptyBatch", message: "Batch cannot be empty.", retryable: false, action: "adjust_input" },
+  { code: 23, name: "BatchTooLarge", message: "Batch exceeds the maximum allowed size. Please split into smaller batches.", retryable: false, action: "adjust_input" },
+  { code: 24, name: "DuplicateVoucherInBatch", message: "The batch contains two vouchers with the same nonce.", retryable: false, action: "adjust_input" },
+  { code: 25, name: "ApprovalExpired", message: "This approval has expired. Please request a new one.", retryable: false, action: "refresh_and_retry" },
+  { code: 26, name: "InvalidBps", message: "The royalty basis-points value is invalid.", retryable: false, action: "adjust_input" },
+  { code: 27, name: "EmptyName", message: "The collection name cannot be empty.", retryable: false, action: "adjust_input" },
+  { code: 28, name: "NameTooLong", message: "The collection name exceeds the maximum allowed length of 64 characters.", retryable: false, action: "adjust_input" },
 ];
 
 export const CONTRACT_ERROR_CATALOG: Record<ContractName, ContractErrorDefinition[]> = {
