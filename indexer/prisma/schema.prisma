@@ -287,6 +287,10 @@ model Collection {
   feeBpsOverride  Int?
   /// Whether the collection metadata has been permanently frozen.
   metadataFrozen  Boolean  @default(false)
+  /// Metadata validation status (Issue #476).
+  /// "valid"   — deployed after #476 validation rules; all fields passed launchpad checks.
+  /// "unknown" — deployed before #476; no validation guarantee.
+  metadataStatus  String   @default("unknown")
   createdAt       DateTime @default(now())
   // GIN-indexed tsvector updated by collection_search_vector_trigger.
   searchVector    Unsupported("tsvector")?

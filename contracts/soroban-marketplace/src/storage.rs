@@ -302,6 +302,10 @@ pub enum DataKey {
     GovernanceProposal(u64),
     /// Ordered list of approver addresses for a governance proposal (Issue #472).
     GovernanceApprovals(u64),
+    /// Resumable cursor for the `cleanup_terminal_records` permissionless sweep
+    /// (Issue #474). Stores the last listing-id and offer-id processed so the
+    /// sweep can be interrupted and resumed safely.
+    TerminalCleanupCursor,
 }
 
 /// Custody record for an NFT held by the marketplace, keyed by
@@ -2171,4 +2175,47 @@ pub fn save_governance_approvals(env: &Env, proposal_id: u64, approvals: &Vec<Ad
     let key = DataKey::GovernanceApprovals(proposal_id);
     env.storage().persistent().set(&key, approvals);
     bump_entry_ttl(env, &key);
+}
+
+// ── Terminal-record cleanup cursor (Issue #474) ──────────────────────────────
+//
+// `cleanup_terminal_records` is a permissionless (or role-gated) entry point
+// that emits a `TerminalCleanedEvent` marker for each terminal record it
+// processes, then stops refreshing that record's TTL so Soroban's own archival
+// mechanism eventually reclaims the storage rent. The cursor makes the sweep
+// resumable across multiple calls.
+//
+// State layout:
+//   phase 0 — walk listing ids 1..=ListingCount (skip Active / unknown)
+//   phase 1 — walk offer ids 1..=OfferCount (skip Pending / unknown)
+//   Once phase 1 completes the cursor is cleared; callers may re-run at will.
+
+/// Resumable cursor for the `cleanup_terminal_records` permissionless sweep.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TerminalCleanupCursor {
+    /// Current sweep phase: 0 = listings, 1 = offers.
+    pub phase: u32,
+    /// Last id processed in the current phase (0 = not started).
+    pub cursor: u64,
+}
+
+pub fn get_terminal_cleanup_cursor(env: &Env) -> TerminalCleanupCursor {
+    env.storage()
+        .persistent()
+        .get::<DataKey, TerminalCleanupCursor>(&DataKey::TerminalCleanupCursor)
+        .unwrap_or(TerminalCleanupCursor { phase: 0, cursor: 0 })
+}
+
+pub fn set_terminal_cleanup_cursor(env: &Env, cursor: &TerminalCleanupCursor) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::TerminalCleanupCursor, cursor);
+    bump_entry_ttl(env, &DataKey::TerminalCleanupCursor);
+}
+
+pub fn clear_terminal_cleanup_cursor(env: &Env) {
+    env.storage()
+        .persistent()
+        .remove(&DataKey::TerminalCleanupCursor);
 }
