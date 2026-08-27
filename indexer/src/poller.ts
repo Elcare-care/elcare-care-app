@@ -982,7 +982,7 @@ export async function applyDecodedEvents(decodedEvents: any[], tx: any) {
 }
 
 export async function processEvent(event: any, tx?: any, skipInsert = false) {
-  const { eventType, listingId, actor, ledgerSequence, data } = event;
+  const { eventType, listingId, actor, ledgerSequence, data, txHash } = event;
   const db = tx ?? prisma;
 
   // ── Measure per-event-type processing time ────────────────────────────────
@@ -1274,17 +1274,22 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
         ? chainAuction.recipients.map((r: any) => ({ address: r.address.toString(), percentage: Number(r.percentage) }))
         : [];
 
+      const maxExtensions = chainAuction?.max_extensions != null
+        ? Number(chainAuction.max_extensions)
+        : 0;
+
       await db.auction.upsert({
         where: { auctionId: listingId },
         create: {
           auctionId: listingId, creator, collection, nftTokenId, token, reservePrice,
           highestBid: '0', highestBidder: null, endTime, status: 'Active' as const,
           recipients, createdAtLedger: ledgerSequence, updatedAtLedger: ledgerSequence,
-          extensionCount: 0, originalEndTime: endTime,
+          extensionCount: 0, originalEndTime: endTime, maxExtensions,
         },
         update: {
           creator, collection, nftTokenId, token, reservePrice, endTime,
           status: 'Active' as const, recipients, updatedAtLedger: ledgerSequence,
+          maxExtensions,
         },
       });
 
@@ -1330,16 +1335,30 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
     }
 
     case 'AUCTION_RESOLVED': {
+      const winner: string | null = data.winner || null;
       const { count } = await db.auction.updateMany({
         where: { auctionId: listingId, updatedAtLedger: { lte: ledgerSequence } },
         data: {
           status: 'Finalized' as const,
           highestBid: data.amount,
-          highestBidder: data.winner || null,
+          highestBidder: winner,
           updatedAtLedger: ledgerSequence,
         },
       });
       if (count === 0) logger.error('AUCTION_RESOLVED: auction not found — resolution not recorded', { eventType, auctionId: listingId?.toString(), ledger: ledgerSequence });
+
+      // Mark all losing bids as Refundable (Issue #466). The winner's bid stays None
+      // because their funds went to the seller; only genuinely losing bids need recovery.
+      if (listingId != null) {
+        await db.bid.updateMany({
+          where: {
+            auctionId: listingId,
+            ...(winner ? { bidder: { not: winner } } : {}),
+            refundStatus: 'None',
+          },
+          data: { refundStatus: 'Refundable' },
+        });
+      }
 
       auctionFinalizationsTotal.inc();
       invalidateAuction(listingId.toString()).catch(() => {});
@@ -1373,6 +1392,41 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
       }
       invalidateAuction(listingId.toString()).catch(() => {});
 
+      break;
+    }
+
+    case 'AUCTION_BID_REFUNDED': {
+      // Mark the refunded bid as Claimed so the UI shows the correct state (Issue #466).
+      // The event carries bidder + auction_id; we update the most-recent Bid row for
+      // this (auctionId, bidder) pair (the one with the highest ledgerSequence).
+      if (listingId != null) {
+        const latestBid = await db.bid.findFirst({
+          where: { auctionId: listingId, bidder: data.bidder },
+          orderBy: { ledgerSequence: 'desc' },
+        });
+        if (latestBid) {
+          await db.bid.update({
+            where: { id: latestBid.id },
+            data: { refundStatus: 'Claimed' },
+          });
+        }
+      }
+      break;
+    }
+
+    case 'AUCTION_RESERVE_UPDATED': {
+      // Update the stored reserve price when the creator makes a pre-bid change (Issue #467).
+      if (listingId != null) {
+        const { count } = await db.auction.updateMany({
+          where: { auctionId: listingId },
+          data: {
+            reservePrice: data.new_reserve_price,
+            updatedAtLedger: ledgerSequence,
+          },
+        });
+        if (count === 0) logger.warn('AUCTION_RESERVE_UPDATED: auction not found', { eventType, auctionId: listingId?.toString(), ledger: ledgerSequence });
+      }
+      invalidateAuction(listingId?.toString() ?? '').catch(() => {});
       break;
     }
 
@@ -1411,6 +1465,10 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
 
     case 'OFFER_MADE': {
       const offerExpiresAt = data.expires_at != null ? BigInt(data.expires_at) : null;
+      // #528: escrowTxHash records the tx that moved funds into escrow, so
+      // the offers UI can link directly to it. Falls back to null for events
+      // replayed without a tx hash (e.g. some test fixtures).
+      const escrowTxHash = txHash || null;
       await db.offer.upsert({
         where: { offerId: BigInt(data.offer_id) },
         create: {
@@ -1421,6 +1479,7 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
           token: data.token,
           status: 'Pending' as const,
           expiresAt: offerExpiresAt,
+          escrowTxHash,
           createdAtLedger: ledgerSequence,
           updatedAtLedger: ledgerSequence,
         },
@@ -1436,6 +1495,7 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
           token: data.token,
           status: 'Pending' as const,
           expiresAt: offerExpiresAt,
+          escrowTxHash,
           updatedAtLedger: ledgerSequence,
         },
       });
@@ -1447,7 +1507,7 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
     case 'OFFER_ACCEPTED': {
       await db.offer.update({
         where: { offerId: BigInt(data.offer_id) },
-        data: { status: 'Accepted' as const, updatedAtLedger: ledgerSequence },
+        data: { status: 'Accepted' as const, refundTxHash: txHash || null, updatedAtLedger: ledgerSequence },
       });
       const { count: listingCount } = await db.listing.updateMany({
         where: { listingId: BigInt(data.listing_id) },
@@ -1468,7 +1528,7 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
     case 'OFFER_REJECTED': {
       await db.offer.update({
         where: { offerId: BigInt(data.offer_id) },
-        data: { status: 'Rejected' as const, updatedAtLedger: ledgerSequence },
+        data: { status: 'Rejected' as const, refundTxHash: txHash || null, updatedAtLedger: ledgerSequence },
       });
       invalidateOffer(data.listing_id?.toString()).catch(() => {});
       break;
@@ -1478,7 +1538,7 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
     case 'OFFER_RECLAIMED': {
       await db.offer.update({
         where: { offerId: BigInt(data.offer_id) },
-        data: { status: 'Withdrawn' as const, updatedAtLedger: ledgerSequence },
+        data: { status: 'Withdrawn' as const, refundTxHash: txHash || null, updatedAtLedger: ledgerSequence },
       });
       invalidateOffer(data.listing_id?.toString()).catch(() => {});
       break;

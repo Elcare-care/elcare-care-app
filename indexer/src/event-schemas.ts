@@ -152,6 +152,8 @@ export interface BidPlacedData {
   auction_id: bigint;
   bidder: string;
   bid_amount: bigint;
+  /** Auction end time after any anti-sniping extension (Issue #468). Absent on pre-upgrade events. */
+  effective_end_time?: bigint;
 }
 
 export interface AuctionFinalizedData {
@@ -500,6 +502,8 @@ export const BID_PLACED_SCHEMA: ContractEventSchema = {
     { name: 'auction_id', type: 'bigint' },
     { name: 'bidder', type: 'string' },
     { name: 'bid_amount', type: 'bigint' },
+    // effective_end_time added in Issue #468; absent on pre-upgrade events (optional).
+    { name: 'effective_end_time', type: 'bigint', optional: true },
   ],
 };
 
@@ -803,6 +807,27 @@ export const LISTING_OWNERSHIP_RECONCILED_SCHEMA: ContractEventSchema = {
   ],
 };
 
+// ── Auction reserve price update (Issue #467) ─────────────────────────────────
+
+export interface AuctionReserveUpdatedData {
+  auction_id: bigint;
+  updated_by: string;
+  old_reserve_price: bigint;
+  new_reserve_price: bigint;
+  ledger_sequence: number;
+}
+
+export const AUCTION_RESERVE_UPDATED_SCHEMA: ContractEventSchema = {
+  type: 'AUCTION_RESERVE_UPDATED',
+  data: [
+    { name: 'auction_id', type: 'bigint' },
+    { name: 'updated_by', type: 'string' },
+    { name: 'old_reserve_price', type: 'bigint' },
+    { name: 'new_reserve_price', type: 'bigint' },
+    { name: 'ledger_sequence', type: 'number' },
+  ],
+};
+
 // ── Schema registry ───────────────────────────────────────────────────────────
 
 export const SCHEMA_REGISTRY: Map<string, ContractEventSchema> = new Map([
@@ -845,6 +870,8 @@ export const SCHEMA_REGISTRY: Map<string, ContractEventSchema> = new Map([
   ['LAUNCHPAD_COLLECTION_UPGRADED', LAUNCHPAD_COLLECTION_UPGRADED_SCHEMA],
   // Issue #456: listing ownership reconciliation
   ['LISTING_OWNERSHIP_RECONCILED', LISTING_OWNERSHIP_RECONCILED_SCHEMA],
+  // Issue #467: auction reserve price update
+  ['AUCTION_RESERVE_UPDATED', AUCTION_RESERVE_UPDATED_SCHEMA],
 ]);
 
 // ── Schema-driven decoder ─────────────────────────────────────────────────────

@@ -12,139 +12,19 @@
 
 "use client";
 
-import { useState, useEffect, useMemo } from "react";
-import { useCreateAuction, type CreateAuctionInput } from "@/hooks/useAuctions";
+import { useState, useRef, useEffect } from "react";
+import Image from "next/image";
+import { useCreateAuction } from "@/hooks/useAuctions";
+import { useIpfsUpload } from "@/hooks/useIpfsUpload";
 import { useWalletContext } from "@/context/WalletContext";
-import { CheckCircle2, Loader2, Plus, Trash2, Info } from "lucide-react";
+import { Upload, CheckCircle, Loader2, XCircle, RotateCcw } from "lucide-react";
 import { GuardButton } from "./WalletGuard";
+import { IpfsMetadataPreview } from "./IpfsMetadataPreview";
 import { DEFAULT_TOKEN } from "@/config/tokens";
 import { useSupportedTokens } from "@/hooks/useSupportedTokens";
 import { getDefaultSupportedToken } from "@/lib/token-support";
-import { isValidStellarAddress } from "@/lib/validation";
-import {
-  getAuctionConfig,
-  xlmToStroops,
-  stroopsToXlm,
-  MIN_AUCTION_DURATION_SECONDS,
-  MAX_TOTAL_AUCTION_DURATION_SECONDS,
-  type AuctionConfig,
-} from "@/lib/contract";
-
-/** Maximum number of royalty recipients (TooManyRecipients contract error). */
-const MAX_RECIPIENTS = 4;
-const REQUIRED_SPLIT_SUM = 100;
-const MIN_DURATION_HOURS = MIN_AUCTION_DURATION_SECONDS / 3600; // 1
-const MAX_DURATION_HOURS = MAX_TOTAL_AUCTION_DURATION_SECONDS / 3600; // 720 (30 days)
-
-interface RecipientRow {
-  address: string;
-  percentage: number;
-}
-
-interface FormState {
-  collectionAddress: string;
-  nftTokenId: number;
-  reservePriceXlm: number;
-  durationHours: number;
-  tokenAddress: string;
-  recipients: RecipientRow[];
-}
-
-interface FieldErrors {
-  collectionAddress?: string;
-  nftTokenId?: string;
-  reservePriceXlm?: string;
-  durationHours?: string;
-  tokenAddress?: string;
-  recipients?: string;
-  recipientRows?: Array<{ address?: string; percentage?: string }>;
-}
-
-function validateAuctionForm(
-  form: FormState,
-  minIncrementStroops: bigint | null
-): FieldErrors {
-  const errors: FieldErrors = {};
-
-  if (!form.collectionAddress.trim()) {
-    errors.collectionAddress = "Collection address is required.";
-  } else if (!isValidStellarAddress(form.collectionAddress.trim())) {
-    errors.collectionAddress = "Must be a valid Stellar contract address (starts with C).";
-  }
-
-  if (!Number.isInteger(form.nftTokenId) || form.nftTokenId < 0) {
-    errors.nftTokenId = "Token ID must be a non-negative integer.";
-  }
-
-  if (!Number.isFinite(form.reservePriceXlm) || form.reservePriceXlm <= 0) {
-    errors.reservePriceXlm = "Reserve price must be greater than 0.";
-  } else if (minIncrementStroops !== null) {
-    const stroops = xlmToStroops(form.reservePriceXlm);
-    if (stroops < minIncrementStroops) {
-      errors.reservePriceXlm = `Reserve price must be at least ${stroopsToXlm(
-        minIncrementStroops
-      )} (the platform's minimum bid increment).`;
-    }
-  }
-
-  if (!Number.isFinite(form.durationHours) || form.durationHours < MIN_DURATION_HOURS) {
-    errors.durationHours = `Duration must be at least ${MIN_DURATION_HOURS} hour${
-      MIN_DURATION_HOURS === 1 ? "" : "s"
-    }.`;
-  } else if (form.durationHours > MAX_DURATION_HOURS) {
-    errors.durationHours = `Duration cannot exceed ${MAX_DURATION_HOURS / 24} days.`;
-  }
-
-  if (!form.tokenAddress) {
-    errors.tokenAddress = "A payment token must be selected.";
-  }
-
-  if (form.recipients.length === 0) {
-    errors.recipients = "At least one recipient is required.";
-  } else if (form.recipients.length > MAX_RECIPIENTS) {
-    errors.recipients = `A maximum of ${MAX_RECIPIENTS} recipients is allowed.`;
-  } else {
-    const rowErrors = form.recipients.map((r) => {
-      const rowErr: { address?: string; percentage?: string } = {};
-      if (!r.address.trim()) {
-        rowErr.address = "Address is required.";
-      } else if (!isValidStellarAddress(r.address.trim())) {
-        rowErr.address = "Must be a valid Stellar address.";
-      }
-      if (!Number.isFinite(r.percentage) || r.percentage <= 0) {
-        rowErr.percentage = "Must be greater than 0.";
-      } else if (r.percentage > REQUIRED_SPLIT_SUM) {
-        rowErr.percentage = `Cannot exceed ${REQUIRED_SPLIT_SUM}%.`;
-      }
-      return rowErr;
-    });
-    if (rowErrors.some((e) => e.address || e.percentage)) {
-      errors.recipientRows = rowErrors;
-    }
-    const total = form.recipients.reduce((sum, r) => sum + (r.percentage || 0), 0);
-    if (Math.round(total) !== REQUIRED_SPLIT_SUM) {
-      errors.recipients = `Recipient percentages must sum to exactly ${REQUIRED_SPLIT_SUM}% (currently ${total.toFixed(
-        2
-      )}%).`;
-    }
-  }
-
-  return errors;
-}
-
-function isFormValid(errors: FieldErrors): boolean {
-  const hasTopLevel =
-    errors.collectionAddress !== undefined ||
-    errors.nftTokenId !== undefined ||
-    errors.reservePriceXlm !== undefined ||
-    errors.durationHours !== undefined ||
-    errors.tokenAddress !== undefined ||
-    errors.recipients !== undefined;
-  const hasRow =
-    errors.recipientRows !== undefined &&
-    errors.recipientRows.some((r) => r.address || r.percentage);
-  return !hasTopLevel && !hasRow;
-}
+import { ART_CATEGORIES } from "./ListingForm";
+import { validateImageFile, ImageValidationResult } from "@/lib/ipfs";
 
 interface AuctionFormProps {
   onSuccess?: (auctionId: number) => void;
@@ -154,19 +34,20 @@ interface AuctionFormProps {
 export function AuctionForm({ onSuccess, onCancel }: AuctionFormProps) {
   const { publicKey } = useWalletContext();
   const { tokens: availableTokens } = useSupportedTokens();
-  const { create, isCreating, progress, error } = useCreateAuction(publicKey);
+  const { create, isCreating, progress: createProgress, error: createError } = useCreateAuction(publicKey);
+  const ipfsUpload = useIpfsUpload();
 
   const [successId, setSuccessId] = useState<number | null>(null);
-  const [submitAttempted, setSubmitAttempted] = useState(false);
-  const [auctionConfig, setAuctionConfig] = useState<AuctionConfig | null>(null);
-
-  const [form, setForm] = useState<FormState>({
-    collectionAddress: "",
-    nftTokenId: 0,
+  const [fileError, setFileError] = useState<string | null>(null);
+  const [form, setForm] = useState({
+    title: "",
+    description: "",
+    artistName: "",
+    year: new Date().getFullYear().toString(),
+    category: ART_CATEGORIES[0],
     reservePriceXlm: 1,
     durationHours: 24,
     tokenAddress: DEFAULT_TOKEN.address,
-    recipients: [{ address: publicKey ?? "", percentage: 100 }],
   });
 
   const hasTokenOptions = availableTokens.length > 0;
@@ -184,14 +65,22 @@ export function AuctionForm({ onSuccess, onCancel }: AuctionFormProps) {
     }
   }, [availableTokens, form.tokenAddress]);
 
-  // Sync connected wallet into recipient[0] once known.
-  useEffect(() => {
-    if (!publicKey) return;
-    setForm((cur) => {
-      if (cur.recipients.length !== 1 || cur.recipients[0].address) return cur;
-      return { ...cur, recipients: [{ address: publicKey, percentage: 100 }] };
-    });
-  }, [publicKey]);
+  // Issue #530: run client-side file validation (MIME/size/dimensions) at
+  // the moment a file is selected, regardless of whether it came from the
+  // file picker or a drag-and-drop — every entry point must be validated.
+  const handleFile = async (file: File) => {
+    ipfsUpload.reset();
+    setFileError(null);
+    const validation: ImageValidationResult = await validateImageFile(file);
+    if (!validation.valid) {
+      setFileError(validation.messages.join(" "));
+      setSelectedFile(null);
+      setPreview(null);
+      return;
+    }
+    setSelectedFile(file);
+    setPreview(URL.createObjectURL(file));
+  };
 
   // Fetch live contract bounds (min bid increment, anti-snipe settings) once.
   useEffect(() => {
@@ -224,27 +113,41 @@ export function AuctionForm({ onSuccess, onCancel }: AuctionFormProps) {
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    setSubmitAttempted(true);
-    if (!formIsValid) return;
+    if (!selectedFile || fileError) return;
 
-    const input: CreateAuctionInput = {
-      collectionAddress: form.collectionAddress.trim(),
-      nftTokenId: form.nftTokenId,
-      reservePriceXlm: form.reservePriceXlm,
-      durationSeconds: Math.round(form.durationHours * 3600),
-      recipients: form.recipients.map((r) => ({
-        address: r.address.trim(),
-        percentage: r.percentage,
-      })),
-      tokenAddress: form.tokenAddress,
-    };
+    // Step 1: validate + upload image and metadata to IPFS, then verify the
+    // returned CIDs actually resolve to the submitted content. The on-chain
+    // transaction is only ever attempted once this pipeline reaches
+    // "success" — a failed or unverified upload never reaches step 2.
+    const uploadResult = await ipfsUpload.start({
+      imageFile: selectedFile,
+      name: form.title,
+      buildMetadata: (imageCid) => ({
+        title: form.title,
+        description: form.description,
+        artist: form.artistName,
+        image: imageCid ?? "",
+        year: form.year,
+        category: form.category,
+      }),
+    });
+    if (!uploadResult) return;
 
-    const id = await create(input);
+    // Step 2: create the on-chain auction using the verified metadata CID.
+    const id = await create({
+      ...form,
+      imageFile: selectedFile,
+      verifiedMetadataCid: uploadResult.metadataCid,
+    });
     if (id !== null) {
       setSuccessId(id);
       onSuccess?.(id);
     }
   };
+
+  const isUploading = ipfsUpload.isActive;
+  const isBusy = isUploading || isCreating;
+  const progress = isUploading ? ipfsUpload.progressLabel : createProgress;
 
   if (successId !== null) {
     return (
@@ -284,31 +187,91 @@ export function AuctionForm({ onSuccess, onCancel }: AuctionFormProps) {
           </p>
         </header>
 
-        <form onSubmit={handleSubmit} noValidate className="space-y-8">
+        <form onSubmit={handleSubmit} className="space-y-8">
+          {/* Image upload */}
+          <div
+            onDrop={handleDrop}
+            onDragOver={(e) => e.preventDefault()}
+            onClick={() => fileRef.current?.click()}
+            className="group relative flex flex-col items-center justify-center rounded-3xl border-2 border-dashed border-brand-200 bg-brand-50/30 p-12 text-center cursor-pointer hover:border-brand-400 hover:bg-brand-50/60 transition-all"
+          >
+            {preview ? (
+              <div className="relative h-64 w-full">
+                <Image
+                  src={preview}
+                  alt="Preview"
+                  fill
+                  className="object-contain rounded-2xl"
+                  unoptimized
+                />
+                <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 flex items-center justify-center rounded-2xl transition-opacity">
+                  <p className="text-white text-base font-bold underline underline-offset-4">
+                    Click to change
+                  </p>
+                </div>
+              </div>
+            ) : (
+              <div className="py-4">
+                <div className="mx-auto w-16 h-16 rounded-full bg-brand-100 flex items-center justify-center mb-4 group-hover:scale-110 transition-transform">
+                  <Upload size={32} className="text-brand-500" />
+                </div>
+                <p className="text-lg font-semibold text-brand-950 font-display">
+                  Select Artwork
+                </p>
+                <p className="mt-1 text-sm text-brand-400 font-inter">
+                  JPEG, PNG, GIF, WEBP or SVG — max 20 MB
+                </p>
+              </div>
+            )}
+            <input
+              ref={fileRef}
+              type="file"
+              accept="image/*"
+              className="hidden"
+              onChange={(e) => {
+                const file = e.target.files?.[0];
+                if (file) handleFile(file);
+              }}
+            />
+          </div>
+          {fileError && (
+            <p className="text-sm text-red-600" role="alert">
+              {fileError}
+            </p>
+          )}
+
+          {/* Fields */}
           <div className="grid gap-6 sm:grid-cols-2">
-            {/* Collection address */}
-            <div className="space-y-2">
+
+            {/* Title */}
+            <div className="sm:col-span-2 space-y-2">
               <label className="block text-sm font-bold text-gray-950 uppercase tracking-wider font-inter">
-                Collection Address *
+                Title *
               </label>
               <input
                 required
-                value={form.collectionAddress}
-                onChange={(e) => setForm({ ...form, collectionAddress: e.target.value })}
-                aria-invalid={shouldShow("collectionAddress")}
-                className={`w-full rounded-2xl border px-5 py-4 text-base font-mono focus:outline-none transition-all shadow-sm ${
-                  shouldShow("collectionAddress")
-                    ? "border-red-400 bg-red-50/40 focus:border-red-500"
-                    : "border-gray-200 bg-gray-50/50 focus:border-brand-500 focus:bg-white"
-                }`}
-                placeholder="C… collection contract address"
+                value={form.title}
+                onChange={(e) => setForm({ ...form, title: e.target.value })}
+                className="w-full rounded-2xl border border-gray-200 bg-gray-50/50 px-5 py-4 text-base focus:border-brand-500 focus:bg-white focus:outline-none transition-all shadow-sm font-inter"
+                placeholder="e.g. Echoes of the Serengeti"
               />
-              {shouldShow("collectionAddress") && (
-                <p className="text-sm text-red-600" role="alert">{errors.collectionAddress}</p>
-              )}
             </div>
 
-            {/* Token ID */}
+            <div className="sm:col-span-2 space-y-2">
+              <label className="block text-sm font-bold text-gray-950 uppercase tracking-wider font-inter">
+                Description
+              </label>
+              <textarea
+                rows={3}
+                value={form.description}
+                onChange={(e) =>
+                  setForm({ ...form, description: e.target.value })
+                }
+                className="w-full rounded-2xl border border-gray-200 bg-gray-50/50 px-5 py-4 text-base focus:border-brand-500 focus:bg-white focus:outline-none transition-all shadow-sm font-inter"
+                placeholder="Describe the soul of this artwork…"
+              />
+            </div>
+
             <div className="space-y-2">
               <label className="block text-sm font-bold text-gray-950 uppercase tracking-wider font-inter">
                 Token ID *
@@ -482,33 +445,74 @@ export function AuctionForm({ onSuccess, onCancel }: AuctionFormProps) {
             </div>
           </div>
 
-          {/* Anti-sniping info — read-only, snapshotted from platform config */}
-          {auctionConfig && (
-            <div className="flex items-start gap-2 rounded-2xl bg-brand-50/60 px-5 py-4 text-xs text-brand-800">
-              <Info size={14} className="mt-0.5 shrink-0" />
-              <p>
-                Anti-sniping is enabled platform-wide: a bid placed within{" "}
-                <strong>{auctionConfig.extensionTrigger}s</strong> of the close extends the
-                auction by <strong>{auctionConfig.extensionWindow}s</strong>
-                {auctionConfig.maxExtensions > 0
-                  ? ` (up to ${auctionConfig.maxExtensions} times)`
-                  : " (unlimited times, capped at 30 days total)"}
-                . These settings apply automatically and aren&apos;t configurable per auction.
-              </p>
+          {/* Upload pipeline progress — validate → upload image → upload
+              metadata → verify (Issue #530). Distinct from the on-chain
+              transaction progress reported by useCreateAuction. */}
+          {isUploading && progress && (
+            <div className="flex items-center justify-between gap-3 rounded-2xl bg-brand-50 px-6 py-4 text-sm font-semibold text-brand-700">
+              <span className="flex items-center gap-3">
+                <Loader2 size={20} className="animate-spin" />
+                {progress}
+              </span>
+              <button
+                type="button"
+                onClick={ipfsUpload.cancel}
+                className="flex items-center gap-1.5 rounded-xl px-3 py-1.5 text-xs font-bold text-brand-700 hover:bg-brand-100 transition-all"
+              >
+                <XCircle size={14} />
+                Cancel
+              </button>
+            </div>
+          )}
+          {isCreating && !isUploading && createProgress && (
+            <div className="flex items-center gap-3 rounded-2xl bg-brand-50 px-6 py-4 text-sm font-semibold text-brand-700 animate-pulse">
+              <Loader2 size={20} className="animate-spin" />
+              {createProgress}
             </div>
           )}
 
-          {/* Progress / error */}
-          {isCreating && progress && (
-            <div className="flex items-center gap-3 rounded-2xl bg-brand-50 px-6 py-4 text-sm font-semibold text-brand-700 animate-pulse">
-              <Loader2 size={20} className="animate-spin" />
-              {progress}
+          {/* Upload errors — distinguishes validation, upload, verification
+              and cancellation failures, and offers a resumable retry. */}
+          {ipfsUpload.state === "error" && ipfsUpload.error && (
+            <div className="flex items-start justify-between gap-3 rounded-2xl bg-red-50 px-6 py-4 text-sm border border-red-100">
+              <div>
+                <p className="font-bold text-red-700">
+                  {ipfsUpload.error.kind === "verification"
+                    ? "Verification failed"
+                    : ipfsUpload.error.kind === "cancelled"
+                    ? "Upload cancelled"
+                    : ipfsUpload.error.kind === "validation"
+                    ? "Invalid metadata"
+                    : "Upload failed"}
+                </p>
+                <p className="text-red-600 mt-0.5">{ipfsUpload.error.message}</p>
+              </div>
+              {ipfsUpload.error.kind !== "cancelled" && (
+                <button
+                  type="button"
+                  onClick={() => ipfsUpload.retry()}
+                  className="flex shrink-0 items-center gap-1.5 rounded-xl bg-red-100 px-3 py-2 text-xs font-bold text-red-700 hover:bg-red-200 transition-all"
+                >
+                  <RotateCcw size={14} />
+                  Retry
+                </button>
+              )}
             </div>
           )}
-          {error && (
+          {createError && (
             <p className="rounded-2xl bg-red-50 px-6 py-4 text-sm font-bold text-red-600 border border-red-100">
-              {error}
+              {createError}
             </p>
+          )}
+
+          {/* Verified upload preview — confirms the fields the indexer will
+              actually store (title/description/artist) before the on-chain
+              transaction is submitted. */}
+          {ipfsUpload.state === "success" && ipfsUpload.metadataResult && (
+            <IpfsMetadataPreview
+              cid={ipfsUpload.metadataResult.cid}
+              metadata={ipfsUpload.metadata}
+            />
           )}
 
           {/* Buttons */}
@@ -517,7 +521,7 @@ export function AuctionForm({ onSuccess, onCancel }: AuctionFormProps) {
               <button
                 type="button"
                 onClick={onCancel}
-                disabled={isCreating}
+                disabled={isBusy}
                 className="flex-1 rounded-2xl border border-gray-200 py-4 text-lg font-semibold text-gray-600 hover:bg-gray-50 transition-all disabled:opacity-50"
               >
                 Cancel
@@ -525,11 +529,11 @@ export function AuctionForm({ onSuccess, onCancel }: AuctionFormProps) {
             )}
             <GuardButton
               type="submit"
-              disabled={isCreating || !hasTokenOptions || (submitAttempted && !formIsValid)}
+              disabled={isBusy || !hasTokenOptions || !selectedFile || !!fileError}
               actionName="to create your auction"
               className="flex-[2] flex items-center justify-center gap-3 rounded-2xl bg-brand-500 py-5 text-xl font-bold text-white shadow-2xl shadow-brand-500/30 hover:bg-brand-600 hover:scale-[1.01] transition-all active:scale-[0.98] disabled:opacity-50 disabled:hover:scale-100"
             >
-              {isCreating ? (
+              {isBusy ? (
                 <>
                   <Loader2 size={24} className="animate-spin" />
                   {progress || "Processing…"}

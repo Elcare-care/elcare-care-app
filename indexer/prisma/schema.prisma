@@ -32,6 +32,16 @@ enum OfferStatus {
   Reclaimed
 }
 
+/// Tracks per-bid refund eligibility for `refund_losing_bid` (Issue #466).
+enum BidRefundStatus {
+  /// Default: refund eligibility not yet determined (auction still Active).
+  None
+  /// The auction has settled; this losing bid is eligible for `refund_losing_bid`.
+  Refundable
+  /// The bidder has successfully claimed their refund via `refund_losing_bid`.
+  Claimed
+}
+
 model SyncState {
   id               Int      @id @default(1)
   lastLedger       Int      @default(0)
@@ -128,6 +138,8 @@ model Auction {
   extensionCount  Int           @default(0)
   /// Original end time set at auction creation, used to enforce total duration cap
   originalEndTime BigInt
+  /// Snapshotted max-extensions cap from auction creation (0 = unlimited). Issue #468.
+  maxExtensions   Int           @default(0)
   @@index([updatedAtLedger])
   @@index([status, updatedAtLedger])
   @@index([creator, updatedAtLedger])
@@ -142,12 +154,20 @@ model Offer {
   status          OfferStatus @default(Pending)
   /// Optional expiry (ledger timestamp) after which the offer can be reclaimed. Null = never expires.
   expiresAt       BigInt?
+  /// Soroban tx hash of the escrow deposit (set from the OFFER_MADE event). Null until indexed.
+  escrowTxHash    String?
+  /// Soroban tx hash of the terminal payout/refund (accept, reject, withdraw, or reclaim). Null until indexed.
+  refundTxHash    String?
+  /// Issue #528 groundwork: offerId of the offer this one counters, when the
+  /// (not-yet-built) counter-offer flow creates one. Always null today.
+  parentOfferId   BigInt?
   createdAtLedger Int
   updatedAtLedger Int
   createdAt       DateTime    @default(now())
   updatedAt       DateTime    @updatedAt
   @@index([listingId])
   @@index([listingId, updatedAtLedger])
+  @@index([parentOfferId])
 }
 
 // ── Token whitelist registry (Issue #208) ─────────────────────────────────
@@ -170,15 +190,18 @@ model WhitelistedToken {
 }
 
 model Bid {
-  id              Int      @id @default(autoincrement())
+  id              Int             @id @default(autoincrement())
   auctionId       BigInt
   bidder          String
-  amount          Decimal  @db.Decimal(32, 7)
+  amount          Decimal         @db.Decimal(32, 7)
   ledgerSequence  Int
-  createdAt       DateTime @default(now())
+  createdAt       DateTime        @default(now())
+  /// Refund eligibility state populated from AUCTION_BID_REFUNDED events (Issue #466).
+  refundStatus    BidRefundStatus @default(None)
   @@index([auctionId])
   @@index([bidder])
   @@index([ledgerSequence])
+  @@index([auctionId, refundStatus])
   @@unique([auctionId, ledgerSequence, bidder])
 }
 
@@ -199,6 +222,10 @@ model MarketplaceEvent {
   /// behind the network tip.  On reorg, events past the safe ledger are
   /// hard-deleted (provisional by definition).
   confirmed       Boolean  @default(false)
+  /// Issue #532: position of this event within its ledger transaction, used
+  /// for deterministic same-ledger ordering in the provenance timeline.
+  /// NULL for legacy rows ingested before this field was introduced.
+  eventIndex      Int?
   @@index([actor])
   @@index([eventType])
   @@index([listingId])
@@ -207,6 +234,8 @@ model MarketplaceEvent {
   @@index([contractId])
   @@index([actor, ledgerSequence])
   @@index([contractId, ledgerSequence])
+  // Issue #532: composite index for provenance timeline ordering
+  @@index([ledgerSequence, eventIndex])
   @@unique([listingId, eventType, ledgerSequence])
 }
 
@@ -821,7 +850,7 @@ model OperationalAudit {
   ipAddress       String?       // client IP address
   userAgent       String?       // client user agent
   createdAt       DateTime      @default(now())
-  
+
   @@index([actor])
   @@index([actionType])
   @@index([createdAt])
@@ -942,4 +971,69 @@ model FinancialAggregateSnapshot {
   @@unique([snapshotType, scopeKey, ledgerFrom, ledgerTo, confirmedOnly])
   @@index([snapshotType, ledgerFrom, ledgerTo])
   @@index([scopeKey])
+}
+
+// ── Projection Rebuild Job ────────────────────────────────────────────────────
+//
+// Tracks a single resumable projection-rebuild operation initiated by the
+// rebuild-projections CLI or admin API.
+//
+// A rebuild replays canonical MarketplaceEvent rows through the same
+// processEvent() projection functions used during live ingestion, updating
+// Listing / Auction / Offer / Collection rows from the event log without
+// touching the live sync cursor.
+//
+// Lifecycle:
+//   Pending → Running → Completed
+//                     → Failed     (retryable via --resume=<id>)
+//                     → Cancelled  (operator-cancelled)
+//
+// Dry-run jobs reach DryRunComplete without modifying domain tables.
+
+enum ProjectionRebuildStatus {
+  Pending
+  Running
+  Completed
+  Failed
+  Cancelled
+  DryRunComplete
+}
+
+model ProjectionRebuildJob {
+  id                 Int                      @id @default(autoincrement())
+  /// Projection types included in this rebuild, e.g. ["listing","auction","offer","collection"]
+  projections        String[]
+  /// Ledger range lower bound (inclusive). 0 = "from genesis".
+  ledgerFrom         Int                      @default(0)
+  /// Ledger range upper bound (inclusive). 0 = "to current tip at start time".
+  ledgerTo           Int                      @default(0)
+  /// Optional filter: rebuild only entities matching this id (BigInt as string).
+  entityId           String?
+  /// Last fully-processed ledger sequence; 0 before first batch.
+  checkpointLedger   Int                      @default(0)
+  /// Number of event rows processed so far.
+  processedEvents    Int                      @default(0)
+  /// Total event rows in scope (estimated at job start; 0 until counted).
+  totalEvents        Int                      @default(0)
+  /// Number of domain table rows touched (upserted / updated).
+  affectedRows       Int                      @default(0)
+  /// Number of conflicts detected (rows that would change) in dry-run or execute mode.
+  conflictsDetected  Int                      @default(0)
+  /// SHA-256 of canonical event hashes before rebuild (hex string, null until computed).
+  checksumBefore     String?
+  /// SHA-256 of canonical event hashes after rebuild (null until rebuild completes).
+  checksumAfter      String?
+  status             ProjectionRebuildStatus  @default(Pending)
+  dryRun             Boolean                  @default(false)
+  /// Whether SSE broadcasts were suppressed during this rebuild.
+  sseSuppressed      Boolean                  @default(true)
+  error              String?
+  startedAt          DateTime?
+  completedAt        DateTime?
+  createdAt          DateTime                 @default(now())
+  updatedAt          DateTime                 @updatedAt
+
+  @@index([status])
+  @@index([createdAt])
+  @@index([ledgerFrom, ledgerTo])
 }

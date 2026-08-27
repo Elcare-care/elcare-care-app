@@ -175,8 +175,16 @@ export interface CreateListingInput {
   nftTokenId: number;
   price: number;
   tokenAddress?: string;
-  /** Revenue-split recipients; percentages must sum to exactly 100. */
+  /** Revenue-split recipients; percentages are basis points (0–10 000). */
   recipients?: Array<{ address: string; percentage: number }>;
+  /**
+   * Number of editions being listed. `1` for single-edition (721-style)
+   * collections; any value `>= 1` (bounded by the artist's on-chain
+   * balance) for multi-edition (1155-style) collections. Defaults to `1`.
+   */
+  quantity?: number;
+  /** Optional unix-seconds expiry. `null`/`undefined` means no expiry. */
+  expiresAt?: number | null;
 }
 
 export function useCreateListing(artistPublicKey: string | null) {
@@ -213,7 +221,9 @@ export function useCreateListing(artistPublicKey: string | null) {
               token.address,
               input.collectionAddress,
               input.nftTokenId,
-              input.recipients ?? []
+              input.recipients ?? [],
+              input.quantity ?? 1,
+              input.expiresAt ?? null
             ),
           { action: "Listing" }
         );
@@ -245,7 +255,7 @@ export function useCreateListing(artistPublicKey: string | null) {
 // ── useBuyArtwork ─────────────────────────────────────────────
 
 export function useBuyArtwork(buyerPublicKey: string | null) {
-  const { run, isRunning: isBuying } = useTxToast();
+  const { run, isRunning: isBuying, txHash } = useTxToast();
 
   const buy = useCallback(
     async (listingId: number, expectedIntent?: TransactionIntent): Promise<boolean> => {
@@ -276,7 +286,9 @@ export function useBuyArtwork(buyerPublicKey: string | null) {
     [buyerPublicKey, run],
   );
 
-  return { buy, isBuying, error: null };
+  // Issue #520: expose the real transaction hash once known so callers can
+  // key a provisional/optimistic UI update against it (see useReconciliation).
+  return { buy, isBuying, error: null, txHash };
 }
 
 // ── useCancelListing ──────────────────────────────────────────
@@ -473,7 +485,19 @@ export interface ListingMutationPayload {
 
 export function useMarketplaceWithReconciliation(opts?: { page?: number; limit?: number }) {
   const marketplace = useMarketplace(opts);
-  const recon = useReconciliation<Listing>({ mutationTtlMs: 60_000 });
+  const marketplaceRefreshRef = useRef(marketplace.refresh);
+  marketplaceRefreshRef.current = marketplace.refresh;
+
+  const recon = useReconciliation<Listing>({
+    mutationTtlMs: 60_000,
+    // Issue #520: a REORG/CRITICAL_REORG event invalidates any provisional
+    // state built on the now-orphaned chain history — discard all local
+    // pending mutations and confirmed snapshots, then re-fetch confirmed
+    // truth so the UI performs a full reconciliation rather than leaving
+    // stale local entities behind.
+    reorgIndexerUrl: config.indexerUrl || null,
+    onReorgReset: () => marketplaceRefreshRef.current(),
+  });
 
   // When fresh listing data arrives (from SSE-triggered refresh), push it into
   // the reconciler as confirmed snapshots.

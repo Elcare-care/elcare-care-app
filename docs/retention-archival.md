@@ -6,6 +6,59 @@ Marketplace activity and raw events grow continuously. This document defines the
 retention periods, archival procedures, and restore mechanisms for every major
 table in the indexer PostgreSQL database.
 
+## Wallet data — retention classes
+
+ElcareHub is non-custodial. There is no `User` table; a wallet is identified
+solely by its public key (a 56-character Stellar `G…` address). Wallet keys
+are public ledger data; they are not treated as PII. The table below
+catalogues every field in the off-chain database that contains or derives from
+a wallet address and assigns a retention class to it.
+
+| Field | Table | Class | Retention | Notes |
+|-------|-------|-------|-----------|-------|
+| `artist` | `Listing` | **canonical** | Indefinite | On-chain provenance — cannot be deleted |
+| `owner` | `Listing` | **canonical** | Indefinite | Current on-chain owner — cannot be deleted |
+| `originalCreator` | `Listing` | **canonical** | Indefinite | Attribution for royalty calculations |
+| `creator` | `Auction` | **canonical** | Indefinite | On-chain provenance |
+| `highestBidder` | `Auction` | **canonical** | Indefinite | On-chain state |
+| `offerer` | `Offer` | **canonical** | Indefinite | On-chain provenance |
+| `creator` | `Collection` | **canonical** | Indefinite | On-chain provenance |
+| `bidder` | `Bid` | **canonical** | Indefinite | On-chain bid history |
+| `actor` | `MarketplaceEvent` | **warm** | 90 days hot, then archive | Mirrors on-chain signer; pseudonymised in analytics exports |
+| `data` (wallet keys embedded in JSON) | `MarketplaceEvent` | **warm** | 90 days hot, then archive | `buyer`, `artist`, `offerer`, `bidder`, `winner`, `creator` JSON paths — redacted in debug logs |
+| `actor` | `ArchivedMarketplaceEvent` | **cold** | Indefinite archive | Append-only; not deleted |
+| `recipient` | `RoyaltyPayment` | **canonical** | Indefinite | Financial audit trail |
+| `actor` | `OperationalAudit` | **operational** | 90 days, then delete | Operator identity; pseudonymised in CSV exports |
+| `addedBy` / `removedBy` | `WhitelistedToken` | **canonical** | Indefinite | On-chain governance trail |
+| `changedBy` | `PriceHistory` | **warm** | 90 days hot, then archive | Mirrors on-chain signer |
+| `ipAddress` | `OperationalAudit` | **operational** | 90 days, then delete | Never exported in analytics; omitted from CSV if pseudonymisation flag set |
+
+### Retention class definitions
+
+| Class | Description |
+|-------|-------------|
+| **canonical** | Mirrors public on-chain state. Cannot be deleted without destroying the integrity of the indexer. No deletion scheduled. |
+| **warm** | Derived from on-chain data but not the authoritative source. Archived to immutable tables after the hot retention window; no deletion from archive. |
+| **operational** | Internal bookkeeping (audit logs, request metadata). Deleted after the retention window. Not included in analytics exports in raw form. |
+
+### Analytics / export pseudonymisation
+
+Analytics queries (`stats.ts`, CSV exports from `audit-routes.ts`) that
+surface wallet addresses **must** use `pseudonymizeWallet()` from
+`src/wallet-privacy.ts` rather than emitting raw keys. The function returns
+the first 4 and last 4 characters of the key separated by `…` (e.g.
+`GCAT…ZXAB`), consistent with the privacy policy (§2).
+
+### Debug-log redaction
+
+Wallet addresses embedded in `data` JSON fields of `MarketplaceEvent` rows
+are public on-chain data and may appear in full in audit logs and error
+messages where the address is the subject of the operation. They must **not**
+appear in generic debug/error log lines where the address is incidental
+context. Routes that log wallet addresses must pass the address through the
+`maybeRedactWallet()` helper (`src/wallet-privacy.ts`) which applies the
+pseudonymisation transform when the current log level is `debug` or lower.
+
 ## Table classification
 
 ### Hot — kept in primary PostgreSQL tables indefinitely
@@ -112,3 +165,45 @@ still retrieving it on demand.
 - `archive_rows_archived_total{table}` — counter of rows moved per table
 - `archive_job_errors_total{table}` — counter of failures per table
 - Alert when `archive_job_errors_total` increases for any table
+
+## OperationalAudit retention
+
+`OperationalAudit` rows are not archived — they are deleted after 90 days.
+The `deleteOldRecords(90)` call in `audit-service.ts` is the deletion
+mechanism. Deletion is gated on the same advisory lock and time-window checks
+used by the archival job.
+
+```sql
+DELETE FROM "OperationalAudit"
+WHERE "createdAt" < now() - INTERVAL '90 days';
+```
+
+`ipAddress` is included in the deleted rows. It is never written to an archive
+table.
+
+## Legal-hold exclusions
+
+A legal hold prevents deletion of rows that are under active regulatory or
+litigation hold. The archival and retention jobs consult the `LEGAL_HOLD_IDS`
+environment variable — a comma-separated list of `OperationalAudit.requestId`
+values — and skip any row whose `requestId` is in that list.
+
+The archive job similarly skips `MarketplaceEvent` rows whose `eventHash` is
+listed in `LEGAL_HOLD_EVENT_HASHES`. Canonical tables (`Listing`, `Auction`,
+etc.) are never deleted by the retention job and are not subject to this
+exclusion mechanism.
+
+## Cleanup verification
+
+The retention and archival jobs are tested in
+`src/__tests__/retention-cleanup.test.ts` which verifies:
+
+1. Every wallet-related field has a documented retention class (static
+   catalogue assertion).
+2. `archiveTable()` moves eligible off-chain rows to archive tables without
+   touching `Listing`, `Auction`, `Offer`, `Bid`, `RoyaltyPayment`, or
+   `Collection` rows (canonical tables must not be deleted).
+3. `deleteOldOperationalAuditRecords()` removes `OperationalAudit` rows
+   outside the retention window and preserves legal-hold rows.
+4. Redaction tests confirm that `pseudonymizeWallet()` and
+   `maybeRedactWallet()` produce the correct output.

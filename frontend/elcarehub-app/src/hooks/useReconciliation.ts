@@ -19,6 +19,7 @@
 "use client";
 
 import { useCallback, useEffect, useReducer, useRef } from "react";
+import { subscribeToMarketplaceEvents, type MarketplaceSSEEvent } from "@/lib/indexer";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -77,10 +78,13 @@ interface ReconciliationState<TData> {
 type ReconciliationAction<TData> =
   | { type: "APPLY_CONFIRMED_DATA"; payload: ConfirmedSnapshot<TData>[] }
   | { type: "ADD_MUTATION"; payload: PendingMutation<TData> }
-  | { type: "RESOLVE_MUTATION"; pendingId: string; txHash?: string }
-  | { type: "REJECT_MUTATION"; pendingId: string; reason: string }
+  | { type: "RESOLVE_MUTATION"; pendingId: string; txHash?: string; eventId?: string }
+  | { type: "REJECT_MUTATION"; pendingId: string; reason: string; eventId?: string }
+  | { type: "RESOLVE_MUTATION_BY_TX_HASH"; txHash: string; eventId?: string }
+  | { type: "REJECT_MUTATION_BY_TX_HASH"; txHash: string; reason: string; eventId?: string }
   | { type: "EXPIRE_STALE_MUTATIONS" }
-  | { type: "RESET" };
+  | { type: "RESET" }
+  | { type: "RESET_FOR_REORG"; reorgType: "REORG" | "CRITICAL_REORG"; depth?: number };
 
 // ── Reducer ───────────────────────────────────────────────────────────────────
 
@@ -119,25 +123,85 @@ function reconciliationReducer<TData>(
     }
 
     case "RESOLVE_MUTATION": {
+      // Duplicate-SSE guard: if this exact confirmation event was already
+      // applied (e.g. the indexer stream redelivers on reconnect), this is a
+      // no-op rather than re-processing the same resolution twice.
+      if (action.eventId && state.seenEventIds.has(action.eventId)) {
+        return state;
+      }
       const newPending = new Map(state.pending);
       const mut = newPending.get(action.pendingId);
       if (mut) {
         newPending.set(action.pendingId, {
           ...mut,
           status: "confirmed",
+          // Reconcile against the real transaction identity once known —
+          // a mutation created before broadcast (txHash null) is upgraded
+          // to the real hash here so it is keyed by tx hash end-to-end.
           txHash: action.txHash ?? mut.txHash,
         });
       }
-      return { ...state, pending: newPending };
+      const seenEventIds = action.eventId
+        ? new Set(state.seenEventIds).add(action.eventId)
+        : state.seenEventIds;
+      return { ...state, pending: newPending, seenEventIds };
     }
 
     case "REJECT_MUTATION": {
+      if (action.eventId && state.seenEventIds.has(action.eventId)) {
+        return state;
+      }
       const newPending = new Map(state.pending);
       const mut = newPending.get(action.pendingId);
       if (mut) {
         newPending.set(action.pendingId, { ...mut, status: "rejected" });
       }
-      return { ...state, pending: newPending };
+      const seenEventIds = action.eventId
+        ? new Set(state.seenEventIds).add(action.eventId)
+        : state.seenEventIds;
+      return { ...state, pending: newPending, seenEventIds };
+    }
+
+    // ── Resolve/reject by transaction hash ──────────────────────────────────
+    // Lets an SSE event or webhook that only carries a tx hash (not the local
+    // pendingId) reconcile the matching provisional mutation. This is the
+    // txHash-keyed counterpart of RESOLVE_MUTATION/REJECT_MUTATION above.
+    case "RESOLVE_MUTATION_BY_TX_HASH": {
+      if (action.eventId && state.seenEventIds.has(action.eventId)) {
+        return state;
+      }
+      const newPending = new Map(state.pending);
+      let changed = false;
+      for (const [id, mut] of newPending) {
+        if (mut.txHash === action.txHash && mut.status === "pending") {
+          newPending.set(id, { ...mut, status: "confirmed" });
+          changed = true;
+        }
+      }
+      if (!changed) return state;
+      const seenEventIds = action.eventId
+        ? new Set(state.seenEventIds).add(action.eventId)
+        : state.seenEventIds;
+      return { ...state, pending: newPending, seenEventIds };
+    }
+
+    case "REJECT_MUTATION_BY_TX_HASH": {
+      if (action.eventId && state.seenEventIds.has(action.eventId)) {
+        return state;
+      }
+      const newPending = new Map(state.pending);
+      let changed = false;
+      for (const [id, mut] of newPending) {
+        if (mut.txHash === action.txHash && mut.status === "pending") {
+          newPending.set(id, { ...mut, status: "rejected" });
+          changed = true;
+        }
+      }
+      if (!changed) return state;
+      const seenEventIds = action.eventId
+        ? new Set(state.seenEventIds).add(action.eventId)
+        : state.seenEventIds;
+      return { ...state, pending: newPending, seenEventIds };
     }
 
     case "EXPIRE_STALE_MUTATIONS": {
@@ -161,6 +225,16 @@ function reconciliationReducer<TData>(
     case "RESET":
       return { confirmed: new Map(), pending: new Map(), seenEventIds: new Set() };
 
+    // ── Chain reorganization reset ──────────────────────────────────────────
+    // A REORG/CRITICAL_REORG event means the confirmed data (and any
+    // provisional state layered on top of it) may reference orphaned ledger
+    // history. Rather than trying to selectively patch individual pending
+    // mutations, discard *all* local state — confirmed snapshots, pending
+    // mutations, and the dedup set — so the next confirmed fetch performs a
+    // full reconciliation from scratch instead of merging with stale data.
+    case "RESET_FOR_REORG":
+      return { confirmed: new Map(), pending: new Map(), seenEventIds: new Set() };
+
     default:
       return state;
   }
@@ -180,6 +254,24 @@ export interface ReconciliationOptions {
    * Defaults to 10 000 ms.
    */
   sweepIntervalMs?: number;
+
+  /**
+   * Indexer base URL to subscribe to for chain-reorganization notifications.
+   * When set, the hook opens an SSE subscription and performs a full
+   * reconciliation reset (discarding every local pending mutation *and*
+   * confirmed snapshot) whenever a REORG or CRITICAL_REORG event arrives —
+   * rather than leaving stale local entities built on orphaned ledger
+   * history. Omit (or leave null) to disable — e.g. in tests, or when a
+   * caller already handles reorg notifications elsewhere.
+   */
+  reorgIndexerUrl?: string | null;
+
+  /**
+   * Called immediately after a reorg-triggered reset. Callers should use
+   * this to re-fetch confirmed truth (REST refresh) so the UI repopulates
+   * from a clean slate instead of showing an empty state.
+   */
+  onReorgReset?: (info: { type: "REORG" | "CRITICAL_REORG"; depth?: number }) => void;
 }
 
 export interface UseReconciliationResult<TData> {
@@ -199,11 +291,26 @@ export interface UseReconciliationResult<TData> {
   /** Add a new pending mutation (call after submitting a tx). */
   addMutation: (mut: Omit<PendingMutation<TData>, "expiresAt" | "status">) => void;
 
-  /** Mark a mutation as resolved (call when SSE/REST confirms the change). */
-  resolveMutation: (pendingId: string, txHash?: string) => void;
+  /**
+   * Mark a mutation as resolved (call when SSE/REST confirms the change).
+   * Pass `eventId` when the confirmation originates from an SSE event so a
+   * redelivered/duplicate event is a no-op instead of being re-applied.
+   */
+  resolveMutation: (pendingId: string, txHash?: string, eventId?: string) => void;
 
   /** Mark a mutation as rejected (call on tx failure). */
-  rejectMutation: (pendingId: string, reason?: string) => void;
+  rejectMutation: (pendingId: string, reason?: string, eventId?: string) => void;
+
+  /**
+   * Resolve whichever pending mutation(s) carry this transaction hash.
+   * Use this when the confirming event (SSE/webhook) only carries the tx
+   * hash rather than the locally-generated pendingId — the mutation is
+   * still keyed by transaction identity end-to-end.
+   */
+  resolveMutationByTxHash: (txHash: string, eventId?: string) => void;
+
+  /** Reject whichever pending mutation(s) carry this transaction hash. */
+  rejectMutationByTxHash: (txHash: string, reason?: string, eventId?: string) => void;
 
   /** Apply fresh confirmed data from REST or SSE (handles out-of-order safely). */
   applyConfirmedData: (snapshots: ConfirmedSnapshot<TData>[]) => void;
@@ -226,7 +333,12 @@ const INITIAL_STATE = <TData>(): ReconciliationState<TData> => ({
 export function useReconciliation<TData = unknown>(
   opts: ReconciliationOptions = {}
 ): UseReconciliationResult<TData> {
-  const { mutationTtlMs = 60_000, sweepIntervalMs = 10_000 } = opts;
+  const {
+    mutationTtlMs = 60_000,
+    sweepIntervalMs = 10_000,
+    reorgIndexerUrl = null,
+    onReorgReset,
+  } = opts;
 
   const [state, dispatch] = useReducer(
     reconciliationReducer as React.Reducer<
@@ -245,6 +357,32 @@ export function useReconciliation<TData = unknown>(
     return () => clearInterval(id);
   }, [sweepIntervalMs]);
 
+  // ── Reorg / reset subscription ────────────────────────────────────────────
+  // Keep a stable ref to onReorgReset so the subscription effect below only
+  // re-runs when the indexer URL itself changes, not on every render.
+  const onReorgResetRef = useRef(onReorgReset);
+  onReorgResetRef.current = onReorgReset;
+
+  useEffect(() => {
+    if (!reorgIndexerUrl) return;
+
+    const sub = subscribeToMarketplaceEvents(reorgIndexerUrl, {
+      onEvent: (event: MarketplaceSSEEvent) => {
+        if (event.type !== "REORG" && event.type !== "CRITICAL_REORG") return;
+        // Full reconciliation: discard every local pending mutation and
+        // confirmed snapshot rather than trying to selectively patch state
+        // that may reference orphaned ledger history.
+        dispatch({ type: "RESET_FOR_REORG", reorgType: event.type, depth: event.depth });
+        onReorgResetRef.current?.({ type: event.type, depth: event.depth });
+      },
+      // Reorg notifications must never be merged/dropped by the debounce
+      // window — each one has to trigger its own reset.
+      debounceMs: 0,
+    });
+
+    return () => sub.close();
+  }, [reorgIndexerUrl]);
+
   const addMutation = useCallback(
     (mut: Omit<PendingMutation<TData>, "expiresAt" | "status">) => {
       dispatch({
@@ -259,13 +397,30 @@ export function useReconciliation<TData = unknown>(
     [mutationTtlMs]
   );
 
-  const resolveMutation = useCallback((pendingId: string, txHash?: string) => {
-    dispatch({ type: "RESOLVE_MUTATION", pendingId, txHash });
-  }, []);
+  const resolveMutation = useCallback(
+    (pendingId: string, txHash?: string, eventId?: string) => {
+      dispatch({ type: "RESOLVE_MUTATION", pendingId, txHash, eventId });
+    },
+    []
+  );
 
   const rejectMutation = useCallback(
-    (pendingId: string, reason = "Transaction failed") => {
-      dispatch({ type: "REJECT_MUTATION", pendingId, reason });
+    (pendingId: string, reason = "Transaction failed", eventId?: string) => {
+      dispatch({ type: "REJECT_MUTATION", pendingId, reason, eventId });
+    },
+    []
+  );
+
+  const resolveMutationByTxHash = useCallback(
+    (txHash: string, eventId?: string) => {
+      dispatch({ type: "RESOLVE_MUTATION_BY_TX_HASH", txHash, eventId });
+    },
+    []
+  );
+
+  const rejectMutationByTxHash = useCallback(
+    (txHash: string, reason = "Transaction failed", eventId?: string) => {
+      dispatch({ type: "REJECT_MUTATION_BY_TX_HASH", txHash, reason, eventId });
     },
     []
   );
@@ -340,6 +495,8 @@ export function useReconciliation<TData = unknown>(
     addMutation,
     resolveMutation,
     rejectMutation,
+    resolveMutationByTxHash,
+    rejectMutationByTxHash,
     applyConfirmedData,
     pendingMutations,
     reset,

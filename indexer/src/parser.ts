@@ -61,6 +61,7 @@ const TOPIC_MAP: Record<string, string> = {
   'auc_rslv':  'AUCTION_RESOLVED',
   'auc_cncl':  'AUCTION_CANCELLED',
   'auc_ext':   'AUCTION_EXTENDED',
+  'auc_res_upd': 'AUCTION_RESERVE_UPDATED',
   // ── Offer events ────────────────────────────────────────────────────────
   'ofr_made':  'OFFER_MADE',
   'ofr_accp':  'OFFER_ACCEPTED',
