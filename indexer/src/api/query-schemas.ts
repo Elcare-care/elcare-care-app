@@ -40,19 +40,49 @@ const cursorFields = {
 
 // ── Per-endpoint schemas ──────────────────────────────────────────────────────
 
+// Sort options — literal values must stay in sync with `SortOption` in
+// frontend/elcarehub-app/src/components/FilterSidebar.tsx. "newest" is the
+// default (no ORDER BY override needed since it matches the base query).
+const listingSortEnum = z.enum(['newest', 'oldest', 'price-low', 'price-high', 'recently-sold']);
+
+// `collection` may be sent as a single value or repeated (?collection=a&collection=b),
+// matching how useFilterUrlSync.ts appends one `collection` param per selected
+// collection. Normalise to an array of non-empty strings.
+const collectionField = z
+  .union([z.string(), z.array(z.string())])
+  .optional()
+  .transform((v) => {
+    if (v === undefined) return undefined;
+    const arr = Array.isArray(v) ? v : [v];
+    const cleaned = arr.map((s) => s.trim()).filter(Boolean);
+    return cleaned.length > 0 ? cleaned : undefined;
+  });
+
 export const listingsQuerySchema = z.object({
-  artist:   optionalString,
-  owner:    optionalString,
-  status:   z.enum(['Active', 'Sold', 'Cancelled', 'Auction', 'expired']).optional(),
-  search:   optionalString,
-  minPrice: z.coerce.number().nonnegative().optional(),
-  maxPrice: z.coerce.number().nonnegative().optional(),
-  limit:    positiveInt(100).optional(),
-  offset:   positiveInt(10_000).optional(),
+  artist:     optionalString,
+  owner:      optionalString,
+  status:     z.enum(['Active', 'Sold', 'Cancelled', 'Auction', 'expired']).optional(),
+  search:     optionalString,
+  minPrice:   z.coerce.number().nonnegative().optional(),
+  maxPrice:   z.coerce.number().nonnegative().optional(),
+  sort:       listingSortEnum.optional(),
+  collection: collectionField,
+  token:      optionalString,
+  limit:      positiveInt(100).optional(),
+  offset:     positiveInt(10_000).optional(),
   ...cursorFields,
 }).refine(
   (d) => d.minPrice === undefined || d.maxPrice === undefined || d.minPrice <= d.maxPrice,
   { message: 'minPrice must be ≤ maxPrice', path: ['minPrice'] }
+).refine(
+  // Ledger-cursor pagination (cursor_ledger) assumes the result set is
+  // ordered by updatedAtLedger. "price-low"/"price-high" order by price
+  // instead, so a ledger cursor computed for one ordering is meaningless
+  // (and silently wrong — skipped/duplicated rows) against the other.
+  // Reject the combination up front rather than returning an ambiguous
+  // page; callers paginating a price sort must use offset instead.
+  (d) => d.cursor_ledger === undefined || d.sort === undefined || (d.sort !== 'price-low' && d.sort !== 'price-high'),
+  { message: 'cursor_ledger pagination is not supported with sort=price-low or sort=price-high; use offset pagination for price-sorted results', path: ['cursor_ledger'] }
 );
 
 export const auctionsQuerySchema = z.object({
