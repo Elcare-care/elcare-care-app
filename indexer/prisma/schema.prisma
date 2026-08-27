@@ -84,6 +84,11 @@ model Listing {
   /// Collection-level royalty in basis points (0–10 000).
   royaltyBps      Int           @default(0)
 
+  /// Snapshot of the token's metadata version at last write.
+  /// NULL for rows ingested before token metadata versioning was introduced.
+  /// Used by cache-invalidation to target stale rows when decimals change.
+  tokenMetadataVersion Int?
+
   // ── Full-text search fields (populated from IPFS metadata after indexing) ──
   // Populated asynchronously after a LISTING_CREATED event is processed.
   // Null until IPFS metadata has been fetched and stored.
@@ -128,6 +133,8 @@ model Auction {
   extensionCount  Int           @default(0)
   /// Original end time set at auction creation, used to enforce total duration cap
   originalEndTime BigInt
+  /// Snapshot of the token's metadata version at last write (see tokenMetadataVersion on Listing)
+  tokenMetadataVersion Int?
   @@index([updatedAtLedger])
   @@index([status, updatedAtLedger])
   @@index([creator, updatedAtLedger])
@@ -153,6 +160,8 @@ model Offer {
   updatedAtLedger Int
   createdAt       DateTime    @default(now())
   updatedAt       DateTime    @updatedAt
+  /// Snapshot of the token's metadata version at last write (see tokenMetadataVersion on Listing)
+  tokenMetadataVersion Int?
   @@index([listingId])
   @@index([listingId, updatedAtLedger])
   @@index([parentOfferId])
@@ -172,9 +181,21 @@ model WhitelistedToken {
   removedBy       String?
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
+  /// Monotonically increasing version counter; incremented on each metadata change.
+  /// Starts at 1 on first insertion. Used by cache-invalidation to detect stale responses.
+  metadataVersion Int      @default(1)
+  /// Token decimal precision (e.g. 7 for XLM/SAC). NULL until set by a registry event.
+  decimals        Int?
+  /// Short token symbol from registry (e.g. "XLM", "USDC")
+  symbol          String?
+  /// Human-readable token name from registry
+  name            String?
+  /// The ledger sequence that caused the most recent metadata update.
+  sourceLedger    Int?
 
   @@index([active])
   @@index([addedAtLedger])
+  @@index([metadataVersion])
 }
 
 model Bid {
@@ -1021,4 +1042,60 @@ model ProjectionRebuildJob {
   @@index([status])
   @@index([createdAt])
   @@index([ledgerFrom, ledgerTo])
+}
+
+// ── PendingOffer staging table (Issue: offer orphan FK strategy) ─────────────
+//
+// Holds OFFER_MADE events whose parent listing has not yet been ingested.
+// The promote_pending_offers() PostgreSQL trigger automatically moves these rows
+// into the live Offer table when the parent LISTING_CREATED arrives.
+// On reorg rollback, rows staged from > safeAtLedger are deleted via
+// revert_pending_offers(safe_ledger) raw SQL.
+
+model PendingOffer {
+  offerId         BigInt       @id
+  listingId       BigInt
+  offerer         String       @default("")
+  amount          Decimal      @db.Decimal(32, 7) @default(0)
+  token           String       @default("")
+  expiresAt       BigInt?
+  escrowTxHash    String?
+  createdAtLedger Int
+  updatedAtLedger Int
+  /// Full OFFER_MADE event payload preserved for replay after listing arrives.
+  rawEventData    Json?
+  stagedAt        DateTime     @default(now())
+
+  @@index([listingId])
+  @@index([createdAtLedger])
+}
+
+// ── TokenMetadataHistory (Issue: token metadata versioning) ──────────────────
+//
+// Audit trail of every metadata version change for a whitelisted token.
+// One row per (address, version). The current version matches WhitelistedToken.metadataVersion.
+// Used by cache-invalidation to target listings/auctions/offers that were written
+// with an older decimal precision.
+
+model TokenMetadataHistory {
+  id           Int      @id @default(autoincrement())
+  /// Token contract address (matches WhitelistedToken.address)
+  address      String
+  /// Monotonically increasing version number for this token (starts at 1)
+  version      Int
+  /// Decimal precision at this version (NULL = unknown / not yet set)
+  decimals     Int?
+  /// Short token symbol at this version
+  symbol       String?
+  /// Human-readable token name at this version
+  name         String?
+  /// Ledger sequence that triggered this version change
+  sourceLedger Int
+  /// Whether this token was active at this version
+  active       Boolean  @default(true)
+  changedAt    DateTime @default(now())
+
+  @@unique([address, version])
+  @@index([address])
+  @@index([sourceLedger])
 }

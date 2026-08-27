@@ -2026,6 +2026,150 @@ router.get('/config/auction', cacheMiddleware(60), async (req: Request, res: Res
 
 router.get('/admin/query-cost', operationalRateLimiter, authMiddleware('operator'), handleQueryCostDiagnostics);
 
+// ── GET /admin/token-metadata ─────────────────────────────────────────────────
+// Returns token metadata version state for all whitelisted tokens, or for a
+// specific token when ?address= is provided.  Also reports stale
+// listing/auction/offer rows whose tokenMetadataVersion is behind the current
+// token version — useful for diagnosing stale decimal responses.
+//
+// Response shape (per token):
+// {
+//   address, active, metadataVersion, decimals, symbol, name, sourceLedger,
+//   staleRows: { listingCount, auctionCount, offerCount }
+// }
+
+router.get('/admin/token-metadata', operationalRateLimiter, authMiddleware('operator'), async (req: Request, res: Response, next: NextFunction) => {
+  const addressFilter = req.query.address as string | undefined;
+  try {
+    const { findStaleTokenMetadataRows } = await import('../token-metadata.js');
+
+    const where: any = {};
+    if (addressFilter) where.address = addressFilter;
+
+    const tokens = await prisma.whitelistedToken.findMany({
+      where,
+      orderBy: { addedAtLedger: 'asc' },
+      select: {
+        address: true,
+        active: true,
+        metadataVersion: true,
+        decimals: true,
+        symbol: true,
+        name: true,
+        sourceLedger: true,
+      },
+    });
+
+    const results = await Promise.all(
+      tokens.map(async (token: any) => {
+        const stale = await findStaleTokenMetadataRows(
+          token.address,
+          token.metadataVersion ?? 1,
+        );
+        return {
+          ...token,
+          staleRows: {
+            listingCount: stale.listingIds.length,
+            auctionCount: stale.auctionIds.length,
+            offerCount:   stale.offerIds.length,
+          },
+        };
+      })
+    );
+
+    res.json(serialize(results));
+  } catch (err) {
+    next(internalError('Failed to fetch token metadata diagnostics'));
+  }
+});
+
+// ── POST /admin/token-metadata/:address/invalidate ────────────────────────────
+// Force-invalidate cache and bump the metadata version for a single token.
+// Body (optional): { decimals?: number, symbol?: string, name?: string }
+
+router.post('/admin/token-metadata/:address/invalidate', operationalRateLimiter, authMiddleware('operator'), async (req: Request, res: Response, next: NextFunction) => {
+  const address = req.params.address as string;
+  if (!address) return next(badRequest('address is required'));
+
+  const { decimals, symbol, name } = req.body ?? {};
+
+  try {
+    const { applyTokenMetadataVersionChange } = await import('../token-metadata.js');
+
+    // Get current sync state for sourceLedger
+    const syncState = await prisma.syncState.findUnique({ where: { id: 1 }, select: { lastLedger: true } });
+    const sourceLedger = syncState?.lastLedger ?? 0;
+
+    await applyTokenMetadataVersionChange(
+      address,
+      typeof decimals === 'number' ? decimals : null,
+      sourceLedger,
+      typeof symbol === 'string' ? symbol : undefined,
+      typeof name   === 'string' ? name   : undefined,
+    );
+
+    res.json({ address, invalidated: true, sourceLedger });
+  } catch (err) {
+    next(internalError('Failed to invalidate token metadata'));
+  }
+});
+
+// ── GET /admin/orphaned-offers ────────────────────────────────────────────────
+// Returns a summary and paginated list of Offer rows with no matching parent
+// Listing (orphans from out-of-order ingestion or incomplete backfills).
+// These are expected to be resolved once the parent listing is indexed.
+
+router.get('/admin/orphaned-offers', operationalRateLimiter, authMiddleware('operator'), async (req: Request, res: Response, next: NextFunction) => {
+  const limitRaw  = req.query.limit  as string | undefined;
+  const offsetRaw = req.query.offset as string | undefined;
+  const limit  = Math.min(limitRaw  ? parseInt(limitRaw,  10) : 50, 200);
+  const offset = offsetRaw ? parseInt(offsetRaw, 10) : 0;
+
+  try {
+    // Use the orphaned_offers view created by the migration
+    const [rows, countResult] = await Promise.all([
+      prisma.$queryRawUnsafe<any[]>(
+        `SELECT * FROM "orphaned_offers" ORDER BY "createdAtLedger" ASC LIMIT $1 OFFSET $2`,
+        limit,
+        offset,
+      ),
+      prisma.$queryRawUnsafe<[{ count: bigint }]>(
+        `SELECT COUNT(*) AS count FROM "orphaned_offers"`,
+      ),
+    ]);
+
+    const total = Number(countResult[0]?.count ?? 0);
+    res.json({ total, limit, offset, orphans: serialize(rows) });
+  } catch (err) {
+    next(internalError('Failed to fetch orphaned offers'));
+  }
+});
+
+// ── GET /admin/pending-offers ─────────────────────────────────────────────────
+// Returns offers currently staged in PendingOffer (awaiting parent listing).
+
+router.get('/admin/pending-offers', operationalRateLimiter, authMiddleware('operator'), async (req: Request, res: Response, next: NextFunction) => {
+  const limitRaw  = req.query.limit  as string | undefined;
+  const offsetRaw = req.query.offset as string | undefined;
+  const limit  = Math.min(limitRaw  ? parseInt(limitRaw,  10) : 50, 200);
+  const offset = offsetRaw ? parseInt(offsetRaw, 10) : 0;
+
+  try {
+    const [rows, total] = await Promise.all([
+      (prisma as any).pendingOffer.findMany({
+        orderBy: { createdAtLedger: 'asc' },
+        take: limit,
+        skip: offset,
+      }),
+      (prisma as any).pendingOffer.count(),
+    ]);
+
+    res.json({ total, limit, offset, pendingOffers: serialize(rows) });
+  } catch (err) {
+    next(internalError('Failed to fetch pending offers'));
+  }
+});
+
 // ── Notification routes (Issue #8) ────────────────────────────────────────────
 import notificationRouter from './notification-routes.js';
 router.use(notificationRouter);
