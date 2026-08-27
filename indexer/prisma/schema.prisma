@@ -287,12 +287,33 @@ model Collection {
   feeBpsOverride  Int?
   /// Whether the collection metadata has been permanently frozen.
   metadataFrozen  Boolean  @default(false)
+  /// Collection-level default royalty in basis points (0–10 000) snapshotted
+  /// from the on-chain CollectionRecord at deploy time (#482).  Null for
+  /// collections deployed before this field was introduced.
+  defaultRoyaltyBps      Int?
+  /// Royalty receiver address snapshotted from the on-chain record at deploy
+  /// time (#482).  Used by the marketplace as the fallback recipient when no
+  /// per-listing override is present.  Null for pre-482 collections.
+  defaultRoyaltyReceiver String?
+  /// Original creator address — set once at collection initialization and
+  /// never changed by two-step succession (#484).  Null for collections
+  /// indexed before this field was introduced; the indexer backfills from
+  /// the `OriginalCreator` storage key when available.
+  originalCreator String?
+  /// Pending successor address in an active two-step succession proposal
+  /// (#484).  Null when no proposal is currently pending or after acceptance.
+  pendingCreator  String?
+  /// Ledger sequence at which the pending succession proposal expires (#484).
+  /// Null when no proposal is active.
+  pendingCreatorExpiry Int?
   createdAt       DateTime @default(now())
   // GIN-indexed tsvector updated by collection_search_vector_trigger.
   searchVector    Unsupported("tsvector")?
   @@index([creator])
   @@index([creator, deployedAtLedger])
   @@index([kind, deployedAtLedger])
+  @@index([defaultRoyaltyReceiver])
+  @@index([originalCreator])
 }
 
 // ── Lazy-mint voucher registry ────────────────────────────────────────────────
@@ -307,6 +328,11 @@ model Voucher {
   tokenId         BigInt?  // target token id (may be null until redeemed)
   status          String   @default("Issued") // Issued | Redeemed | Revoked | Expired
   redeemer        String?  // address that redeemed (null if not yet redeemed)
+  /// Ledger sequence at which the voucher expires; 0 or null means no expiry (#481).
+  validUntil      BigInt?
+  /// Ledger sequence at which the indexer detected expiry (populated by the
+  /// expiry-sweep worker when validUntil < current ledger) (#481).
+  expiredAtLedger Int?
   createdAtLedger Int
   updatedAtLedger Int      @default(0)
   createdAt       DateTime @default(now())
@@ -316,6 +342,9 @@ model Voucher {
   @@index([collection])
   @@index([collection, status])
   @@index([createdAtLedger])
+  /// Composite index for the expiry-sweep query: find Issued vouchers whose
+  /// validUntil is non-zero and <= current ledger (#481).
+  @@index([status, validUntil])
 }
 
 // ── IPFS metadata cache ───────────────────────────────────────────────────────
@@ -992,7 +1021,45 @@ model FinancialAggregateSnapshot {
   @@index([scopeKey])
 }
 
-// ── Projection Rebuild Job ────────────────────────────────────────────────────
+// ── Deployment fee accounting (Issue #483) ────────────────────────────────────
+//
+// One row per successful deploy_* call that charged a flat fee.  Sourced from
+// the "fee_coll" launchpad event.  Enables reconciliation between on-chain fee
+// transfers and indexed protocol revenue without reprocessing raw events.
+//
+// collectionAddress is nullable for legacy rows ingested before the fee event
+// carried the deployed collection address.
+
+model DeploymentFee {
+  id                Int      @id @default(autoincrement())
+  /// Launchpad contract address that emitted the event.
+  launchpadAddress  String
+  /// Creator who paid the fee.
+  creator           String
+  /// Treasury / fee receiver address.
+  treasury          String
+  /// Fee amount in the smallest token unit.
+  amount            Decimal  @db.Decimal(32, 7)
+  /// Token SAC address used for the fee transfer.
+  currency          String
+  /// Deployed collection contract address (null for pre-#483 rows).
+  collectionAddress String?
+  /// Kind of collection deployed (null for pre-#483 rows).
+  collectionKind    String?
+  /// Platform fee in basis points configured for this collection.
+  platformFeeBps    Int?
+  /// Ledger sequence this event was recorded at.
+  ledgerSequence    Int
+  createdAt         DateTime @default(now())
+
+  @@index([creator])
+  @@index([treasury])
+  @@index([launchpadAddress, ledgerSequence])
+  @@index([collectionAddress])
+  @@index([ledgerSequence])
+}
+
+
 //
 // Tracks a single resumable projection-rebuild operation initiated by the
 // rebuild-projections CLI or admin API.
