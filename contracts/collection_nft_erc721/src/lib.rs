@@ -61,6 +61,12 @@ pub enum Error {
     EmptyBatch = 18,
     /// Batch exceeds maximum size.
     BatchTooLarge = 19,
+    /// Succession proposal has expired (#484).
+    ProposalExpired = 20,
+    /// No pending creator proposal exists (#484).
+    NoPendingCreator = 21,
+    /// Caller is not the pending creator (#484).
+    NotPendingCreator = 22,
 }
 
 // ─── Storage Keys ─────────────────────────────────────────────────────────────
@@ -71,6 +77,16 @@ pub enum DataKey {
     // Instance storage — cheap, shared TTL with contract instance
     Initialized,
     Creator,
+    /// Original creator address — set once at initialization and never changed
+    /// even after a successful two-step creator succession (#484).  Used to
+    /// preserve historical royalty attribution and voucher revocation authority
+    /// for pre-succession tokens.
+    OriginalCreator,
+    /// Pending successor address proposed via `propose_creator` (#484).
+    PendingCreator,
+    /// Ledger sequence at which the pending proposal expires (#484).
+    /// Redemptions after this sequence are rejected with `ProposalExpired`.
+    PendingCreatorExpiry,
     Name,
     Symbol,
     MaxSupply,
@@ -169,6 +185,9 @@ impl NormalNFT721 {
 
         env.storage().instance().set(&DataKey::Initialized, &true);
         env.storage().instance().set(&DataKey::Creator, &creator);
+        // OriginalCreator is set once at initialization and never overwritten
+        // by succession — it preserves historical royalty attribution (#484).
+        env.storage().instance().set(&DataKey::OriginalCreator, &creator);
         env.storage().instance().set(&DataKey::Name, &name);
         env.storage().instance().set(&DataKey::Symbol, &symbol);
         env.storage()
@@ -811,6 +830,132 @@ impl NormalNFT721 {
             .instance()
             .set(&DataKey::Creator, &new_creator);
         Ok(())
+    }
+
+    /// Step 1 of the two-step creator succession (#484).
+    ///
+    /// The current creator proposes `new_creator` as the next collection
+    /// administrator.  The proposal expires at `expires_at` (ledger sequence).
+    ///
+    /// - Overwrites any previously pending proposal.
+    /// - Does NOT transfer any authority until `accept_creator` is called.
+    /// - If `expires_at` is in the past the call reverts with `ApprovalExpired`.
+    pub fn propose_creator(
+        env: Env,
+        new_creator: Address,
+        expires_at: u32,
+    ) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
+        let current = Self::only_creator(&env)?;
+        if env.ledger().sequence() >= expires_at {
+            return Err(Error::ApprovalExpired);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingCreator, &new_creator);
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingCreatorExpiry, &expires_at);
+        env.events().publish(
+            (symbol_short!("cr_prop"), current),
+            (new_creator, expires_at),
+        );
+        Ok(())
+    }
+
+    /// Step 2 of the two-step creator succession (#484).
+    ///
+    /// The proposed successor accepts the role.  After a successful call:
+    /// - `Creator` is updated to `new_creator`.
+    /// - `OriginalCreator` is **unchanged** so historical royalty attribution
+    ///    and voucher revocation records remain intact.
+    /// - The pending proposal and expiry are cleared.
+    pub fn accept_creator(env: Env, new_creator: Address) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
+        new_creator.require_auth();
+        let pending: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingCreator)
+            .ok_or(Error::NoPendingCreator)?;
+        if new_creator != pending {
+            return Err(Error::NotPendingCreator);
+        }
+        let expiry: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingCreatorExpiry)
+            .unwrap_or(0);
+        if env.ledger().sequence() >= expiry {
+            return Err(Error::ProposalExpired);
+        }
+        let old_creator: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Creator)
+            .ok_or(Error::NotInitialized)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::Creator, &new_creator);
+        env.storage().instance().remove(&DataKey::PendingCreator);
+        env.storage()
+            .instance()
+            .remove(&DataKey::PendingCreatorExpiry);
+        env.events().publish(
+            (symbol_short!("cr_acc"), old_creator),
+            new_creator,
+        );
+        Ok(())
+    }
+
+    /// Cancel a pending creator succession proposal (#484).  Only the current
+    /// creator may cancel.  Returns `NoPendingCreator` if no proposal exists.
+    pub fn cancel_creator_proposal(env: Env) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
+        let current = Self::only_creator(&env)?;
+        let pending: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingCreator)
+            .ok_or(Error::NoPendingCreator)?;
+        env.storage().instance().remove(&DataKey::PendingCreator);
+        env.storage()
+            .instance()
+            .remove(&DataKey::PendingCreatorExpiry);
+        env.events().publish(
+            (symbol_short!("cr_canc"), current),
+            pending,
+        );
+        Ok(())
+    }
+
+    /// Returns the original creator address set at initialization (#484).
+    /// This never changes even after a successful creator succession.
+    pub fn original_creator(env: Env) -> Address {
+        env.storage()
+            .instance()
+            .get(&DataKey::OriginalCreator)
+            // Fallback for collections initialized before #484: treat the
+            // current Creator as the original creator (safe because succession
+            // could not have happened without OriginalCreator being set first).
+            .unwrap_or_else(|| {
+                env.storage().instance().get(&DataKey::Creator).unwrap()
+            })
+    }
+
+    /// Returns the pending creator address and expiry, or None if no proposal
+    /// is currently active (#484).
+    pub fn pending_creator(env: Env) -> Option<(Address, u32)> {
+        let pending = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::PendingCreator)?;
+        let expiry = env
+            .storage()
+            .instance()
+            .get::<DataKey, u32>(&DataKey::PendingCreatorExpiry)
+            .unwrap_or(0);
+        Some((pending, expiry))
     }
 
     pub fn update_royalty(env: Env, receiver: Address, bps: u32) -> Result<(), Error> {
