@@ -130,13 +130,30 @@ fn make_secure_salt(env: &Env, creator: &Address, raw_salt: &BytesN<32>) -> Byte
 // â”€â”€â”€ Shared deploy guards â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /// Transfers the flat deploy fee (if any) from `creator` to the treasury and
-/// emits `fee_coll`.  Returns the configured fee receiver so lazy deploys can
-/// forward it to the child contract as `platform_fee_receiver`.
-fn collect_deploy_fee(env: &Env, creator: &Address, currency: &Address) -> Address {
+/// emits `fee_coll` with full attribution (#483).  Returns the configured fee
+/// receiver so lazy deploys can forward it to the child contract as
+/// `platform_fee_receiver`.
+fn collect_deploy_fee(
+    env: &Env,
+    creator: &Address,
+    currency: &Address,
+    collection: &Address,
+    kind_tag: soroban_sdk::Symbol,
+    platform_fee_bps: u32,
+) -> Address {
     let (receiver, deploy_fee) = storage::get_fee_config(env);
     if deploy_fee > 0 {
         token::TokenClient::new(env, currency).transfer(creator, &receiver, &deploy_fee);
-        events::publish_deployment_fee_collected(env, creator, &receiver, deploy_fee, currency);
+        events::publish_deployment_fee_collected(
+            env,
+            creator,
+            &receiver,
+            deploy_fee,
+            currency,
+            collection,
+            kind_tag,
+            platform_fee_bps,
+        );
     }
     receiver
 }
@@ -459,7 +476,15 @@ impl Launchpad {
         }
         let wasm = wasm_opt.unwrap();
 
-        collect_deploy_fee(&env, &creator, &currency);
+        // Pre-compute the deterministic address so fee attribution (#483) can
+        // reference the collection address in the `fee_coll` event even though
+        // the contract is deployed in the same transaction.
+        let addr = env
+            .deployer()
+            .with_current_contract(secure_salt.clone())
+            .deployed_address();
+
+        collect_deploy_fee(&env, &creator, &currency, &addr, symbol_short!("n721"), platform_fee_bps);
 
         let addr = env
             .deployer()
@@ -485,6 +510,8 @@ impl Launchpad {
             &symbol,
             env.ledger().sequence(),
             platform_fee_bps,
+            royalty_bps,
+            &royalty_receiver,
         );
         events::publish_deploy(&env, symbol_short!("n721"), &creator, &addr);
         Ok(addr)
@@ -565,7 +592,12 @@ impl Launchpad {
         }
         let wasm = wasm_opt.unwrap();
 
-        collect_deploy_fee(&env, &creator, &currency);
+        let addr = env
+            .deployer()
+            .with_current_contract(secure_salt.clone())
+            .deployed_address();
+
+        collect_deploy_fee(&env, &creator, &currency, &addr, symbol_short!("n1155"), platform_fee_bps);
 
         let addr = env
             .deployer()
@@ -590,6 +622,8 @@ impl Launchpad {
             &empty_symbol,
             env.ledger().sequence(),
             platform_fee_bps,
+            royalty_bps,
+            &royalty_receiver,
         );
         events::publish_deploy(&env, symbol_short!("n1155"), &creator, &addr);
         Ok(addr)
@@ -671,7 +705,13 @@ impl Launchpad {
         }
         let wasm = wasm_opt.unwrap();
 
-        let platform_fee_receiver = collect_deploy_fee(&env, &creator, &currency);
+        // Pre-compute address for fee attribution (#483).
+        let pred_addr = env
+            .deployer()
+            .with_current_contract(secure_salt.clone())
+            .deployed_address();
+
+        let platform_fee_receiver = collect_deploy_fee(&env, &creator, &currency, &pred_addr, symbol_short!("l721"), platform_fee_bps);
 
         let addr = env
             .deployer()
@@ -701,6 +741,8 @@ impl Launchpad {
             &symbol,
             env.ledger().sequence(),
             platform_fee_bps,
+            royalty_bps,
+            &royalty_receiver,
         );
         events::publish_deploy(&env, symbol_short!("l721"), &creator, &addr);
         Ok(addr)
@@ -779,7 +821,13 @@ impl Launchpad {
         }
         let wasm = wasm_opt.unwrap();
 
-        let platform_fee_receiver = collect_deploy_fee(&env, &creator, &currency);
+        // Pre-compute address for fee attribution (#483).
+        let pred_addr = env
+            .deployer()
+            .with_current_contract(secure_salt.clone())
+            .deployed_address();
+
+        let platform_fee_receiver = collect_deploy_fee(&env, &creator, &currency, &pred_addr, symbol_short!("l1155"), platform_fee_bps);
 
         let addr = env
             .deployer()
@@ -808,6 +856,8 @@ impl Launchpad {
             &empty_symbol,
             env.ledger().sequence(),
             platform_fee_bps,
+            royalty_bps,
+            &royalty_receiver,
         );
         events::publish_deploy(&env, symbol_short!("l1155"), &creator, &addr);
         Ok(addr)
@@ -983,6 +1033,40 @@ impl Launchpad {
     }
 
     // â”€â”€ View functions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+    /// Returns the royalty default (bps, receiver) snapshotted into the registry
+    /// for `collection_address` at deploy time (#482).  Returns `None` when the
+    /// collection address is not in the registry.  Callers should use this as the
+    /// fallback when no per-listing royalty override is present.
+    pub fn collection_royalty_defaults(env: Env, collection_address: Address) -> Option<(u32, Address)> {
+        storage::get_collection_by_address(&env, &collection_address)
+            .map(|rec| (rec.royalty_bps, rec.royalty_receiver))
+    }
+
+    /// Admin-callable: update the stored royalty default for an already-deployed
+    /// collection.  This allows a creator who has updated their on-chain royalty
+    /// to keep the registry in sync without redeploying.  Only the contract admin
+    /// may call this because the authoritative source of truth is the on-chain
+    /// royalty_info() on the collection itself.
+    pub fn update_collection_royalty_defaults(
+        env: Env,
+        collection_address: Address,
+        royalty_bps: u32,
+        royalty_receiver: Address,
+    ) -> Result<(), Error> {
+        storage::extend_instance_ttl(&env);
+        storage::require_admin(&env)?;
+        if royalty_bps > MAX_ROYALTY_BPS {
+            return Err(Error::InvalidRoyaltyBps);
+        }
+        storage::update_collection_royalty_defaults(
+            &env,
+            &collection_address,
+            royalty_bps,
+            &royalty_receiver,
+        )?;
+        Ok(())
+    }
 
     pub fn collections_by_creator(env: Env, creator: Address) -> Vec<CollectionRecord> {
         storage::collections_by_creator(&env, &creator)
