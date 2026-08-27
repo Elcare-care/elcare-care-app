@@ -42,6 +42,12 @@ import {
   searchQuerySchema,
   eventsQuerySchema,
 } from './query-schemas.js';
+import {
+  CursorEndpoint,
+  decodeCursor,
+  buildCursorWhere,
+  nextCursorFromRows,
+} from './cursor.js';
 import { isValidStellarAddress, STELLAR_ADDRESS_ERROR } from '../stellar-address.js';
 import {
   getOverviewStats,
@@ -196,6 +202,28 @@ const serialize = (obj: any) =>
   JSON.parse(JSON.stringify(obj, (key, value) =>
     typeof value === 'bigint' ? value.toString() : value
   ));
+
+// ── Cursor resolution helper ──────────────────────────────────────────────────
+//
+// Resolves whichever cursor style the client supplied:
+//   1. Opaque composite cursor (`cursor` param) — decoded + verified.
+//   2. Legacy plain-integer cursor (`cursor_ledger` param) — decoded as legacy.
+//   3. Neither — returns null (no cursor active; use offset pagination).
+//
+// Throws badRequest on tampering or endpoint mismatch (propagated via next()).
+
+function resolveCursor(
+  query: Record<string, any>,
+  endpoint: CursorEndpoint,
+): ReturnType<typeof decodeCursor> | null {
+  if (query.cursor) {
+    return decodeCursor(query.cursor, endpoint);
+  }
+  if (query.cursor_ledger !== undefined) {
+    return decodeCursor(String(query.cursor_ledger), endpoint);
+  }
+  return null;
+}
 // ── Raw + human-readable money fields (Issue #282) ────────────────────────────
 //
 // Listing/Auction/Offer rows carry raw on-chain base-unit amounts (see
@@ -355,13 +383,43 @@ function sanitiseTsQuery(raw: string): string {
   return raw.replace(/[&|!:<>()]/g, ' ').trim();
 }
 
+// Non-default sort options that order by a field other than updatedAtLedger.
+// Ledger-based cursor pagination (cursor_ledger) is only meaningful when the
+// result set is primarily ordered by updatedAtLedger, so these two sorts are
+// rejected in combination with cursor_ledger at the schema level
+// (listingsQuerySchema) — see the comment there for why.
+const PRICE_SORTS = new Set(['price-low', 'price-high']);
+
+/** Map a validated `sort` value (or its absence) to a Prisma `orderBy` clause. */
+function listingsOrderBy(sort: string | undefined, direction: 'asc' | 'desc'): Prisma.ListingOrderByWithRelationInput {
+  switch (sort) {
+    case 'oldest':        return { updatedAtLedger: 'asc' };
+    case 'price-low':     return { price: 'asc' };
+    case 'price-high':    return { price: 'desc' };
+    // "recently-sold" and the default ("newest"/undefined) both order by
+    // updatedAtLedger — recently-sold additionally scopes `where.status`
+    // to 'Sold' (see below) so the same cursor mechanics apply unchanged.
+    case 'recently-sold':
+    case 'newest':
+    default:
+      return { updatedAtLedger: direction };
+  }
+}
+
 router.get('/listings', lightRateLimiter, cacheMiddleware(TTL.LISTINGS_LIST), queryCostGuard(), validateQuery(listingsQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
-  const { artist, owner, status, limit, offset, minPrice, maxPrice, search, cursor_ledger, cursor_direction } =
+  const { artist, owner, status, limit, offset, minPrice, maxPrice, search, sort, collection, token, cursor_ledger, cursor_direction } =
     (req as any).validatedQuery;
   try {
     const where: any = {};
     if (artist) where.artist = artist;
     if (owner) where.owner = owner;
+    if (token) where.token = token;
+    // `collection` is the collection contract address on Listing (not a
+    // relation) — matches FilterSidebar.tsx's `coll.contractAddress` values.
+    // A single selected collection still works fine with `in: [addr]`.
+    if (collection && collection.length > 0) {
+      where.collection = collection.length === 1 ? collection[0] : { in: collection };
+    }
 
     // status=expired is a virtual filter: Cancelled listings whose
     // LISTING_CANCELLED event carries reason.Expired (tag 2).
@@ -380,6 +438,10 @@ router.get('/listings', lightRateLimiter, cacheMiddleware(TTL.LISTINGS_LIST), qu
       where.status = 'Cancelled';
     } else if (status) {
       where.status = status;
+    } else if (sort === 'recently-sold') {
+      // "recently-sold" implicitly scopes to Sold listings when the caller
+      // hasn't already filtered status explicitly.
+      where.status = 'Sold';
     }
 
     if (minPrice !== undefined || maxPrice !== undefined) {
@@ -389,7 +451,10 @@ router.get('/listings', lightRateLimiter, cacheMiddleware(TTL.LISTINGS_LIST), qu
     }
 
     // ── Cursor pagination ─────────────────────────────────────────────────
-    const direction: 'asc' | 'desc' = cursor_direction ?? 'desc';
+    // "oldest" reverses the default direction; price sorts never reach here
+    // with a cursor_ledger set — listingsQuerySchema rejects that combination
+    // up front because ledger order and price order are incompatible cursors.
+    const direction: 'asc' | 'desc' = sort === 'oldest' ? 'asc' : (cursor_direction ?? 'desc');
     if (cursor_ledger !== undefined) {
       where.updatedAtLedger = direction === 'desc'
         ? { lt: cursor_ledger }
@@ -397,18 +462,11 @@ router.get('/listings', lightRateLimiter, cacheMiddleware(TTL.LISTINGS_LIST), qu
     }
 
     const take = limit ?? 20;
-    const skip = cursor_ledger !== undefined ? 0 : (offset ?? 0);
+    const skip = decoded ? 0 : (offset ?? 0);
 
     // ── Full-text search ──────────────────────────────────────────────────
     if (search && search.length >= FTS_MIN_LENGTH) {
-      // Build a safe plainto_tsquery expression.  plainto_tsquery handles
-      // phrase tokenisation automatically and never throws on malformed input.
       const sanitised = sanitiseTsQuery(search);
-
-      // Construct the additional Prisma filters as raw-SQL fragments so we can
-      // combine them with the ts_rank ORDER BY.
-      // We build the WHERE conditions from the `where` object manually for the
-      // raw query so we can inject the tsquery predicate.
 
       const filterClauses: string[] = [
         `"searchVector" @@ plainto_tsquery('english', $1)`,
@@ -418,19 +476,32 @@ router.get('/listings', lightRateLimiter, cacheMiddleware(TTL.LISTINGS_LIST), qu
 
       if (artist)   { filterClauses.push(`"artist" = $${pIdx++}`);  params.push(artist); }
       if (owner)    { filterClauses.push(`"owner" = $${pIdx++}`);   params.push(owner); }
+      if (token)    { filterClauses.push(`"token" = $${pIdx++}`);   params.push(token); }
+      if (collection && collection.length > 0) {
+        filterClauses.push(`"collection" = ANY($${pIdx++}::text[])`);
+        params.push(collection);
+      }
       if (status)   { filterClauses.push(`"status" = $${pIdx++}::"ListingStatus"`); params.push(status); }
+      else if (sort === 'recently-sold') { filterClauses.push(`"status" = $${pIdx++}::"ListingStatus"`); params.push('Sold'); }
       if (minPrice !== undefined) { filterClauses.push(`"price" >= $${pIdx++}`); params.push(String(minPrice)); }
       if (maxPrice !== undefined) { filterClauses.push(`"price" <= $${pIdx++}`); params.push(String(maxPrice)); }
-      if (cursor_ledger !== undefined) {
+      if (decoded) {
         filterClauses.push(
           direction === 'desc'
             ? `"updatedAtLedger" < $${pIdx++}`
             : `"updatedAtLedger" > $${pIdx++}`
         );
-        params.push(cursor_ledger);
+        params.push(decoded.ledger);
       }
 
       const whereSQL = filterClauses.length ? `WHERE ${filterClauses.join(' AND ')}` : '';
+
+      // Relevance (_rank) is always the primary key for a text search; the
+      // secondary tie-break follows the requested sort so results are stable
+      // and predictable when multiple rows share a rank.
+      const tieBreakSQL = (!!sort && PRICE_SORTS.has(sort))
+        ? `"price" ${sort === 'price-low' ? 'ASC' : 'DESC'}`
+        : `"updatedAtLedger" ${direction === 'desc' ? 'DESC' : 'ASC'}`;
 
       // ts_rank_cd is the coverage-density variant; it rewards documents where
       // the query terms are near each other.  Normalisation option 1 divides
@@ -440,7 +511,7 @@ router.get('/listings', lightRateLimiter, cacheMiddleware(TTL.LISTINGS_LIST), qu
                 ts_rank_cd("searchVector", plainto_tsquery('english', $1), 1) AS "_rank"
          FROM "Listing"
          ${whereSQL}
-         ORDER BY "_rank" DESC, "updatedAtLedger" ${direction === 'desc' ? 'DESC' : 'ASC'}
+         ORDER BY "_rank" DESC, ${tieBreakSQL}
          LIMIT ${take} OFFSET ${skip}`,
         ...params
       );
@@ -450,7 +521,10 @@ router.get('/listings', lightRateLimiter, cacheMiddleware(TTL.LISTINGS_LIST), qu
         ...params
       );
 
-      const nextCursor = results.length === take
+      // A ledger cursor is only valid when the tie-break (and therefore the
+      // page boundary) is ledger-based; price-sorted search results must be
+      // paginated with offset instead (see listingsQuerySchema's refine).
+      const nextCursor = results.length === take && !(!!sort && PRICE_SORTS.has(sort))
         ? String(results[results.length - 1].updatedAtLedger)
         : '';
 
@@ -479,40 +553,40 @@ router.get('/listings', lightRateLimiter, cacheMiddleware(TTL.LISTINGS_LIST), qu
     const [results, total] = await Promise.all([
       prisma.listing.findMany({
         where,
-        orderBy: { updatedAtLedger: direction },
+        orderBy: listingsOrderBy(sort, direction),
         take,
         skip,
       }),
-      prisma.listing.count({ where: { ...where, updatedAtLedger: undefined } }),
+      prisma.listing.count({ where: { ...where, updatedAtLedger: undefined, OR: where.OR } }),
     ]);
 
-    const nextCursor = results.length === take
+    // See the schema-level refine on listingsQuerySchema: a ledger cursor is
+    // only meaningful when the page boundary is ledger-ordered, so price
+    // sorts never advertise a next cursor — callers must use offset instead.
+    const nextCursor = results.length === take && !(!!sort && PRICE_SORTS.has(sort))
       ? String(results[results.length - 1].updatedAtLedger)
       : '';
 
     res.setHeader('X-Next-Cursor', nextCursor);
     res.setHeader('X-Total-Count', String(total));
 
-    // Moderation overlay — see comment on the FTS branch above. `total` is
-    // not adjusted for the exclusion below.
     const withModeration = excludeModerated(await attachModerationState(results));
 
-    // When search is active always return { listings, total } shape
-    // (consistent with the FTS path above).
     if (search) {
       return res.json({ listings: serialize(withModeration), total });
     }
 
-    if (limit !== undefined || offset !== undefined || cursor_ledger !== undefined) {
-      const validated = validateResponse(z.object({ listings: ListingResponseV1.array(), total: z.number() }), {
+    if (limit !== undefined || offset !== undefined || decoded !== null) {
+      const validatedResp = validateResponse(z.object({ listings: ListingResponseV1.array(), total: z.number() }), {
         listings: serialize(withModeration),
         total: Number(total),
       });
-      return ok(res, validated);
+      return ok(res, validatedResp);
     }
-    const validated = validateResponse(ListingResponseV1.array(), serialize(withModeration));
-    return ok(res, validated);
+    const validatedResp = validateResponse(ListingResponseV1.array(), serialize(withModeration));
+    return ok(res, validatedResp);
   } catch (err) {
+    if ((err as any)?.code === 'BAD_REQUEST') return next(err);
     next(internalError('Failed to fetch listings'));
   }
 });
@@ -544,6 +618,24 @@ router.get('/listings/:id', lightRateLimiter, cacheMiddleware(TTL.LISTING_DETAIL
 });
 
 // ── GET /listings/:id/history ─────────────────────────────────────────────────
+//
+// Issue #532: Enhanced provenance timeline endpoint.
+// Returns a normalized NormalizedEvent[] ordered by (ledgerSequence, eventIndex)
+// so same-ledger events appear in their on-chain submission order.
+//
+// Response shape: { events: NormalizedEvent[], total: number, hasMore: boolean }
+//
+// NormalizedEvent fields:
+//   id              – string  – "evt_<db id>"
+//   eventType       – string  – raw event type from MarketplaceEvent
+//   actor           – string  – address that triggered the event
+//   data            – object  – raw JSON data blob
+//   ledgerSequence  – number  – ledger the event was recorded in
+//   ledgerTimestamp – string  – ISO-8601 timestamp (or null for legacy rows)
+//   confirmed       – boolean – true once CONFIRMATION_DEPTH ledgers behind tip
+//   txHash          – string  – from data.tx_hash, data.txHash, or "ledger_<seq>"
+//   contractId      – string  – source contract address
+//   eventIndex      – number | null – intra-ledger position (null for legacy rows)
 
 router.get('/listings/:id/history', heavyRateLimiter, abuseDetection('tx-lookup'), async (req: Request, res: Response, next: NextFunction) => {
   const id = req.params.id as string;
@@ -569,21 +661,58 @@ router.get('/listings/:id/history', heavyRateLimiter, abuseDetection('tx-lookup'
 
   try {
     const where: any = { listingId: BigInt(id) };
+
     // Issue #286: optional filter for confirmed-only events
     const confirmedOnly = (req.query as any).confirmed === 'true';
     if (confirmedOnly) {
       where.confirmed = true;
     }
+
     const [results, total] = await Promise.all([
       prisma.marketplaceEvent.findMany({
         where,
-        orderBy: { ledgerSequence: 'asc' },
+        // Issue #532: primary sort by ledger, secondary by eventIndex for
+        // deterministic same-ledger ordering.  Rows without eventIndex (legacy)
+        // sort after rows that have it within the same ledger.
+        orderBy: [
+          { ledgerSequence: 'asc' },
+          { eventIndex: { sort: 'asc', nulls: 'last' } },
+        ],
         take: limit,
         skip: offset,
       }),
       prisma.marketplaceEvent.count({ where }),
     ]);
-    res.json({ events: serialize(results), total });
+
+    // Normalize each row into the provenance timeline shape
+    const events = results.map((row: any) => {
+      const data = (row.data as Record<string, unknown>) ?? {};
+      // Prefer an explicit tx_hash stored in the data blob; fall back to a
+      // synthetic ledger-scoped identifier so TxLink still renders usefully.
+      const txHash =
+        (typeof data.tx_hash  === 'string' && data.tx_hash)  ||
+        (typeof data.txHash   === 'string' && data.txHash)   ||
+        `ledger_${row.ledgerSequence}`;
+
+      return {
+        id: `evt_${row.id}`,
+        eventType: row.eventType,
+        actor: row.actor,
+        data,
+        ledgerSequence: row.ledgerSequence,
+        ledgerTimestamp: row.ledgerTimestamp
+          ? row.ledgerTimestamp instanceof Date
+            ? row.ledgerTimestamp.toISOString()
+            : String(row.ledgerTimestamp)
+          : null,
+        confirmed: row.confirmed,
+        txHash,
+        contractId: row.contractId ?? '',
+        eventIndex: row.eventIndex ?? null,
+      };
+    });
+
+    res.json({ events, total, hasMore: offset + events.length < total });
   } catch (err) {
     next(internalError('Failed to fetch listing history'));
   }
@@ -689,30 +818,32 @@ router.get('/ipfs/:cid', mediumRateLimiter, cacheMiddleware(300), async (req: Re
 // ── GET /auctions ─────────────────────────────────────────────────────────────
 
 router.get('/auctions', lightRateLimiter, cacheMiddleware(TTL.AUCTIONS_LIST), queryCostGuard(), validateQuery(auctionsQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
-  const { creator, status, limit, offset, cursor_ledger, cursor_direction } = (req as any).validatedQuery;
+  const { creator, status, limit, offset, cursor_direction } = (req as any).validatedQuery;
   try {
     const where: any = {};
     if (creator) where.creator = creator;
     if (status) where.status = status;
 
     const direction: 'asc' | 'desc' = cursor_direction ?? 'desc';
-    if (cursor_ledger !== undefined) {
-      where.updatedAtLedger = direction === 'desc' ? { lt: cursor_ledger } : { gt: cursor_ledger };
+    const decoded = resolveCursor((req as any).validatedQuery, CursorEndpoint.AUCTIONS);
+    if (decoded) {
+      Object.assign(where, buildCursorWhere(decoded, direction, 'updatedAtLedger'));
     }
 
     const take = limit ?? 20;
-    const skip = cursor_ledger !== undefined ? 0 : (offset ?? 0);
+    const skip = decoded ? 0 : (offset ?? 0);
 
     const [results, total] = await Promise.all([
       prisma.auction.findMany({ where, orderBy: { updatedAtLedger: direction }, take, skip }),
       prisma.auction.count({ where: { ...(creator ? { creator } : {}), ...(status ? { status } : {}) } }),
     ]);
 
-    const nextCursor = results.length === take ? String(results[results.length - 1].updatedAtLedger) : '';
+    const nextCursor = nextCursorFromRows(results as any[], take, 'updatedAtLedger', CursorEndpoint.AUCTIONS);
     res.setHeader('X-Next-Cursor', nextCursor);
     res.setHeader('X-Total-Count', String(total));
     res.json(serializeAuctions(results));
   } catch (err) {
+    if ((err as any)?.code === 'BAD_REQUEST') return next(err);
     next(internalError('Failed to fetch auctions'));
   }
 });
@@ -782,29 +913,38 @@ router.get('/auctions/:id/blocked-bidders', lightRateLimiter, async (req: Reques
 // ── GET /offers ───────────────────────────────────────────────────────────────
 
 router.get('/offers', lightRateLimiter, queryCostGuard(), validateQuery(offersQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
-  const { listing_id, limit, offset, cursor_ledger, cursor_direction } = (req as any).validatedQuery;
+  const { listing_id, offerer, limit, offset, cursor_ledger, cursor_direction } = (req as any).validatedQuery;
   try {
     const where: any = {};
     if (listing_id) where.listingId = BigInt(listing_id);
+    if (offerer) where.offerer = offerer;
 
     const direction: 'asc' | 'desc' = cursor_direction ?? 'desc';
-    if (cursor_ledger !== undefined) {
-      where.updatedAtLedger = direction === 'desc' ? { lt: cursor_ledger } : { gt: cursor_ledger };
+    const decoded = resolveCursor((req as any).validatedQuery, CursorEndpoint.OFFERS);
+    if (decoded) {
+      Object.assign(where, buildCursorWhere(decoded, direction, 'updatedAtLedger'));
     }
 
     const take = limit ?? 20;
-    const skip = cursor_ledger !== undefined ? 0 : (offset ?? 0);
+    const skip = decoded ? 0 : (offset ?? 0);
+
+    // COUNT query mirrors the same listing_id/offerer filters, but never the
+    // cursor bound, so X-Total-Count reflects the full matching set.
+    const countWhere: any = {};
+    if (listing_id) countWhere.listingId = BigInt(listing_id);
+    if (offerer) countWhere.offerer = offerer;
 
     const [results, total] = await Promise.all([
       prisma.offer.findMany({ where, orderBy: { updatedAtLedger: direction }, take, skip }),
-      prisma.offer.count({ where: listing_id ? { listingId: BigInt(listing_id) } : {} }),
+      prisma.offer.count({ where: countWhere }),
     ]);
 
-    const nextCursor = results.length === take ? String(results[results.length - 1].updatedAtLedger) : '';
+    const nextCursor = nextCursorFromRows(results as any[], take, 'updatedAtLedger', CursorEndpoint.OFFERS);
     res.setHeader('X-Next-Cursor', nextCursor);
     res.setHeader('X-Total-Count', String(total));
     res.json(serializeOffers(results));
   } catch (err) {
+    if ((err as any)?.code === 'BAD_REQUEST') return next(err);
     next(internalError('Failed to fetch offers'));
   }
 });
@@ -833,30 +973,28 @@ router.get('/activity/recent', cacheMiddleware(TTL.ACTIVITY_RECENT), async (req:
 // ── GET /collections ──────────────────────────────────────────────────────────
 
 router.get('/collections', lightRateLimiter, cacheMiddleware(TTL.COLLECTIONS), queryCostGuard(), validateQuery(collectionsQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
-  const { kind, creator, limit, offset, cursor_ledger, cursor_direction } = (req as any).validatedQuery;
+  const { kind, creator, limit, offset, cursor_direction } = (req as any).validatedQuery;
   try {
     const where: any = {};
     if (kind)    where.kind    = kind;
     if (creator) where.creator = creator;
 
     const direction: 'asc' | 'desc' = cursor_direction ?? 'desc';
-    if (cursor_ledger !== undefined) {
-      where.deployedAtLedger = direction === 'desc' ? { lt: cursor_ledger } : { gt: cursor_ledger };
+    const decoded = resolveCursor((req as any).validatedQuery, CursorEndpoint.COLLECTIONS);
+    if (decoded) {
+      Object.assign(where, buildCursorWhere(decoded, direction, 'deployedAtLedger', 'id'));
     }
 
     const take = limit ?? 20;
-    const skip = cursor_ledger !== undefined ? 0 : (offset ?? 0);
+    const skip = decoded ? 0 : (offset ?? 0);
 
     const results = await prisma.collection.findMany({ where, orderBy: { deployedAtLedger: direction }, take, skip });
     const total = prisma.collection.count ? await prisma.collection.count({ where: { ...(kind ? { kind } : {}), ...(creator ? { creator } : {}) } }) : results.length;
 
-    const nextCursor = results.length === take ? String(results[results.length - 1].deployedAtLedger) : '';
+    const nextCursor = nextCursorFromRows(results as any[], take, 'deployedAtLedger', CursorEndpoint.COLLECTIONS, 'id');
     res.setHeader('X-Next-Cursor', nextCursor);
     res.setHeader('X-Total-Count', String(total));
 
-    // Attach a resolved fee_bps field: collection override when set, otherwise null
-    // (clients should fall back to the global fee from GET /stats or contract view).
-    // Also include metadataFrozen field for frontend freeze controls.
     const withFee = results.map((c) => ({
       ...c,
       fee_bps: c.feeBpsOverride ?? null,
@@ -865,6 +1003,7 @@ router.get('/collections', lightRateLimiter, cacheMiddleware(TTL.COLLECTIONS), q
 
     res.json(serialize(withFee));
   } catch (err) {
+    if ((err as any)?.code === 'BAD_REQUEST') return next(err);
     next(internalError('Failed to fetch collections'));
   }
 });
@@ -934,24 +1073,26 @@ router.get('/creators/:address/collections', lightRateLimiter, validateQuery(cre
   if (!address) {
     return next(badRequest('Creator address is required'));
   }
-  const { limit, offset, cursor_ledger, cursor_direction } = (req as any).validatedQuery;
+  const { limit, offset, cursor_direction } = (req as any).validatedQuery;
   try {
     const direction: 'asc' | 'desc' = cursor_direction ?? 'desc';
     const where: any = { creator: address };
-    if (cursor_ledger !== undefined) {
-      where.deployedAtLedger = direction === 'desc' ? { lt: cursor_ledger } : { gt: cursor_ledger };
+    const decoded = resolveCursor((req as any).validatedQuery, CursorEndpoint.CREATOR_COLLECTIONS);
+    if (decoded) {
+      Object.assign(where, buildCursorWhere(decoded, direction, 'deployedAtLedger', 'id'));
     }
     const take = limit ?? 20;
-    const skip = cursor_ledger !== undefined ? 0 : (offset ?? 0);
+    const skip = decoded ? 0 : (offset ?? 0);
 
     const results = await prisma.collection.findMany({ where, orderBy: { deployedAtLedger: direction }, take, skip });
     const total = prisma.collection.count ? await prisma.collection.count({ where: { creator: address } }) : results.length;
 
-    const nextCursor = results.length === take ? String(results[results.length - 1].deployedAtLedger) : '';
+    const nextCursor = nextCursorFromRows(results as any[], take, 'deployedAtLedger', CursorEndpoint.CREATOR_COLLECTIONS, 'id');
     res.setHeader('X-Next-Cursor', nextCursor);
     res.setHeader('X-Total-Count', String(total));
     res.json(serialize(results));
   } catch (err) {
+    if ((err as any)?.code === 'BAD_REQUEST') return next(err);
     next(internalError('Failed to fetch creator collections'));
   }
 });
@@ -960,14 +1101,12 @@ router.get('/creators/:address/collections', lightRateLimiter, validateQuery(cre
 
 router.get('/wallets/:address/activity', strictRateLimiter, queryCostGuard(), validateQuery(walletActivityQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
   const address = req.params.address as string;
-  const { limit, offset, cursor_ledger, cursor_direction } = (req as any).validatedQuery;
+  const { limit, offset, cursor_direction } = (req as any).validatedQuery;
   const take = Math.min(limit ?? 50, 200);
 
   try {
     const direction: 'asc' | 'desc' = cursor_direction ?? 'desc';
-    const cursorWhere: any = cursor_ledger !== undefined
-      ? { ledgerSequence: direction === 'desc' ? { lt: cursor_ledger } : { gt: cursor_ledger } }
-      : {};
+    const decoded = resolveCursor((req as any).validatedQuery, CursorEndpoint.WALLET_ACTIVITY);
 
     const jsonKeys = ['buyer', 'artist', 'offerer', 'bidder', 'winner', 'creator'];
     const fromJson = jsonKeys.map((path) => ({
@@ -975,6 +1114,9 @@ router.get('/wallets/:address/activity', strictRateLimiter, queryCostGuard(), va
     }));
 
     const baseWhere = { OR: [{ actor: address }, ...fromJson] };
+    const cursorWhere = decoded
+      ? buildCursorWhere(decoded, direction, 'ledgerSequence')
+      : {};
     const where = { ...baseWhere, ...cursorWhere };
 
     const [events, total] = await Promise.all([
@@ -982,19 +1124,19 @@ router.get('/wallets/:address/activity', strictRateLimiter, queryCostGuard(), va
         where,
         orderBy: { ledgerSequence: direction },
         take,
-        skip: cursor_ledger !== undefined ? 0 : (offset ?? 0),
+        skip: decoded ? 0 : (offset ?? 0),
       }),
       prisma.marketplaceEvent.count({ where: baseWhere }),
     ]);
 
-    const nextCursor = events.length === take ? String(events[events.length - 1].ledgerSequence) : '';
+    const nextCursor = nextCursorFromRows(events as any[], take, 'ledgerSequence', CursorEndpoint.WALLET_ACTIVITY);
     res.setHeader('X-Next-Cursor', nextCursor);
     res.setHeader('X-Total-Count', String(total));
-    // Issue #508: wallet activity contains provisional events; must revalidate.
     res.set('Cache-Control', cacheControlForPath('/wallets/activity'));
     res.set('Vary', 'Accept-Encoding');
     res.json(serialize(events));
   } catch (err) {
+    if ((err as any)?.code === 'BAD_REQUEST') return next(err);
     next(internalError('Failed to fetch wallet activity'));
   }
 });
@@ -1907,6 +2049,150 @@ router.get('/config/auction', cacheMiddleware(60), async (req: Request, res: Res
 // No DB access — safe to call frequently for observability.
 
 router.get('/admin/query-cost', operationalRateLimiter, authMiddleware('operator'), handleQueryCostDiagnostics);
+
+// ── GET /admin/token-metadata ─────────────────────────────────────────────────
+// Returns token metadata version state for all whitelisted tokens, or for a
+// specific token when ?address= is provided.  Also reports stale
+// listing/auction/offer rows whose tokenMetadataVersion is behind the current
+// token version — useful for diagnosing stale decimal responses.
+//
+// Response shape (per token):
+// {
+//   address, active, metadataVersion, decimals, symbol, name, sourceLedger,
+//   staleRows: { listingCount, auctionCount, offerCount }
+// }
+
+router.get('/admin/token-metadata', operationalRateLimiter, authMiddleware('operator'), async (req: Request, res: Response, next: NextFunction) => {
+  const addressFilter = req.query.address as string | undefined;
+  try {
+    const { findStaleTokenMetadataRows } = await import('../token-metadata.js');
+
+    const where: any = {};
+    if (addressFilter) where.address = addressFilter;
+
+    const tokens = await prisma.whitelistedToken.findMany({
+      where,
+      orderBy: { addedAtLedger: 'asc' },
+      select: {
+        address: true,
+        active: true,
+        metadataVersion: true,
+        decimals: true,
+        symbol: true,
+        name: true,
+        sourceLedger: true,
+      },
+    });
+
+    const results = await Promise.all(
+      tokens.map(async (token: any) => {
+        const stale = await findStaleTokenMetadataRows(
+          token.address,
+          token.metadataVersion ?? 1,
+        );
+        return {
+          ...token,
+          staleRows: {
+            listingCount: stale.listingIds.length,
+            auctionCount: stale.auctionIds.length,
+            offerCount:   stale.offerIds.length,
+          },
+        };
+      })
+    );
+
+    res.json(serialize(results));
+  } catch (err) {
+    next(internalError('Failed to fetch token metadata diagnostics'));
+  }
+});
+
+// ── POST /admin/token-metadata/:address/invalidate ────────────────────────────
+// Force-invalidate cache and bump the metadata version for a single token.
+// Body (optional): { decimals?: number, symbol?: string, name?: string }
+
+router.post('/admin/token-metadata/:address/invalidate', operationalRateLimiter, authMiddleware('operator'), async (req: Request, res: Response, next: NextFunction) => {
+  const address = req.params.address as string;
+  if (!address) return next(badRequest('address is required'));
+
+  const { decimals, symbol, name } = req.body ?? {};
+
+  try {
+    const { applyTokenMetadataVersionChange } = await import('../token-metadata.js');
+
+    // Get current sync state for sourceLedger
+    const syncState = await prisma.syncState.findUnique({ where: { id: 1 }, select: { lastLedger: true } });
+    const sourceLedger = syncState?.lastLedger ?? 0;
+
+    await applyTokenMetadataVersionChange(
+      address,
+      typeof decimals === 'number' ? decimals : null,
+      sourceLedger,
+      typeof symbol === 'string' ? symbol : undefined,
+      typeof name   === 'string' ? name   : undefined,
+    );
+
+    res.json({ address, invalidated: true, sourceLedger });
+  } catch (err) {
+    next(internalError('Failed to invalidate token metadata'));
+  }
+});
+
+// ── GET /admin/orphaned-offers ────────────────────────────────────────────────
+// Returns a summary and paginated list of Offer rows with no matching parent
+// Listing (orphans from out-of-order ingestion or incomplete backfills).
+// These are expected to be resolved once the parent listing is indexed.
+
+router.get('/admin/orphaned-offers', operationalRateLimiter, authMiddleware('operator'), async (req: Request, res: Response, next: NextFunction) => {
+  const limitRaw  = req.query.limit  as string | undefined;
+  const offsetRaw = req.query.offset as string | undefined;
+  const limit  = Math.min(limitRaw  ? parseInt(limitRaw,  10) : 50, 200);
+  const offset = offsetRaw ? parseInt(offsetRaw, 10) : 0;
+
+  try {
+    // Use the orphaned_offers view created by the migration
+    const [rows, countResult] = await Promise.all([
+      prisma.$queryRawUnsafe<any[]>(
+        `SELECT * FROM "orphaned_offers" ORDER BY "createdAtLedger" ASC LIMIT $1 OFFSET $2`,
+        limit,
+        offset,
+      ),
+      prisma.$queryRawUnsafe<[{ count: bigint }]>(
+        `SELECT COUNT(*) AS count FROM "orphaned_offers"`,
+      ),
+    ]);
+
+    const total = Number(countResult[0]?.count ?? 0);
+    res.json({ total, limit, offset, orphans: serialize(rows) });
+  } catch (err) {
+    next(internalError('Failed to fetch orphaned offers'));
+  }
+});
+
+// ── GET /admin/pending-offers ─────────────────────────────────────────────────
+// Returns offers currently staged in PendingOffer (awaiting parent listing).
+
+router.get('/admin/pending-offers', operationalRateLimiter, authMiddleware('operator'), async (req: Request, res: Response, next: NextFunction) => {
+  const limitRaw  = req.query.limit  as string | undefined;
+  const offsetRaw = req.query.offset as string | undefined;
+  const limit  = Math.min(limitRaw  ? parseInt(limitRaw,  10) : 50, 200);
+  const offset = offsetRaw ? parseInt(offsetRaw, 10) : 0;
+
+  try {
+    const [rows, total] = await Promise.all([
+      (prisma as any).pendingOffer.findMany({
+        orderBy: { createdAtLedger: 'asc' },
+        take: limit,
+        skip: offset,
+      }),
+      (prisma as any).pendingOffer.count(),
+    ]);
+
+    res.json({ total, limit, offset, pendingOffers: serialize(rows) });
+  } catch (err) {
+    next(internalError('Failed to fetch pending offers'));
+  }
+});
 
 // ── Notification routes (Issue #8) ────────────────────────────────────────────
 import notificationRouter from './notification-routes.js';

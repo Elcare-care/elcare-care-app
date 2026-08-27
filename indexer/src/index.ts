@@ -30,6 +30,7 @@ import {
 } from './health.js';
 import { VERSION } from './config.js';
 import { warmCache } from './cache-warmer.js';
+import { startDataQualityScheduler } from './data-quality.js';
 
 dotenv.config();
 
@@ -211,6 +212,12 @@ const httpServer = app.listen(PORT, () => {
           err: err instanceof Error ? err.message : String(err),
         });
       });
+    }
+
+    // ── Data-quality checks ───────────────────────────────────────────────
+    if (process.env.DATA_QUALITY_ENABLED !== 'false') {
+      const stopDataQuality = startDataQualityScheduler();
+      registerShutdownHook(async () => { stopDataQuality(); });
     }
 
   // ── Keeper loop ───────────────────────────────────────────────────────────

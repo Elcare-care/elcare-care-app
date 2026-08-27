@@ -14,6 +14,8 @@ const mockGetArtistAuctions = jest.fn();
 const mockCreateAuction = jest.fn();
 const mockPlaceBid = jest.fn();
 const mockFinalizeAuction = jest.fn();
+const mockCancelAuction = jest.fn();
+const mockRefundLosingBid = jest.fn();
 
 jest.mock('@/lib/contract', () => ({
   getAllAuctions: (...args: unknown[]) => mockGetAllAuctions(...args),
@@ -22,6 +24,8 @@ jest.mock('@/lib/contract', () => ({
   createAuction: (...args: unknown[]) => mockCreateAuction(...args),
   placeBid: (...args: unknown[]) => mockPlaceBid(...args),
   finalizeAuction: (...args: unknown[]) => mockFinalizeAuction(...args),
+  cancelAuction: (...args: unknown[]) => mockCancelAuction(...args),
+  refundLosingBid: (...args: unknown[]) => mockRefundLosingBid(...args),
 }));
 
 jest.mock('@/lib/indexer', () => ({
@@ -50,6 +54,8 @@ import {
   useArtistAuctions,
   useCreateAuction,
   useFinalizeAuction,
+  useCancelAuction,
+  useRefundLosingBid,
 } from '@/hooks/useAuctions';
 import { usePlaceBid } from '@/hooks/usePlaceBid';
 
@@ -202,9 +208,8 @@ describe('useCreateAuction', () => {
       return (
         <div>
           <button onClick={async () => setResult(await create({
-            title: 'T', description: 'D', artistName: 'A', year: '2024',
-            category: 'C', imageFile: new File([], 'f.png'),
-            reservePriceXlm: 10, durationHours: 24,
+            collectionAddress: 'CCOLLECTION', nftTokenId: 1,
+            reservePriceXlm: 10, durationSeconds: 3600,
           }))}>create</button>
           <span data-testid="result">{String(result)}</span>
           <span data-testid="creating">{String(isCreating)}</span>
@@ -226,9 +231,8 @@ describe('useCreateAuction', () => {
       return (
         <div>
           <button onClick={async () => setResult(await create({
-            title: 'T', description: 'D', artistName: 'A', year: '2024',
-            category: 'C', imageFile: new File([], 'f.png'),
-            reservePriceXlm: 10, durationHours: 24,
+            collectionAddress: 'CCOLLECTION', nftTokenId: 1,
+            reservePriceXlm: 10, durationSeconds: 3600,
           }))}>create</button>
           <span data-testid="result">{String(result)}</span>
         </div>
@@ -249,9 +253,8 @@ describe('useCreateAuction', () => {
       return (
         <div>
           <button onClick={async () => setResult(await create({
-            title: 'T', description: 'D', artistName: 'A', year: '2024',
-            category: 'C', imageFile: new File([], 'f.png'),
-            reservePriceXlm: 10, durationHours: 24,
+            collectionAddress: 'CCOLLECTION', nftTokenId: 1,
+            reservePriceXlm: 10, durationSeconds: 3600,
           }))}>create</button>
           <span data-testid="result">{String(result)}</span>
           <span data-testid="error">{error ?? 'none'}</span>
@@ -370,5 +373,91 @@ describe('useFinalizeAuction', () => {
     await user.click(screen.getByRole('button'));
     await waitFor(() => expect(screen.getByTestId('result').textContent).toBe('true'));
     expect(mockFinalizeAuction).toHaveBeenCalledWith('GCALLER', 5);
+  });
+});
+
+// ── useCancelAuction ──────────────────────────────────────────────────────────
+
+describe('useCancelAuction', () => {
+  beforeEach(() => jest.clearAllMocks());
+
+  it('returns false immediately when publicKey is null', async () => {
+    function Comp() {
+      const { cancel } = useCancelAuction(null);
+      const [result, setResult] = React.useState<boolean | undefined>(undefined);
+      return (
+        <div>
+          <button onClick={async () => setResult(await cancel(1))}>cancel</button>
+          <span data-testid="result">{String(result)}</span>
+        </div>
+      );
+    }
+    const user = userEvent.setup();
+    render(<Comp />);
+    await user.click(screen.getByRole('button'));
+    await waitFor(() => expect(screen.getByTestId('result').textContent).toBe('false'));
+  });
+
+  it('calls cancelAuction and returns true on success', async () => {
+    mockCancelAuction.mockResolvedValueOnce(undefined);
+
+    function Comp() {
+      const { cancel } = useCancelAuction('GCREATOR');
+      const [result, setResult] = React.useState<boolean | undefined>(undefined);
+      return (
+        <div>
+          <button onClick={async () => setResult(await cancel(7))}>cancel</button>
+          <span data-testid="result">{String(result)}</span>
+        </div>
+      );
+    }
+    const user = userEvent.setup();
+    render(<Comp />);
+    await user.click(screen.getByRole('button'));
+    await waitFor(() => expect(screen.getByTestId('result').textContent).toBe('true'));
+    expect(mockCancelAuction).toHaveBeenCalledWith('GCREATOR', 7);
+  });
+});
+
+// ── useRefundLosingBid ────────────────────────────────────────────────────────
+
+describe('useRefundLosingBid', () => {
+  beforeEach(() => jest.clearAllMocks());
+
+  it('returns false immediately when publicKey is null', async () => {
+    function Comp() {
+      const { refund } = useRefundLosingBid(null);
+      const [result, setResult] = React.useState<boolean | undefined>(undefined);
+      return (
+        <div>
+          <button onClick={async () => setResult(await refund(1))}>refund</button>
+          <span data-testid="result">{String(result)}</span>
+        </div>
+      );
+    }
+    const user = userEvent.setup();
+    render(<Comp />);
+    await user.click(screen.getByRole('button'));
+    await waitFor(() => expect(screen.getByTestId('result').textContent).toBe('false'));
+  });
+
+  it('calls refundLosingBid and returns true on success', async () => {
+    mockRefundLosingBid.mockResolvedValueOnce(undefined);
+
+    function Comp() {
+      const { refund } = useRefundLosingBid('GBIDDER');
+      const [result, setResult] = React.useState<boolean | undefined>(undefined);
+      return (
+        <div>
+          <button onClick={async () => setResult(await refund(9))}>refund</button>
+          <span data-testid="result">{String(result)}</span>
+        </div>
+      );
+    }
+    const user = userEvent.setup();
+    render(<Comp />);
+    await user.click(screen.getByRole('button'));
+    await waitFor(() => expect(screen.getByTestId('result').textContent).toBe('true'));
+    expect(mockRefundLosingBid).toHaveBeenCalledWith('GBIDDER', 9);
   });
 });

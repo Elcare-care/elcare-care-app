@@ -12,7 +12,7 @@ import { MODERATION_POLICY_URL } from "@/lib/moderation";
 import { useAdminSession } from "@/hooks/useAdminSession";
 import { useIndexerFreshness } from "@/hooks/useIndexerFreshness";
 import { AdminConfirmationModal } from "@/components/AdminConfirmationModal";
-import { StaleBanner } from "@/components/StaleBanner";
+import ModerationQueue from "@/components/ModerationQueue";
 import {
     Users,
     Palette,
@@ -633,6 +633,11 @@ export default function AdminPage() {
                                 </div>
                             </div>
                         )}
+                    </section>
+
+                    {/* Content Moderation Queue (Issue #534) */}
+                    <section className="lg:col-span-2 rounded-3xl">
+                        <ModerationQueue />
                     </section>
 
                     {/* Treasury Balances */}

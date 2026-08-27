@@ -32,8 +32,9 @@ import {
   Ban,
 } from "lucide-react";
 import { clsx } from "clsx";
-import { Offer, stroopsToXlm, deriveOfferUIStatus, OfferUIStatus } from "@/lib/contract";
+import { Offer, stroopsToXlm, deriveOfferUIStatus } from "@/lib/contract";
 import { SUPPORTED_TOKENS, TokenConfig } from "@/config/tokens";
+import { OfferStatusBadge } from "@/components/OfferStatusBadge";
 import { GuardButton } from "@/components/WalletGuard";
 import { useAcceptOffer, useRejectOffer } from "@/hooks/useOffers";
 import { useModalA11y } from "@/hooks/useModalA11y";
@@ -65,19 +66,6 @@ function formatCountdown(expiresAtSec: number, nowMs: number): string | null {
   if (days > 0) return `${days}d ${hours}h`;
   if (hours > 0) return `${hours}h ${minutes}m`;
   return `${minutes}m ${seconds}s`;
-}
-
-/** Returns Tailwind classes + label for an offer UI status badge. */
-function getOfferStatusBadgeClass(uiStatus: OfferUIStatus): string {
-  switch (uiStatus) {
-    case "Pending": return "bg-brand-500/10 text-brand-400 border-brand-500/20";
-    case "Accepted": return "bg-mint-500/10 text-mint-400 border-mint-500/20";
-    case "Rejected": return "bg-terracotta-500/10 text-terracotta-400 border-terracotta-500/20";
-    case "Withdrawn": return "bg-white/5 text-white/30 border-white/10";
-    case "Expired": return "bg-amber-500/10 text-amber-400 border-amber-500/20";
-    case "Stale": return "bg-yellow-500/10 text-yellow-400 border-yellow-500/20";
-    default: return "bg-white/5 text-white/30 border-white/10";
-  }
 }
 
 // ── Make-Offer Modal ──────────────────────────────────────────────────────────

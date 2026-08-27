@@ -523,7 +523,7 @@ describe('Public route access — unauthenticated reads work', () => {
 // =============================================================================
 
 describe('Operator route access — rejected without valid token', () => {
-  const mockPrisma = vi.hoisted(() => ({
+  const mockPrismaOp = vi.hoisted(() => ({
     listing: { findMany: vi.fn().mockResolvedValue([]), count: vi.fn().mockResolvedValue(0) },
     auction: { findMany: vi.fn().mockResolvedValue([]) },
     offer:   { findMany: vi.fn().mockResolvedValue([]) },
@@ -540,7 +540,7 @@ describe('Operator route access — rejected without valid token', () => {
     },
   }));
 
-  const mockRedis = vi.hoisted(() => ({
+  const mockRedisOp = vi.hoisted(() => ({
     isOpen: false, isReady: false,
     get: vi.fn().mockResolvedValue(null),
     setEx: vi.fn().mockResolvedValue(undefined),
@@ -548,9 +548,9 @@ describe('Operator route access — rejected without valid token', () => {
     connect: vi.fn().mockRejectedValue(new Error('No Redis')),
   }));
 
-  vi.mock('../src/db', () => ({ default: mockPrisma }));
-  vi.mock('../src/prisma-write', () => ({ default: mockPrisma }));
-  vi.mock('../src/redis.js', () => ({ default: mockRedis }));
+  vi.mock('../src/db', () => ({ default: mockPrismaOp }));
+  vi.mock('../src/prisma-write', () => ({ default: mockPrismaOp }));
+  vi.mock('../src/redis.js', () => ({ default: mockRedisOp }));
 
   beforeEach(() => {
     process.env.OPERATOR_TOKEN = 'test-operator-token';

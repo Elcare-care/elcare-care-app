@@ -290,6 +290,18 @@ pub enum DataKey {
     /// Keyed by (settlement_id, is_listing, recipient_address).
     /// Written at settlement, marked claimed after successful payout.
     RoyaltyClaim(u64, bool, Address),
+    /// Parent offer ID for a counter-offer (Issue #471).
+    /// `CounterOfferParent(counter_offer_id)` → parent_offer_id.
+    CounterOfferParent(u64),
+    /// Counter-offer ID that superseded a parent offer (Issue #471).
+    /// `OfferSupersededBy(parent_offer_id)` → counter_offer_id.
+    OfferSupersededBy(u64),
+    /// Monotonically increasing counter for governance proposal IDs (Issue #472).
+    GovernanceProposalCount,
+    /// One governance proposal record (Issue #472).
+    GovernanceProposal(u64),
+    /// Ordered list of approver addresses for a governance proposal (Issue #472).
+    GovernanceApprovals(u64),
 }
 
 /// Custody record for an NFT held by the marketplace, keyed by
@@ -2064,4 +2076,99 @@ pub fn get_royalty_claim(
         bump_entry_ttl(env, &key);
     }
     value
+}
+
+// ── Counter-offer link storage (Issue #471) ──────────────────────────────────
+
+/// Record that `counter_offer_id` was created as a counter to `parent_offer_id`.
+pub fn set_counter_offer_parent(env: &Env, counter_offer_id: u64, parent_offer_id: u64) {
+    let key = DataKey::CounterOfferParent(counter_offer_id);
+    env.storage().persistent().set(&key, &parent_offer_id);
+    bump_entry_ttl(env, &key);
+}
+
+/// Return the parent offer id for a counter-offer, or `None` if the offer is
+/// not a counter-offer (i.e. it was created via `make_offer`).
+pub fn get_counter_offer_parent(env: &Env, counter_offer_id: u64) -> Option<u64> {
+    let key = DataKey::CounterOfferParent(counter_offer_id);
+    let value = env.storage().persistent().get::<DataKey, u64>(&key);
+    if value.is_some() {
+        bump_entry_ttl(env, &key);
+    }
+    value
+}
+
+/// Record that `parent_offer_id` was superseded by `counter_offer_id`.
+pub fn set_offer_superseded_by(env: &Env, parent_offer_id: u64, counter_offer_id: u64) {
+    let key = DataKey::OfferSupersededBy(parent_offer_id);
+    env.storage().persistent().set(&key, &counter_offer_id);
+    bump_entry_ttl(env, &key);
+}
+
+/// Return the counter-offer id that superseded `parent_offer_id`, or `None`.
+pub fn get_offer_superseded_by(env: &Env, parent_offer_id: u64) -> Option<u64> {
+    let key = DataKey::OfferSupersededBy(parent_offer_id);
+    let value = env.storage().persistent().get::<DataKey, u64>(&key);
+    if value.is_some() {
+        bump_entry_ttl(env, &key);
+    }
+    value
+}
+
+// ── Governance quorum storage (Issue #472) ───────────────────────────────────
+
+pub fn get_governance_proposal_count(env: &Env) -> u64 {
+    env.storage()
+        .persistent()
+        .get::<DataKey, u64>(&DataKey::GovernanceProposalCount)
+        .unwrap_or(0)
+}
+
+pub fn increment_governance_proposal_count(env: &Env) -> u64 {
+    let count = get_governance_proposal_count(env) + 1;
+    env.storage()
+        .persistent()
+        .set(&DataKey::GovernanceProposalCount, &count);
+    bump_entry_ttl(env, &DataKey::GovernanceProposalCount);
+    count
+}
+
+pub fn save_governance_proposal(env: &Env, proposal: &crate::types::GovernanceProposal) {
+    let key = DataKey::GovernanceProposal(proposal.proposal_id);
+    env.storage().persistent().set(&key, proposal);
+    bump_entry_ttl(env, &key);
+}
+
+pub fn load_governance_proposal(
+    env: &Env,
+    proposal_id: u64,
+) -> Option<crate::types::GovernanceProposal> {
+    let key = DataKey::GovernanceProposal(proposal_id);
+    let value = env
+        .storage()
+        .persistent()
+        .get::<DataKey, crate::types::GovernanceProposal>(&key);
+    if value.is_some() {
+        bump_entry_ttl(env, &key);
+    }
+    value
+}
+
+pub fn load_governance_approvals(env: &Env, proposal_id: u64) -> Vec<Address> {
+    let key = DataKey::GovernanceApprovals(proposal_id);
+    let value = env
+        .storage()
+        .persistent()
+        .get::<DataKey, Vec<Address>>(&key)
+        .unwrap_or_else(|| Vec::new(env));
+    if !value.is_empty() {
+        bump_entry_ttl(env, &key);
+    }
+    value
+}
+
+pub fn save_governance_approvals(env: &Env, proposal_id: u64, approvals: &Vec<Address>) {
+    let key = DataKey::GovernanceApprovals(proposal_id);
+    env.storage().persistent().set(&key, approvals);
+    bump_entry_ttl(env, &key);
 }
