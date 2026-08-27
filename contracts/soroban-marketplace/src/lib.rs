@@ -38,10 +38,23 @@ mod asset_equivalence_tests;
 #[cfg(test)]
 mod settlement_pause_tests;
 
+#[cfg(test)]
+mod auction_cancel_audit_tests;
+
+#[cfg(test)]
+mod offer_sweep_tests;
+
+#[cfg(test)]
+mod counter_offer_tests;
+
+#[cfg(test)]
+mod governance_quorum_tests;
+
 pub use contract::MarketplaceContract;
 pub use types::{
-    BatchItemError, BidRecord, CancelReason, CollectionStandard, Listing, ListingStatus,
-    MarketplaceError, Offer, OfferStatus, PauseMatrix, RoleType,
+    AuctionCancelReason, BatchItemError, BidRecord, CancelReason, CollectionStandard,
+    GovernanceProposal, GovernanceProposalType, Listing, ListingStatus, MarketplaceError, Offer,
+    OfferStatus, PauseMatrix, RoleType,
 };
 
 #[cfg(any(test, feature = "testutils"))]
