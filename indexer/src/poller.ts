@@ -982,7 +982,7 @@ export async function applyDecodedEvents(decodedEvents: any[], tx: any) {
 }
 
 export async function processEvent(event: any, tx?: any, skipInsert = false) {
-  const { eventType, listingId, actor, ledgerSequence, data } = event;
+  const { eventType, listingId, actor, ledgerSequence, data, txHash } = event;
   const db = tx ?? prisma;
 
   // ── Measure per-event-type processing time ────────────────────────────────
@@ -1411,6 +1411,10 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
 
     case 'OFFER_MADE': {
       const offerExpiresAt = data.expires_at != null ? BigInt(data.expires_at) : null;
+      // #528: escrowTxHash records the tx that moved funds into escrow, so
+      // the offers UI can link directly to it. Falls back to null for events
+      // replayed without a tx hash (e.g. some test fixtures).
+      const escrowTxHash = txHash || null;
       await db.offer.upsert({
         where: { offerId: BigInt(data.offer_id) },
         create: {
@@ -1421,6 +1425,7 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
           token: data.token,
           status: 'Pending' as const,
           expiresAt: offerExpiresAt,
+          escrowTxHash,
           createdAtLedger: ledgerSequence,
           updatedAtLedger: ledgerSequence,
         },
@@ -1436,6 +1441,7 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
           token: data.token,
           status: 'Pending' as const,
           expiresAt: offerExpiresAt,
+          escrowTxHash,
           updatedAtLedger: ledgerSequence,
         },
       });
@@ -1447,7 +1453,7 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
     case 'OFFER_ACCEPTED': {
       await db.offer.update({
         where: { offerId: BigInt(data.offer_id) },
-        data: { status: 'Accepted' as const, updatedAtLedger: ledgerSequence },
+        data: { status: 'Accepted' as const, refundTxHash: txHash || null, updatedAtLedger: ledgerSequence },
       });
       const { count: listingCount } = await db.listing.updateMany({
         where: { listingId: BigInt(data.listing_id) },
@@ -1468,7 +1474,7 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
     case 'OFFER_REJECTED': {
       await db.offer.update({
         where: { offerId: BigInt(data.offer_id) },
-        data: { status: 'Rejected' as const, updatedAtLedger: ledgerSequence },
+        data: { status: 'Rejected' as const, refundTxHash: txHash || null, updatedAtLedger: ledgerSequence },
       });
       invalidateOffer(data.listing_id?.toString()).catch(() => {});
       break;
@@ -1478,7 +1484,7 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
     case 'OFFER_RECLAIMED': {
       await db.offer.update({
         where: { offerId: BigInt(data.offer_id) },
-        data: { status: 'Withdrawn' as const, updatedAtLedger: ledgerSequence },
+        data: { status: 'Withdrawn' as const, refundTxHash: txHash || null, updatedAtLedger: ledgerSequence },
       });
       invalidateOffer(data.listing_id?.toString()).catch(() => {});
       break;

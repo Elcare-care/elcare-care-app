@@ -13,10 +13,18 @@ name: Database Backup
 #   BACKUP_STORAGE_PATH       — Destination path accessible to the runner, or an
 #                               S3-compatible URI (extend the upload step as needed).
 #
+# Optional secrets:
+#   METRICS_PUSH_URL          — Prometheus Pushgateway endpoint.  Only aggregate
+#                               numeric metrics (counts, durations, backup age)
+#                               are pushed.  No secrets or PII are transmitted.
+#   ALERT_WEBHOOK_URL         — Webhook (e.g. Slack / PagerDuty) to notify on
+#                               backup or restore failure.  Payload contains only
+#                               the artifact name, job URL, and failure step.
+#
 # Monitoring:
 #   This workflow fails loudly so that a missed backup surfaces as a CI failure.
 #   Wire the workflow status to an alert channel (PagerDuty / Slack) via
-#   GitHub's notification settings or an external webhook step.
+#   GitHub's notification settings or ALERT_WEBHOOK_URL below.
 
 on:
   schedule:
@@ -33,6 +41,10 @@ jobs:
     name: PostgreSQL Backup
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    outputs:
+      artifact_name: ${{ steps.backup_meta.outputs.artifact_name }}
+      backup_age_seconds: ${{ steps.backup_meta.outputs.backup_age_seconds }}
+
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -52,6 +64,21 @@ jobs:
           chmod +x scripts/backup/backup.sh
           bash scripts/backup/backup.sh
 
+      - name: Collect backup artifact metadata
+        id: backup_meta
+        run: |
+          BACKUP_FILE=$(ls /tmp/elcarehub-backups/pg_backup_*.dump.enc | sort | tail -1)
+          ARTIFACT_NAME=$(basename "$BACKUP_FILE")
+          ARTIFACT_SIZE=$(stat -c%s "$BACKUP_FILE" 2>/dev/null || stat -f%z "$BACKUP_FILE")
+          MTIME=$(stat -c%Y "$BACKUP_FILE" 2>/dev/null || stat -f%m "$BACKUP_FILE")
+          AGE=$(( $(date +%s) - MTIME ))
+
+          echo "artifact_name=${ARTIFACT_NAME}"   >> "$GITHUB_OUTPUT"
+          echo "artifact_size=${ARTIFACT_SIZE}"   >> "$GITHUB_OUTPUT"
+          echo "backup_age_seconds=${AGE}"        >> "$GITHUB_OUTPUT"
+
+          echo "::notice title=Backup artifact::${ARTIFACT_NAME} (${ARTIFACT_SIZE} bytes, age ${AGE}s)"
+
       - name: Upload backup artifact
         uses: actions/upload-artifact@v4
         with:
@@ -66,11 +93,31 @@ jobs:
         if: always()
         run: |
           if [ "${{ job.status }}" = "success" ]; then
-            echo "✓ Backup succeeded at $(date -u +%FT%TZ)"
+            echo "::notice title=Backup succeeded::$(date -u +%FT%TZ)"
           else
-            echo "✗ Backup FAILED at $(date -u +%FT%TZ)" >&2
-            exit 1
+            echo "::error title=Backup FAILED::Backup job failed at $(date -u +%FT%TZ). Artifact: ${{ steps.backup_meta.outputs.artifact_name || 'unknown' }}. Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           fi
+
+      - name: Alert on backup failure
+        if: failure() && secrets.ALERT_WEBHOOK_URL != ''
+        env:
+          ALERT_WEBHOOK_URL: ${{ secrets.ALERT_WEBHOOK_URL }}
+        run: |
+          # Payload contains only safe, non-secret fields.
+          curl --silent --fail -X POST "$ALERT_WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "text": "⚠️ *ElcareHub DB Backup FAILED*",
+              "attachments": [{
+                "color": "danger",
+                "fields": [
+                  {"title": "Artifact",    "value": "${{ steps.backup_meta.outputs.artifact_name || 'unknown' }}", "short": true},
+                  {"title": "Run",         "value": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}", "short": false},
+                  {"title": "Triggered by","value": "${{ github.event_name }}", "short": true},
+                  {"title": "Timestamp",   "value": "'"$(date -u +%FT%TZ)"'", "short": true}
+                ]
+              }]
+            }' || echo "Alert webhook delivery failed (non-fatal)"
 
   verify-restore:
     name: Restore Verification (DR Drill)
@@ -114,14 +161,59 @@ jobs:
         id: locate
         run: |
           BACKUP_FILE=$(ls /tmp/elcarehub-backups/pg_backup_*.dump.enc | sort | tail -1)
-          echo "path=${BACKUP_FILE}" >> "$GITHUB_OUTPUT"
+          ARTIFACT_NAME=$(basename "$BACKUP_FILE")
+          echo "path=${BACKUP_FILE}"              >> "$GITHUB_OUTPUT"
+          echo "artifact_name=${ARTIFACT_NAME}"   >> "$GITHUB_OUTPUT"
+          echo "::notice title=Restoring artifact::${ARTIFACT_NAME}"
 
       - name: Run restore and read checks
+        id: restore
         env:
           BACKUP_FILE: ${{ steps.locate.outputs.path }}
+          # BACKUP_ENCRYPTION_KEY is injected from secrets — never printed.
           BACKUP_ENCRYPTION_KEY: ${{ secrets.BACKUP_ENCRYPTION_KEY }}
           RESTORE_TARGET_URL: postgresql://restore_test:restore_test@localhost:5432/restore_test
           INDEXER_DIR: ${{ github.workspace }}/indexer
+          # METRICS_PUSH_URL is optional; push only safe aggregate metrics.
+          METRICS_PUSH_URL: ${{ secrets.METRICS_PUSH_URL }}
         run: |
           chmod +x scripts/backup/restore.sh
           bash scripts/backup/restore.sh
+
+      - name: Annotate restore report in job summary
+        if: always()
+        run: |
+          ARTIFACT="${{ steps.locate.outputs.artifact_name }}"
+          STATUS="${{ job.status }}"
+          BACKUP_AGE="${{ needs.backup.outputs.backup_age_seconds }}"
+
+          echo "## DB Restore Verification" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Artifact | \`${ARTIFACT}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Backup age | ${BACKUP_AGE:-unknown}s |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Restore outcome | ${STATUS} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Run | [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Alert on restore failure
+        if: failure() && secrets.ALERT_WEBHOOK_URL != ''
+        env:
+          ALERT_WEBHOOK_URL: ${{ secrets.ALERT_WEBHOOK_URL }}
+        run: |
+          # Payload contains only safe, non-secret fields.
+          # RESTORE_TARGET_URL is deliberately excluded from the alert payload.
+          curl --silent --fail -X POST "$ALERT_WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "text": "🔴 *ElcareHub DB Restore Verification FAILED*",
+              "attachments": [{
+                "color": "danger",
+                "fields": [
+                  {"title": "Artifact",    "value": "${{ steps.locate.outputs.artifact_name }}", "short": true},
+                  {"title": "Backup age",  "value": "${{ needs.backup.outputs.backup_age_seconds }}s", "short": true},
+                  {"title": "Run",         "value": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}", "short": false},
+                  {"title": "Action required", "value": "Investigate restore failure before relying on this backup for disaster recovery.", "short": false}
+                ]
+              }]
+            }' || echo "Alert webhook delivery failed (non-fatal)"

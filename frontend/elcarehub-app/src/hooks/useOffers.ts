@@ -502,3 +502,58 @@ export function useOffersWithReconciliation(publicKey: string | null) {
     rejectMutation: recon.rejectMutation,
   };
 }
+
+// ── useIncomingOffersWithReconciliation (Issue #528) ──────────────────────────
+//
+// Same optimistic-transition-with-rollback pattern as
+// useOffersWithReconciliation, applied to the listing-centric inbox so
+// accept/reject can update the UI immediately and roll back on failure.
+
+export function useIncomingOffersWithReconciliation(ownerPublicKey: string | null) {
+  const incomingHook = useIncomingOffers(ownerPublicKey);
+  const recon = useReconciliation<Offer>({ mutationTtlMs: 60_000 });
+
+  const prevRef = useRef(incomingHook.offersByListing);
+  useEffect(() => {
+    if (incomingHook.offersByListing === prevRef.current) return;
+    prevRef.current = incomingHook.offersByListing;
+
+    const snapshots: ConfirmedSnapshot<Offer>[] = incomingHook.offersByListing.flatMap((group) =>
+      group.offers.map((o) => ({
+        resourceId: String(o.offer_id),
+        data: o,
+        ledger: (o as any).updatedAtLedger ?? 0,
+      }))
+    );
+    recon.applyConfirmedData(snapshots);
+  }, [incomingHook.offersByListing]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const addOfferMutation = useCallback(
+    (action: "accept" | "reject", offer: Offer, txHash: string | null = null): string => {
+      const pendingId = generatePendingId(`offer-${action}`);
+      recon.addMutation({
+        pendingId,
+        txHash,
+        kind: "offer",
+        resourceId: String(offer.offer_id),
+        optimisticValue: offer,
+      });
+      return pendingId;
+    },
+    [recon]
+  );
+
+  const getOfferState = useCallback(
+    (offerId: string | number) => recon.getResourceState(String(offerId), "offer"),
+    [recon]
+  );
+
+  return {
+    ...incomingHook,
+    pendingMutations: recon.pendingMutations,
+    addOfferMutation,
+    getOfferState,
+    resolveMutation: recon.resolveMutation,
+    rejectMutation: recon.rejectMutation,
+  };
+}

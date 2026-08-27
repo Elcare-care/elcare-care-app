@@ -71,6 +71,16 @@ pub const LISTING_PRICE_UPDATED: &str = "listing_price_updated";
 pub const LISTING_EXPIRED: &str = "listing_expired";
 pub const AUCTION_EXTENDED: &str = "auction_extended";
 pub const AUCTION_CANCELLED: &str = "auction_cancelled";
+// Offer auto-expiry sweep (Issue #470)
+pub const OFFER_EXPIRED_SWEEP: &str = "offer_expired_sweep";
+// Counter-offer (Issue #471)
+pub const COUNTER_OFFER_MADE: &str = "counter_offer_made";
+pub const COUNTER_OFFER_SUPERSEDED: &str = "counter_offer_superseded";
+// Governance quorum (Issue #472)
+pub const GOVERNANCE_PROPOSED: &str = "gov_proposed";
+pub const GOVERNANCE_APPROVED: &str = "gov_approved";
+pub const GOVERNANCE_EXECUTED: &str = "gov_executed";
+pub const GOVERNANCE_CANCELLED: &str = "gov_cancelled";
 pub const PROTOCOL_FEE_COLLECTED: &str = "protocol_fee_collected";
 pub const OFFER_RECLAIMED: &str = "offer_reclaimed";
 pub const NFT_ESCROWED: &str = "nft_escrowed";
@@ -247,13 +257,22 @@ impl AuctionExtendedEvent {
     }
 }
 
+/// Emitted on every auction cancellation — creator, admin, or emergency path.
+/// Carries a stable typed `reason` enum instead of an opaque Symbol so API
+/// consumers receive a stable discriminant they can pattern-match. (Issue #469)
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AuctionCancelledEvent {
     pub auction_id: u64,
     pub cancelled_by: Address,
-    /// Reason code: "owner" | "admin" | "no_bids"
-    pub reason: soroban_sdk::Symbol,
+    /// Typed reason: Owner | Admin | Emergency (Issue #469).
+    pub reason: crate::types::AuctionCancelReason,
+    /// Escrowed bid amount that was refunded (0 when no bids existed).
+    pub escrow_amount: i128,
+    /// Payment token in which the refund was denominated.
+    pub token: Address,
+    pub ledger_sequence: u32,
+    pub schema_version: u32,
 }
 impl AuctionCancelledEvent {
     #[allow(deprecated)]
@@ -1526,6 +1545,236 @@ pub fn emit_listing_reservation_set(
         reserved_for,
         reservation_start,
         reservation_end,
+        ledger_sequence: env.ledger().sequence(),
+    }
+    .publish(env);
+}
+
+// ── Offer auto-expiry sweep events (Issue #470) ───────────────────────────────
+
+/// Emitted once per offer that the permissionless `sweep_expired_offers` batch
+/// transitions to `Expired` status. Carries the full refund audit trail so
+/// indexers can reconcile escrow without replaying the transaction.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OfferExpiredSweepEvent {
+    pub offer_id: u64,
+    pub listing_id: u64,
+    pub offerer: Address,
+    pub amount: i128,
+    pub token: Address,
+    pub ledger_sequence: u32,
+}
+
+impl OfferExpiredSweepEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, OFFER_EXPIRED_SWEEP),), self);
+    }
+}
+
+pub fn emit_offer_expired_sweep(
+    env: &Env,
+    offer_id: u64,
+    listing_id: u64,
+    offerer: Address,
+    amount: i128,
+    token: Address,
+) {
+    OfferExpiredSweepEvent {
+        offer_id,
+        listing_id,
+        offerer,
+        amount,
+        token,
+        ledger_sequence: env.ledger().sequence(),
+    }
+    .publish(env);
+}
+
+// ── Counter-offer events (Issue #471) ────────────────────────────────────────
+
+/// Emitted when the listing artist creates a counter-offer referencing a
+/// buyer's pending offer. The `parent_offer_id` is the buyer's original offer
+/// that was atomically closed; `counter_offer_id` is the new pending proposal.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CounterOfferMadeEvent {
+    pub counter_offer_id: u64,
+    pub parent_offer_id: u64,
+    pub listing_id: u64,
+    pub counterparty: Address,
+    pub amount: i128,
+    pub token: Address,
+    pub expires_at: Option<u64>,
+    pub ledger_sequence: u32,
+}
+
+impl CounterOfferMadeEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, COUNTER_OFFER_MADE),), self);
+    }
+}
+
+pub fn emit_counter_offer_made(
+    env: &Env,
+    counter_offer_id: u64,
+    parent_offer_id: u64,
+    listing_id: u64,
+    counterparty: Address,
+    amount: i128,
+    token: Address,
+    expires_at: Option<u64>,
+) {
+    CounterOfferMadeEvent {
+        counter_offer_id,
+        parent_offer_id,
+        listing_id,
+        counterparty,
+        amount,
+        token,
+        expires_at,
+        ledger_sequence: env.ledger().sequence(),
+    }
+    .publish(env);
+}
+
+// ── Governance quorum events (Issue #472) ─────────────────────────────────────
+
+/// Emitted when a new multi-approval governance proposal is created.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GovernanceProposedEvent {
+    pub proposal_id: u64,
+    pub proposal_type: crate::types::GovernanceProposalType,
+    pub proposed_by: Address,
+    pub threshold: u32,
+    pub expires_at: u64,
+    pub ledger_sequence: u32,
+}
+
+impl GovernanceProposedEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, GOVERNANCE_PROPOSED),), self);
+    }
+}
+
+/// Emitted each time a signer approves a pending governance proposal.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GovernanceApprovedEvent {
+    pub proposal_id: u64,
+    pub approved_by: Address,
+    /// Running count of approvals after this one.
+    pub approval_count: u32,
+    pub threshold: u32,
+    pub ledger_sequence: u32,
+}
+
+impl GovernanceApprovedEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, GOVERNANCE_APPROVED),), self);
+    }
+}
+
+/// Emitted when a fully-approved proposal is executed and the underlying
+/// operation takes effect.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GovernanceExecutedEvent {
+    pub proposal_id: u64,
+    pub proposal_type: crate::types::GovernanceProposalType,
+    pub executed_by: Address,
+    pub ledger_sequence: u32,
+}
+
+impl GovernanceExecutedEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, GOVERNANCE_EXECUTED),), self);
+    }
+}
+
+/// Emitted when a governance proposal is cancelled before execution.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GovernanceCancelledEvent {
+    pub proposal_id: u64,
+    pub cancelled_by: Address,
+    pub ledger_sequence: u32,
+}
+
+impl GovernanceCancelledEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, GOVERNANCE_CANCELLED),), self);
+    }
+}
+
+pub fn emit_governance_proposed(
+    env: &Env,
+    proposal_id: u64,
+    proposal_type: crate::types::GovernanceProposalType,
+    proposed_by: Address,
+    threshold: u32,
+    expires_at: u64,
+) {
+    GovernanceProposedEvent {
+        proposal_id,
+        proposal_type,
+        proposed_by,
+        threshold,
+        expires_at,
+        ledger_sequence: env.ledger().sequence(),
+    }
+    .publish(env);
+}
+
+pub fn emit_governance_approved(
+    env: &Env,
+    proposal_id: u64,
+    approved_by: Address,
+    approval_count: u32,
+    threshold: u32,
+) {
+    GovernanceApprovedEvent {
+        proposal_id,
+        approved_by,
+        approval_count,
+        threshold,
+        ledger_sequence: env.ledger().sequence(),
+    }
+    .publish(env);
+}
+
+pub fn emit_governance_executed(
+    env: &Env,
+    proposal_id: u64,
+    proposal_type: crate::types::GovernanceProposalType,
+    executed_by: Address,
+) {
+    GovernanceExecutedEvent {
+        proposal_id,
+        proposal_type,
+        executed_by,
+        ledger_sequence: env.ledger().sequence(),
+    }
+    .publish(env);
+}
+
+pub fn emit_governance_cancelled(env: &Env, proposal_id: u64, cancelled_by: Address) {
+    GovernanceCancelledEvent {
+        proposal_id,
+        cancelled_by,
         ledger_sequence: env.ledger().sequence(),
     }
     .publish(env);

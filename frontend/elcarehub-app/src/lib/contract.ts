@@ -715,6 +715,13 @@ export interface Offer {
    * Populated by the indexer; absent when the terminal tx is not yet indexed.
    */
   refund_tx_hash?: string;
+  /**
+   * Groundwork for future counter-offers: the offer_id this offer counters,
+   * when set. Not produced by any current write path — the contract and
+   * `make_offer` never populate it yet, so this is always absent today.
+   * Populated by the indexer once a counter-offer flow exists.
+   */
+  parent_offer_id?: number;
 }
 
 /**
@@ -769,6 +776,11 @@ function parseOfferFromScVal(raw: unknown): Offer {
     typeof obj["escrow_tx_hash"] === "string" ? obj["escrow_tx_hash"] : undefined;
   const refund_tx_hash =
     typeof obj["refund_tx_hash"] === "string" ? obj["refund_tx_hash"] : undefined;
+  // parent_offer_id is indexer-enriched groundwork for future counter-offers;
+  // never present in the on-chain ScVal today.
+  const parentOfferIdRaw = obj["parent_offer_id"];
+  const parent_offer_id =
+    parentOfferIdRaw != null ? Number(parentOfferIdRaw) : undefined;
 
   return {
     offer_id: Number(obj["offer_id"]),
@@ -781,6 +793,7 @@ function parseOfferFromScVal(raw: unknown): Offer {
     ...(expires_at !== undefined && { expires_at }),
     ...(escrow_tx_hash !== undefined && { escrow_tx_hash }),
     ...(refund_tx_hash !== undefined && { refund_tx_hash }),
+    ...(parent_offer_id !== undefined && { parent_offer_id }),
   };
 }
 

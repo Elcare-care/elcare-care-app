@@ -16,7 +16,7 @@ export default function PrivacyPage() {
     <div className="min-h-screen bg-midnight-950 pt-24 pb-16 text-white">
       <div className="mx-auto max-w-3xl px-4 sm:px-6">
         <h1 className="text-4xl font-display font-bold mb-2">Privacy Policy</h1>
-        <p className="text-white/40 text-sm mb-10">Last updated: July 2026</p>
+        <p className="text-white/40 text-sm mb-10">Last updated: August 2026</p>
 
         <div className="prose prose-invert prose-sm max-w-none space-y-8">
 
@@ -289,17 +289,34 @@ export default function PrivacyPage() {
             <h2 className="text-xl font-bold text-white mb-3">8. Your rights</h2>
             <div className="text-white/70 leading-relaxed space-y-3">
               <p>
-                For mutable platform data (indexer records, analytics), you can request
-                deletion by contacting us. We will remove your wallet address from our
-                indexer database and revoke any associated records where technically possible.
+                Connect your wallet and go to{" "}
+                <a href="/settings" className="text-brand-400 hover:underline">
+                  Settings → Data &amp; Privacy Controls
+                </a>{" "}
+                to self-service an export or deletion request. Because ElcareHub has no
+                accounts or passwords, your connected wallet address is the identity used
+                to scope the request — the same trust model already used for our other
+                wallet-scoped endpoints.
               </p>
               <p>
-                For immutable data (blockchain transactions, IPFS-pinned metadata),
-                deletion is not technically possible. We will explain which records
-                are affected if you make a request.
+                An <strong className="text-white">export request</strong> returns a JSON
+                document with all eligible off-chain data linked to your wallet, plus a
+                list of canonical on-chain records (by id/hash) kept for reference.
               </p>
               <p>
-                To exercise any privacy right, contact:{" "}
+                A <strong className="text-white">deletion request</strong> removes eligible
+                off-chain data (e.g. previously generated export documents) and reports
+                exactly which records were retained and why — for immutable data
+                (blockchain transactions, IPFS-pinned metadata) or operator audit records,
+                deletion is not technically or legally possible, and the request result
+                will say so explicitly rather than promising something we can't do.
+              </p>
+              <p>
+                Requests are processed immediately and tracked with a status you can check
+                at any time from the same Settings page.
+              </p>
+              <p>
+                For anything outside the self-service flow, contact:{" "}
                 <a
                   href="mailto:privacy@elcarehub.art"
                   className="text-brand-400 hover:underline"

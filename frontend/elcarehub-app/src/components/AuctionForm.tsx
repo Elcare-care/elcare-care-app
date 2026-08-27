@@ -7,14 +7,16 @@
 import { useState, useRef, useEffect } from "react";
 import Image from "next/image";
 import { useCreateAuction } from "@/hooks/useAuctions";
+import { useIpfsUpload } from "@/hooks/useIpfsUpload";
 import { useWalletContext } from "@/context/WalletContext";
-import { Upload, CheckCircle, Loader2 } from "lucide-react";
+import { Upload, CheckCircle, Loader2, XCircle, RotateCcw } from "lucide-react";
 import { GuardButton } from "./WalletGuard";
+import { IpfsMetadataPreview } from "./IpfsMetadataPreview";
 import { DEFAULT_TOKEN } from "@/config/tokens";
 import { useSupportedTokens } from "@/hooks/useSupportedTokens";
 import { getDefaultSupportedToken } from "@/lib/token-support";
 import { ART_CATEGORIES } from "./ListingForm";
-import { validateIpfsCid } from "@/lib/validation";
+import { validateImageFile, ImageValidationResult } from "@/lib/ipfs";
 
 interface AuctionFormProps {
   onSuccess?: (auctionId: number) => void;
@@ -24,12 +26,13 @@ interface AuctionFormProps {
 export function AuctionForm({ onSuccess, onCancel }: AuctionFormProps) {
   const { publicKey } = useWalletContext();
   const { tokens: availableTokens } = useSupportedTokens();
-  const { create, isCreating, progress, error } = useCreateAuction(publicKey);
+  const { create, isCreating, progress: createProgress, error: createError } = useCreateAuction(publicKey);
+  const ipfsUpload = useIpfsUpload();
 
   const [preview, setPreview] = useState<string | null>(null);
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [successId, setSuccessId] = useState<number | null>(null);
-  const [cidError, setCidError] = useState<string | null>(null);
+  const [fileError, setFileError] = useState<string | null>(null);
   const [form, setForm] = useState({
     title: "",
     description: "",
@@ -39,7 +42,6 @@ export function AuctionForm({ onSuccess, onCancel }: AuctionFormProps) {
     reservePriceXlm: 1,
     durationHours: 24,
     tokenAddress: DEFAULT_TOKEN.address,
-    metadataCid: "",
   });
 
   const fileRef = useRef<HTMLInputElement>(null);
@@ -59,7 +61,19 @@ export function AuctionForm({ onSuccess, onCancel }: AuctionFormProps) {
     }
   }, [availableTokens, form.tokenAddress]);
 
-  const handleFile = (file: File) => {
+  // Issue #530: run client-side file validation (MIME/size/dimensions) at
+  // the moment a file is selected, regardless of whether it came from the
+  // file picker or a drag-and-drop — every entry point must be validated.
+  const handleFile = async (file: File) => {
+    ipfsUpload.reset();
+    setFileError(null);
+    const validation: ImageValidationResult = await validateImageFile(file);
+    if (!validation.valid) {
+      setFileError(validation.messages.join(" "));
+      setSelectedFile(null);
+      setPreview(null);
+      return;
+    }
     setSelectedFile(file);
     setPreview(URL.createObjectURL(file));
   };
@@ -72,19 +86,41 @@ export function AuctionForm({ onSuccess, onCancel }: AuctionFormProps) {
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!selectedFile) return;
+    if (!selectedFile || fileError) return;
 
-    // Validate CID before submitting — avoids a contract InvalidCid revert
-    const err = validateIpfsCid(form.metadataCid);
-    setCidError(err);
-    if (err) return;
+    // Step 1: validate + upload image and metadata to IPFS, then verify the
+    // returned CIDs actually resolve to the submitted content. The on-chain
+    // transaction is only ever attempted once this pipeline reaches
+    // "success" — a failed or unverified upload never reaches step 2.
+    const uploadResult = await ipfsUpload.start({
+      imageFile: selectedFile,
+      name: form.title,
+      buildMetadata: (imageCid) => ({
+        title: form.title,
+        description: form.description,
+        artist: form.artistName,
+        image: imageCid ?? "",
+        year: form.year,
+        category: form.category,
+      }),
+    });
+    if (!uploadResult) return;
 
-    const id = await create({ ...form, imageFile: selectedFile });
+    // Step 2: create the on-chain auction using the verified metadata CID.
+    const id = await create({
+      ...form,
+      imageFile: selectedFile,
+      verifiedMetadataCid: uploadResult.metadataCid,
+    });
     if (id !== null) {
       setSuccessId(id);
       onSuccess?.(id);
     }
   };
+
+  const isUploading = ipfsUpload.isActive;
+  const isBusy = isUploading || isCreating;
+  const progress = isUploading ? ipfsUpload.progressLabel : createProgress;
 
   if (successId !== null) {
     return (
@@ -154,7 +190,7 @@ export function AuctionForm({ onSuccess, onCancel }: AuctionFormProps) {
                   Select Artwork
                 </p>
                 <p className="mt-1 text-sm text-brand-400 font-inter">
-                  PNG, JPG, GIF or WEBP — max 50 MB
+                  JPEG, PNG, GIF, WEBP or SVG — max 20 MB
                 </p>
               </div>
             )}
@@ -169,44 +205,14 @@ export function AuctionForm({ onSuccess, onCancel }: AuctionFormProps) {
               }}
             />
           </div>
+          {fileError && (
+            <p className="text-sm text-red-600" role="alert">
+              {fileError}
+            </p>
+          )}
 
           {/* Fields */}
           <div className="grid gap-6 sm:grid-cols-2">
-
-            {/* Metadata CID */}
-            <div className="sm:col-span-2 space-y-2">
-              <label className="block text-sm font-bold text-gray-950 uppercase tracking-wider font-inter">
-                Artwork Metadata CID *
-              </label>
-              <input
-                required
-                value={form.metadataCid}
-                onChange={(e) => {
-                  const val = e.target.value;
-                  setForm({ ...form, metadataCid: val });
-                  setCidError(validateIpfsCid(val));
-                }}
-                onBlur={() => setCidError(validateIpfsCid(form.metadataCid))}
-                aria-invalid={!!cidError}
-                aria-describedby={cidError ? "err-auction-cid" : undefined}
-                className={`w-full rounded-2xl border px-5 py-4 text-base font-mono focus:outline-none transition-all shadow-sm font-inter ${
-                  cidError
-                    ? "border-red-400 bg-red-50/40 focus:border-red-500"
-                    : "border-gray-200 bg-gray-50/50 focus:border-brand-500 focus:bg-white"
-                }`}
-                placeholder="bafybeig… or Qm…"
-              />
-              {cidError ? (
-                <p id="err-auction-cid" className="text-sm text-red-600 mt-1" role="alert">
-                  {cidError}
-                </p>
-              ) : (
-                <p className="text-xs text-gray-400 font-inter">
-                  CIDv1 starts with <code className="font-mono">b</code> (46–100 chars) or
-                  CIDv0 starts with <code className="font-mono">Qm</code> (46 chars).
-                </p>
-              )}
-            </div>
 
             {/* Title */}
             <div className="sm:col-span-2 space-y-2">
@@ -355,17 +361,74 @@ export function AuctionForm({ onSuccess, onCancel }: AuctionFormProps) {
             </div>
           </div>
 
-          {/* Progress / error */}
-          {isCreating && progress && (
-            <div className="flex items-center gap-3 rounded-2xl bg-brand-50 px-6 py-4 text-sm font-semibold text-brand-700 animate-pulse">
-              <Loader2 size={20} className="animate-spin" />
-              {progress}
+          {/* Upload pipeline progress — validate → upload image → upload
+              metadata → verify (Issue #530). Distinct from the on-chain
+              transaction progress reported by useCreateAuction. */}
+          {isUploading && progress && (
+            <div className="flex items-center justify-between gap-3 rounded-2xl bg-brand-50 px-6 py-4 text-sm font-semibold text-brand-700">
+              <span className="flex items-center gap-3">
+                <Loader2 size={20} className="animate-spin" />
+                {progress}
+              </span>
+              <button
+                type="button"
+                onClick={ipfsUpload.cancel}
+                className="flex items-center gap-1.5 rounded-xl px-3 py-1.5 text-xs font-bold text-brand-700 hover:bg-brand-100 transition-all"
+              >
+                <XCircle size={14} />
+                Cancel
+              </button>
             </div>
           )}
-          {error && (
+          {isCreating && !isUploading && createProgress && (
+            <div className="flex items-center gap-3 rounded-2xl bg-brand-50 px-6 py-4 text-sm font-semibold text-brand-700 animate-pulse">
+              <Loader2 size={20} className="animate-spin" />
+              {createProgress}
+            </div>
+          )}
+
+          {/* Upload errors — distinguishes validation, upload, verification
+              and cancellation failures, and offers a resumable retry. */}
+          {ipfsUpload.state === "error" && ipfsUpload.error && (
+            <div className="flex items-start justify-between gap-3 rounded-2xl bg-red-50 px-6 py-4 text-sm border border-red-100">
+              <div>
+                <p className="font-bold text-red-700">
+                  {ipfsUpload.error.kind === "verification"
+                    ? "Verification failed"
+                    : ipfsUpload.error.kind === "cancelled"
+                    ? "Upload cancelled"
+                    : ipfsUpload.error.kind === "validation"
+                    ? "Invalid metadata"
+                    : "Upload failed"}
+                </p>
+                <p className="text-red-600 mt-0.5">{ipfsUpload.error.message}</p>
+              </div>
+              {ipfsUpload.error.kind !== "cancelled" && (
+                <button
+                  type="button"
+                  onClick={() => ipfsUpload.retry()}
+                  className="flex shrink-0 items-center gap-1.5 rounded-xl bg-red-100 px-3 py-2 text-xs font-bold text-red-700 hover:bg-red-200 transition-all"
+                >
+                  <RotateCcw size={14} />
+                  Retry
+                </button>
+              )}
+            </div>
+          )}
+          {createError && (
             <p className="rounded-2xl bg-red-50 px-6 py-4 text-sm font-bold text-red-600 border border-red-100">
-              {error}
+              {createError}
             </p>
+          )}
+
+          {/* Verified upload preview — confirms the fields the indexer will
+              actually store (title/description/artist) before the on-chain
+              transaction is submitted. */}
+          {ipfsUpload.state === "success" && ipfsUpload.metadataResult && (
+            <IpfsMetadataPreview
+              cid={ipfsUpload.metadataResult.cid}
+              metadata={ipfsUpload.metadata}
+            />
           )}
 
           {/* Buttons */}
@@ -374,7 +437,7 @@ export function AuctionForm({ onSuccess, onCancel }: AuctionFormProps) {
               <button
                 type="button"
                 onClick={onCancel}
-                disabled={isCreating}
+                disabled={isBusy}
                 className="flex-1 rounded-2xl border border-gray-200 py-4 text-lg font-semibold text-gray-600 hover:bg-gray-50 transition-all disabled:opacity-50"
               >
                 Cancel
@@ -382,11 +445,11 @@ export function AuctionForm({ onSuccess, onCancel }: AuctionFormProps) {
             )}
             <GuardButton
               type="submit"
-              disabled={isCreating || !hasTokenOptions || !selectedFile || !!cidError}
+              disabled={isBusy || !hasTokenOptions || !selectedFile || !!fileError}
               actionName="to create your auction"
               className="flex-[2] flex items-center justify-center gap-3 rounded-2xl bg-brand-500 py-5 text-xl font-bold text-white shadow-2xl shadow-brand-500/30 hover:bg-brand-600 hover:scale-[1.01] transition-all active:scale-[0.98] disabled:opacity-50 disabled:hover:scale-100"
             >
-              {isCreating ? (
+              {isBusy ? (
                 <>
                   <Loader2 size={24} className="animate-spin" />
                   {progress || "Processing…"}
