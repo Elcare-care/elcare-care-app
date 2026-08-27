@@ -10,7 +10,9 @@ import { useWallet } from "@/hooks/useWallet";
 import { useAdminStats, useModeration, useTokenManagement, useAdminCheck, useAdminTransfer, usePauseControls, useAuctionConfig, useListingOversight, useModerationQueue, PAUSABLE_FUNCTIONS, type PausableFunction } from "@/hooks/useAdmin";
 import { MODERATION_POLICY_URL } from "@/lib/moderation";
 import { useAdminSession } from "@/hooks/useAdminSession";
+import { useIndexerFreshness } from "@/hooks/useIndexerFreshness";
 import { AdminConfirmationModal } from "@/components/AdminConfirmationModal";
+import ModerationQueue from "@/components/ModerationQueue";
 import {
     Users,
     Palette,
@@ -44,6 +46,8 @@ import {
     ExternalLink,
 } from "lucide-react";
 import { stroopsToXlm } from "@/lib/contract";
+import { getNativeTokenConfig } from "@/config/tokens";
+import { validateAmountInput } from "@/lib/amount";
 
 // ── Admin key rotation helpers (Issue #202) ───────────────────────────────────
 
@@ -153,6 +157,27 @@ export default function AdminPage() {
         refresh: refreshModeration,
     } = useModerationQueue(isAdmin ? publicKey : null);
     const [moderationReason, setModerationReason] = useState("");
+
+    // Issue #522 — indexer freshness/health for the admin dashboard. Admin
+    // views drive moderation and oversight decisions off indexed data, so a
+    // lagging/unavailable indexer (or an active reorg) must be visible here
+    // too, not just on public-facing pages.
+    const refreshAdminData = useCallback(async () => {
+        await Promise.all([
+            refreshStats(),
+            refreshTokens(),
+            refreshOversight(),
+            refreshModeration(),
+        ]);
+    }, [refreshStats, refreshTokens, refreshOversight, refreshModeration]);
+    const freshness = useIndexerFreshness({
+        resourceType: "default",
+        onRefresh: refreshAdminData,
+    });
+    useEffect(() => {
+        if (stats) freshness.markUpdated();
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [stats]);
 
     // Collection rows for circuit-breaker (loaded from indexer on mount)
     const [collectionPauseRows, setCollectionPauseRows] = useState<
@@ -490,6 +515,19 @@ export default function AdminPage() {
                     </div>
                 </div>
 
+                {/* Issue #522 — non-blocking indexer freshness indicator */}
+                {freshness.status !== "healthy" && (
+                    <div className="mb-8">
+                        <StaleBanner
+                            freshness={freshness.freshness}
+                            status={freshness.status}
+                            reorg={freshness.reorg}
+                            onRefresh={freshness.refresh}
+                            isRefreshing={freshness.isRefreshing}
+                        />
+                    </div>
+                )}
+
                 <div className="mb-12 grid gap-6 sm:grid-cols-2 lg:grid-cols-4">
                     <StatCard
                         title="Total Listed NFTs"
@@ -597,6 +635,11 @@ export default function AdminPage() {
                                 </div>
                             </div>
                         )}
+                    </section>
+
+                    {/* Content Moderation Queue (Issue #534) */}
+                    <section className="lg:col-span-2 rounded-3xl">
+                        <ModerationQueue />
                     </section>
 
                     {/* Treasury Balances */}
@@ -809,10 +852,12 @@ export default function AdminPage() {
                                         disabled={isAuctionConfigProcessing}
                                         onClick={async () => {
                                             const input = document.getElementById('min-bid-input') as HTMLInputElement;
-                                            const value = parseFloat(input.value);
-                                            if (isNaN(value) || value <= 0) return;
-                                            const stroops = Math.floor(value * 10_000_000);
-                                            await setMinBid(BigInt(stroops));
+                                            // Bigint-safe parse (Issue #521) — the previous
+                                            // `Math.floor(value * 10_000_000)` was literal
+                                            // floating-point arithmetic on the submitted amount.
+                                            const result = validateAmountInput(input.value, getNativeTokenConfig());
+                                            if (!result.valid || result.baseUnits === null) return;
+                                            await setMinBid(result.baseUnits);
                                             input.value = '';
                                         }}
                                         className="mt-5 flex items-center gap-2 rounded-xl bg-purple-600 px-5 py-2.5 text-sm font-bold text-white transition-all hover:bg-purple-700 disabled:opacity-50 shadow-md shadow-purple-200"

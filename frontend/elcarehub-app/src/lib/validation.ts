@@ -2,31 +2,59 @@
 // lib/validation.ts — Shared validation utilities
 // ─────────────────────────────────────────────────────────────
 
-/**
- * Returns true if the given string looks like a valid Stellar public key (G...)
- * or a valid Stellar contract address (C...).
- *
- * Stellar addresses are 56-character base-32 strings:
- *   - Public keys start with G
- *   - Contract addresses start with C
- */
-export function isValidStellarAddress(address: string): boolean {
-  if (!address || typeof address !== "string") return false;
-  const trimmed = address.trim();
-  // Must be 56 characters, start with G (public key) or C (contract/muxed)
+import { StrKey } from "@stellar/stellar-sdk";
+
+/** Format-only fallback: 56-char base32 string starting with G, C, or M. */
+function looksLikeStellarAddress(trimmed: string): boolean {
   if (trimmed.length !== 56) return false;
   if (!/^[GCM]/.test(trimmed)) return false;
-  // Must consist only of base-32 characters (uppercase alphanumeric excluding 0, O, I, L)
   return /^[A-Z2-7]{56}$/.test(trimmed);
 }
 
 /**
- * Returns true if the given string looks like a valid Stellar public key (G...).
+ * Returns true if the given string is a checksum-valid Stellar address:
+ *   - G... — Ed25519 public key (verified via StrKey checksum)
+ *   - C... — contract address (verified via StrKey checksum)
+ *   - M... — muxed account (verified via StrKey checksum)
+ *
+ * Falls back to format-only regex validation for any address kind the
+ * installed `@stellar/stellar-sdk` version does not expose a StrKey
+ * checksum verifier for.
+ */
+export function isValidStellarAddress(address: string): boolean {
+  if (!address || typeof address !== "string") return false;
+  const trimmed = address.trim();
+  if (!looksLikeStellarAddress(trimmed)) return false;
+
+  try {
+    switch (trimmed[0]) {
+      case "G":
+        return StrKey.isValidEd25519PublicKey(trimmed);
+      case "C":
+        return StrKey.isValidContract(trimmed);
+      case "M":
+        return StrKey.isValidMed25519PublicKey(trimmed);
+      default:
+        // Unreachable given looksLikeStellarAddress, but fall back safely.
+        return true;
+    }
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Returns true if the given string is a checksum-valid Stellar public key (G...).
  */
 export function isValidStellarPublicKey(address: string): boolean {
   if (!address || typeof address !== "string") return false;
   const trimmed = address.trim();
-  return trimmed.length === 56 && /^G[A-Z2-7]{55}$/.test(trimmed);
+  if (trimmed.length !== 56 || !/^G[A-Z2-7]{55}$/.test(trimmed)) return false;
+  try {
+    return StrKey.isValidEd25519PublicKey(trimmed);
+  } catch {
+    return false;
+  }
 }
 
 // ── IPFS CID validation (Issue #206) ─────────────────────────────────────────
@@ -83,4 +111,79 @@ export function validateIpfsCid(cid: string): string | null {
     return null;
   }
   return "Invalid CID: must start with 'b' (CIDv1 base32) or 'Qm' (CIDv0 base58).";
+}
+
+// ── Collection metadata validation (Issue #476) ───────────────────────────────
+//
+// These constraints mirror the on-chain rules in contracts/*/src/metadata.rs
+// exactly. Changing either side without updating the other will cause the
+// preflight to pass while the transaction rejects (or vice versa).
+
+/** Maximum collection name length in UTF-8 bytes (mirrors metadata.rs MAX_NAME_LEN). */
+export const COLLECTION_NAME_MAX_BYTES = 64;
+/** Maximum collection symbol length in UTF-8 bytes (mirrors metadata.rs MAX_SYMBOL_LEN). */
+export const COLLECTION_SYMBOL_MAX_BYTES = 16;
+/** Maximum per-token or base URI length in bytes (mirrors MAX_URI_LEN). */
+export const COLLECTION_URI_MAX_BYTES = 2048;
+/** Maximum max_supply value accepted at initialise (mirrors MAX_SUPPLY_LIMIT). */
+export const COLLECTION_MAX_SUPPLY_LIMIT = 1_000_000_000;
+
+/**
+ * Validates a collection name.
+ * @returns `null` when valid, or a human-readable error string.
+ */
+export function validateCollectionName(name: string): string | null {
+  if (!name || name.trim().length === 0) {
+    return "Collection name cannot be empty.";
+  }
+  const byteLen = new TextEncoder().encode(name).length;
+  if (byteLen > COLLECTION_NAME_MAX_BYTES) {
+    return `Collection name is too long (${byteLen} bytes). Maximum is ${COLLECTION_NAME_MAX_BYTES} bytes.`;
+  }
+  return null;
+}
+
+/**
+ * Validates a collection symbol (721-shaped collections only).
+ * @returns `null` when valid, or a human-readable error string.
+ */
+export function validateCollectionSymbol(symbol: string): string | null {
+  if (!symbol || symbol.trim().length === 0) {
+    return "Collection symbol cannot be empty.";
+  }
+  const byteLen = new TextEncoder().encode(symbol).length;
+  if (byteLen > COLLECTION_SYMBOL_MAX_BYTES) {
+    return `Collection symbol is too long (${byteLen} bytes). Maximum is ${COLLECTION_SYMBOL_MAX_BYTES} bytes.`;
+  }
+  return null;
+}
+
+/**
+ * Validates a collection max_supply value.
+ * @returns `null` when valid, or a human-readable error string.
+ */
+export function validateCollectionMaxSupply(maxSupply: number | string): string | null {
+  const val = typeof maxSupply === "string" ? parseInt(maxSupply, 10) : maxSupply;
+  if (!Number.isFinite(val) || val <= 0) {
+    return "Max supply must be greater than zero.";
+  }
+  if (val > COLLECTION_MAX_SUPPLY_LIMIT) {
+    return `Max supply cannot exceed ${COLLECTION_MAX_SUPPLY_LIMIT.toLocaleString()}.`;
+  }
+  return null;
+}
+
+/**
+ * Validates a token URI or base URI string.
+ * @returns `null` when valid, or a human-readable error string.
+ */
+export function validateCollectionUri(uri: string): string | null {
+  if (!uri || uri.length === 0) {
+    return "URI cannot be empty.";
+  }
+  const byteLen = new TextEncoder().encode(uri).length;
+  if (byteLen > COLLECTION_URI_MAX_BYTES) {
+    return `URI is too long (${byteLen} bytes). Maximum is ${COLLECTION_URI_MAX_BYTES} bytes.`;
+  }
+  return null;
 }

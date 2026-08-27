@@ -356,6 +356,18 @@ export async function revertLedgers(safeAtLedger: number): Promise<void> {
         // the primary rollback already completed above.
       }
     }
+
+    // Revert staged (pending) offers from the rolled-back ledger range.
+    // These are OFFER_MADE events whose parent listing had not yet arrived —
+    // if the listing was also in the reorg window, the staged offer must go too.
+    try {
+      await (tx as any).$executeRawUnsafe(
+        `SELECT revert_pending_offers($1)`,
+        safeAtLedger,
+      );
+    } catch {
+      // Non-fatal: the function may not exist in test/older environments.
+    }
   });
   const rollbackDurationSec = (Date.now() - rollbackStart) / 1000;
   reorgRollbackDurationSeconds.observe(rollbackDurationSec);
@@ -982,7 +994,7 @@ export async function applyDecodedEvents(decodedEvents: any[], tx: any) {
 }
 
 export async function processEvent(event: any, tx?: any, skipInsert = false) {
-  const { eventType, listingId, actor, ledgerSequence, data } = event;
+  const { eventType, listingId, actor, ledgerSequence, data, txHash } = event;
   const db = tx ?? prisma;
 
   // ── Measure per-event-type processing time ────────────────────────────────
@@ -1021,10 +1033,14 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
           kind: kindMap[eventType],
           creator: creatorAddr,
           deployedAtLedger: ledgerSequence,
+          // Issue #476: collections deployed via the updated launchpad have
+          // passed the shared metadata validation rules.
+          metadataStatus: 'valid',
         },
         update: {
           creator: creatorAddr,
           deployedAtLedger: ledgerSequence,
+          metadataStatus: 'valid',
         },
       });
       // Invalidate collections cache
@@ -1076,6 +1092,19 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
         ? chainListing.recipients.map((r: any) => ({ address: r.address.toString(), percentage: Number(r.percentage) }))
         : [];
 
+      // Resolve token metadata version for snapshotting — fire-and-forget
+      // safe because the result is used for the new column only.
+      let listingTokenMetadataVersion: number | null = null;
+      if (token) {
+        try {
+          const { resolveTokenMetadata } = await import('./token-metadata.js');
+          const meta = await resolveTokenMetadata(token);
+          listingTokenMetadataVersion = meta.metadataVersion;
+        } catch {
+          // Non-fatal: version snapshot is best-effort
+        }
+      }
+
       // Ensure the row exists, then apply data only if this event is not
       // stale — a late-arriving LISTING_CREATED must not reset a listing
       // that has since been sold or cancelled back to Active.
@@ -1085,10 +1114,16 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
           listingId, artist, owner: null, price, currency, collection,
           nftTokenId, token, status: 'Active' as const, recipients,
           createdAtLedger: ledgerSequence, updatedAtLedger: ledgerSequence,
+          ...(listingTokenMetadataVersion !== null
+            ? { tokenMetadataVersion: listingTokenMetadataVersion }
+            : {}),
         },
         update: {
           artist, price, collection, nftTokenId,
           status: 'Active' as const, recipients, updatedAtLedger: ledgerSequence,
+          ...(listingTokenMetadataVersion !== null
+            ? { tokenMetadataVersion: listingTokenMetadataVersion }
+            : {}),
         },
       });
 
@@ -1274,17 +1309,22 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
         ? chainAuction.recipients.map((r: any) => ({ address: r.address.toString(), percentage: Number(r.percentage) }))
         : [];
 
+      const maxExtensions = chainAuction?.max_extensions != null
+        ? Number(chainAuction.max_extensions)
+        : 0;
+
       await db.auction.upsert({
         where: { auctionId: listingId },
         create: {
           auctionId: listingId, creator, collection, nftTokenId, token, reservePrice,
           highestBid: '0', highestBidder: null, endTime, status: 'Active' as const,
           recipients, createdAtLedger: ledgerSequence, updatedAtLedger: ledgerSequence,
-          extensionCount: 0, originalEndTime: endTime,
+          extensionCount: 0, originalEndTime: endTime, maxExtensions,
         },
         update: {
           creator, collection, nftTokenId, token, reservePrice, endTime,
           status: 'Active' as const, recipients, updatedAtLedger: ledgerSequence,
+          maxExtensions,
         },
       });
 
@@ -1330,16 +1370,30 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
     }
 
     case 'AUCTION_RESOLVED': {
+      const winner: string | null = data.winner || null;
       const { count } = await db.auction.updateMany({
         where: { auctionId: listingId, updatedAtLedger: { lte: ledgerSequence } },
         data: {
           status: 'Finalized' as const,
           highestBid: data.amount,
-          highestBidder: data.winner || null,
+          highestBidder: winner,
           updatedAtLedger: ledgerSequence,
         },
       });
       if (count === 0) logger.error('AUCTION_RESOLVED: auction not found — resolution not recorded', { eventType, auctionId: listingId?.toString(), ledger: ledgerSequence });
+
+      // Mark all losing bids as Refundable (Issue #466). The winner's bid stays None
+      // because their funds went to the seller; only genuinely losing bids need recovery.
+      if (listingId != null) {
+        await db.bid.updateMany({
+          where: {
+            auctionId: listingId,
+            ...(winner ? { bidder: { not: winner } } : {}),
+            refundStatus: 'None',
+          },
+          data: { refundStatus: 'Refundable' },
+        });
+      }
 
       auctionFinalizationsTotal.inc();
       invalidateAuction(listingId.toString()).catch(() => {});
@@ -1376,7 +1430,66 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
       break;
     }
 
+    case 'AUCTION_BID_REFUNDED': {
+      // Mark the refunded bid as Claimed so the UI shows the correct state (Issue #466).
+      // The event carries bidder + auction_id; we update the most-recent Bid row for
+      // this (auctionId, bidder) pair (the one with the highest ledgerSequence).
+      if (listingId != null) {
+        const latestBid = await db.bid.findFirst({
+          where: { auctionId: listingId, bidder: data.bidder },
+          orderBy: { ledgerSequence: 'desc' },
+        });
+        if (latestBid) {
+          await db.bid.update({
+            where: { id: latestBid.id },
+            data: { refundStatus: 'Claimed' },
+          });
+        }
+      }
+      break;
+    }
+
+    case 'AUCTION_RESERVE_UPDATED': {
+      // Update the stored reserve price when the creator makes a pre-bid change (Issue #467).
+      if (listingId != null) {
+        const { count } = await db.auction.updateMany({
+          where: { auctionId: listingId },
+          data: {
+            reservePrice: data.new_reserve_price,
+            updatedAtLedger: ledgerSequence,
+          },
+        });
+        if (count === 0) logger.warn('AUCTION_RESERVE_UPDATED: auction not found', { eventType, auctionId: listingId?.toString(), ledger: ledgerSequence });
+      }
+      invalidateAuction(listingId?.toString() ?? '').catch(() => {});
+      break;
+    }
+
     case 'TOKEN_WHITELISTED': {
+      // Upsert the whitelist row.  On a re-add (previously removed token), reset
+      // active + housekeeping fields but preserve metadataVersion so the version
+      // history is not reset if the token simply got re-listed.
+      const existing = await db.whitelistedToken.findUnique({
+        where: { address: data.token },
+        select: { metadataVersion: true },
+      }).catch(() => null);
+
+      const decimalsFromEvent: number | undefined =
+        typeof data.decimals === 'number' ? data.decimals : undefined;
+      const symbolFromEvent: string | undefined =
+        typeof data.symbol === 'string' ? data.symbol : undefined;
+      const nameFromEvent: string | undefined =
+        typeof data.name === 'string' ? data.name : undefined;
+
+      // A metadata change (new decimal value or first-time addition) bumps the version.
+      const hasNewMetadata =
+        !existing ||
+        decimalsFromEvent !== undefined ||
+        symbolFromEvent !== undefined;
+      const nextVersion = hasNewMetadata
+        ? (existing?.metadataVersion ?? 0) + 1
+        : (existing?.metadataVersion ?? 1);
+
       await db.whitelistedToken.upsert({
         where: { address: data.token },
         create: {
@@ -1384,6 +1497,11 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
           active: true,
           addedAtLedger: ledgerSequence,
           addedBy: data.added_by,
+          metadataVersion: nextVersion,
+          decimals: decimalsFromEvent ?? null,
+          symbol: symbolFromEvent ?? null,
+          name: nameFromEvent ?? null,
+          sourceLedger: ledgerSequence,
         },
         update: {
           active: true,
@@ -1391,8 +1509,56 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
           addedBy: data.added_by,
           removedAtLedger: null,
           removedBy: null,
+          ...(hasNewMetadata ? {
+            metadataVersion: nextVersion,
+            decimals: decimalsFromEvent ?? undefined,
+            symbol: symbolFromEvent ?? undefined,
+            name: nameFromEvent ?? undefined,
+            sourceLedger: ledgerSequence,
+          } : {}),
         },
       });
+
+      // Record a history row for every version bump so the audit trail is complete.
+      if (hasNewMetadata) {
+        try {
+          await (db as any).tokenMetadataHistory.create({
+            data: {
+              address: data.token,
+              version: nextVersion,
+              decimals: decimalsFromEvent ?? null,
+              symbol: symbolFromEvent ?? null,
+              name: nameFromEvent ?? null,
+              sourceLedger: ledgerSequence,
+              active: true,
+            },
+          });
+        } catch {
+          // Duplicate version on replay — safe to ignore (unique constraint).
+        }
+
+        // Evict in-process metadata cache and invalidate Redis keys for all rows
+        // that referenced the old decimal precision.
+        try {
+          const { applyTokenMetadataVersionChange } = await import('./token-metadata.js');
+          // Fire-and-forget: cache invalidation must not block the event transaction.
+          applyTokenMetadataVersionChange(
+            data.token,
+            decimalsFromEvent ?? null,
+            ledgerSequence,
+            symbolFromEvent,
+            nameFromEvent,
+          ).catch((err: unknown) => {
+            logger.warn('[processEvent] Token metadata cache invalidation failed', {
+              token: data.token, err: err instanceof Error ? err.message : String(err),
+            });
+          });
+        } catch {
+          // token-metadata module unavailable in test env — non-fatal.
+        }
+      }
+
+      invalidateConfig().catch(() => {});
       break;
     }
 
@@ -1411,18 +1577,76 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
 
     case 'OFFER_MADE': {
       const offerExpiresAt = data.expires_at != null ? BigInt(data.expires_at) : null;
+      // #528: escrowTxHash records the tx that moved funds into escrow, so
+      // the offers UI can link directly to it. Falls back to null for events
+      // replayed without a tx hash (e.g. some test fixtures).
+      const escrowTxHash = txHash || null;
+      const offerListingId = BigInt(data.listing_id);
+
+      // Check whether the parent listing exists; if not, stage in PendingOffer
+      // so out-of-order ingestion (OFFER_MADE before LISTING_CREATED) is handled
+      // without breaking idempotency or blocking reorg rollback.
+      const listingExists = await db.listing.findUnique({
+        where: { listingId: offerListingId },
+        select: { listingId: true },
+      }).catch(() => null);
+
+      if (!listingExists) {
+        // Stage in PendingOffer — will be promoted by the DB trigger when
+        // LISTING_CREATED for this listingId is ingested.
+        await (db as any).pendingOffer.upsert({
+          where: { offerId: BigInt(data.offer_id) },
+          create: {
+            offerId: BigInt(data.offer_id),
+            listingId: offerListingId,
+            offerer: String(data.offerer ?? ''),
+            amount: String(data.amount ?? '0'),
+            token: String(data.token ?? ''),
+            expiresAt: offerExpiresAt,
+            escrowTxHash,
+            createdAtLedger: ledgerSequence,
+            updatedAtLedger: ledgerSequence,
+            rawEventData: data,
+          },
+          update: {},
+        });
+        logger.info('[processEvent] Staged OFFER_MADE in PendingOffer (listing not yet indexed)', {
+          offerId: data.offer_id,
+          listingId: data.listing_id,
+          ledger: ledgerSequence,
+        });
+        offersMadeTotal.inc();
+        break;
+      }
+
+      // Resolve token metadata version for snapshotting
+      let offerTokenMetadataVersion: number | null = null;
+      if (data.token) {
+        try {
+          const { resolveTokenMetadata } = await import('./token-metadata.js');
+          const meta = await resolveTokenMetadata(String(data.token));
+          offerTokenMetadataVersion = meta.metadataVersion;
+        } catch {
+          // Non-fatal
+        }
+      }
+
       await db.offer.upsert({
         where: { offerId: BigInt(data.offer_id) },
         create: {
           offerId: BigInt(data.offer_id),
-          listingId: BigInt(data.listing_id),
+          listingId: offerListingId,
           offerer: data.offerer,
           amount: data.amount,
           token: data.token,
           status: 'Pending' as const,
           expiresAt: offerExpiresAt,
+          escrowTxHash,
           createdAtLedger: ledgerSequence,
           updatedAtLedger: ledgerSequence,
+          ...(offerTokenMetadataVersion !== null
+            ? { tokenMetadataVersion: offerTokenMetadataVersion }
+            : {}),
         },
         update: {},
       });
@@ -1430,13 +1654,17 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
       await db.offer.updateMany({
         where: { offerId: BigInt(data.offer_id), updatedAtLedger: { lte: ledgerSequence } },
         data: {
-          listingId: BigInt(data.listing_id),
+          listingId: offerListingId,
           offerer: data.offerer,
           amount: data.amount,
           token: data.token,
           status: 'Pending' as const,
           expiresAt: offerExpiresAt,
+          escrowTxHash,
           updatedAtLedger: ledgerSequence,
+          ...(offerTokenMetadataVersion !== null
+            ? { tokenMetadataVersion: offerTokenMetadataVersion }
+            : {}),
         },
       });
       offersMadeTotal.inc();
@@ -1447,7 +1675,7 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
     case 'OFFER_ACCEPTED': {
       await db.offer.update({
         where: { offerId: BigInt(data.offer_id) },
-        data: { status: 'Accepted' as const, updatedAtLedger: ledgerSequence },
+        data: { status: 'Accepted' as const, refundTxHash: txHash || null, updatedAtLedger: ledgerSequence },
       });
       const { count: listingCount } = await db.listing.updateMany({
         where: { listingId: BigInt(data.listing_id) },
@@ -1468,48 +1696,37 @@ export async function processEvent(event: any, tx?: any, skipInsert = false) {
     case 'OFFER_REJECTED': {
       await db.offer.update({
         where: { offerId: BigInt(data.offer_id) },
-        data: { status: 'Rejected' as const, updatedAtLedger: ledgerSequence },
+        data: { status: 'Rejected' as const, refundTxHash: txHash || null, updatedAtLedger: ledgerSequence },
       });
       invalidateOffer(data.listing_id?.toString()).catch(() => {});
       break;
     }
 
-    case 'OFFER_WITHDRAWN':
-    case 'OFFER_RECLAIMED': {
+    case 'OFFER_WITHDRAWN': {
       await db.offer.update({
         where: { offerId: BigInt(data.offer_id) },
-        data: { status: 'Withdrawn' as const, updatedAtLedger: ledgerSequence },
+        data: { status: 'Withdrawn' as const, refundTxHash: txHash || null, updatedAtLedger: ledgerSequence },
       });
       invalidateOffer(data.listing_id?.toString()).catch(() => {});
       break;
     }
 
     // An expired offer reclaimed by (or on behalf of) its offerer: the contract
-    // refunds the escrow and moves the offer to its Withdrawn terminal state.
-    // Without this case an expired-then-reclaimed offer stays Pending in the DB
-    // forever, misleading artists into thinking it is still acceptable.  The
-    // refunded `amount` travels with the persisted MarketplaceEvent's data.
+    // refunds the escrow and moves the offer to its Reclaimed terminal state.
+    // Uses a ledger-guarded updateMany so stale replays cannot reset a terminal offer.
     case 'OFFER_RECLAIMED': {
       const { count } = await db.offer.updateMany({
-        where: { offerId: BigInt(data.offer_id) },
-        data: {
-          status: 'Withdrawn' as const,
-          updatedAtLedger: ledgerSequence,
-        }
-      });
-      if (count === 0) logger.warn('OFFER_RECLAIMED: offer not found', { eventType, offerId: data.offer_id?.toString(), ledger: ledgerSequence });
-      break;
-    }
-
-    // Terminal state: the offerer reclaimed escrowed funds after expiry.
-    case 'OFFER_RECLAIMED': {
-      await db.offer.updateMany({
         where: { offerId: BigInt(data.offer_id), updatedAtLedger: { lte: ledgerSequence } },
         data: {
           status: 'Reclaimed' as const,
+          refundTxHash: txHash || null,
           updatedAtLedger: ledgerSequence,
-        }
+        },
       });
+      if (count === 0) logger.warn('OFFER_RECLAIMED: offer not found or already terminal', {
+        eventType, offerId: data.offer_id?.toString(), ledger: ledgerSequence,
+      });
+      invalidateOffer(data.listing_id?.toString()).catch(() => {});
       break;
     }
 

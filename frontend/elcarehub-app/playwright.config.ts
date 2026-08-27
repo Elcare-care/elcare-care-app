@@ -15,6 +15,11 @@ export default defineConfig({
     },
     // Work item A: snapshot directory (committed to repo, reviewed in PR diffs)
     snapshotDir: './tests/e2e/snapshots',
+    // Visual regression baselines live under the committed snapshots dir.
+    // {platform} suffix keeps OS-specific font rendering out of PR diffs
+    // (baselines generated on Linux CI will not clash with Windows/macOS runs).
+    snapshotPathTemplate:
+        '{snapshotDir}/{testFileDir}/{testFileName}-snapshots/{arg}{-projectName}{-platform}{ext}',
     projects: [
         {
             name: 'chromium',

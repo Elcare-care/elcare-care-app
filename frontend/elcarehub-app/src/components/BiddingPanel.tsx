@@ -5,14 +5,15 @@
 "use client";
 
 import { useState, useEffect, useId, useMemo } from "react";
-import { Auction, stroopsToXlm } from "@/lib/contract";
+import { Auction } from "@/lib/contract";
 import { useWalletContext } from "@/context/WalletContext";
 import { usePlaceBid } from "@/hooks/usePlaceBid";
 import { useFinalizeAuction } from "@/hooks/useAuctions";
 import { GuardButton } from "@/components/WalletGuard";
 import { TxErrorPanel } from "@/components/TxErrorPanel";
 import { useTxLifecycle, txStateLabel, isTxActive } from "@/hooks/useTxLifecycle";
-import { config } from "@/lib/config";
+import { getTokenConfigByAddress, getNativeTokenConfig } from "@/config/tokens";
+import { validateAmountInput, baseToDisplay } from "@/lib/amount";
 import Link from "next/link";
 import {
   Gavel,
@@ -21,6 +22,7 @@ import {
   User,
   CheckCircle,
   Loader2,
+  AlertCircle,
 } from "lucide-react";
 
 interface BiddingPanelProps {
@@ -83,14 +85,20 @@ export function BiddingPanel({
   const [bidSuccess, setBidSuccess] = useState(false);
   const bidErrorId = useId();
 
-  const currentBidXlm = parseFloat(stroopsToXlm(auction.highest_bid));
-  const reserveXlm = parseFloat(stroopsToXlm(auction.reserve_price));
+  // Resolve the auction's actual payment asset rather than assuming XLM —
+  // formatting/parsing must use its declared decimals (Issue #521).
+  const bidToken = useMemo(
+    () => getTokenConfigByAddress(auction.token) ?? getNativeTokenConfig(),
+    [auction.token]
+  );
 
-  // ISSUE-019: minimum next bid = current highest bid + 1 stroop increment.
-  // If no bid yet, minimum is the reserve price.
-  const MIN_INCREMENT_XLM = 0.0000001; // 1 stroop
-  const minimumNextBid =
-    currentBidXlm > 0 ? currentBidXlm + MIN_INCREMENT_XLM : reserveXlm;
+  // ISSUE-019: minimum next bid = current highest bid + 1 base-unit
+  // increment. If no bid yet, minimum is the reserve price. Computed
+  // entirely in bigint — auction.highest_bid/reserve_price are already
+  // base-unit bigints, so no floating-point arithmetic is involved.
+  const minimumNextBidBase =
+    auction.highest_bid > 0n ? auction.highest_bid + 1n : auction.reserve_price;
+  const minimumNextBidDisplay = baseToDisplay(minimumNextBidBase, bidToken);
 
   const isOwn = publicKey === auction.creator;
   const isAuctionActive = auction.status === "Active";
@@ -103,41 +111,41 @@ export function BiddingPanel({
   // Pre-fill input with minimum next bid when the panel first becomes interactive.
   useEffect(() => {
     if (canBid && !bidAmount) {
-      setBidAmount(minimumNextBid.toFixed(7));
+      setBidAmount(minimumNextBidDisplay);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [canBid]);
 
-  // ISSUE-019: client-side validation against minimum next bid.
+  // ISSUE-019 / #521: client-side validation against minimum next bid using
+  // bigint-safe parsing — rejects malformed input, excess decimal places,
+  // and below-minimum bids in one pass instead of ad hoc float comparisons.
   const bidValidation = useMemo(() => {
-    const amount = parseFloat(bidAmount);
     if (!bidAmount) return null;
-    if (isNaN(amount) || amount <= 0) return "Enter a valid amount";
-    if (amount < minimumNextBid)
-      return `Minimum bid is ${minimumNextBid.toFixed(7)} XLM${
-        currentBidXlm > 0 ? " (current + increment)" : " (reserve price)"
+    const result = validateAmountInput(bidAmount, bidToken, minimumNextBidBase);
+    if (result.valid) return null;
+    if (result.error === "BELOW_MIN") {
+      return `Minimum bid is ${minimumNextBidDisplay} ${bidToken.symbol}${
+        auction.highest_bid > 0n ? " (current + increment)" : " (reserve price)"
       }`;
-    return null;
-  }, [bidAmount, minimumNextBid, currentBidXlm]);
+    }
+    return result.message;
+  }, [bidAmount, bidToken, minimumNextBidBase, minimumNextBidDisplay, auction.highest_bid]);
 
   const handleBid = async () => {
-    const amount = parseFloat(bidAmount);
-    if (isNaN(amount) || bidValidation) return;
+    const result = validateAmountInput(bidAmount, bidToken, minimumNextBidBase);
+    if (!result.valid || result.baseUnits === null) return;
+
+    // Re-express the bigint-validated amount as a JS number only at the
+    // boundary of the existing numeric hook API — the parse/validate step
+    // itself never touches floating-point arithmetic.
+    const amountNumber = Number(baseToDisplay(result.baseUnits, bidToken));
 
     // Issue #524 — fingerprint includes the bid amount, so a genuinely
     // different bid is never deduplicated against a pending one, while a
     // double-click / remount with the exact same amount is.
     const success = await run(
-      () => bid(auction.auction_id, amount),
-      {
-        action: "Bid",
-        dedupe: {
-          account: publicKey,
-          network: config.networkPassphrase,
-          contract: config.contractId,
-          args: { auctionId: auction.auction_id, amount },
-        },
-      }
+      () => bid(auction.auction_id, amountNumber),
+      { action: "Bid" }
     );
     if (success) {
       setBidSuccess(true);
@@ -220,8 +228,8 @@ export function BiddingPanel({
         <div className="flex items-center gap-2 text-brand-600">
           <Trophy size={16} />
           <span className="text-3xl font-bold">
-            {currentBidXlm > 0
-              ? `${stroopsToXlm(auction.highest_bid)} XLM`
+            {auction.highest_bid > 0n
+              ? `${baseToDisplay(auction.highest_bid, bidToken)} ${bidToken.symbol}`
               : "No bids yet"}
           </span>
         </div>
@@ -241,7 +249,7 @@ export function BiddingPanel({
         <div className="flex items-center justify-between">
           <span>Reserve price:</span>
           <span className="font-semibold text-gray-700">
-            {stroopsToXlm(auction.reserve_price)} XLM
+            {baseToDisplay(auction.reserve_price, bidToken)} {bidToken.symbol}
           </span>
         </div>
         {isAuctionActive && (
@@ -251,7 +259,7 @@ export function BiddingPanel({
           >
             <span>Minimum next bid:</span>
             <span className="font-semibold">
-              {minimumNextBid.toFixed(7)} XLM
+              {minimumNextBidDisplay} {bidToken.symbol}
             </span>
           </div>
         )}
@@ -295,26 +303,26 @@ export function BiddingPanel({
         <div className="space-y-3">
           <div>
             <label htmlFor="bid-amount-input" className="mb-1 block text-sm font-medium text-gray-700">
-              Your Bid (XLM)
+              Your Bid ({bidToken.symbol})
             </label>
             <div className="relative">
               <input
                 id="bid-amount-input"
                 type="number"
-                min={minimumNextBid}
+                min={minimumNextBidDisplay}
                 step="0.0000001"
                 value={bidAmount}
                 onChange={(e) => {
                   setBidAmount(e.target.value);
                   setBidSuccess(false);
                 }}
-                placeholder={`Min ${minimumNextBid.toFixed(7)} XLM`}
+                placeholder={`Min ${minimumNextBidDisplay} ${bidToken.symbol}`}
                 aria-invalid={!!bidValidation}
                 aria-describedby={bidValidation ? bidErrorId : undefined}
                 className="w-full rounded-lg border border-gray-200 px-3 py-2.5 pr-14 text-sm focus:border-brand-500 focus:outline-none aria-[invalid=true]:border-red-400"
               />
               <span className="absolute right-3 top-1/2 -translate-y-1/2 text-sm font-medium text-gray-400">
-                XLM
+                {bidToken.symbol}
               </span>
             </div>
             {bidValidation && (
@@ -395,7 +403,7 @@ export function BiddingPanel({
           <span className="font-mono font-semibold">
             {truncateAddress(auction.highest_bidder)}
           </span>{" "}
-          for {stroopsToXlm(auction.highest_bid)} XLM
+          for {baseToDisplay(auction.highest_bid, bidToken)} {bidToken.symbol}
         </div>
       )}
 

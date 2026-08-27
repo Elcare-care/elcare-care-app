@@ -268,7 +268,7 @@ export function queryCostGuard(opts: QueryCostMiddlewareOptions = {}) {
     const hasSort       = q.sort !== undefined || q.cursor_direction === 'asc';
 
     // Count active filter params (not limit/offset/search/sort/pagination)
-    const filterParams  = ['artist', 'owner', 'status', 'creator', 'kind', 'listing_id', 'actionType', 'source'];
+    const filterParams  = ['artist', 'owner', 'status', 'creator', 'kind', 'listing_id', 'actionType', 'source', 'collection', 'token'];
     const activeFilters = filterParams.filter((p) => q[p] !== undefined).length + (hasPriceRange ? 1 : 0);
 
     // Entity-type count for cross-entity search (/search?types=)

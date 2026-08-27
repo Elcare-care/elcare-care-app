@@ -92,6 +92,32 @@ export function decimalStringToBase(input: string, decimals: number): bigint | n
   }
 }
 
+/**
+ * Parse a raw base-unit amount string returned by an API/indexer (e.g. an
+ * aggregate sum) into a bigint, without ever routing it through a JS
+ * float. Base units are always integers; some aggregate endpoints emit a
+ * trailing ".0" (or more), which is simply truncated — the same tolerant
+ * behaviour the previous ad hoc `split(".")[0]` call sites relied on.
+ *
+ * This exists because `BigInt(Math.round(parseFloat(raw)))` — a pattern
+ * that has crept into a few display call sites — silently loses precision
+ * for sums beyond `Number.MAX_SAFE_INTEGER` (~9e15 base units).
+ *
+ * @example
+ * baseUnitsStringToBigInt("15500000")   // 15_500_000n
+ * baseUnitsStringToBigInt("15500000.0") // 15_500_000n
+ * baseUnitsStringToBigInt("")           // 0n
+ */
+export function baseUnitsStringToBigInt(raw: string): bigint {
+  const trimmed = raw.trim();
+  if (!trimmed) return 0n;
+
+  const wholePart = trimmed.split(".")[0];
+  if (!/^-?\d*$/.test(wholePart) || wholePart === "" || wholePart === "-") return 0n;
+
+  return BigInt(wholePart);
+}
+
 // ── Public API ───────────────────────────────────────────────────────────────
 
 /**
@@ -231,6 +257,39 @@ export function formatAmount(
   }).format(num);
 
   return showSymbol ? `${formatted} ${token.symbol}` : formatted;
+}
+
+// ── Basis point helpers ─────────────────────────────────────────────────────
+
+/**
+ * Convert basis points (0–10,000) to a percentage (0–100).
+ *
+ * @example
+ * bpsToPercent(250) // 2.5
+ */
+export function bpsToPercent(bps: number): number {
+  return bps / 100;
+}
+
+/**
+ * Convert a percentage (0–100) to basis points (0–10,000), rounded to the
+ * nearest whole bps.
+ *
+ * @example
+ * percentToBps(2.5) // 250
+ */
+export function percentToBps(percent: number): number {
+  return Math.round(percent * 100);
+}
+
+/**
+ * Format basis points for display alongside their percentage equivalent.
+ *
+ * @example
+ * formatBps(250) // "250 bps (2.50%)"
+ */
+export function formatBps(bps: number): string {
+  return `${bps} bps (${bpsToPercent(bps).toFixed(2)}%)`;
 }
 
 // ── Fee preview ───────────────────────────────────────────────────────────────

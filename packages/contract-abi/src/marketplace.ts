@@ -66,6 +66,9 @@ export interface Auction {
   bid_history_cap: number;
   max_extensions: number;
   extension_count: number;
+  /** Original end time set at auction creation — the extension cap is
+   *  original_end_time + MAX_TOTAL_AUCTION_DURATION. */
+  original_end_time: bigint;
 }
 
 export interface Offer {
@@ -140,6 +143,24 @@ export const MarketplaceErrorCode = {
   NoBidToRefund:            46,
   InvalidExtensionWindow:   47,
   MaxExtensionsReached:     48,
+  NotTokenOwner:            49,
+  TokenAlreadyEscrowed:     50,
+  AuctionDurationLimitReached: 51,
+  NoRoleProposalPending:    52,
+  RoleProposalExpired:      53,
+  RoleTransferToSelf:       54,
+  RoleTransferToContract:   55,
+  TreasuryProposalExpired:  56,
+  NoTreasuryProposalPending: 57,
+  TreasuryProposalSelf:     58,
+  InvalidListingDuration:   59,
+  CollectionIncompatible:   60,
+  BatchItemInvalid:         61,
+  OwnershipMismatch:        62,
+  RoyaltyAlreadyClaimed:    63,
+  RoyaltyClaimNotFound:     64,
+  ReservationWindowActive:  65,
+  InvalidReservationWindow: 66,
 } as const;
 
 export type MarketplaceErrorCode = typeof MarketplaceErrorCode[keyof typeof MarketplaceErrorCode];

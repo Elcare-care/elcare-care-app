@@ -14,6 +14,7 @@ Each runbook covers: detection, containment, diagnosis, recovery, and post-incid
 | [database-outage.md](./database-outage.md) | PostgreSQL unavailable | CRITICAL |
 | [redis-outage.md](./redis-outage.md) | Redis cache unavailable | MEDIUM |
 | [compromised-admin-key.md](./compromised-admin-key.md) | Admin Stellar key exposed or stolen | CRITICAL |
+| [role-rotation.md](./role-rotation.md) | Role-holder rotation procedure (Issue #473) | HIGH |
 | [contract-pause.md](./contract-pause.md) | Emergency pause / unpause procedure | CRITICAL |
 | [pinata-outage.md](./pinata-outage.md) | Pinata/IPFS unavailable | MEDIUM |
 | [wallet-incompatibility.md](./wallet-incompatibility.md) | Freighter or Magic.link failures | HIGH |

@@ -8,6 +8,7 @@ import { useState, useEffect } from "react";
 import { useWalletContext } from "@/context/WalletContext";
 import { useArtistListings, useCancelListing, useCancelListings } from "@/hooks/useMarketplace";
 import { ListingForm } from "@/components/ListingForm";
+import { ListingWizard } from "@/components/ListingWizard";
 import { AuctionForm } from "@/components/AuctionForm";
 import { stroopsToXlm, Listing } from "@/lib/contract";
 import { fetchArtistMetrics, ArtistMetrics, MetricsRange, fetchRoyaltyBreakdown, RoyaltyPaymentRow } from "@/lib/indexer";
@@ -16,6 +17,7 @@ import Link from "next/link";
 import { config } from "@/lib/config";
 import { WalletGuard } from "@/components/WalletGuard";
 import { SUPPORTED_TOKENS } from "@/config/tokens";
+import { baseUnitsStringToBigInt } from "@/lib/amount";
 import { clsx } from "clsx";
 
 type Tab = "listings" | "list" | "edit" | "auction" | "metrics" | "royalties";
@@ -144,10 +146,14 @@ function RoyaltyHistory({ publicKey }: { publicKey: string }) {
                   </Link>
                 </td>
                 <td className="px-6 py-4 text-sm font-mono text-white/70 whitespace-nowrap">
-                  {stroopsToXlm(BigInt(Math.round(parseFloat(p.salePrice))))}
+                  {/* Issue #521: p.salePrice is a raw base-unit (stroops) string
+                      from the indexer — parse it as a bigint directly rather
+                      than routing it through parseFloat/Math.round, which
+                      loses precision for large sums. */}
+                  {stroopsToXlm(baseUnitsStringToBigInt(p.salePrice))}
                 </td>
                 <td className="px-6 py-4 text-sm font-mono font-bold text-mint-400 whitespace-nowrap">
-                  {stroopsToXlm(BigInt(Math.round(parseFloat(p.amount))))}
+                  {stroopsToXlm(baseUnitsStringToBigInt(p.amount))}
                 </td>
                 <td className="px-6 py-4 whitespace-nowrap">
                   <a
@@ -281,8 +287,9 @@ function MetricsDashboard({ publicKey }: { publicKey: string }) {
                   parseFloat/Math.round first (as this used to) both loses
                   precision for large sums and double-applies the stroops→XLM
                   scaling, since stroopsToXlm already divides by 10^7. Parse
-                  the integer part directly as a BigInt instead. */}
-              {stroopsToXlm(BigInt(metrics.totalVolume.split(".")[0] || "0"))}
+                  the integer part directly as a BigInt instead (now shared
+                  via lib/amount.ts's baseUnitsStringToBigInt, Issue #521). */}
+              {stroopsToXlm(baseUnitsStringToBigInt(metrics.totalVolume))}
               <span className="ml-2 text-sm font-normal text-brand-400">XLM</span>
             </p>
           </div>
@@ -571,7 +578,7 @@ export default function DashboardPage() {
               <RoyaltyHistory publicKey={publicKey ?? ""} />
             ) : tab === "list" ? (
               <div className="w-full">
-                <ListingForm
+                <ListingWizard
                   onSuccess={() => {
                     refresh();
                     setTab("listings");

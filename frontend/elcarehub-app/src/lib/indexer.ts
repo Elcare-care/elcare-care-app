@@ -146,6 +146,13 @@ interface RawMarketplaceEvent {
   data: Record<string, unknown>;
   ledgerSequence: number;
   ledgerTimestamp?: string;
+  /** Real Stellar transaction hash, when the indexer captured one. */
+  txHash?: string | null;
+}
+
+/** True for a well-formed 64-hex-character Stellar transaction hash. */
+function isRealTxHash(v: unknown): v is string {
+  return typeof v === "string" && /^[0-9a-fA-F]{64}$/.test(v);
 }
 
 function sleep(ms: number) {
@@ -327,7 +334,7 @@ function mapWalletEventToActivity(
     timestamp: ts,
     from: from || "—",
     to: to || "—",
-    tx_hash: `ledger_${ev.ledgerSequence}`,
+    tx_hash: isRealTxHash(ev.txHash) ? ev.txHash : `ledger_${ev.ledgerSequence}`,
   };
 }
 
@@ -451,6 +458,12 @@ function mapListingHistoryEvent(
   const price = priceField != null ? String(priceField) : "0";
   const artist = addrString(data.artist);
   const buyer = addrString(data.buyer);
+  // Use txHash from the normalized endpoint response when present,
+  // fall back to a synthetic ledger identifier for backwards compatibility.
+  const txHash =
+    (ev as any).txHash ||
+    addrString(data.tx_hash) ||
+    `ledger_${ev.ledgerSequence}`;
 
   return {
     id: `lst_${ev.id}`,
@@ -461,8 +474,15 @@ function mapListingHistoryEvent(
     timestamp: ts,
     from: artist || ev.actor,
     to: buyer || config.contractId,
-    tx_hash: `ledger_${ev.ledgerSequence}`,
-  };
+    tx_hash: txHash,
+    // Pass through confirmation state and ledger info for the timeline component
+    ...(typeof (ev as any).confirmed === "boolean" && {
+      confirmed: (ev as any).confirmed,
+    }),
+    ...(typeof ev.ledgerSequence === "number" && {
+      ledgerSequence: ev.ledgerSequence,
+    }),
+  } as ActivityEvent & { confirmed?: boolean; ledgerSequence?: number };
 }
 
 /**
@@ -690,6 +710,8 @@ export async function fetchAuctions(options: {
 // Bid history — paginated endpoint (Feature B)
 // ─────────────────────────────────────────────────────────────
 
+export type BidRefundStatus = 'None' | 'Refundable' | 'Claimed';
+
 export interface BidHistoryRecord {
   /** Soroban ledger sequence at which the bid was placed. */
   ledger: number;
@@ -699,6 +721,8 @@ export interface BidHistoryRecord {
   amount: string;
   /** Wall-clock timestamp derived from ledger close time (ms since epoch). */
   timestamp?: number;
+  /** Refund eligibility state from indexer (Issue #466). */
+  refundStatus?: BidRefundStatus;
 }
 
 export interface BidHistoryPage {
@@ -779,6 +803,9 @@ function parseBidRecords(raw: unknown[]): BidHistoryRecord[] {
           : typeof item.ledgerTimestamp === "string"
           ? new Date(item.ledgerTimestamp).getTime()
           : undefined,
+      refundStatus: (item.refundStatus === "None" || item.refundStatus === "Refundable" || item.refundStatus === "Claimed")
+        ? (item.refundStatus as BidRefundStatus)
+        : "None",
     }));
 }
 
@@ -1370,6 +1397,9 @@ export interface ActivityFeedEvent {
   data: Record<string, unknown>;
   ledgerSequence: number;
   ledgerTimestamp: string | null;
+  /** Real Stellar transaction hash, when the indexer captured one — usable
+   *  as a direct link to /tx/[hash] for on-chain verification. */
+  txHash?: string | null;
   /** Human-readable summary generated client-side */
   summary?: string;
 }
@@ -1378,6 +1408,20 @@ export interface ActivityFeedEvent {
  * Fetch the most recent marketplace events for the global activity feed.
  * Endpoint: GET /activity/recent
  */
+function mapActivityFeedItem(item: Record<string, unknown>): ActivityFeedEvent {
+  return {
+    id: typeof item.id === "number" ? item.id : 0,
+    eventType: typeof item.eventType === "string" ? item.eventType : "UNKNOWN",
+    listingId: item.listingId != null ? String(item.listingId) : null,
+    actor: typeof item.actor === "string" ? item.actor : "",
+    data: typeof item.data === "object" && item.data !== null
+      ? (item.data as Record<string, unknown>)
+      : {},
+    ledgerSequence: typeof item.ledgerSequence === "number" ? item.ledgerSequence : 0,
+    ledgerTimestamp: typeof item.ledgerTimestamp === "string" ? item.ledgerTimestamp : null,
+  };
+}
+
 export async function fetchRecentActivity(limit = 20): Promise<ActivityFeedEvent[]> {
   try {
     const raw = await fetchWithRetry<unknown>(`/activity/recent?limit=${limit}`);
@@ -1386,19 +1430,88 @@ export async function fetchRecentActivity(limit = 20): Promise<ActivityFeedEvent
       .filter((item): item is Record<string, unknown> =>
         item !== null && typeof item === "object"
       )
-      .map((item) => ({
-        id: typeof item.id === "number" ? item.id : 0,
-        eventType: typeof item.eventType === "string" ? item.eventType : "UNKNOWN",
-        listingId: item.listingId != null ? String(item.listingId) : null,
-        actor: typeof item.actor === "string" ? item.actor : "",
-        data: typeof item.data === "object" && item.data !== null
-          ? (item.data as Record<string, unknown>)
-          : {},
-        ledgerSequence: typeof item.ledgerSequence === "number" ? item.ledgerSequence : 0,
-        ledgerTimestamp: typeof item.ledgerTimestamp === "string" ? item.ledgerTimestamp : null,
-      }));
+      .map(mapActivityFeedItem);
   } catch (e) {
     console.warn("[indexer] fetchRecentActivity:", e instanceof Error ? e.message : e);
     return [];
   }
+}
+
+// ── Cursor-paginated activity feed (Issue #523) ────────────────────────────────
+//
+// Mirrors the standardized cursor pattern used by fetchListings /
+// fetchNextListingsPage / fetchPrevListingsPage: a `cursor_ledger` +
+// `cursor_direction` query pair, with the server returning the cursor for
+// the following page via the `X-Next-Cursor` response header.
+
+export interface FetchActivityPageOptions {
+  limit?: number;
+  /** Cursor ledger from X-Next-Cursor header for cursor-based pagination. */
+  cursor_ledger?: number;
+  /** Direction for cursor pagination: "asc" | "desc" (default "desc"). */
+  cursor_direction?: "asc" | "desc";
+}
+
+export interface ActivityPageResult {
+  events: ActivityFeedEvent[];
+  /** Ledger sequence of the last returned item — pass as cursor_ledger for the next page. */
+  nextCursor: string;
+}
+
+/**
+ * Fetch a cursor-paginated page of the global activity feed from
+ * GET /activity/recent, following the same cursor convention as
+ * {@link fetchListings}.
+ */
+export async function fetchActivityPage(
+  options: FetchActivityPageOptions = {}
+): Promise<ActivityPageResult> {
+  const params = new URLSearchParams();
+  params.set("limit", String(options.limit ?? 20));
+  if (options.cursor_ledger != null) params.set("cursor_ledger", String(options.cursor_ledger));
+  if (options.cursor_direction) params.set("cursor_direction", options.cursor_direction);
+
+  const url = `${config.indexerUrl}/activity/recent?${params.toString()}`;
+  try {
+    const res = await axios.get(url, { timeout: DEFAULT_TIMEOUT_MS, validateStatus: (s) => s < 400 });
+    const raw = res.data;
+    const nextCursor = res.headers?.["x-next-cursor"] ?? "";
+    const list: unknown[] = Array.isArray(raw)
+      ? raw
+      : (raw !== null && typeof raw === "object" && Array.isArray((raw as any).events))
+        ? (raw as any).events
+        : [];
+    const events = list
+      .filter((item): item is Record<string, unknown> => item !== null && typeof item === "object")
+      .map(mapActivityFeedItem);
+    return { events, nextCursor };
+  } catch (e) {
+    console.warn("[indexer] fetchActivityPage:", e instanceof Error ? e.message : e);
+    return { events: [], nextCursor: "" };
+  }
+}
+
+/**
+ * Fetch the next (older) page of the activity feed using the cursor
+ * returned by a previous {@link fetchActivityPage} call.
+ */
+export async function fetchNextActivityPage(
+  cursor: string,
+  options: Omit<FetchActivityPageOptions, "cursor_ledger" | "cursor_direction"> = {}
+): Promise<ActivityPageResult> {
+  const ledger = parseInt(cursor, 10);
+  if (!Number.isFinite(ledger)) return { events: [], nextCursor: "" };
+  return fetchActivityPage({ ...options, cursor_ledger: ledger, cursor_direction: "desc" });
+}
+
+/**
+ * Stable, collision-resistant identity for an activity event — used for
+ * virtualized-list row keys and de-duplication across REST pages and
+ * SSE-pushed events. REST rows carry a durable indexer row id; SSE-originated
+ * rows (prepended locally before the indexer assigns/returns one) fall back
+ * to a composite of event type, listing, ledger sequence and actor.
+ */
+export function activityEventKey(event: ActivityFeedEvent): string {
+  if (event.id > 0) return `db:${event.id}`;
+  return `sse:${event.eventType}:${event.listingId ?? ""}:${event.ledgerSequence}:${event.actor}`;
 }

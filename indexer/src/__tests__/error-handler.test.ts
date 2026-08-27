@@ -19,6 +19,7 @@ describe('error shape', () => {
     expect(res.body.error.code).toBe(ErrorCode.BAD_REQUEST);
     expect(res.body.error.message).toBe('Param x is required');
     expect(res.body.error.class).toBe('CLIENT_ERROR');
+    expect(res.body.error.retryable).toBe(false);
   });
 
   it('404 — wraps notFound in standard envelope', async () => {
@@ -28,6 +29,7 @@ describe('error shape', () => {
     expect(res.body.error.code).toBe(ErrorCode.NOT_FOUND);
     expect(res.body.error.message).toBe('Resource not found');
     expect(res.body.error.class).toBe('CLIENT_ERROR');
+    expect(res.body.error.retryable).toBe(false);
   });
 
   it('500 — wraps unknown error without leaking internals', async () => {
@@ -36,6 +38,7 @@ describe('error shape', () => {
     expect(res.status).toBe(500);
     expect(res.body.error.code).toBe(ErrorCode.INTERNAL);
     expect(res.body.error.class).toBe('SERVER_ERROR');
+    expect(res.body.error.retryable).toBe(true);
     expect(JSON.stringify(res.body)).not.toContain('secret db password');
     expect(JSON.stringify(res.body)).not.toContain('stack');
   });
@@ -47,6 +50,7 @@ describe('error shape', () => {
     expect(res.body.error.code).toBe(ErrorCode.INTERNAL);
     expect(res.body.error.message).toBe('Failed to fetch data');
     expect(res.body.error.class).toBe('SERVER_ERROR');
+    expect(res.body.error.retryable).toBe(true);
   });
 
   it('ApiError preserves statusCode and code', () => {
@@ -56,7 +60,7 @@ describe('error shape', () => {
     expect(err.message).toBe('Unprocessable');
   });
 
-  it('all error responses share { error: { code, message, class } } shape', async () => {
+  it('all error responses share { error: { code, message, class, retryable } } shape', async () => {
     const cases: Array<[string, () => ApiError]> = [
       ['400', () => badRequest('bad')],
       ['404', () => notFound('not found')],
@@ -69,6 +73,7 @@ describe('error shape', () => {
       expect(res.body.error, `error.code for ${label}`).toHaveProperty('code');
       expect(res.body.error, `error.message for ${label}`).toHaveProperty('message');
       expect(res.body.error, `error.class for ${label}`).toHaveProperty('class');
+      expect(res.body.error, `error.retryable for ${label}`).toHaveProperty('retryable');
     }
   });
 });

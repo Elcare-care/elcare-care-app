@@ -1,7 +1,8 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useRef, useEffect, useCallback, useMemo, type KeyboardEvent } from "react";
 import Link from "next/link";
+import { useVirtualizer } from "@tanstack/react-virtual";
 import {
   Activity as ActivityIcon,
   RefreshCw,
@@ -14,11 +15,14 @@ import {
   WifiOff,
   TrendingUp,
   AlertCircle,
+  ArrowUp,
+  Loader2,
 } from "lucide-react";
 import { Breadcrumb } from "@/components/Breadcrumb";
 import { useActivityFeed } from "@/hooks/useActivityFeed";
-import { ActivityFeedEvent } from "@/lib/indexer";
+import { ActivityFeedEvent, activityEventKey } from "@/lib/indexer";
 import { formatRelativeTime } from "@/lib/format";
+import { StaleBanner } from "@/components/StaleBanner";
 
 // ── Event type icon mapping ───────────────────────────────────────────────────
 
@@ -84,7 +88,7 @@ function ActivityRow({ event }: { event: ActivityFeedEvent }) {
   return (
     <div
       className="flex items-start gap-3 px-4 py-3 border-b border-white/5 hover:bg-white/[0.03] transition-colors group"
-      data-testid={`activity-event-${event.id}`}
+      data-testid={`activity-event-${activityEventKey(event)}`}
     >
       <div className="mt-0.5">
         <EventIcon eventType={event.eventType} />
@@ -119,8 +123,41 @@ function ActivityRow({ event }: { event: ActivityFeedEvent }) {
               <span className="font-mono">ledger {event.ledgerSequence.toLocaleString()}</span>
             </>
           )}
+          {event.txHash && (
+            <>
+              <span>·</span>
+              {/* Issue #522 — direct on-chain verification path, independent
+                  of whether the indexer's view of this event is current. */}
+              <Link
+                href={`/tx/${event.txHash}`}
+                className="inline-flex items-center gap-0.5 text-brand-400 hover:text-brand-300 transition-colors"
+              >
+                Verify on-chain
+                <ExternalLink size={9} />
+              </Link>
+            </>
+          )}
         </div>
       </div>
+    </div>
+  );
+}
+
+// ── Bottom-of-list loader / end-of-list row ────────────────────────────────────
+
+function TailRow({ isLoadingMore, hasMore }: { isLoadingMore: boolean; hasMore: boolean }) {
+  return (
+    <div className="flex items-center justify-center gap-2 px-4 py-4 text-xs text-gray-500">
+      {isLoadingMore ? (
+        <>
+          <Loader2 size={13} className="animate-spin" />
+          Loading more…
+        </>
+      ) : hasMore ? (
+        <span className="opacity-0">·</span>
+      ) : (
+        <span>End of activity</span>
+      )}
     </div>
   );
 }
@@ -152,13 +189,165 @@ function matchesDomainFilter(event: ActivityFeedEvent, filter: DomainFilter): bo
   return true;
 }
 
+// ── Virtualized, cursor-paginated list ────────────────────────────────────────
+
+const ROW_ESTIMATE_PX = 68;
+const LIST_HEIGHT_CLASS = "h-[65vh] min-h-[420px] max-h-[780px]";
+
+function ActivityList({
+  visible,
+  hasMore,
+  isLoadingMore,
+  loadMoreError,
+  onLoadMore,
+}: {
+  visible: ActivityFeedEvent[];
+  hasMore: boolean;
+  isLoadingMore: boolean;
+  loadMoreError: string | null;
+  onLoadMore: () => void;
+}) {
+  const parentRef = useRef<HTMLDivElement>(null);
+  // One extra virtual row for the trailing loader / end-of-list marker.
+  const rowCount = visible.length + 1;
+
+  const rowVirtualizer = useVirtualizer({
+    count: rowCount,
+    getScrollElement: () => parentRef.current,
+    estimateSize: () => ROW_ESTIMATE_PX,
+    overscan: 8,
+    getItemKey: (index) =>
+      index < visible.length ? activityEventKey(visible[index]) : "__tail__",
+  });
+
+  const virtualItems = rowVirtualizer.getVirtualItems();
+
+  // Infinite loading: once the trailing sentinel row scrolls into range, fetch the next page.
+  useEffect(() => {
+    const last = virtualItems[virtualItems.length - 1];
+    if (!last) return;
+    if (last.index >= visible.length && hasMore && !isLoadingMore) {
+      onLoadMore();
+    }
+  }, [virtualItems, visible.length, hasMore, isLoadingMore, onLoadMore]);
+
+  const handleKeyDown = useCallback(
+    (e: KeyboardEvent<HTMLDivElement>) => {
+      const el = parentRef.current;
+      if (!el) return;
+      switch (e.key) {
+        case "ArrowDown":
+          e.preventDefault();
+          el.scrollBy({ top: ROW_ESTIMATE_PX, behavior: "smooth" });
+          break;
+        case "ArrowUp":
+          e.preventDefault();
+          el.scrollBy({ top: -ROW_ESTIMATE_PX, behavior: "smooth" });
+          break;
+        case "PageDown":
+          e.preventDefault();
+          el.scrollBy({ top: el.clientHeight * 0.9, behavior: "smooth" });
+          break;
+        case "PageUp":
+          e.preventDefault();
+          el.scrollBy({ top: -el.clientHeight * 0.9, behavior: "smooth" });
+          break;
+        case "Home":
+          e.preventDefault();
+          rowVirtualizer.scrollToIndex(0, { align: "start" });
+          break;
+        case "End":
+          e.preventDefault();
+          rowVirtualizer.scrollToIndex(rowCount - 1, { align: "end" });
+          break;
+        default:
+          break;
+      }
+    },
+    [rowVirtualizer, rowCount]
+  );
+
+  return (
+    <div>
+      <div
+        ref={parentRef}
+        className={`${LIST_HEIGHT_CLASS} overflow-y-auto overflow-x-hidden outline-none focus-visible:ring-1 focus-visible:ring-brand-400/60`}
+        role="feed"
+        aria-label="Marketplace activity"
+        tabIndex={0}
+        onKeyDown={handleKeyDown}
+        data-testid="activity-scroll-container"
+      >
+        <div
+          style={{
+            height: `${rowVirtualizer.getTotalSize()}px`,
+            width: "100%",
+            position: "relative",
+          }}
+        >
+          {virtualItems.map((virtualRow) => {
+            const isTailRow = virtualRow.index >= visible.length;
+            return (
+              <div
+                key={virtualRow.key}
+                data-index={virtualRow.index}
+                ref={rowVirtualizer.measureElement}
+                style={{
+                  position: "absolute",
+                  top: 0,
+                  left: 0,
+                  width: "100%",
+                  transform: `translateY(${virtualRow.start}px)`,
+                }}
+              >
+                {isTailRow ? (
+                  <TailRow isLoadingMore={isLoadingMore} hasMore={hasMore} />
+                ) : (
+                  <ActivityRow event={visible[virtualRow.index]} />
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+      {loadMoreError && (
+        <div className="flex items-center justify-between gap-3 px-4 py-2 border-t border-white/5 bg-red-500/5">
+          <span className="text-xs text-red-400">Couldn&apos;t load more: {loadMoreError}</span>
+          <button
+            type="button"
+            onClick={onLoadMore}
+            className="text-xs text-brand-400 hover:text-brand-300 transition-colors shrink-0"
+          >
+            Retry
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ── Page ──────────────────────────────────────────────────────────────────────
 
 export default function ActivityPage() {
   const [domainFilter, setDomainFilter] = useState<DomainFilter>("all");
-  const { events, isLoading, error, sseConnected, refresh } = useActivityFeed(50);
+  const {
+    events,
+    isLoading,
+    isLoadingMore,
+    error,
+    loadMoreError,
+    sseConnected,
+    hasMore,
+    pendingCount,
+    refresh,
+    loadMore,
+    commitPending,
+  } = useActivityFeed(50);
 
-  const visible = events.filter((e) => matchesDomainFilter(e, domainFilter));
+  const visible = useMemo(
+    () => events.filter((e) => matchesDomainFilter(e, domainFilter)),
+    [events, domainFilter]
+  );
 
   return (
     <div className="min-h-screen bg-midnight-950 pt-20">
@@ -212,6 +401,19 @@ export default function ActivityPage() {
           </div>
         </div>
 
+        {/* Issue #522 — non-blocking indexer freshness indicator */}
+        {freshness.status !== "healthy" && (
+          <div className="mb-4">
+            <StaleBanner
+              freshness={freshness.freshness}
+              status={freshness.status}
+              reorg={freshness.reorg}
+              onRefresh={freshness.refresh}
+              isRefreshing={freshness.isRefreshing}
+            />
+          </div>
+        )}
+
         {/* Domain filter tabs */}
         <div className="flex gap-1 mb-4 flex-wrap" role="tablist" aria-label="Filter by domain">
           {(Object.keys(FILTER_LABELS) as DomainFilter[]).map((f) => (
@@ -233,6 +435,20 @@ export default function ActivityPage() {
           ))}
         </div>
 
+        {/* New-activity pill — merges buffered SSE/poll events without ever
+            auto-scrolling or shifting the list the user is currently browsing. */}
+        {pendingCount > 0 && (
+          <button
+            type="button"
+            onClick={commitPending}
+            className="w-full mb-3 flex items-center justify-center gap-2 rounded-xl border border-brand-500/30 bg-brand-500/10 text-brand-300 hover:bg-brand-500/15 transition-colors text-xs font-medium px-3 py-2"
+            data-testid="activity-new-events-pill"
+          >
+            <ArrowUp size={12} />
+            {pendingCount} new event{pendingCount !== 1 ? "s" : ""} — click to view
+          </button>
+        )}
+
         {/* Content */}
         <div className="rounded-2xl border border-white/10 bg-midnight-900 overflow-hidden">
           {isLoading && events.length === 0 ? (
@@ -247,7 +463,7 @@ export default function ActivityPage() {
                 </div>
               ))}
             </div>
-          ) : error ? (
+          ) : error && events.length === 0 ? (
             <div className="flex flex-col items-center gap-2 py-12 text-center px-4">
               <AlertCircle size={32} className="text-red-400" />
               <p className="text-sm font-medium text-white">Failed to load activity</p>
@@ -270,11 +486,13 @@ export default function ActivityPage() {
               </p>
             </div>
           ) : (
-            <div>
-              {visible.map((event) => (
-                <ActivityRow key={`${event.eventType}-${event.id}-${event.ledgerSequence}`} event={event} />
-              ))}
-            </div>
+            <ActivityList
+              visible={visible}
+              hasMore={hasMore}
+              isLoadingMore={isLoadingMore}
+              loadMoreError={loadMoreError}
+              onLoadMore={() => void loadMore()}
+            />
           )}
         </div>
 

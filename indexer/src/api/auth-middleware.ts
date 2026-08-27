@@ -243,6 +243,10 @@ export const OPERATOR_ROUTES = new Set([
   '/admin/dead-letters/{id}/replay',
   // Query cost diagnostics (operator-only)
   '/admin/query-cost',
+  // Abuse detection blocklist management
+  '/admin/abuse/block',
+  '/admin/abuse/block/{key}',
+  '/admin/abuse/blocklist',
 ]);
 
 export function classifyRoute(path: string): RoutePolicy {
@@ -382,6 +386,9 @@ export const ROUTE_POLICY_MATRIX: Record<string, PolicyEntry> = {
   '/admin/dead-letters':           { policy: 'operator', description: 'Dead-letter event queue view' },
   '/admin/dead-letters/{id}/replay':{ policy: 'operator', description: 'Replay a dead-letter event' },
   '/admin/query-cost':             { policy: 'operator', description: 'Query cost model diagnostics' },
+  '/admin/abuse/block':            { policy: 'operator', description: 'Add a temporary abuse blocklist entry' },
+  '/admin/abuse/block/{key}':      { policy: 'operator', description: 'Remove or check a blocklist entry by key' },
+  '/admin/abuse/blocklist':        { policy: 'operator', description: 'List all active abuse blocklist entries' },
 
   // ── Dev-only (excluded from production) ───────────────────────────────────
   '/cors-test': { policy: 'public', description: 'CORS debug — non-production only' },
