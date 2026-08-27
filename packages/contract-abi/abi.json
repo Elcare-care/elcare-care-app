@@ -32,14 +32,14 @@
           "auth": ["admin"]
         },
         {
-          "name": "pause",
-          "args": [],
+          "name": "admin_pause",
+          "args": [{ "name": "admin", "type": "Address" }],
           "returns": "void",
           "auth": ["admin"]
         },
         {
-          "name": "unpause",
-          "args": [],
+          "name": "admin_unpause",
+          "args": [{ "name": "admin", "type": "Address" }],
           "returns": "void",
           "auth": ["admin"]
         },
@@ -80,14 +80,20 @@
           "auth": ["admin"]
         },
         {
-          "name": "whitelist_token",
-          "args": [{ "name": "token", "type": "Address" }],
+          "name": "add_token_to_whitelist",
+          "args": [
+            { "name": "admin", "type": "Address" },
+            { "name": "token", "type": "Address" }
+          ],
           "returns": "void",
           "auth": ["admin"]
         },
         {
-          "name": "remove_token",
-          "args": [{ "name": "token", "type": "Address" }],
+          "name": "remove_token_from_whitelist",
+          "args": [
+            { "name": "caller", "type": "Address" },
+            { "name": "token", "type": "Address" }
+          ],
           "returns": "void",
           "auth": ["admin"]
         },
@@ -160,13 +166,12 @@
           "auth": ["any"]
         },
         {
-          "name": "purchase",
+          "name": "buy_artwork",
           "args": [
             { "name": "buyer", "type": "Address" },
-            { "name": "listing_id", "type": "u64" },
-            { "name": "token", "type": "Address" }
+            { "name": "listing_id", "type": "u64" }
           ],
-          "returns": "void",
+          "returns": "bool",
           "auth": ["buyer"]
         },
         {
@@ -296,7 +301,7 @@
           "auth": []
         },
         {
-          "name": "get_version",
+          "name": "version",
           "args": [],
           "returns": "String",
           "auth": []
@@ -388,7 +393,25 @@
         "InvalidAuctionState": 45,
         "NoBidToRefund": 46,
         "InvalidExtensionWindow": 47,
-        "MaxExtensionsReached": 48
+        "MaxExtensionsReached": 48,
+        "NotTokenOwner": 49,
+        "TokenAlreadyEscrowed": 50,
+        "AuctionDurationLimitReached": 51,
+        "NoRoleProposalPending": 52,
+        "RoleProposalExpired": 53,
+        "RoleTransferToSelf": 54,
+        "RoleTransferToContract": 55,
+        "TreasuryProposalExpired": 56,
+        "NoTreasuryProposalPending": 57,
+        "TreasuryProposalSelf": 58,
+        "InvalidListingDuration": 59,
+        "CollectionIncompatible": 60,
+        "BatchItemInvalid": 61,
+        "OwnershipMismatch": 62,
+        "RoyaltyAlreadyClaimed": 63,
+        "RoyaltyClaimNotFound": 64,
+        "ReservationWindowActive": 65,
+        "InvalidReservationWindow": 66
       },
       "events": {
         "listing_created": {
@@ -719,6 +742,25 @@
           "auth": ["creator"]
         }
       ],
+      "errors": {
+        "AlreadyInitialized": 1,
+        "NotInitialized": 2,
+        "NotAdmin": 3,
+        "WasmHashNotSet": 4,
+        "InvalidFeeBps": 5,
+        "ContractPaused": 6,
+        "InvalidDeployFee": 7,
+        "NoPendingAdmin": 8,
+        "NotPendingAdmin": 9,
+        "DuplicateSalt": 10,
+        "InvalidRoyaltyBps": 11,
+        "EmptyName": 12,
+        "EmptySymbol": 13,
+        "InvalidMaxSupply": 14,
+        "InsufficientFee": 15,
+        "AlreadyMigrated": 16,
+        "CollectionNotFound": 17
+      },
       "events": {
         "deploy_normal_721": {
           "topic": ["deploy", "dep_n721"],

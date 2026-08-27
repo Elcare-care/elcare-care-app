@@ -15,6 +15,8 @@ import {
   blockBidder,
   unblockBidder,
   getBlockedBidders,
+  updateAuctionReservePrice,
+  refundLosingBid,
 } from "@/lib/contract";
 import { StrKey } from "@stellar/stellar-sdk";
 import { fetchMetadata, cidToGatewayUrl, ArtworkMetadata } from "@/lib/ipfs";
@@ -51,6 +53,8 @@ import {
   ChevronRight,
   Ban,
   X,
+  Edit2,
+  RotateCcw,
 } from "lucide-react";
 import { Breadcrumb } from "@/components/Breadcrumb";
 
@@ -152,6 +156,24 @@ export function Countdown({ endTime, onExtend }: CountdownProps) {
 
 // ── Bid history row ──────────────────────────────────────────
 
+function RefundBadge({ status }: { status?: string }) {
+  if (status === "Claimed") {
+    return (
+      <span className="inline-flex items-center gap-1 rounded-full bg-gray-100 px-2 py-0.5 text-xs text-gray-500">
+        <CheckCircle2 size={10} /> Refunded
+      </span>
+    );
+  }
+  if (status === "Refundable") {
+    return (
+      <span className="inline-flex items-center gap-1 rounded-full bg-amber-50 px-2 py-0.5 text-xs text-amber-700 border border-amber-200">
+        <RotateCcw size={10} /> Refundable
+      </span>
+    );
+  }
+  return null;
+}
+
 function BidHistoryRow({ bid }: { bid: BidHistoryRecord }) {
   const amountXlm = (Number(bid.amount) / 10_000_000).toLocaleString(undefined, {
     maximumFractionDigits: 4,
@@ -170,7 +192,7 @@ function BidHistoryRow({ bid }: { bid: BidHistoryRecord }) {
     : `Ledger ${bid.ledger}`;
 
   return (
-    <div className="grid grid-cols-[1fr_auto_auto] items-center gap-3 rounded-xl border border-gray-100 bg-white px-4 py-3 text-sm">
+    <div className="grid grid-cols-[1fr_auto_auto_auto] items-center gap-3 rounded-xl border border-gray-100 bg-white px-4 py-3 text-sm">
       {/* Bidder */}
       <div className="flex items-center gap-2 text-gray-700 min-w-0">
         <User size={13} className="shrink-0 text-gray-400" />
@@ -178,6 +200,8 @@ function BidHistoryRow({ bid }: { bid: BidHistoryRecord }) {
       </div>
       {/* Amount */}
       <span className="font-semibold text-brand-600 whitespace-nowrap">{amountXlm} XLM</span>
+      {/* Refund status badge (Issue #466) */}
+      <RefundBadge status={bid.refundStatus} />
       {/* Time */}
       <span className="text-xs text-gray-400 whitespace-nowrap text-right">{formattedTime}</span>
     </div>
@@ -569,6 +593,12 @@ export default function AuctionDetailPage() {
   const [bidSuccess, setBidSuccess] = useState(false);
   const [finalizeSuccess, setFinalizeSuccess] = useState(false);
 
+  // Reserve price edit state (Issue #467)
+  const [isEditingReserve, setIsEditingReserve] = useState(false);
+  const [newReserveXlm, setNewReserveXlm] = useState("");
+  const [reserveUpdateBusy, setReserveUpdateBusy] = useState(false);
+  const [reserveUpdateError, setReserveUpdateError] = useState<string | null>(null);
+
   // Tracks the live end time — may be updated by an SSE AUCTION_EXTENDED event.
   const [liveEndTime, setLiveEndTime] = useState<number>(0);
 
@@ -651,6 +681,19 @@ export default function AuctionDetailPage() {
           case "AUCTION_CANCELLED":
             loadData();
             break;
+
+          // Reserve price updated — patch auction state in place (Issue #467).
+          case "AUCTION_RESERVE_UPDATED": {
+            const newReserve = event.data?.new_reserve_price != null
+              ? BigInt(event.data.new_reserve_price)
+              : undefined;
+            if (newReserve !== undefined) {
+              setAuction((prev) =>
+                prev ? { ...prev, reserve_price: newReserve } : prev
+              );
+            }
+            break;
+          }
         }
       },
     });
@@ -682,6 +725,24 @@ export default function AuctionDetailPage() {
     }
   };
 
+  const handleReserveUpdate = async () => {
+    if (!auction || !publicKey || !newReserveXlm) return;
+    const newPriceStroops = BigInt(Math.round(Number(newReserveXlm) * 10_000_000));
+    if (newPriceStroops <= 0n) return;
+    setReserveUpdateBusy(true);
+    setReserveUpdateError(null);
+    try {
+      await updateAuctionReservePrice(publicKey, auction.auction_id, newPriceStroops);
+      setIsEditingReserve(false);
+      setNewReserveXlm("");
+      loadData();
+    } catch (e: unknown) {
+      setReserveUpdateError(e instanceof Error ? e.message : "Failed to update reserve price");
+    } finally {
+      setReserveUpdateBusy(false);
+    }
+  };
+
   // ── Derived state ─────────────────────────────────────────
 
   const now = Math.floor(Date.now() / 1000);
@@ -692,6 +753,10 @@ export default function AuctionDetailPage() {
   const isCancelled = auction?.status === "Cancelled";
   const canFinalize = isActive && isExpired;
   const canBid = isActive && !isExpired;
+  // Reserve price is only editable by the creator while Active and no bids placed (Issue #467).
+  const isCreator = publicKey && auction?.creator === publicKey;
+  const hasNoBids = auction ? auction.highest_bid === 0n : true;
+  const canEditReserve = isActive && !isExpired && isCreator && hasNoBids;
 
   const imageUrl = metadata?.image ? cidToGatewayUrl(metadata.image) : null;
   const highestBidXlm = auction ? stroopsToXlm(auction.highest_bid) : "0";
@@ -840,10 +905,50 @@ export default function AuctionDetailPage() {
               </div>
               <div className="flex items-center justify-between text-sm">
                 <span className="text-gray-500">Reserve Price</span>
-                <span className="font-medium text-gray-700">
-                  {reserveXlm} XLM
-                </span>
+                {isEditingReserve ? (
+                  <div className="flex items-center gap-1">
+                    <input
+                      type="number"
+                      min="0"
+                      step="0.0000001"
+                      value={newReserveXlm}
+                      onChange={(e) => setNewReserveXlm(e.target.value)}
+                      className="w-28 rounded-lg border border-gray-200 px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-brand-400"
+                      placeholder={reserveXlm}
+                      disabled={reserveUpdateBusy}
+                    />
+                    <button
+                      onClick={handleReserveUpdate}
+                      disabled={reserveUpdateBusy || !newReserveXlm}
+                      className="rounded-lg bg-brand-500 px-2 py-1 text-xs font-semibold text-white hover:bg-brand-600 disabled:opacity-50"
+                    >
+                      {reserveUpdateBusy ? "…" : "Save"}
+                    </button>
+                    <button
+                      onClick={() => { setIsEditingReserve(false); setNewReserveXlm(""); setReserveUpdateError(null); }}
+                      className="rounded-lg bg-gray-100 px-2 py-1 text-xs text-gray-500 hover:bg-gray-200"
+                    >
+                      <X size={11} />
+                    </button>
+                  </div>
+                ) : (
+                  <div className="flex items-center gap-1.5">
+                    <span className="font-medium text-gray-700">{reserveXlm} XLM</span>
+                    {canEditReserve && (
+                      <button
+                        onClick={() => setIsEditingReserve(true)}
+                        title="Edit reserve price"
+                        className="text-gray-400 hover:text-brand-500 transition-colors"
+                      >
+                        <Edit2 size={11} />
+                      </button>
+                    )}
+                  </div>
+                )}
               </div>
+              {reserveUpdateError && (
+                <p className="text-xs text-red-600">{reserveUpdateError}</p>
+              )}
               {auction.highest_bidder && (
                 <div className="flex items-center justify-between text-sm">
                   <span className="text-gray-500">Highest Bidder</span>

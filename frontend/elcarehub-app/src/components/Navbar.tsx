@@ -34,6 +34,7 @@ import {
 import { ConnectWalletModal } from "./ConnectWalletModal";
 import { WalletMenu } from "./WalletMenu";
 import { NotificationCenter } from "./NotificationCenter";
+import { LocaleSwitcher } from "./LocaleSwitcher";
 
 // ── Nav item definitions ──────────────────────────────────────
 
@@ -317,6 +318,7 @@ export function Navbar() {
             )}
 
             {/* Always-visible utility links */}
+            <LocaleSwitcher />
             <Link
               href="/settings"
               aria-label="Settings"
