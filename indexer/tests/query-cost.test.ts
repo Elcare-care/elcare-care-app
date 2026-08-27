@@ -747,9 +747,10 @@ describe('queryCostGuard — wired into routes', () => {
     app.use(router);
     app.use(errorHandler);
 
-    // limit=200 → 20 < operator budget (200)
+    // limit=75 → MEDIUM_PAGE (10) > public budget (5) but < operator budget (200)
+    // /listings schema caps limit at 100, so 200 would fail validateQuery before DB.
     const res = await request(app)
-      .get('/listings?limit=200')
+      .get('/listings?limit=75')
       .set('x-operator-token', 'any');
     expect(res.status).toBe(200);
     expect(mockPrisma.listing.findMany).toHaveBeenCalled();

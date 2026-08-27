@@ -66,6 +66,9 @@ export interface Auction {
   bid_history_cap: number;
   max_extensions: number;
   extension_count: number;
+  /** Original end time set at auction creation — the extension cap is
+   *  original_end_time + MAX_TOTAL_AUCTION_DURATION. */
+  original_end_time: bigint;
 }
 
 export interface Offer {

@@ -8,6 +8,7 @@ import { useState, useEffect } from "react";
 import { useWalletContext } from "@/context/WalletContext";
 import { useArtistListings, useCancelListing, useCancelListings } from "@/hooks/useMarketplace";
 import { ListingForm } from "@/components/ListingForm";
+import { ListingWizard } from "@/components/ListingWizard";
 import { AuctionForm } from "@/components/AuctionForm";
 import { stroopsToXlm, Listing } from "@/lib/contract";
 import { fetchArtistMetrics, ArtistMetrics, MetricsRange, fetchRoyaltyBreakdown, RoyaltyPaymentRow } from "@/lib/indexer";
@@ -571,7 +572,7 @@ export default function DashboardPage() {
               <RoyaltyHistory publicKey={publicKey ?? ""} />
             ) : tab === "list" ? (
               <div className="w-full">
-                <ListingForm
+                <ListingWizard
                   onSuccess={() => {
                     refresh();
                     setTab("listings");

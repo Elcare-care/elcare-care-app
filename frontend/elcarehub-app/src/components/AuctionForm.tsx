@@ -1,5 +1,13 @@
 // ─────────────────────────────────────────────────────────────
-// components/AuctionForm.tsx — create auction form
+// components/AuctionForm.tsx — create-auction form (Issue #527)
+//
+// Escrows an NFT the connected wallet already owns (collection + token ID —
+// mirrors ListingForm.tsx) into a new on-chain auction. Validates duration
+// and reserve-price bounds against the live contract configuration before
+// ever building a transaction, and surfaces the platform's current
+// anti-sniping settings (which are snapshotted into the auction at creation
+// time — they are not creator-configurable, see create_auction in
+// contracts/soroban-marketplace/src/contract.rs).
 // ─────────────────────────────────────────────────────────────
 
 "use client";
@@ -29,8 +37,6 @@ export function AuctionForm({ onSuccess, onCancel }: AuctionFormProps) {
   const { create, isCreating, progress: createProgress, error: createError } = useCreateAuction(publicKey);
   const ipfsUpload = useIpfsUpload();
 
-  const [preview, setPreview] = useState<string | null>(null);
-  const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [successId, setSuccessId] = useState<number | null>(null);
   const [fileError, setFileError] = useState<string | null>(null);
   const [form, setForm] = useState({
@@ -44,13 +50,11 @@ export function AuctionForm({ onSuccess, onCancel }: AuctionFormProps) {
     tokenAddress: DEFAULT_TOKEN.address,
   });
 
-  const fileRef = useRef<HTMLInputElement>(null);
   const hasTokenOptions = availableTokens.length > 0;
   const defaultToken = getDefaultSupportedToken(availableTokens);
   const selectedToken =
     availableTokens.find((t) => t.address === form.tokenAddress) ?? defaultToken;
 
-  // When available tokens load, snap to a valid selection if needed
   useEffect(() => {
     if (availableTokens.length === 0) return;
     if (!availableTokens.some((t) => t.address === form.tokenAddress)) {
@@ -78,10 +82,33 @@ export function AuctionForm({ onSuccess, onCancel }: AuctionFormProps) {
     setPreview(URL.createObjectURL(file));
   };
 
-  const handleDrop = (e: React.DragEvent) => {
-    e.preventDefault();
-    const file = e.dataTransfer.files[0];
-    if (file && file.type.startsWith("image/")) handleFile(file);
+  // Fetch live contract bounds (min bid increment, anti-snipe settings) once.
+  useEffect(() => {
+    let cancelled = false;
+    getAuctionConfig()
+      .then((cfg) => {
+        if (!cancelled) setAuctionConfig(cfg);
+      })
+      .catch(() => {
+        /* Non-fatal — validation falls back to the ">0" check only. */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const errors = useMemo(
+    () => validateAuctionForm(form, auctionConfig?.minBidIncrementStroops ?? null),
+    [form, auctionConfig]
+  );
+  const formIsValid = useMemo(() => isFormValid(errors), [errors]);
+
+  const updateRecipient = (i: number, patch: Partial<RecipientRow>) => {
+    setForm((cur) => {
+      const next = [...cur.recipients];
+      next[i] = { ...next[i], ...patch };
+      return { ...cur, recipients: next };
+    });
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -126,7 +153,7 @@ export function AuctionForm({ onSuccess, onCancel }: AuctionFormProps) {
     return (
       <div className="max-w-xl mx-auto flex flex-col items-center gap-6 rounded-3xl border border-green-100 bg-white p-12 text-center shadow-2xl shadow-green-900/5">
         <div className="rounded-full bg-green-50 p-4">
-          <CheckCircle size={56} className="text-green-500" />
+          <CheckCircle2 size={56} className="text-green-500" />
         </div>
         <div className="space-y-2">
           <h3 className="text-3xl font-display font-bold text-gray-900">
@@ -146,6 +173,8 @@ export function AuctionForm({ onSuccess, onCancel }: AuctionFormProps) {
     );
   }
 
+  const shouldShow = (field: keyof FieldErrors) => submitAttempted && !!errors[field];
+
   return (
     <div className="max-w-3xl mx-auto px-4 py-8">
       <div className="bg-white rounded-3xl shadow-2xl shadow-brand-900/5 border border-brand-100/50 p-6 md:p-10">
@@ -154,7 +183,7 @@ export function AuctionForm({ onSuccess, onCancel }: AuctionFormProps) {
             Create Auction
           </h2>
           <p className="text-gray-500 font-inter">
-            Set a reserve price, duration, and payment token for your auction.
+            Escrow an NFT you own and set a reserve price, duration, and payment token.
           </p>
         </header>
 
@@ -245,79 +274,61 @@ export function AuctionForm({ onSuccess, onCancel }: AuctionFormProps) {
 
             <div className="space-y-2">
               <label className="block text-sm font-bold text-gray-950 uppercase tracking-wider font-inter">
-                Artist Name *
-              </label>
-              <input
-                required
-                value={form.artistName}
-                onChange={(e) =>
-                  setForm({ ...form, artistName: e.target.value })
-                }
-                className="w-full rounded-2xl border border-gray-200 bg-gray-50/50 px-5 py-4 text-base focus:border-brand-500 focus:bg-white focus:outline-none transition-all shadow-sm font-inter"
-                placeholder="Your name or alias"
-              />
-            </div>
-
-            <div className="space-y-2">
-              <label className="block text-sm font-bold text-gray-950 uppercase tracking-wider font-inter">
-                Creation Year *
+                Token ID *
               </label>
               <input
                 required
                 type="number"
-                min={1900}
-                max={2100}
-                value={form.year}
-                onChange={(e) => setForm({ ...form, year: e.target.value })}
-                className="w-full rounded-2xl border border-gray-200 bg-gray-50/50 px-5 py-4 text-base focus:border-brand-500 focus:bg-white focus:outline-none transition-all shadow-sm font-inter"
+                min={0}
+                value={form.nftTokenId}
+                onChange={(e) =>
+                  setForm({ ...form, nftTokenId: parseInt(e.target.value, 10) || 0 })
+                }
+                aria-invalid={shouldShow("nftTokenId")}
+                className={`w-full rounded-2xl border px-5 py-4 text-base focus:outline-none transition-all shadow-sm font-inter ${
+                  shouldShow("nftTokenId")
+                    ? "border-red-400 bg-red-50/40 focus:border-red-500"
+                    : "border-gray-200 bg-gray-50/50 focus:border-brand-500 focus:bg-white"
+                }`}
               />
+              {shouldShow("nftTokenId") && (
+                <p className="text-sm text-red-600" role="alert">{errors.nftTokenId}</p>
+              )}
             </div>
 
-            <div className="space-y-2">
-              <label className="block text-sm font-bold text-gray-950 uppercase tracking-wider font-inter">
-                Category *
-              </label>
-              <select
-                required
-                value={form.category}
-                onChange={(e) => setForm({ ...form, category: e.target.value })}
-                className="w-full appearance-none rounded-2xl border border-gray-200 bg-gray-50/50 px-5 py-4 text-base focus:border-brand-500 focus:bg-white focus:outline-none transition-all shadow-sm font-inter"
-              >
-                {ART_CATEGORIES.map((cat) => (
-                  <option key={cat} value={cat}>
-                    {cat}
-                  </option>
-                ))}
-              </select>
-            </div>
-
-            {/* ── Reserve price + token selector side-by-side ── */}
+            {/* Reserve price + token selector */}
             <div className="space-y-2">
               <label className="block text-sm font-bold text-gray-950 uppercase tracking-wider font-inter">
                 Reserve Price ({selectedToken?.symbol ?? "Token"}) *
               </label>
-              <div className="relative">
-                <input
-                  required
-                  type="number"
-                  min={0.0000001}
-                  step="any"
-                  value={form.reservePriceXlm}
-                  onChange={(e) =>
-                    setForm({
-                      ...form,
-                      reservePriceXlm: parseFloat(e.target.value),
-                    })
-                  }
-                  className="w-full rounded-2xl border border-gray-200 bg-gray-50/50 px-5 py-4 pr-16 text-base focus:border-brand-500 focus:bg-white focus:outline-none transition-all shadow-sm font-inter"
-                />
-                <span className="absolute right-5 top-1/2 -translate-y-1/2 text-sm font-bold text-brand-600">
-                  {selectedToken?.symbol ?? ""}
-                </span>
-              </div>
+              <input
+                required
+                type="number"
+                min={0.0000001}
+                step="any"
+                value={form.reservePriceXlm}
+                onChange={(e) =>
+                  setForm({ ...form, reservePriceXlm: parseFloat(e.target.value) || 0 })
+                }
+                aria-invalid={shouldShow("reservePriceXlm")}
+                className={`w-full rounded-2xl border px-5 py-4 text-base focus:outline-none transition-all shadow-sm font-inter ${
+                  shouldShow("reservePriceXlm")
+                    ? "border-red-400 bg-red-50/40 focus:border-red-500"
+                    : "border-gray-200 bg-gray-50/50 focus:border-brand-500 focus:bg-white"
+                }`}
+              />
+              {shouldShow("reservePriceXlm") ? (
+                <p className="text-sm text-red-600" role="alert">{errors.reservePriceXlm}</p>
+              ) : (
+                auctionConfig && (
+                  <p className="text-xs text-gray-400">
+                    Minimum: {stroopsToXlm(auctionConfig.minBidIncrementStroops)}{" "}
+                    {selectedToken?.symbol ?? ""}
+                  </p>
+                )
+              )}
             </div>
 
-            {/* Token address selector — the key addition for this issue */}
             <div className="space-y-2">
               <label className="block text-sm font-bold text-gray-950 uppercase tracking-wider font-inter">
                 Payment Token *
@@ -327,9 +338,7 @@ export function AuctionForm({ onSuccess, onCancel }: AuctionFormProps) {
                 id="auction-token-address"
                 disabled={!hasTokenOptions}
                 value={form.tokenAddress}
-                onChange={(e) =>
-                  setForm({ ...form, tokenAddress: e.target.value })
-                }
+                onChange={(e) => setForm({ ...form, tokenAddress: e.target.value })}
                 className="w-full appearance-none rounded-2xl border border-gray-200 bg-gray-50/50 px-5 py-4 text-base focus:border-brand-500 focus:bg-white focus:outline-none transition-all shadow-sm font-inter"
               >
                 {hasTokenOptions ? (
@@ -344,6 +353,7 @@ export function AuctionForm({ onSuccess, onCancel }: AuctionFormProps) {
               </select>
             </div>
 
+            {/* Duration */}
             <div className="sm:col-span-2 space-y-2">
               <label className="block text-sm font-bold text-gray-950 uppercase tracking-wider font-inter">
                 Duration (hours) *
@@ -351,13 +361,87 @@ export function AuctionForm({ onSuccess, onCancel }: AuctionFormProps) {
               <input
                 required
                 type="number"
-                min={1}
+                min={MIN_DURATION_HOURS}
+                max={MAX_DURATION_HOURS}
                 value={form.durationHours}
                 onChange={(e) =>
-                  setForm({ ...form, durationHours: parseInt(e.target.value) })
+                  setForm({ ...form, durationHours: parseFloat(e.target.value) || 0 })
                 }
-                className="w-full rounded-2xl border border-gray-200 bg-gray-50/50 px-5 py-4 text-base focus:border-brand-500 focus:bg-white focus:outline-none transition-all shadow-sm font-inter"
+                aria-invalid={shouldShow("durationHours")}
+                className={`w-full rounded-2xl border px-5 py-4 text-base focus:outline-none transition-all shadow-sm font-inter ${
+                  shouldShow("durationHours")
+                    ? "border-red-400 bg-red-50/40 focus:border-red-500"
+                    : "border-gray-200 bg-gray-50/50 focus:border-brand-500 focus:bg-white"
+                }`}
               />
+              {shouldShow("durationHours") ? (
+                <p className="text-sm text-red-600" role="alert">{errors.durationHours}</p>
+              ) : (
+                <p className="text-xs text-gray-400">
+                  Between {MIN_DURATION_HOURS} hour and {MAX_DURATION_HOURS / 24} days.
+                </p>
+              )}
+            </div>
+
+            {/* Recipients */}
+            <div className="sm:col-span-2 space-y-2">
+              <label className="block text-sm font-bold text-gray-950 uppercase tracking-wider font-inter">
+                Royalty Recipients (must total 100%) *
+              </label>
+              <div className="space-y-2">
+                {form.recipients.map((row, i) => (
+                  <div key={i} className="flex gap-2">
+                    <input
+                      value={row.address}
+                      onChange={(e) => updateRecipient(i, { address: e.target.value })}
+                      placeholder="G… recipient address"
+                      className="flex-1 rounded-xl border border-gray-200 bg-gray-50/50 px-4 py-3 font-mono text-xs focus:outline-none focus:border-brand-500 focus:bg-white"
+                    />
+                    <input
+                      type="number"
+                      min={0}
+                      max={100}
+                      value={row.percentage}
+                      onChange={(e) =>
+                        updateRecipient(i, { percentage: parseFloat(e.target.value) || 0 })
+                      }
+                      className="w-24 rounded-xl border border-gray-200 bg-gray-50/50 px-3 py-3 text-sm focus:outline-none focus:border-brand-500 focus:bg-white"
+                    />
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setForm({
+                          ...form,
+                          recipients: form.recipients.filter((_, idx) => idx !== i),
+                        })
+                      }
+                      disabled={form.recipients.length <= 1}
+                      className="rounded-xl px-2 text-gray-400 hover:text-red-500 disabled:opacity-30"
+                      aria-label="Remove recipient"
+                    >
+                      <Trash2 size={16} />
+                    </button>
+                  </div>
+                ))}
+              </div>
+              <button
+                type="button"
+                onClick={() =>
+                  setForm({
+                    ...form,
+                    recipients: [...form.recipients, { address: "", percentage: 0 }],
+                  })
+                }
+                disabled={form.recipients.length >= MAX_RECIPIENTS}
+                className="flex items-center gap-1 text-xs font-semibold text-brand-600 hover:text-brand-700 disabled:opacity-40"
+              >
+                <Plus size={12} /> Add recipient
+              </button>
+              {(shouldShow("recipients") || shouldShow("recipientRows")) && (
+                <p className="text-sm text-red-600" role="alert">
+                  {errors.recipients ?? "Check each recipient row above."}
+                </p>
+              )}
             </div>
           </div>
 
