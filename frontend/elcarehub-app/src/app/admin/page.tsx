@@ -10,6 +10,7 @@ import { useWallet } from "@/hooks/useWallet";
 import { useAdminStats, useModeration, useTokenManagement, useAdminCheck, useAdminTransfer, usePauseControls, useAuctionConfig, useListingOversight, useModerationQueue, PAUSABLE_FUNCTIONS, type PausableFunction } from "@/hooks/useAdmin";
 import { MODERATION_POLICY_URL } from "@/lib/moderation";
 import { useAdminSession } from "@/hooks/useAdminSession";
+import { useIndexerFreshness } from "@/hooks/useIndexerFreshness";
 import { AdminConfirmationModal } from "@/components/AdminConfirmationModal";
 import ModerationQueue from "@/components/ModerationQueue";
 import {
@@ -156,6 +157,27 @@ export default function AdminPage() {
         refresh: refreshModeration,
     } = useModerationQueue(isAdmin ? publicKey : null);
     const [moderationReason, setModerationReason] = useState("");
+
+    // Issue #522 — indexer freshness/health for the admin dashboard. Admin
+    // views drive moderation and oversight decisions off indexed data, so a
+    // lagging/unavailable indexer (or an active reorg) must be visible here
+    // too, not just on public-facing pages.
+    const refreshAdminData = useCallback(async () => {
+        await Promise.all([
+            refreshStats(),
+            refreshTokens(),
+            refreshOversight(),
+            refreshModeration(),
+        ]);
+    }, [refreshStats, refreshTokens, refreshOversight, refreshModeration]);
+    const freshness = useIndexerFreshness({
+        resourceType: "default",
+        onRefresh: refreshAdminData,
+    });
+    useEffect(() => {
+        if (stats) freshness.markUpdated();
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [stats]);
 
     // Collection rows for circuit-breaker (loaded from indexer on mount)
     const [collectionPauseRows, setCollectionPauseRows] = useState<
@@ -492,6 +514,19 @@ export default function AdminPage() {
                         </button>
                     </div>
                 </div>
+
+                {/* Issue #522 — non-blocking indexer freshness indicator */}
+                {freshness.status !== "healthy" && (
+                    <div className="mb-8">
+                        <StaleBanner
+                            freshness={freshness.freshness}
+                            status={freshness.status}
+                            reorg={freshness.reorg}
+                            onRefresh={freshness.refresh}
+                            isRefreshing={freshness.isRefreshing}
+                        />
+                    </div>
+                )}
 
                 <div className="mb-12 grid gap-6 sm:grid-cols-2 lg:grid-cols-4">
                     <StatCard

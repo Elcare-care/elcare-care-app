@@ -703,6 +703,19 @@ export default function AuctionDetailPage() {
     loadData();
   }, [loadData]);
 
+  // Issue #522 — indexer freshness/health for this auction. Reuses the SSE
+  // subscription below (subscribeToEvents: false) rather than opening a
+  // second connection, so it's fed via reportSSEEvent/reportSSEConnected.
+  const freshness = useIndexerFreshness({
+    resourceType: "auction",
+    subscribeToEvents: false,
+    onRefresh: loadData,
+  });
+  useEffect(() => {
+    if (auction) freshness.markUpdated();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [auction]);
+
   // ── SSE subscription — live event streaming (ISSUE-021) ──
 
   useEffect(() => {
@@ -711,7 +724,14 @@ export default function AuctionDetailPage() {
 
     const sub = subscribeToMarketplaceEvents(config.indexerUrl, {
       debounceMs: 0,
+      onOpen: () => freshness.reportSSEConnected(true),
+      onClose: () => freshness.reportSSEConnected(false),
       onEvent(event) {
+        // Feed every event (including REORG/CRITICAL_REORG, which never
+        // carry an auctionId) into the freshness hook regardless of the
+        // per-auction filter below.
+        freshness.reportSSEEvent(event);
+
         // Only process events for this auction.
         if (event.auctionId !== undefined && event.auctionId !== auctionId) {
           return;
@@ -762,6 +782,7 @@ export default function AuctionDetailPage() {
     });
 
     return () => sub.close();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id, loadData]);
 
   // ── Handlers ──────────────────────────────────────────────
@@ -900,6 +921,22 @@ export default function AuctionDetailPage() {
       </div>
 
       <div className="mx-auto max-w-6xl px-4 sm:px-6 pb-16">
+        {/* Issue #522 — non-blocking indexer freshness indicator. Critical
+            for auctions: the countdown and highest-bid figures come straight
+            from indexed events, so a lagging/unavailable indexer or a reorg
+            must never be silently trusted as final. */}
+        {freshness.status !== "healthy" && (
+          <div className="mb-6">
+            <StaleBanner
+              freshness={freshness.freshness}
+              status={freshness.status}
+              reorg={freshness.reorg}
+              onRefresh={freshness.refresh}
+              isRefreshing={freshness.isRefreshing}
+            />
+          </div>
+        )}
+
         <div className="grid gap-10 lg:grid-cols-[1fr_420px]">
           {/* Artwork image */}
           <div className="relative aspect-square overflow-hidden rounded-3xl bg-brand-50 shadow-md">
