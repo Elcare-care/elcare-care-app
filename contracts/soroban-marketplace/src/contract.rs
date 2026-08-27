@@ -2682,7 +2682,12 @@ impl MarketplaceContract {
                 &BidRecord { bidder: bidder.clone(), amount, ledger: env.ledger().sequence() },
                 auction.bid_history_cap,
             );
-            BidPlacedEvent { auction_id, bidder: bidder.clone(), bid_amount: amount }.publish(&env);
+            BidPlacedEvent {
+                auction_id,
+                bidder: bidder.clone(),
+                bid_amount: amount,
+                effective_end_time: auction.end_time,
+            }.publish(&env);
             AuctionExtendedEvent {
                 auction_id,
                 prev_end_time,
@@ -2698,7 +2703,12 @@ impl MarketplaceContract {
                 &BidRecord { bidder: bidder.clone(), amount, ledger: env.ledger().sequence() },
                 auction.bid_history_cap,
             );
-            BidPlacedEvent { auction_id, bidder: bidder.clone(), bid_amount: amount }.publish(&env);
+            BidPlacedEvent {
+                auction_id,
+                bidder: bidder.clone(),
+                bid_amount: amount,
+                effective_end_time: auction.end_time,
+            }.publish(&env);
             false
         };
         let _ = extended;
@@ -2861,6 +2871,11 @@ impl MarketplaceContract {
             }
         }
 
+        // Invariant: idempotency — duplicate claims return a stable error (Issue #466).
+        if crate::storage::is_bid_refunded(&env, auction_id, &bidder) {
+            panic_with_error!(&env, MarketplaceError::NoBidToRefund);
+        }
+
         // Invariant 3 + 4: scan bid history for the caller's most-recent entry.
         let bids = load_auction_bids(&env, auction_id);
         let mut refund_amount: i128 = 0;
@@ -2876,6 +2891,10 @@ impl MarketplaceContract {
         if refund_amount <= 0 {
             panic_with_error!(&env, MarketplaceError::NoBidToRefund);
         }
+
+        // CEI: write the refund record before the token transfer so that a
+        // failed or re-entrant transfer cannot be replayed for a double payout.
+        crate::storage::mark_bid_refunded(&env, auction_id, &bidder);
 
         // Transfer refund from contract to bidder.
         TokenClient::new(&env, &auction.token).transfer(
@@ -2945,6 +2964,8 @@ impl MarketplaceContract {
         // Refund the highest bidder (if any) before marking cancelled.
         let refunded_amount = auction.highest_bid;
         if let Some(ref bidder) = auction.highest_bidder.clone() {
+            // CEI: mark before transfer so refund_losing_bid idempotency blocks replay.
+            crate::storage::mark_bid_refunded(&env, auction_id, bidder);
             let tc = TokenClient::new(&env, &auction.token);
             tc.transfer(&env.current_contract_address(), bidder, &refunded_amount);
             AuctionBidRefundedEvent {
@@ -2980,6 +3001,63 @@ impl MarketplaceContract {
         escrow::release_nft(&env, &auction.collection, auction.token_id,
             &auction.creator, env.ledger().sequence(), auction_id);
         release_auction_lock(&env, auction_id);
+    }
+
+    // ── update_auction_reserve_price ─────────────────────────────────────────
+    //
+    // Issue #467 — Creators may correct a pricing mistake after creating an
+    // auction, provided no bids have been placed yet.  Once the first bid lands
+    // the reserve price is locked, so bidder expectations are never retroactively
+    // undermined.
+    //
+    // Invariants enforced:
+    //   1. Only the auction creator may call this.
+    //   2. Auction must be Active.
+    //   3. No bids may exist (highest_bidder is None and highest_bid == 0).
+    //   4. New price must be >= min_bid_increment (same floor as create_auction).
+
+    /// Update the reserve price of an active, no-bid auction.
+    ///
+    /// Panics with:
+    /// - `AuctionNotFound`     — unknown `auction_id`.
+    /// - `Unauthorized`        — caller is not the auction creator.
+    /// - `AuctionNotActive`    — auction is not Active.
+    /// - `AuctionHasBids`      — at least one bid has already been placed.
+    /// - `InvalidPrice`        — `new_price` is below `min_bid_increment`.
+    pub fn update_auction_reserve_price(
+        env: Env,
+        creator: Address,
+        auction_id: u64,
+        new_price: i128,
+    ) {
+        bump_instance_ttl(&env);
+        creator.require_auth();
+        let mut auction = load_auction(&env, auction_id)
+            .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::AuctionNotFound));
+
+        if auction.creator != creator {
+            panic_with_error!(&env, MarketplaceError::Unauthorized);
+        }
+        if auction.status != AuctionStatus::Active {
+            panic_with_error!(&env, MarketplaceError::AuctionNotActive);
+        }
+        // Lock out updates once any bid exists.
+        if auction.highest_bidder.is_some() || auction.highest_bid > 0 {
+            panic_with_error!(&env, MarketplaceError::AuctionHasBids);
+        }
+        let min_increment = crate::storage::get_min_bid_increment_storage(&env)
+            .unwrap_or(DEFAULT_MIN_BID_INCREMENT);
+        if new_price < min_increment {
+            panic_with_error!(&env, MarketplaceError::InvalidPrice);
+        }
+
+        let old_price = auction.reserve_price;
+        auction.reserve_price = new_price;
+        save_auction(&env, &auction);
+
+        crate::events::emit_auction_reserve_updated(
+            &env, auction_id, creator, old_price, new_price,
+        );
     }
 
     // ── Offers ───────────────────────────────────────────────
@@ -4127,30 +4205,36 @@ impl MarketplaceContract {
         if amount < required_min {
             panic_with_error!(env, MarketplaceError::BidTooLow);
         }
-        // G — anti-sniping extension analysis
+        // G — anti-sniping extension analysis (Issue #468)
+        //
+        // A bid that arrives inside the trigger window is always accepted.
+        // Whether the auction extends depends on two independent caps:
+        //   • extension_count cap  (max_extensions > 0): bid accepted, no extension
+        //   • total duration cap   (original_end_time + MAX_TOTAL_AUCTION_DURATION): same
+        // Neither cap ever rejects a bid — they only suppress the extension.
         let extension = if auction.extension_trigger > 0 {
             let time_remaining = auction.end_time.saturating_sub(now);
             if time_remaining < auction.extension_trigger {
-                // Check extension cap
+                // Extension count cap reached — bid accepted, extension suppressed.
                 if auction.max_extensions > 0
                     && auction.extension_count >= auction.max_extensions
                 {
-                    panic_with_error!(env, MarketplaceError::MaxExtensionsReached);
-                }
-                // Extension window must be non-zero
-                if auction.extension_window == 0 {
-                    panic_with_error!(env, MarketplaceError::InvalidExtensionWindow);
-                }
-                let proposed_end =
-                    now.checked_add(auction.extension_window).unwrap_or(auction.end_time);
-                let max_allowed = auction
-                    .original_end_time
-                    .saturating_add(MAX_TOTAL_AUCTION_DURATION);
-                if proposed_end <= max_allowed {
-                    Some((proposed_end, auction.extension_count.saturating_add(1)))
-                } else {
-                    // Duration cap reached — bid accepted but no extension
                     None
+                } else if auction.extension_window == 0 {
+                    // Extension window misconfigured — suppress silently.
+                    None
+                } else {
+                    let proposed_end =
+                        now.checked_add(auction.extension_window).unwrap_or(auction.end_time);
+                    let max_allowed = auction
+                        .original_end_time
+                        .saturating_add(MAX_TOTAL_AUCTION_DURATION);
+                    if proposed_end <= max_allowed {
+                        Some((proposed_end, auction.extension_count.saturating_add(1)))
+                    } else {
+                        // Duration cap reached — bid accepted but no extension.
+                        None
+                    }
                 }
             } else {
                 None

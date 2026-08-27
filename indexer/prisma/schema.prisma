@@ -32,6 +32,16 @@ enum OfferStatus {
   Reclaimed
 }
 
+/// Tracks per-bid refund eligibility for `refund_losing_bid` (Issue #466).
+enum BidRefundStatus {
+  /// Default: refund eligibility not yet determined (auction still Active).
+  None
+  /// The auction has settled; this losing bid is eligible for `refund_losing_bid`.
+  Refundable
+  /// The bidder has successfully claimed their refund via `refund_losing_bid`.
+  Claimed
+}
+
 model SyncState {
   id               Int      @id @default(1)
   lastLedger       Int      @default(0)
@@ -128,6 +138,8 @@ model Auction {
   extensionCount  Int           @default(0)
   /// Original end time set at auction creation, used to enforce total duration cap
   originalEndTime BigInt
+  /// Snapshotted max-extensions cap from auction creation (0 = unlimited). Issue #468.
+  maxExtensions   Int           @default(0)
   @@index([updatedAtLedger])
   @@index([status, updatedAtLedger])
   @@index([creator, updatedAtLedger])
@@ -178,15 +190,18 @@ model WhitelistedToken {
 }
 
 model Bid {
-  id              Int      @id @default(autoincrement())
+  id              Int             @id @default(autoincrement())
   auctionId       BigInt
   bidder          String
-  amount          Decimal  @db.Decimal(32, 7)
+  amount          Decimal         @db.Decimal(32, 7)
   ledgerSequence  Int
-  createdAt       DateTime @default(now())
+  createdAt       DateTime        @default(now())
+  /// Refund eligibility state populated from AUCTION_BID_REFUNDED events (Issue #466).
+  refundStatus    BidRefundStatus @default(None)
   @@index([auctionId])
   @@index([bidder])
   @@index([ledgerSequence])
+  @@index([auctionId, refundStatus])
   @@unique([auctionId, ledgerSequence, bidder])
 }
 

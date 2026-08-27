@@ -190,6 +190,9 @@ pub struct BidPlacedEvent {
     pub auction_id: u64,
     pub bidder: Address,
     pub bid_amount: i128,
+    /// The auction's end time after applying any anti-sniping extension.
+    /// Equals `auction.end_time` when no extension occurred (Issue #468).
+    pub effective_end_time: u64,
 }
 
 #[contracttype]
@@ -1371,6 +1374,46 @@ pub fn emit_treasury_proposal_cancelled(
     TreasuryProposalCancelledEvent {
         cancelled_by,
         cancelled_candidate,
+    }
+    .publish(env);
+}
+
+// ── Auction reserve price update event (Issue #467) ──────────────────────────
+
+pub const AUCTION_RESERVE_UPDATED: &str = "auc_res_upd";
+
+/// Emitted when the creator updates the reserve price of a no-bid active auction.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuctionReservePriceUpdatedEvent {
+    pub auction_id: u64,
+    pub updated_by: Address,
+    pub old_reserve_price: i128,
+    pub new_reserve_price: i128,
+    pub ledger_sequence: u32,
+}
+
+impl AuctionReservePriceUpdatedEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, AUCTION_RESERVE_UPDATED),), self);
+    }
+}
+
+pub fn emit_auction_reserve_updated(
+    env: &Env,
+    auction_id: u64,
+    updated_by: Address,
+    old_reserve_price: i128,
+    new_reserve_price: i128,
+) {
+    AuctionReservePriceUpdatedEvent {
+        auction_id,
+        updated_by,
+        old_reserve_price,
+        new_reserve_price,
+        ledger_sequence: env.ledger().sequence(),
     }
     .publish(env);
 }
