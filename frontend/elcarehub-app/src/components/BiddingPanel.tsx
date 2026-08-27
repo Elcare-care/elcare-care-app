@@ -140,6 +140,9 @@ export function BiddingPanel({
     // itself never touches floating-point arithmetic.
     const amountNumber = Number(baseToDisplay(result.baseUnits, bidToken));
 
+    // Issue #524 — fingerprint includes the bid amount, so a genuinely
+    // different bid is never deduplicated against a pending one, while a
+    // double-click / remount with the exact same amount is.
     const success = await run(
       () => bid(auction.auction_id, amountNumber),
       { action: "Bid" }
@@ -154,7 +157,15 @@ export function BiddingPanel({
   const handleFinalize = async () => {
     const success = await run(
       () => finalize(auction.auction_id),
-      { action: "Finalize auction" }
+      {
+        action: "Finalize auction",
+        dedupe: {
+          account: publicKey,
+          network: config.networkPassphrase,
+          contract: config.contractId,
+          args: { auctionId: auction.auction_id },
+        },
+      }
     );
     if (success) {
       onFinalized?.();

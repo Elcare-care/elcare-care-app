@@ -41,6 +41,7 @@ import { useModalA11y } from "@/hooks/useModalA11y";
 import { StatusAnnouncer } from "@/components/a11y/StatusAnnouncer";
 import { TxErrorPanel } from "@/components/TxErrorPanel";
 import { useTxLifecycle, txStateLabel } from "@/hooks/useTxLifecycle";
+import { config } from "@/lib/config";
 import Link from "next/link";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -518,7 +519,18 @@ function OwnerOfferList({
                         onClick={async () => {
                           const ok = await runOfferTx(
                             () => accept(offer.offer_id),
-                            { action: "Accept offer" }
+                            {
+                              action: "Accept offer",
+                              // Issue #524 — fingerprint includes the offer id
+                              // so accepting one offer is never deduplicated
+                              // against a pending accept/reject of another.
+                              dedupe: {
+                                account: ownerPublicKey,
+                                network: config.networkPassphrase,
+                                contract: config.contractId,
+                                args: { action: "accept", offerId: offer.offer_id },
+                              },
+                            }
                           );
                           if (ok) onRefresh();
                         }}
@@ -539,7 +551,15 @@ function OwnerOfferList({
                         onClick={async () => {
                           const ok = await runOfferTx(
                             () => reject(offer.offer_id),
-                            { action: "Reject offer" }
+                            {
+                              action: "Reject offer",
+                              dedupe: {
+                                account: ownerPublicKey,
+                                network: config.networkPassphrase,
+                                contract: config.contractId,
+                                args: { action: "reject", offerId: offer.offer_id },
+                              },
+                            }
                           );
                           if (ok) onRefresh();
                         }}
