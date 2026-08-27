@@ -485,3 +485,327 @@ Built with ❤️ for African artists and collectors everywhere.
 © 2026 ElcareHub · Built on [Stellar](https://stellar.org)
 
 </div>
+150-Line TODO — Deterministic Database & Mock-Chain Seed System
+
+Phase 1 — Understand the Existing Architecture
+
+[ ] 001. Open the project in VS Code.
+
+[ ] 002. Read the existing local architecture guide.
+
+[ ] 003. Identify how the local stack is started.
+
+[ ] 004. Identify the database technology.
+
+[ ] 005. Identify the database initialization process.
+
+[ ] 006. Identify existing database migrations.
+
+[ ] 007. Identify existing integration fixtures.
+
+[ ] 008. Identify existing E2E fixtures.
+
+[ ] 009. Identify the mock-chain implementation.
+
+[ ] 010. Identify how the mock chain is started.
+
+[ ] 011. Identify existing mock wallets.
+
+[ ] 012. Identify existing event fixtures.
+
+[ ] 013. Identify existing listing fixtures.
+
+[ ] 014. Identify existing auction fixtures.
+
+[ ] 015. Identify existing offer fixtures.
+
+[ ] 016. Identify existing collection fixtures.
+
+[ ] 017. Identify existing metadata fixtures.
+
+[ ] 018. Identify existing reorganization fixtures.
+
+[ ] 019. Identify existing test data generators.
+
+[ ] 020. Avoid duplicating fixtures that already exist.
+
+
+Phase 2 — Design the Seed System
+
+[ ] 021. Define the purpose of the seed command.
+
+[ ] 022. Define the default seed profile.
+
+[ ] 023. Define the small seed profile.
+
+[ ] 024. Define the large seed profile.
+
+[ ] 025. Define the reset behavior.
+
+[ ] 026. Make seed generation deterministic.
+
+[ ] 027. Choose a fixed random seed.
+
+[ ] 028. Ensure repeated runs produce predictable data.
+
+[ ] 029. Define the seed command interface.
+
+[ ] 030. Define command-line options.
+
+[ ] 031. Define profile selection.
+
+[ ] 032. Define reset options.
+
+[ ] 033. Define database-only seeding.
+
+[ ] 034. Define mock-chain-only seeding.
+
+[ ] 035. Define combined database and chain seeding.
+
+
+Phase 3 — Environment Configuration
+
+[ ] 036. Identify all required environment variables.
+
+[ ] 037. Document database connection variables.
+
+[ ] 038. Document mock-chain connection variables.
+
+[ ] 039. Document seed profile variables.
+
+[ ] 040. Document deterministic seed variables.
+
+[ ] 041. Document reset-related variables.
+
+[ ] 042. Create a safe local environment example.
+
+[ ] 043. Add seed-specific configuration where necessary.
+
+[ ] 044. Ensure production credentials are never required.
+
+[ ] 045. Ensure production credentials cannot accidentally be used.
+
+[ ] 046. Add safeguards against production database connections.
+
+[ ] 047. Add safeguards against production chain endpoints.
+
+[ ] 048. Ensure synthetic wallets are clearly identified.
+
+[ ] 049. Keep private keys limited to test/mock environments.
+
+[ ] 050. Review environment configuration for secrets.
+
+
+Phase 4 — Synthetic Wallets
+
+[ ] 051. Identify the wallet format required by the application.
+
+[ ] 052. Reuse existing test wallet generation utilities.
+
+[ ] 053. Create deterministic synthetic wallet identities.
+
+[ ] 054. Generate enough wallets for the small profile.
+
+[ ] 055. Generate additional wallets for the large profile.
+
+[ ] 056. Label wallets by their test purpose.
+
+[ ] 057. Create seller wallets.
+
+[ ] 058. Create buyer wallets.
+
+[ ] 059. Create bidder wallets.
+
+[ ] 060. Create collector wallets.
+
+[ ] 061. Ensure wallet addresses are synthetic.
+
+[ ] 062. Ensure wallets cannot represent production accounts.
+
+[ ] 063. Keep mock private keys isolated.
+
+[ ] 064. Document the synthetic wallet strategy.
+
+[ ] 065. Test wallet generation deterministically.
+
+
+Phase 5 — Database Seed Data
+
+[ ] 066. Identify all database tables requiring seed data.
+
+[ ] 067. Create deterministic users.
+
+[ ] 068. Create deterministic profiles.
+
+[ ] 069. Create deterministic listings.
+
+[ ] 070. Create active listings.
+
+[ ] 071. Create sold listings.
+
+[ ] 072. Create expired listings.
+
+[ ] 073. Create cancelled listings.
+
+[ ] 074. Create auction records.
+
+[ ] 075. Create active auctions.
+
+[ ] 076. Create completed auctions.
+
+[ ] 077. Create expired auctions.
+
+[ ] 078. Create offer records.
+
+[ ] 079. Create accepted offers.
+
+[ ] 080. Create rejected offers.
+
+[ ] 081. Create pending offers.
+
+[ ] 082. Create collection records.
+
+[ ] 083. Create collection ownership data.
+
+[ ] 084. Create metadata records.
+
+[ ] 085. Create missing/edge-case metadata.
+
+[ ] 086. Create reorganization-related records.
+
+[ ] 087. Create relationships between all seeded entities.
+
+[ ] 088. Ensure foreign keys remain valid.
+
+[ ] 089. Ensure timestamps are deterministic.
+
+[ ] 090. Verify seeded database integrity.
+
+
+Phase 6 — Mock-Chain Data
+
+[ ] 091. Reuse the existing E2E mock-chain capabilities.
+
+[ ] 092. Identify the required blockchain event types.
+
+[ ] 093. Generate deterministic block data.
+
+[ ] 094. Generate deterministic transaction identities.
+
+[ ] 095. Generate valid event identities.
+
+[ ] 096. Create listing events.
+
+[ ] 097. Create auction events.
+
+[ ] 098. Create offer events.
+
+[ ] 099. Create collection events.
+
+[ ] 100. Create metadata events.
+
+[ ] 101. Create ownership-transfer events.
+
+[ ] 102. Create reorganization scenarios.
+
+[ ] 103. Ensure event ordering is valid.
+
+[ ] 104. Ensure transaction relationships are valid.
+
+[ ] 105. Ensure block relationships are valid.
+
+[ ] 106. Ensure event IDs cannot collide unexpectedly.
+
+[ ] 107. Link chain events to seeded database records.
+
+[ ] 108. Verify the mock chain starts cleanly.
+
+[ ] 109. Verify the mock chain can be reseeded.
+
+[ ] 110. Verify chain fixtures remain deterministic.
+
+
+Phase 7 — Small & Large Profiles
+
+[ ] 111. Implement the small profile.
+
+[ ] 112. Keep the small profile fast.
+
+[ ] 113. Include at least one useful example of every major entity.
+
+[ ] 114. Include active listings.
+
+[ ] 115. Include auctions.
+
+[ ] 116. Include offers.
+
+[ ] 117. Include collections.
+
+[ ] 118. Include metadata.
+
+[ ] 119. Include at least one reorg scenario.
+
+[ ] 120. Implement the large profile.
+
+[ ] 121. Generate significantly more listings.
+
+[ ] 122. Generate multiple auctions.
+
+[ ] 123. Generate multiple offer states.
+
+[ ] 124. Generate multiple collections.
+
+[ ] 125. Generate varied metadata.
+
+[ ] 126. Generate larger ownership sets.
+
+[ ] 127. Include realistic pagination data.
+
+[ ] 128. Include realistic search/filter data.
+
+[ ] 129. Ensure the large profile remains deterministic.
+
+[ ] 130. Measure large-profile execution time.
+
+
+Phase 8 — Reset & Documentation
+
+[ ] 131. Implement a safe reset command.
+
+[ ] 132. Ensure reset only targets local/test resources.
+
+[ ] 133. Prevent accidental production resets.
+
+[ ] 134. Remove seeded database records during reset.
+
+[ ] 135. Reset mock-chain state.
+
+[ ] 136. Reset synthetic wallets where necessary.
+
+[ ] 137. Reset deterministic counters.
+
+[ ] 138. Return the database to a known clean state.
+
+[ ] 139. Return the mock chain to a known clean state.
+
+[ ] 140. Test seed → reset → seed.
+
+[ ] 141. Test repeated seed execution.
+
+[ ] 142. Test small-profile execution.
+
+[ ] 143. Test large-profile execution.
+
+[ ] 144. Update the local architecture guide.
+
+[ ] 145. Document the one-command setup process.
+
+[ ] 146. Document environment variables.
+
+[ ] 147. Document small versus large profiles.
+
+[ ] 148. Document reset behavior and safety warnings.
+
+[ ] 149. Verify a new developer can start the stack and populate useful data with one documented command.
+
+[ ] 150. Run the complete integration/E2E suite and confirm all major UI states work without production credentials.

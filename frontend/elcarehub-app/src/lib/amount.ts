@@ -259,6 +259,39 @@ export function formatAmount(
   return showSymbol ? `${formatted} ${token.symbol}` : formatted;
 }
 
+// ── Basis point helpers ─────────────────────────────────────────────────────
+
+/**
+ * Convert basis points (0–10,000) to a percentage (0–100).
+ *
+ * @example
+ * bpsToPercent(250) // 2.5
+ */
+export function bpsToPercent(bps: number): number {
+  return bps / 100;
+}
+
+/**
+ * Convert a percentage (0–100) to basis points (0–10,000), rounded to the
+ * nearest whole bps.
+ *
+ * @example
+ * percentToBps(2.5) // 250
+ */
+export function percentToBps(percent: number): number {
+  return Math.round(percent * 100);
+}
+
+/**
+ * Format basis points for display alongside their percentage equivalent.
+ *
+ * @example
+ * formatBps(250) // "250 bps (2.50%)"
+ */
+export function formatBps(bps: number): string {
+  return `${bps} bps (${bpsToPercent(bps).toFixed(2)}%)`;
+}
+
 // ── Fee preview ───────────────────────────────────────────────────────────────
 
 export interface FeeLineItem {

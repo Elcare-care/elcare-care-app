@@ -7,13 +7,14 @@
 import { useState, useEffect } from "react";
 import Link from "next/link";
 import { useWalletContext } from "@/context/WalletContext";
-import { useOffererOffers, useWithdrawOffer, useReclaimOffer } from "@/hooks/useOffers";
-import { stroopsToXlm, Offer, deriveOfferUIStatus, OfferUIStatus } from "@/lib/contract";
+import { useOffersWithReconciliation, useWithdrawOffer, useReclaimOffer } from "@/hooks/useOffers";
+import { stroopsToXlm, Offer, deriveOfferUIStatus } from "@/lib/contract";
 import { ShoppingBag, Clock, CheckCircle, XCircle, ArrowUpRight, History, Activity, TrendingUp, Loader2, Inbox, CalendarClock, Timer, Coins, AlertTriangle, X, ExternalLink, AlertOctagon } from "lucide-react";
 import { WalletGuard } from "@/components/WalletGuard";
 import { ResourceState } from "@/components/PageStates";
 import { categorizePageError } from "@/lib/pageState";
 import { SUPPORTED_TOKENS } from "@/config/tokens";
+import { OfferStatusBadge } from "@/components/OfferStatusBadge";
 import { clsx } from "clsx";
 
 type Tab = "all" | "Pending" | "Expired" | "Accepted" | "Rejected" | "Withdrawn";
@@ -33,20 +34,18 @@ function formatCountdown(expiresAtSec: number, nowMs: number): string | null {
   return `${minutes}m ${seconds}s`;
 }
 
-function getStatusBadgeClass(uiStatus: OfferUIStatus): string {
-  switch (uiStatus) {
-    case "Pending":  return "bg-brand-500/10 text-brand-400 border-brand-500/20";
-    case "Accepted": return "bg-mint-500/10 text-mint-400 border-mint-500/20";
-    case "Rejected": return "bg-terracotta-500/10 text-terracotta-400 border-terracotta-500/20";
-    case "Expired":  return "bg-amber-500/10 text-amber-400 border-amber-500/20";
-    case "Stale":    return "bg-yellow-500/10 text-yellow-400 border-yellow-500/20";
-    default:         return "bg-white/5 text-white/40 border-white/10";
-  }
-}
-
 export default function OffersPage() {
   const { publicKey } = useWalletContext();
-  const { offers, isLoading, error, refresh } = useOffererOffers(publicKey);
+  const {
+    offers,
+    isLoading,
+    error,
+    refresh,
+    addOfferMutation,
+    getOfferState,
+    resolveMutation,
+    rejectMutation,
+  } = useOffersWithReconciliation(publicKey);
   const { withdraw, isWithdrawing, error: withdrawError } = useWithdrawOffer(publicKey);
   const { reclaim, isReclaiming } = useReclaimOffer(publicKey);
   const [tab, setTab] = useState<Tab>("all");
@@ -59,11 +58,32 @@ export default function OffersPage() {
     return () => clearInterval(id);
   }, []);
 
+  // Optimistic transition with rollback (Issue #528 / #302 infra): flip the
+  // offer to its terminal status immediately on submit, and only persist
+  // that view once the tx confirms via refresh(); a failed tx rolls back to
+  // the last confirmed snapshot automatically via useReconciliation.
+  const handleWithdraw = async (o: Offer) => {
+    const pendingId = addOfferMutation("withdraw", { ...o, status: "Withdrawn" });
+    const ok = await withdraw(o.offer_id);
+    if (ok) {
+      resolveMutation(pendingId);
+      refresh();
+    } else {
+      rejectMutation(pendingId);
+    }
+  };
+
   const handleReclaim = async () => {
     if (!confirmOffer) return;
+    const pendingId = addOfferMutation("reclaim", { ...confirmOffer, status: "Withdrawn" });
     const ok = await reclaim(confirmOffer.offer_id);
     setConfirmOffer(null);
-    if (ok) refresh();
+    if (ok) {
+      resolveMutation(pendingId);
+      refresh();
+    } else {
+      rejectMutation(pendingId);
+    }
   };
 
   const pendingCnt = offers.filter((o: Offer) => deriveOfferUIStatus(o, now) === "Pending").length;
@@ -193,11 +213,20 @@ export default function OffersPage() {
             ))}
           </div>
 
-          {/* Navigational Tabs */}
-          <div className="mb-10 flex flex-wrap gap-2 border-b border-white/5 pb-px overflow-x-auto no-scrollbar scroll-smooth">
+          {/* Navigational Tabs — status filter, exposed as an accessible tablist */}
+          <div
+            role="tablist"
+            aria-label="Filter offers by status"
+            className="mb-10 flex flex-wrap gap-2 border-b border-white/5 pb-px overflow-x-auto no-scrollbar scroll-smooth"
+          >
             {tabs.map(({ key, label, icon: Icon }) => (
               <button
                 key={key}
+                role="tab"
+                id={`offers-tab-${key}`}
+                aria-selected={tab === key}
+                aria-controls="offers-tabpanel"
+                tabIndex={tab === key ? 0 : -1}
                 onClick={() => setTab(key)}
                 className={clsx(
                   "group relative flex items-center gap-3 px-6 sm:px-8 py-5 text-sm font-bold transition-all duration-500 whitespace-nowrap",
@@ -227,7 +256,12 @@ export default function OffersPage() {
           )}
 
           {/* Content area */}
-          <div className="animate-fade-in duration-700">
+          <div
+            className="animate-fade-in duration-700"
+            role="tabpanel"
+            id="offers-tabpanel"
+            aria-labelledby={`offers-tab-${tab}`}
+          >
             {error ? (
               <ResourceState
                 isLoading={false}
@@ -260,7 +294,10 @@ export default function OffersPage() {
               />
             ) : (
               <div className="grid gap-6 sm:grid-cols-2 lg:grid-cols-3">
-                {filtered.map((o) => {
+                {filtered.map((raw) => {
+                  // Show the optimistic value while a mutation is in flight;
+                  // falls back to the confirmed/raw offer otherwise.
+                  const o = (getOfferState(raw.offer_id).data as Offer) ?? raw;
                   const uiStatus = deriveOfferUIStatus(o, now);
                   const isExpired = uiStatus === "Expired";
                   const isPending = uiStatus === "Pending" || uiStatus === "Stale";
@@ -273,15 +310,10 @@ export default function OffersPage() {
                       <div className="h-12 w-12 rounded-[1rem] bg-white/5 flex items-center justify-center text-white/40 border border-white/10 shadow-inner">
                         <span className="font-bold text-sm font-mono">#{o.offer_id}</span>
                       </div>
-                      <span
-                        className={clsx(
-                          "px-4 py-1.5 rounded-full text-[10px] font-bold uppercase tracking-[0.2em] border",
-                          getStatusBadgeClass(uiStatus)
-                        )}
+                      <OfferStatusBadge
+                        uiStatus={uiStatus}
                         data-testid={`offer-status-badge-${o.offer_id}`}
-                      >
-                        {uiStatus}
-                      </span>
+                      />
                     </div>
 
                     <div className="flex flex-col gap-1 mb-8">
@@ -290,6 +322,14 @@ export default function OffersPage() {
                         <span className="font-display text-4xl font-bold text-white">{stroopsToXlm(o.amount)}</span>
                         <span className="text-[11px] font-bold text-brand-400 uppercase tracking-widest">{getTokenSymbol(o.token)}</span>
                       </div>
+                      {o.parent_offer_id != null && (
+                        <span
+                          className="mt-1 text-[10px] font-bold text-white/30 uppercase tracking-widest"
+                          data-testid={`counter-offer-indicator-${o.offer_id}`}
+                        >
+                          Counter-offer to offer #{o.parent_offer_id}
+                        </span>
+                      )}
                     </div>
 
                     <div className="mt-auto space-y-6">
@@ -403,10 +443,7 @@ export default function OffersPage() {
                       ) : isPending ? (
                         <button
                           data-testid={`withdraw-btn-${o.offer_id}`}
-                          onClick={async () => {
-                            const ok = await withdraw(o.offer_id);
-                            if (ok) refresh();
-                          }}
+                          onClick={() => handleWithdraw(o)}
                           disabled={isWithdrawing}
                           className="w-full flex items-center justify-center gap-2 rounded-2xl bg-white/5 hover:bg-terracotta-500/20 py-4 text-xs font-bold text-terracotta-400 border border-white/10 hover:border-terracotta-500/30 transition-all shadow-xl group/btn"
                         >

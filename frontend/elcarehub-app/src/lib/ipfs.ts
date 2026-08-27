@@ -253,7 +253,8 @@ export interface IpfsUploadResult {
  */
 export async function uploadImageToIPFS(
   file: File,
-  name?: string
+  name?: string,
+  signal?: AbortSignal
 ): Promise<IpfsUploadResult> {
   // Client-side validation before any network request
   const validation = await validateImageFile(file);
@@ -277,6 +278,7 @@ export async function uploadImageToIPFS(
     mimeType: string;
   }>("/api/ipfs/upload-image", formData, {
     maxBodyLength: Infinity,
+    signal,
   });
 
   const { cid, uploadId, contentHash, isDuplicate } = res.data;
@@ -298,17 +300,22 @@ export async function uploadImageToIPFS(
  */
 export async function uploadMetadataToIPFS(
   metadata: ArtworkMetadata,
-  name?: string
+  name?: string,
+  signal?: AbortSignal
 ): Promise<IpfsUploadResult> {
   const res = await axios.post<{
     cid: string;
     uploadId: string;
     contentHash: string;
     isDuplicate: boolean;
-  }>("/api/ipfs/upload-metadata", {
-    metadata,
-    name: name ?? `${metadata.title}-metadata.json`,
-  });
+  }>(
+    "/api/ipfs/upload-metadata",
+    {
+      metadata,
+      name: name ?? `${metadata.title}-metadata.json`,
+    },
+    { signal }
+  );
 
   const { cid, uploadId, contentHash, isDuplicate } = res.data;
   return {
@@ -364,7 +371,10 @@ export function getGatewayUrls(
  * `cid` can be a raw CID string or an "ipfs://CID" URI.
  * Tries the primary gateway first, then falls back to public gateways.
  */
-export async function fetchMetadata(cid?: string): Promise<ArtworkMetadata> {
+export async function fetchMetadata(
+  cid?: string,
+  signal?: AbortSignal
+): Promise<ArtworkMetadata> {
   if (!cid) {
     return {
       title: "Unknown Artwork",
@@ -380,13 +390,139 @@ export async function fetchMetadata(cid?: string): Promise<ArtworkMetadata> {
   let lastError: unknown;
   for (const url of urls) {
     try {
-      const res = await axios.get<ArtworkMetadata>(url);
+      const res = await axios.get<ArtworkMetadata>(url, { signal });
       return res.data;
     } catch (err) {
       lastError = err;
     }
   }
   throw lastError;
+}
+
+// ── CID / content verification (Issue #530) ────────────────────
+//
+// After a successful Pinata upload, we recompute a hash of the content the
+// gateway actually serves back for the returned CID and compare it against a
+// hash computed client-side before the upload. This catches a corrupted or
+// mismatched pin (wrong CID, gateway serving stale/altered bytes) so that a
+// listing is never finalised with a CID that doesn't resolve to the content
+// the artist actually submitted.
+
+/** Computes a SHA-256 hex digest of an ArrayBuffer (browser only). */
+async function hashBuffer(buffer: ArrayBuffer): Promise<string> {
+  if (typeof crypto === "undefined" || !crypto.subtle) return "";
+  const hashBuffer = await crypto.subtle.digest("SHA-256", buffer);
+  return Array.from(new Uint8Array(hashBuffer))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+/**
+ * Deterministically serialises the metadata fields the upload route persists
+ * (sorted keys, trimmed strings) so that a hash computed before upload can be
+ * compared against a hash computed from the re-fetched JSON, independent of
+ * gateway/JSON formatting differences (key order, whitespace).
+ */
+function canonicalMetadataString(metadata: Partial<ArtworkMetadata>): string {
+  const entries = Object.entries(metadata)
+    .filter(([, v]) => v !== undefined && v !== null)
+    .map(([k, v]): [string, unknown] => [k, typeof v === "string" ? v.trim() : v])
+    .sort(([a], [b]) => a.localeCompare(b));
+  return JSON.stringify(Object.fromEntries(entries));
+}
+
+/** Computes a SHA-256 hex digest of the canonicalised metadata object. */
+export async function computeMetadataHash(
+  metadata: Partial<ArtworkMetadata>
+): Promise<string> {
+  if (typeof crypto === "undefined" || !crypto.subtle) return "";
+  const encoded = new TextEncoder().encode(canonicalMetadataString(metadata));
+  return hashBuffer(encoded.buffer);
+}
+
+export class CidVerificationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "CidVerificationError";
+  }
+}
+
+/**
+ * Fetches the raw bytes served for `cid` from the gateway and returns their
+ * SHA-256 hex digest. Used to verify an uploaded image round-trips exactly.
+ */
+export async function fetchContentHash(
+  cid: string,
+  signal?: AbortSignal
+): Promise<string> {
+  const urls = getGatewayUrls(cid);
+  let lastError: unknown;
+  for (const url of urls) {
+    try {
+      const res = await axios.get(url, { responseType: "arraybuffer", signal });
+      return hashBuffer(res.data as ArrayBuffer);
+    } catch (err) {
+      lastError = err;
+    }
+  }
+  throw lastError instanceof Error
+    ? lastError
+    : new Error("Failed to fetch content for verification");
+}
+
+/**
+ * Verifies that the image gateway content for `cid` matches the hash of the
+ * file that was uploaded. Throws CidVerificationError on mismatch or when the
+ * content cannot be fetched.
+ */
+export async function verifyImageUpload(
+  cid: string,
+  expectedHash: string,
+  signal?: AbortSignal
+): Promise<void> {
+  if (!expectedHash) return; // hashing unsupported in this environment — skip
+  let actualHash: string;
+  try {
+    actualHash = await fetchContentHash(cid, signal);
+  } catch (err) {
+    throw new CidVerificationError(
+      `Could not verify uploaded image: content at CID ${cid} could not be fetched from any gateway.`
+    );
+  }
+  if (actualHash !== expectedHash) {
+    throw new CidVerificationError(
+      `Uploaded image content does not match: the CID ${cid} resolves to different bytes than what was uploaded.`
+    );
+  }
+}
+
+/**
+ * Verifies that the metadata gateway content for `cid` matches the metadata
+ * that was submitted for upload. Throws CidVerificationError on mismatch.
+ */
+export async function verifyMetadataUpload(
+  cid: string,
+  submitted: ArtworkMetadata,
+  signal?: AbortSignal
+): Promise<ArtworkMetadata> {
+  let fetched: ArtworkMetadata;
+  try {
+    fetched = await fetchMetadata(cid, signal);
+  } catch (err) {
+    throw new CidVerificationError(
+      `Could not verify uploaded metadata: content at CID ${cid} could not be fetched from any gateway.`
+    );
+  }
+  const [expectedHash, actualHash] = await Promise.all([
+    computeMetadataHash(submitted),
+    computeMetadataHash(fetched),
+  ]);
+  if (expectedHash && actualHash && expectedHash !== actualHash) {
+    throw new CidVerificationError(
+      `Uploaded metadata content does not match: the CID ${cid} resolves to different metadata than what was submitted.`
+    );
+  }
+  return fetched;
 }
 
 // ── Utility ───────────────────────────────────────────────────

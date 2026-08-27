@@ -82,7 +82,7 @@ function getDisplayConfig(
         title: "Request Declined",
         explanation: "You declined the request in your wallet.",
         instruction:
-          "When your wallet prompts you to approve or sign, click "Accept" or "Approve" to continue.",
+          'When your wallet prompts you to approve or sign, click "Accept" or "Approve" to continue.',
         primaryLabel: "Try Again",
         primaryAction: onRetry,
         severity: "info",
