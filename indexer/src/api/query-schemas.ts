@@ -22,18 +22,29 @@ const optionalIsoDate = z
 
 // ── Cursor pagination fields (shared across list endpoints) ───────────────────
 //
-// cursor_ledger    : ledgerSequence value to paginate from (exclusive boundary).
-// cursor_direction : "desc" (default, newest-first) | "asc" (oldest-first).
+// Two cursor styles are supported — clients should prefer the opaque cursor:
 //
-// When cursor_ledger is provided the endpoint uses:
-//   DESC → WHERE updatedAtLedger < cursor_ledger  (next older page)
-//   ASC  → WHERE updatedAtLedger > cursor_ledger  (next newer page)
+// Preferred (opaque composite cursor):
+//   cursor           : opaque base64url token returned in X-Next-Cursor.
+//                      Encodes ledger + row-id tiebreaker + HMAC signature.
+//                      Rejected with 400 if tampered or used on the wrong endpoint.
+//   cursor_direction : "desc" (default, newest-first) | "asc" (oldest-first).
+//
+// Legacy (plain ledger integer — kept for backwards compatibility):
+//   cursor_ledger    : ledgerSequence value to paginate from (exclusive boundary).
+//   cursor_direction : same as above.
 //
 // Responses include:
-//   X-Next-Cursor  : ledgerSequence of the last item returned, or "" when exhausted.
+//   X-Next-Cursor  : opaque cursor token for the next page, or "" when exhausted.
 //   X-Total-Count  : total matching rows (independent COUNT query).
+//
+// NOTE: `cursor` and `cursor_ledger` are mutually exclusive. When `cursor` is
+// present it takes precedence and `cursor_ledger` is ignored.
 
 const cursorFields = {
+  // Preferred opaque cursor (base64url, HMAC-signed composite token).
+  cursor: z.string().max(512).optional(),
+  // Legacy plain-integer cursor (backwards compatibility).
   cursor_ledger:    z.coerce.number().int().min(0).optional(),
   cursor_direction: z.enum(['asc', 'desc']).optional().default('desc'),
 };
