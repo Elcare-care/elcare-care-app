@@ -161,10 +161,9 @@ pub enum DataKey {
     /// `Admin` while absent so existing single-admin deployments are
     /// unaffected until an operator opts into a separate emergency signer.
     EmergencyPauser,
-    /// Completion marker: present when migration to `version` is done.
-    MigrationDone(String),
-    /// Resumable progress cursor during an in-flight migration.
-    MigrationCursor(String),
-    /// Version string last written to on-chain storage by `migrate()`.
-    ContractVersion,
+    /// Deployed collection address for an already-consumed secure salt (Issue #477).
+    /// Stored alongside SaltUsed so idempotent retries can return the existing address.
+    SaltAddress(BytesN<32>),
+    /// Collection-level pause state keyed by collection contract address (Issue #478).
+    CollectionPaused(Address),
 }

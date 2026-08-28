@@ -195,43 +195,39 @@ pub fn publish_migration_completed(env: &Env, version: &soroban_sdk::String) {
     );
 }
 
-/// Emitted when the admin updates the WASM hash for a specific collection kind.
+/// Emitted when a factory returns an existing collection address for an
+/// identical retry rather than deploying a new one (Issue #477).
 ///
-/// Topics: ("wasm_upd", kind_tag)
-/// Data:   (old_wasm: BytesN<32>, new_wasm: BytesN<32>)
+/// Topics: ("dep_idem",)
+/// Data:   (creator: Address, collection_address: Address)
 #[allow(deprecated)]
-pub fn publish_collection_wasm_updated(
-    env: &Env,
-    kind: &crate::types::CollectionKind,
-    old_wasm: &BytesN<32>,
-    new_wasm: &BytesN<32>,
-) {
-    use soroban_sdk::symbol_short;
-    let tag = match kind {
-        crate::types::CollectionKind::Normal721    => symbol_short!("n721"),
-        crate::types::CollectionKind::Normal1155   => symbol_short!("n1155"),
-        crate::types::CollectionKind::LazyMint721  => symbol_short!("l721"),
-        crate::types::CollectionKind::LazyMint1155 => symbol_short!("l1155"),
-    };
+pub fn publish_deploy_idempotent(env: &Env, creator: &Address, address: &Address) {
     env.events().publish(
-        (symbol_short!("wasm_upd"), tag),
-        (old_wasm.clone(), new_wasm.clone()),
+        (symbol_short!("dep_idem"),),
+        (creator.clone(), address.clone()),
     );
 }
 
-/// Emitted when the admin upgrades an existing deployed collection contract.
+/// Emitted when a collection is paused by its creator or admin (Issue #478).
 ///
-/// Topics: ("coll_upg", collection_address)
-/// Data:   (from_wasm: BytesN<32>, to_wasm: BytesN<32>)
+/// Topics: ("c_psd", collection_address)
+/// Data:   (paused_by: Address)
 #[allow(deprecated)]
-pub fn publish_collection_upgraded(
-    env: &Env,
-    collection_address: &Address,
-    from_wasm: &BytesN<32>,
-    to_wasm: &BytesN<32>,
-) {
+pub fn publish_collection_paused(env: &Env, collection: &Address, paused_by: &Address) {
     env.events().publish(
-        (symbol_short!("coll_upg"), collection_address.clone()),
-        (from_wasm.clone(), to_wasm.clone()),
+        (symbol_short!("c_psd"), collection.clone()),
+        paused_by.clone(),
+    );
+}
+
+/// Emitted when a collection is unpaused by its creator or admin (Issue #478).
+///
+/// Topics: ("c_unpsd", collection_address)
+/// Data:   (unpaused_by: Address)
+#[allow(deprecated)]
+pub fn publish_collection_unpaused(env: &Env, collection: &Address, unpaused_by: &Address) {
+    env.events().publish(
+        (symbol_short!("c_unpsd"), collection.clone()),
+        unpaused_by.clone(),
     );
 }

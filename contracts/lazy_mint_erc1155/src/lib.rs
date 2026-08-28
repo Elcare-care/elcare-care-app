@@ -1018,6 +1018,20 @@ impl LazyMint1155 {
             .has(&DataKey::RedeemedVoucher(nonce))
     }
 
+    /// Returns the composite status of a voucher nonce (#480):
+    ///   "Revoked"  — creator has explicitly revoked this nonce
+    ///   "Redeemed" — nonce has been consumed by a successful redeem call
+    ///   "Issued"   — nonce is still valid (not revoked, not redeemed)
+    pub fn voucher_status(env: Env, nonce: u64) -> String {
+        if env.storage().persistent().has(&DataKey::RevokedVoucher(nonce)) {
+            String::from_str(&env, "Revoked")
+        } else if env.storage().persistent().has(&DataKey::RedeemedVoucher(nonce)) {
+            String::from_str(&env, "Redeemed")
+        } else {
+            String::from_str(&env, "Issued")
+        }
+    }
+
     pub fn name(env: Env) -> String {
         env.storage().instance().get(&DataKey::Name).unwrap()
     }

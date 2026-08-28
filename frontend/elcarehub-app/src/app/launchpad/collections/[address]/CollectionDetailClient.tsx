@@ -26,8 +26,62 @@ export default function CollectionDetailClient({ address }: { address: string })
   const [voucherFilter, setVoucherFilter] = useState<'All' | 'Issued' | 'Redeemed' | 'Revoked' | 'Expired'>('All');
   const [showFreezeModal, setShowFreezeModal] = useState(false);
   const [freezing, setFreezing] = useState(false);
+  const [showRevokeModal, setShowRevokeModal] = useState(false);
+  const [selectedVoucher, setSelectedVoucher] = useState<Voucher | null>(null);
+  const [revoking, setRevoking] = useState(false);
+  const [collectionPaused, setCollectionPaused] = useState(false);
+  const [pausing, setPausing] = useState(false);
 
   const isCreator = publicKey === metadata?.creator;
+
+  const handleRevokeVoucher = async () => {
+    if (!selectedVoucher || !address || !publicKey) return;
+    setRevoking(true);
+    try {
+      const response = await fetch(
+        `/api/collections/${address}/vouchers/${selectedVoucher.nonce}/revoke`,
+        { method: 'POST', headers: { 'Content-Type': 'application/json' } }
+      );
+      if (response.ok) {
+        setVouchers((prev) =>
+          prev.map((v) =>
+            v.nonce === selectedVoucher.nonce ? { ...v, status: 'Revoked' as const } : v
+          )
+        );
+        setShowRevokeModal(false);
+        setSelectedVoucher(null);
+      } else {
+        alert('Failed to revoke voucher');
+      }
+    } catch (err) {
+      console.error('Failed to revoke voucher:', err);
+      alert('Failed to revoke voucher');
+    } finally {
+      setRevoking(false);
+    }
+  };
+
+  const handleTogglePause = async () => {
+    if (!address || !publicKey) return;
+    setPausing(true);
+    try {
+      const endpoint = collectionPaused ? 'unpause' : 'pause';
+      const response = await fetch(`/api/collections/${address}/${endpoint}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+      });
+      if (response.ok) {
+        setCollectionPaused((prev) => !prev);
+      } else {
+        alert(`Failed to ${endpoint} collection`);
+      }
+    } catch (err) {
+      console.error('Failed to toggle pause:', err);
+      alert('Failed to toggle collection pause state');
+    } finally {
+      setPausing(false);
+    }
+  };
 
   const handleFreezeCollection = async () => {
     if (!address || !publicKey) return;
@@ -270,24 +324,82 @@ export default function CollectionDetailClient({ address }: { address: string })
                                 </p>
                               </div>
                             </div>
-                            <span
-                              className={`px-3 py-1 rounded-full text-xs font-bold uppercase ${
-                                voucher.status === 'Redeemed'
-                                  ? 'bg-green-100 text-green-700'
-                                  : voucher.status === 'Revoked'
-                                  ? 'bg-red-100 text-red-700'
-                                  : voucher.status === 'Expired'
-                                  ? 'bg-amber-100 text-amber-700'
-                                  : 'bg-blue-100 text-blue-700'
-                              }`}
-                            >
-                              {voucher.status}
-                            </span>
+                            <div className="flex items-center gap-2">
+                              <span
+                                className={`px-3 py-1 rounded-full text-xs font-bold uppercase ${
+                                  voucher.status === 'Redeemed'
+                                    ? 'bg-green-100 text-green-700'
+                                    : voucher.status === 'Revoked'
+                                    ? 'bg-red-100 text-red-700'
+                                    : voucher.status === 'Expired'
+                                    ? 'bg-amber-100 text-amber-700'
+                                    : 'bg-blue-100 text-blue-700'
+                                }`}
+                              >
+                                {voucher.status}
+                              </span>
+                              {isCreator && voucher.status === 'Issued' && (
+                                <button
+                                  onClick={() => {
+                                    setSelectedVoucher(voucher);
+                                    setShowRevokeModal(true);
+                                  }}
+                                  className="px-3 py-1 rounded-xl bg-red-100 text-red-700 text-xs font-bold hover:bg-red-200 transition-colors flex items-center gap-1"
+                                >
+                                  <XCircle size={12} />
+                                  Revoke
+                                </button>
+                              )}
+                            </div>
                           </div>
                         ))}
                       </div>
                     )}
                   </div>
+
+                    <div className="bg-white rounded-3xl border border-gray-100 p-8 shadow-sm">
+                      <div className="flex items-center justify-between mb-6">
+                        <h3 className="text-2xl font-display font-bold text-gray-900">Collection Pause</h3>
+                        <span
+                          className={`px-3 py-1 rounded-full text-xs font-bold uppercase ${
+                            collectionPaused ? 'bg-red-100 text-red-700' : 'bg-green-100 text-green-700'
+                          }`}
+                        >
+                          {collectionPaused ? 'Paused' : 'Active'}
+                        </span>
+                      </div>
+
+                      <div className="flex items-center justify-between p-4 rounded-xl bg-gray-50 border border-gray-100">
+                        <div>
+                          <p className="font-bold text-gray-900 mb-1">
+                            {collectionPaused ? 'Resume collection trading' : 'Pause collection trading'}
+                          </p>
+                          <p className="text-sm text-gray-500">
+                            {collectionPaused
+                              ? 'Unpause to allow listings and purchases for this collection.'
+                              : 'Pause to block new listings and purchases for this collection.'}
+                          </p>
+                        </div>
+                        <button
+                          onClick={handleTogglePause}
+                          disabled={pausing}
+                          className={`px-4 py-2 rounded-xl font-bold transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2 ${
+                            collectionPaused
+                              ? 'bg-green-500 text-white hover:bg-green-600'
+                              : 'bg-amber-500 text-white hover:bg-amber-600'
+                          }`}
+                        >
+                          {pausing ? (
+                            <Loader2 size={16} className="animate-spin" />
+                          ) : collectionPaused ? (
+                            <Unlock size={16} />
+                          ) : (
+                            <Lock size={16} />
+                          )}
+                          {collectionPaused ? 'Unpause' : 'Pause'}
+                        </button>
+                      </div>
+                    </div>
                   </>
                 )}
               </div>
@@ -337,6 +449,60 @@ export default function CollectionDetailClient({ address }: { address: string })
           ) : null}
         </div>
       </div>
+
+      {/* Revoke Voucher Confirmation Modal */}
+      {showRevokeModal && selectedVoucher && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+          <div className="bg-white rounded-3xl p-8 max-w-md w-full shadow-2xl">
+            <div className="flex items-center gap-3 mb-6">
+              <div className="p-3 rounded-full bg-red-100">
+                <XCircle size={24} className="text-red-600" />
+              </div>
+              <h3 className="text-2xl font-display font-bold text-gray-900">Revoke Voucher</h3>
+            </div>
+
+            <div className="space-y-4 mb-8">
+              <p className="text-gray-600">
+                You are about to revoke voucher with nonce{' '}
+                <span className="font-mono font-bold">{selectedVoucher.nonce}</span>. The holder
+                will no longer be able to redeem it.
+              </p>
+              <div className="p-4 rounded-xl bg-amber-50 border border-amber-200">
+                <p className="text-sm text-amber-800 font-medium">
+                  ⚠️ This action cannot be undone. The voucher status will change to Revoked.
+                </p>
+              </div>
+            </div>
+
+            <div className="flex gap-3">
+              <button
+                onClick={() => { setShowRevokeModal(false); setSelectedVoucher(null); }}
+                disabled={revoking}
+                className="flex-1 px-4 py-3 rounded-xl bg-gray-100 text-gray-700 font-bold hover:bg-gray-200 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleRevokeVoucher}
+                disabled={revoking}
+                className="flex-1 px-4 py-3 rounded-xl bg-red-500 text-white font-bold hover:bg-red-600 transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
+              >
+                {revoking ? (
+                  <>
+                    <Loader2 size={16} className="animate-spin" />
+                    Revoking...
+                  </>
+                ) : (
+                  <>
+                    <XCircle size={16} />
+                    Confirm Revoke
+                  </>
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Freeze Confirmation Modal */}
       {showFreezeModal && (

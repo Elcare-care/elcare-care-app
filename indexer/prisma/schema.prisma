@@ -87,6 +87,13 @@ model Listing {
   createdAt       DateTime      @default(now())
   updatedAt       DateTime      @updatedAt
 
+  // ── ERC-1155 quantity fields (Issue #479) ──────────────────────────────────
+  /// Total quantity listed for ERC-1155 editions. Always 1 for ERC-721.
+  quantity          Int     @default(1)
+  /// Remaining unfilled quantity. Decremented on each partial purchase.
+  /// Reaches 0 when fully sold or cancelled. Always 1 for ERC-721.
+  remainingQuantity Int     @default(1)
+
   // ── Royalty fields ─────────────────────────────────────────────────────────
   /// Address of the original creator — used to attribute secondary royalties
   /// after ownership has transferred.
@@ -291,12 +298,18 @@ model Collection {
   /// "valid"   — deployed after #476 validation rules; all fields passed launchpad checks.
   /// "unknown" — deployed before #476; no validation guarantee.
   metadataStatus  String   @default("unknown")
+  /// Collection-level pause state (Issue #478).
+  /// When true, new listings and auctions for this collection are blocked.
+  paused          Boolean  @default(false)
+  /// Address that issued the most recent pause, for audit trail (Issue #478).
+  pausedBy        String?
   createdAt       DateTime @default(now())
   // GIN-indexed tsvector updated by collection_search_vector_trigger.
   searchVector    Unsupported("tsvector")?
   @@index([creator])
   @@index([creator, deployedAtLedger])
   @@index([kind, deployedAtLedger])
+  @@index([paused])
 }
 
 // ── Lazy-mint voucher registry ────────────────────────────────────────────────
@@ -311,6 +324,8 @@ model Voucher {
   tokenId         BigInt?  // target token id (may be null until redeemed)
   status          String   @default("Issued") // Issued | Redeemed | Revoked | Expired
   redeemer        String?  // address that redeemed (null if not yet redeemed)
+  /// Address that revoked this voucher (Issue #480). Null unless status=Revoked.
+  revokedBy       String?
   createdAtLedger Int
   updatedAtLedger Int      @default(0)
   createdAt       DateTime @default(now())
