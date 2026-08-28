@@ -411,6 +411,55 @@ export class ContractRegistry {
     }));
   }
 
+  // ── Cross-contract consistency (Issue #486) ────────────────────────────────
+
+  /**
+   * Returns the lowest `lastLedger` across all active contracts.
+   *
+   * This is the shared consistency floor: API views that join data from
+   * multiple contracts are guaranteed coherent only up to this ledger.
+   * Returns 0 when no active contracts are registered.
+   */
+  sharedConsistencyLedger(): number {
+    const actives = this.active();
+    if (actives.length === 0) return 0;
+    return Math.min(...actives.map((e) => e.lastLedger));
+  }
+
+  /**
+   * Returns the ledger difference between the most-advanced and least-advanced
+   * active contract cursors.  A value of 0 means all cursors are in sync.
+   * High values indicate one contract is lagging and cross-contract joins may
+   * surface stale references.
+   */
+  crossContractLag(): number {
+    const actives = this.active();
+    if (actives.length < 2) return 0;
+    const ledgers = actives.map((e) => e.lastLedger);
+    return Math.max(...ledgers) - Math.min(...ledgers);
+  }
+
+  /**
+   * Returns an aggregate consistency snapshot suitable for the /health/details
+   * and API freshness headers.
+   */
+  consistencySnapshot(): CrossContractConsistencySnapshot {
+    const actives = this.active();
+    return {
+      sharedConsistencyLedger: this.sharedConsistencyLedger(),
+      crossContractLag:        this.crossContractLag(),
+      contractCount:           actives.length,
+      cursors: actives.map((e) => ({
+        contractId:     e.id,
+        label:          e.label,
+        type:           e.type,
+        lastLedger:     e.lastLedger,
+        lastProgressAt: e.lastProgressAt,
+        health:         e.health,
+      })),
+    };
+  }
+
   /**
    * Detect and record stalls for all active contracts based on the time
    * elapsed since their last progress.
@@ -497,6 +546,31 @@ export class ContractRegistry {
 }
 
 // ── Exported types ────────────────────────────────────────────────────────────
+
+/** Per-cursor entry in a CrossContractConsistencySnapshot. */
+export interface ContractCursorEntry {
+  contractId:     string;
+  label:          string;
+  type:           ContractType;
+  lastLedger:     number;
+  lastProgressAt: string | null;
+  health:         ContractHealthState;
+}
+
+/**
+ * Aggregate cross-contract consistency state (Issue #486).
+ * Included in /health/details and API X-Consistency-Ledger headers.
+ */
+export interface CrossContractConsistencySnapshot {
+  /** Lowest lastLedger across all active contracts — the coherent view floor. */
+  sharedConsistencyLedger: number;
+  /** Ledger difference between the fastest and slowest active contract cursors. */
+  crossContractLag: number;
+  /** Number of active contracts in the registry. */
+  contractCount: number;
+  /** Per-contract cursor details. */
+  cursors: ContractCursorEntry[];
+}
 
 export interface ContractHealthSummary {
   contractId:        string;
