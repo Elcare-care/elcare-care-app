@@ -37,7 +37,12 @@ pub fn publish_deploy(env: &Env, tag: soroban_sdk::Symbol, creator: &Address, ad
 /// Emitted when a deployment fee is successfully transferred to the treasury.
 ///
 /// Topics: ("fee_coll", creator, treasury)
-/// Data:   (amount: i128, currency: Address)
+/// Data:   (amount: i128, currency: Address, collection: Address, kind_tag: Symbol, platform_fee_bps: u32)
+///
+/// `collection`, `kind_tag`, and `platform_fee_bps` were added additively for
+/// Issue #483 to give the indexer a single-event source of truth for fee
+/// attribution. The indexer accepts data length >= 2 so existing integrations
+/// that only decode the first two data fields are not broken.
 #[allow(deprecated)]
 pub fn publish_deployment_fee_collected(
     env: &Env,
@@ -45,10 +50,13 @@ pub fn publish_deployment_fee_collected(
     treasury: &Address,
     amount: i128,
     currency: &Address,
+    collection: &Address,
+    kind_tag: soroban_sdk::Symbol,
+    platform_fee_bps: u32,
 ) {
     env.events().publish(
         (symbol_short!("fee_coll"), creator.clone(), treasury.clone()),
-        (amount, currency.clone()),
+        (amount, currency.clone(), collection.clone(), kind_tag, platform_fee_bps),
     );
 }
 
@@ -158,55 +166,6 @@ pub fn publish_collection_wasm_updated(
     old_wasm: &BytesN<32>,
     new_wasm: &BytesN<32>,
 ) {
-    use soroban_sdk::IntoVal;
-    let tag: soroban_sdk::Val = kind.clone().into_val(env);
-    env.events().publish(
-        (symbol_short!("wasm_upd"), tag),
-        (old_wasm.clone(), new_wasm.clone()),
-    );
-}
-
-/// Emitted when the admin upgrades a deployed collection to a new WASM hash.
-///
-/// Topics: ("col_upg", collection: Address)
-/// Data:   (from_wasm: BytesN<32>, to_wasm: BytesN<32>)
-#[allow(deprecated)]
-pub fn publish_collection_upgraded(
-    env: &Env,
-    collection: &Address,
-    from_wasm: &BytesN<32>,
-    to_wasm: &BytesN<32>,
-) {
-    env.events().publish(
-        (symbol_short!("col_upg"), collection.clone()),
-        (from_wasm.clone(), to_wasm.clone()),
-    );
-}
-
-/// Emitted when a versioned migration completes successfully.
-///
-/// Topics: ("migrated", version: String)
-/// Data:   ()
-#[allow(deprecated)]
-pub fn publish_migration_completed(env: &Env, version: &soroban_sdk::String) {
-    env.events().publish(
-        (soroban_sdk::symbol_short!("migrated"), version.clone()),
-        (),
-    );
-}
-
-/// Emitted when the admin updates the WASM hash for a specific collection kind.
-///
-/// Topics: ("wasm_upd", kind_tag)
-/// Data:   (old_wasm: BytesN<32>, new_wasm: BytesN<32>)
-#[allow(deprecated)]
-pub fn publish_collection_wasm_updated(
-    env: &Env,
-    kind: &crate::types::CollectionKind,
-    old_wasm: &BytesN<32>,
-    new_wasm: &BytesN<32>,
-) {
-    use soroban_sdk::symbol_short;
     let tag = match kind {
         crate::types::CollectionKind::Normal721    => symbol_short!("n721"),
         crate::types::CollectionKind::Normal1155   => symbol_short!("n1155"),
@@ -233,5 +192,17 @@ pub fn publish_collection_upgraded(
     env.events().publish(
         (symbol_short!("coll_upg"), collection_address.clone()),
         (from_wasm.clone(), to_wasm.clone()),
+    );
+}
+
+/// Emitted when a versioned migration completes successfully.
+///
+/// Topics: ("migrated", version: String)
+/// Data:   ()
+#[allow(deprecated)]
+pub fn publish_migration_completed(env: &Env, version: &soroban_sdk::String) {
+    env.events().publish(
+        (soroban_sdk::symbol_short!("migrated"), version.clone()),
+        (),
     );
 }
