@@ -2202,4 +2202,114 @@ router.use(notificationRouter);
 import moderationRouter from './moderation-routes.js';
 router.use(moderationRouter);
 
+// ── GET /admin/verify-events ──────────────────────────────────────────────────
+// Read-only event integrity verifier. Compares RPC events vs DB events over a
+// bounded ledger range. Returns JSON report with duplicates, omissions,
+// orphans, and ledger discontinuities. Never mutates production data.
+//
+// Query params:
+//   from     (required) — starting ledger (inclusive)
+//   to       (required) — ending ledger (inclusive)
+//   contract (optional) — comma-separated contract IDs; defaults to all tracked
+//   cursor   (optional) — resumable cursor (ledger to start from)
+//   window   (optional) — window size in ledgers (default 500)
+//
+// Example: GET /admin/verify-events?from=1000000&to=1001000
+
+import { runEventVerifier, serializeVerifierResult } from '../event-verifier.js';
+
+router.get(
+  '/admin/verify-events',
+  operationalRateLimiter,
+  authMiddleware('operator'),
+  async (req: Request, res: Response, next: NextFunction) => {
+    const fromStr    = req.query.from     as string | undefined;
+    const toStr      = req.query.to       as string | undefined;
+    const contractQ  = req.query.contract as string | undefined;
+    const cursorStr  = req.query.cursor   as string | undefined;
+    const windowStr  = req.query.window   as string | undefined;
+
+    if (!fromStr || !toStr) {
+      return next(badRequest('from and to query params are required'));
+    }
+
+    const fromLedger = parseInt(fromStr, 10);
+    const toLedger   = parseInt(toStr, 10);
+
+    if (isNaN(fromLedger) || isNaN(toLedger) || fromLedger > toLedger) {
+      return next(badRequest('from and to must be integers with from <= to'));
+    }
+
+    const contractIds  = contractQ ? contractQ.split(',').filter(Boolean) : undefined;
+    const windowSize   = windowStr ? parseInt(windowStr, 10) : undefined;
+    const cursorLedger = cursorStr ? parseInt(cursorStr, 10) : undefined;
+
+    // Cap range to avoid runaway queries
+    const MAX_RANGE = parseInt(process.env.VERIFY_MAX_RANGE || '50000', 10);
+    if (toLedger - fromLedger > MAX_RANGE) {
+      return next(badRequest(`Range too large. Maximum allowed: ${MAX_RANGE} ledgers. Use cursor to page.`));
+    }
+
+    try {
+      const result = await runEventVerifier({
+        fromLedger,
+        toLedger,
+        contractIds,
+        windowSize,
+        cursorLedger,
+      });
+
+      const json = serializeVerifierResult(result);
+
+      const hasIssues =
+        result.duplicates.length > 0 ||
+        result.omissions.length > 0 ||
+        result.orphans.length > 0 ||
+        result.discontinuities.length > 0;
+
+      res.status(hasIssues ? 207 : 200).json({
+        ok: !hasIssues,
+        ...json,
+      });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+// ── GET /admin/rpc-pool-status ─────────────────────────────────────────────────
+// Returns the current RPC provider pool status: active provider, health scores,
+// failover state, and per-provider metrics.
+
+import { buildProviderPoolFromEnv } from '../rpc-provider-pool.js';
+
+let _poolStatusCache: ReturnType<typeof buildProviderPoolFromEnv> | null = null;
+function getOrCreatePool() {
+  if (!_poolStatusCache) {
+    try {
+      _poolStatusCache = buildProviderPoolFromEnv();
+    } catch {
+      return null;
+    }
+  }
+  return _poolStatusCache;
+}
+
+router.get(
+  '/admin/rpc-pool-status',
+  operationalRateLimiter,
+  authMiddleware('operator'),
+  (_req: Request, res: Response, next: NextFunction) => {
+    try {
+      const pool = getOrCreatePool();
+      if (!pool) {
+        return res.json({ ok: true, message: 'RPC provider pool not configured', providers: [] });
+      }
+      res.json({ ok: true, ...pool.getStatus() });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
 export default router;
