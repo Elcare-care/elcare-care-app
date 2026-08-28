@@ -67,7 +67,7 @@ pub enum CollectionKind {
     LazyMint1155,
 }
 
-/// A record stored for every deployed collection (issues #37 + #38).
+/// A record stored for every deployed collection (issues #37 + #38 + #482).
 #[contracttype]
 #[derive(Clone)]
 pub struct CollectionRecord {
@@ -78,6 +78,12 @@ pub struct CollectionRecord {
     pub symbol: String,
     pub ledger: u32,
     pub platform_fee_bps: u32,
+    /// Collection-level default royalty in basis points (0–10 000) (#482).
+    /// Snapshotted at deploy time; used by the marketplace as the fallback
+    /// royalty when no per-listing override is present.
+    pub royalty_bps: u32,
+    /// Royalty receiver address snapshotted at deploy time (#482).
+    pub royalty_receiver: Address,
 }
 
 /// The four collection WASM hashes plus a monotonically increasing version,
@@ -161,10 +167,4 @@ pub enum DataKey {
     /// `Admin` while absent so existing single-admin deployments are
     /// unaffected until an operator opts into a separate emergency signer.
     EmergencyPauser,
-    /// Completion marker: present when migration to `version` is done.
-    MigrationDone(String),
-    /// Resumable progress cursor during an in-flight migration.
-    MigrationCursor(String),
-    /// Version string last written to on-chain storage by `migrate()`.
-    ContractVersion,
 }

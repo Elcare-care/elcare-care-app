@@ -1035,6 +1035,178 @@ router.get('/collections/:address/fee', lightRateLimiter, async (req: Request, r
   }
 });
 
+// ── GET /collections/:address/royalty-defaults ─────────────────────────────────
+// Returns the default royalty snapshot for a collection (#482).
+// defaultRoyaltyBps and defaultRoyaltyReceiver are snapshotted at deploy time.
+
+router.get('/collections/:address/royalty-defaults', lightRateLimiter, cacheMiddleware(60), async (req: Request, res: Response, next: NextFunction) => {
+  const address = req.params.address as string;
+  if (!address) return next(badRequest('Collection address is required'));
+  try {
+    const collection = await prisma.collection.findUnique({
+      where: { contractAddress: address },
+      select: {
+        contractAddress: true,
+        defaultRoyaltyBps: true,
+        defaultRoyaltyReceiver: true,
+      },
+    });
+    if (!collection) return next(notFound('Collection not found'));
+    res.json({
+      contractAddress: collection.contractAddress,
+      defaultRoyaltyBps: collection.defaultRoyaltyBps ?? null,
+      defaultRoyaltyReceiver: collection.defaultRoyaltyReceiver ?? null,
+    });
+  } catch (err) {
+    next(internalError('Failed to fetch collection royalty defaults'));
+  }
+});
+
+// ── GET /collections/:address/succession ───────────────────────────────────────
+// Returns the current creator succession state for a collection (#484).
+// Shows originalCreator, current creator, and any pending proposal.
+
+router.get('/collections/:address/succession', lightRateLimiter, async (req: Request, res: Response, next: NextFunction) => {
+  const address = req.params.address as string;
+  if (!address) return next(badRequest('Collection address is required'));
+  try {
+    const collection = await prisma.collection.findUnique({
+      where: { contractAddress: address },
+      select: {
+        contractAddress: true,
+        creator: true,
+        originalCreator: true,
+        pendingCreator: true,
+        pendingCreatorExpiry: true,
+      },
+    });
+    if (!collection) return next(notFound('Collection not found'));
+    res.json(serialize(collection));
+  } catch (err) {
+    next(internalError('Failed to fetch collection succession state'));
+  }
+});
+
+// ── GET /admin/deployment-fees ────────────────────────────────────────────────
+// Returns deployment fee accounting records (#483).
+// Supports filtering by creator, treasury, and collection address.
+
+router.get('/admin/deployment-fees', operationalRateLimiter, authMiddleware('operator'), async (req: Request, res: Response, next: NextFunction) => {
+  const creator = req.query.creator as string | undefined;
+  const treasury = req.query.treasury as string | undefined;
+  const collection = req.query.collection as string | undefined;
+  const limitRaw  = req.query.limit  as string | undefined;
+  const offsetRaw = req.query.offset as string | undefined;
+  const limit  = Math.min(limitRaw  ? parseInt(limitRaw,  10) : 50, 200);
+  const offset = offsetRaw ? parseInt(offsetRaw, 10) : 0;
+
+  try {
+    const where: any = {};
+    if (creator)    where.creator    = creator;
+    if (treasury)   where.treasury   = treasury;
+    if (collection) where.collectionAddress = collection;
+
+    const [fees, total] = await Promise.all([
+      (prisma as any).deploymentFee.findMany({
+        where,
+        orderBy: { ledgerSequence: 'desc' },
+        take: limit,
+        skip: offset,
+      }),
+      (prisma as any).deploymentFee.count({ where }),
+    ]);
+
+    res.setHeader('X-Total-Count', String(total));
+    res.json({ total, fees: serialize(fees) });
+  } catch (err) {
+    next(internalError('Failed to fetch deployment fees'));
+  }
+});
+
+// ── GET /admin/deployment-fees ────────────────────────────────────────────────
+// Returns deployment fee accounting records (#483).
+// Supports filtering by creator, treasury, and collection address.
+
+router.get('/admin/deployment-fees', operationalRateLimiter, authMiddleware('operator'), async (req: Request, res: Response, next: NextFunction) => {
+  const creator    = req.query.creator    as string | undefined;
+  const treasury   = req.query.treasury   as string | undefined;
+  const collection = req.query.collection as string | undefined;
+  const limitRaw   = req.query.limit  as string | undefined;
+  const offsetRaw  = req.query.offset as string | undefined;
+  const limit  = Math.min(limitRaw  ? parseInt(limitRaw,  10) : 50, 200);
+  const offset = offsetRaw ? parseInt(offsetRaw, 10) : 0;
+  try {
+    const where: any = {};
+    if (creator)    where.creator           = creator;
+    if (treasury)   where.treasury          = treasury;
+    if (collection) where.collectionAddress = collection;
+    const [fees, total] = await Promise.all([
+      (prisma as any).deploymentFee.findMany({
+        where,
+        orderBy: { ledgerSequence: 'desc' },
+        take: limit,
+        skip: offset,
+      }),
+      (prisma as any).deploymentFee.count({ where }),
+    ]);
+    res.setHeader('X-Total-Count', String(total));
+    res.json({ total, fees: serialize(fees) });
+  } catch (err) {
+    next(internalError('Failed to fetch deployment fees'));
+  }
+});
+
+// ── GET /admin/deployment-fees ────────────────────────────────────────────────
+// Returns deployment fee accounting records (#483).
+
+router.get('/admin/deployment-fees', operationalRateLimiter, authMiddleware('operator'), async (req: Request, res: Response, next: NextFunction) => {
+  const creator    = req.query.creator    as string | undefined;
+  const treasury   = req.query.treasury   as string | undefined;
+  const collection = req.query.collection as string | undefined;
+  const limit  = Math.min(req.query.limit  ? parseInt(req.query.limit  as string, 10) : 50, 200);
+  const offset = req.query.offset ? parseInt(req.query.offset as string, 10) : 0;
+  try {
+    const where: any = {};
+    if (creator)    where.creator           = creator;
+    if (treasury)   where.treasury          = treasury;
+    if (collection) where.collectionAddress = collection;
+    const [fees, total] = await Promise.all([
+      (prisma as any).deploymentFee.findMany({ where, orderBy: { ledgerSequence: 'desc' }, take: limit, skip: offset }),
+      (prisma as any).deploymentFee.count({ where }),
+    ]);
+    res.setHeader('X-Total-Count', String(total));
+    res.json({ total, fees: serialize(fees) });
+  } catch (err) { next(internalError('Failed to fetch deployment fees')); }
+});
+
+// ── GET /collections/:address/royalty-defaults (#482) ────────────────────────
+
+router.get('/collections/:address/royalty-defaults', lightRateLimiter, async (req: Request, res: Response, next: NextFunction) => {
+  const address = req.params.address as string;
+  try {
+    const col = await prisma.collection.findUnique({
+      where: { contractAddress: address },
+      select: { contractAddress: true, defaultRoyaltyBps: true, defaultRoyaltyReceiver: true },
+    });
+    if (!col) return next(notFound('Collection not found'));
+    res.json({ contractAddress: col.contractAddress, defaultRoyaltyBps: col.defaultRoyaltyBps ?? null, defaultRoyaltyReceiver: col.defaultRoyaltyReceiver ?? null });
+  } catch (err) { next(internalError('Failed to fetch royalty defaults')); }
+});
+
+// ── GET /collections/:address/succession (#484) ───────────────────────────────
+
+router.get('/collections/:address/succession', lightRateLimiter, async (req: Request, res: Response, next: NextFunction) => {
+  const address = req.params.address as string;
+  try {
+    const col = await prisma.collection.findUnique({
+      where: { contractAddress: address },
+      select: { contractAddress: true, creator: true, originalCreator: true, pendingCreator: true, pendingCreatorExpiry: true },
+    });
+    if (!col) return next(notFound('Collection not found'));
+    res.json(serialize(col));
+  } catch (err) { next(internalError('Failed to fetch succession state')); }
+});
+
 // ── GET /collections/:address/vouchers ─────────────────────────────────────────
 // Returns vouchers for a collection with status filtering (nonce-based replay protection)
 

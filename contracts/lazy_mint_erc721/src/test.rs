@@ -953,6 +953,98 @@ mod migration {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// SECTION 9 — Voucher status read method (#480)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn voucher_status_fresh_nonce_returns_issued() {
+    let (env, client, _creator, _fee) = setup(0);
+    let status = client.voucher_status(&999u64);
+    assert_eq!(status, String::from_str(&env, "Issued"));
+}
+
+#[test]
+fn voucher_status_redeemed_nonce_returns_redeemed() {
+    let (env, client, _creator, _fee) = setup(0);
+    client.set_public_phase();
+    let buyer = Address::generate(&env);
+    let v = make_voucher(&env, 1001);
+    let sig = sign_voucher(&env, &client.address, &v);
+    client.redeem(&buyer, &v, &sig, &empty_proof(&env));
+    let status = client.voucher_status(&1001u64);
+    assert_eq!(status, String::from_str(&env, "Redeemed"));
+}
+
+#[test]
+fn voucher_status_revoked_nonce_returns_revoked() {
+    let (env, client, _creator, _fee) = setup(0);
+    client.revoke_voucher(&1002u64);
+    let status = client.voucher_status(&1002u64);
+    assert_eq!(status, String::from_str(&env, "Revoked"));
+}
+
+#[test]
+fn voucher_status_revoked_takes_priority_over_redeemed_flag() {
+    let (env, client, _creator, _fee) = setup(0);
+    // Simulate edge case: both flags set (revoked wins for display)
+    env.as_contract(&client.address, || {
+        env.storage().persistent().set(&DataKey::RevokedVoucher(1003u64), &true);
+        env.storage().persistent().set(&DataKey::UsedVoucher(1003u64), &true);
+    });
+    let status = client.voucher_status(&1003u64);
+    assert_eq!(status, String::from_str(&env, "Revoked"));
+}
+
+#[test]
+fn revoke_and_redeem_are_mutually_exclusive_revoke_first() {
+    // Revoke before redeem attempt: redemption must fail with VoucherRevoked.
+    let (env, client, _creator, _fee) = setup(0);
+    client.set_public_phase();
+    client.revoke_voucher(&2000u64);
+    let buyer = Address::generate(&env);
+    let v = make_voucher(&env, 2000);
+    let sig = sign_voucher(&env, &client.address, &v);
+    let result = client.try_redeem(&buyer, &v, &sig, &empty_proof(&env));
+    assert_eq!(result, Err(Ok(Error::VoucherRevoked)));
+    assert_eq!(client.voucher_status(&2000u64), String::from_str(&env, "Revoked"));
+    assert!(!client.is_voucher_redeemed(&2000u64));
+}
+
+#[test]
+fn revoke_after_redeem_returns_already_redeemed_error() {
+    // Redeem first, then attempt revoke: revoke must fail with VoucherAlreadyRedeemed.
+    let (env, client, _creator, _fee) = setup(0);
+    client.set_public_phase();
+    let buyer = Address::generate(&env);
+    let v = make_voucher(&env, 2001);
+    let sig = sign_voucher(&env, &client.address, &v);
+    client.redeem(&buyer, &v, &sig, &empty_proof(&env));
+    assert!(client.is_voucher_redeemed(&2001u64));
+    let result = client.try_revoke_voucher(&2001u64);
+    assert_eq!(result, Err(Ok(Error::VoucherAlreadyRedeemed)));
+    assert_eq!(client.voucher_status(&2001u64), String::from_str(&env, "Redeemed"));
+}
+
+#[test]
+fn batch_revoke_all_or_nothing_partially_redeemed() {
+    // One nonce already redeemed in batch: entire batch revoke must revert.
+    let (env, client, _creator, _fee) = setup(0);
+    client.set_public_phase();
+    let buyer = Address::generate(&env);
+    let v2002 = make_voucher(&env, 2002);
+    let sig = sign_voucher(&env, &client.address, &v2002);
+    client.redeem(&buyer, &v2002, &sig, &empty_proof(&env));
+    // Attempt batch revoke containing the already-redeemed nonce
+    let mut nonces = Vec::new(&env);
+    nonces.push_back(2003u64); // fresh
+    nonces.push_back(2002u64); // already redeemed
+    let result = client.try_revoke_vouchers(&nonces);
+    assert_eq!(result, Err(Ok(Error::VoucherAlreadyRedeemed)));
+    // Fresh nonce must NOT have been revoked (all-or-nothing)
+    assert_eq!(client.voucher_status(&2003u64), String::from_str(&env, "Issued"));
+}
+
 // ── Security hardening regression tests (issue #6) ───────────────────────────
 
 #[test]

@@ -142,6 +142,47 @@ pub fn mark_salt_used(env: &Env, secure_salt: &BytesN<32>) {
     );
 }
 
+/// Record the deployed address alongside the consumed salt for idempotent retries (#477).
+pub fn record_salt_deployment(env: &Env, secure_salt: &BytesN<32>, address: &Address) {
+    mark_salt_used(env, secure_salt);
+    env.storage()
+        .persistent()
+        .set(&DataKey::SaltAddress(secure_salt.clone()), address);
+    env.storage().persistent().extend_ttl(
+        &DataKey::SaltAddress(secure_salt.clone()),
+        TTL_THRESHOLD,
+        TTL_BUMP,
+    );
+}
+
+/// Returns the collection address that was deployed for `secure_salt`, or None
+/// if this salt has never been used (or was written before #477 idempotency) (#477).
+pub fn get_salt_deployment(env: &Env, secure_salt: &BytesN<32>) -> Option<Address> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::SaltAddress(secure_salt.clone()))
+}
+
+// ── Collection-level pause controls (Issue #478) ──────────────────────────────
+
+pub fn set_collection_paused(env: &Env, collection: &Address, paused: bool) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::CollectionPaused(collection.clone()), &paused);
+    env.storage().persistent().extend_ttl(
+        &DataKey::CollectionPaused(collection.clone()),
+        TTL_THRESHOLD,
+        TTL_BUMP,
+    );
+}
+
+pub fn is_collection_paused(env: &Env, collection: &Address) -> bool {
+    env.storage()
+        .persistent()
+        .get(&DataKey::CollectionPaused(collection.clone()))
+        .unwrap_or(false)
+}
+
 pub fn wasm_version(env: &Env) -> u32 {
     env.storage()
         .instance()
@@ -258,7 +299,7 @@ pub fn require_pause_authority(env: &Env) -> Result<Address, Error> {
     }
 }
 
-/// Record a newly deployed collection with full metadata (#37 + #38).
+/// Record a newly deployed collection with full metadata (#37 + #38 + #482).
 #[allow(clippy::too_many_arguments)]
 pub fn record_collection(
     env: &Env,
@@ -269,6 +310,8 @@ pub fn record_collection(
     symbol: &String,
     ledger: u32,
     platform_fee_bps: u32,
+    royalty_bps: u32,
+    royalty_receiver: &Address,
 ) {
     let rec = CollectionRecord {
         address: address.clone(),
@@ -278,6 +321,8 @@ pub fn record_collection(
         symbol: symbol.clone(),
         ledger,
         platform_fee_bps,
+        royalty_bps,
+        royalty_receiver: royalty_receiver.clone(),
     };
 
     // Index by address for O(1) lookup (#37)
@@ -334,7 +379,29 @@ pub fn collection_by_index(env: &Env, index: u64) -> Option<CollectionRecord> {
         .get(&DataKey::CollectionByIndex(index))
 }
 
-pub fn creator_collection_count(env: &Env, creator: &Address) -> u64 {
+/// Update the royalty default for an already-deployed collection in the
+/// by-address index (#482).  Returns `CollectionNotFound` when the address is
+/// not in the registry.
+pub fn update_collection_royalty_defaults(
+    env: &Env,
+    address: &Address,
+    royalty_bps: u32,
+    royalty_receiver: &Address,
+) -> Result<(), crate::types::Error> {
+    let key = DataKey::CollectionByAddress(address.clone());
+    let mut rec: CollectionRecord = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .ok_or(crate::types::Error::CollectionNotFound)?;
+    rec.royalty_bps = royalty_bps;
+    rec.royalty_receiver = royalty_receiver.clone();
+    env.storage().persistent().set(&key, &rec);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, TTL_THRESHOLD, TTL_BUMP);
+    Ok(())
+}pub fn creator_collection_count(env: &Env, creator: &Address) -> u64 {
     env.storage()
         .persistent()
         .get(&DataKey::CreatorCollectionCount(creator.clone()))

@@ -85,6 +85,13 @@ const TOPIC_MAP: Record<string, string> = {
   'dep_l1155': 'DEPLOY_LAZY_1155',
   // ── Listing ownership reconciliation (Issue #456) ────────────────────
   'own_reconciled': 'LISTING_OWNERSHIP_RECONCILED',
+  // ── Lazy-mint voucher revocation (Issue #480) ─────────────────────────
+  'revoke': 'VOUCHER_REVOKED',
+  // ── Collection-level pause controls (Issue #478) ──────────────────────
+  'c_psd':   'COLLECTION_PAUSED',
+  'c_unpsd': 'COLLECTION_UNPAUSED',
+  // ── Deployment idempotency (Issue #477) ───────────────────────────────
+  'dep_idem': 'DEPLOY_IDEMPOTENT',
 };
 
 /** All event type names this parser can produce (exported for tests/UI). */
