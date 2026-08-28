@@ -31,6 +31,7 @@ import {
 import { VERSION } from './config.js';
 import { warmCache } from './cache-warmer.js';
 import { startDataQualityScheduler } from './data-quality.js';
+import { drainIpfsQueue } from './ipfs-backpressure.js';
 
 dotenv.config();
 
@@ -219,6 +220,19 @@ const httpServer = app.listen(PORT, () => {
       const stopDataQuality = startDataQualityScheduler();
       registerShutdownHook(async () => { stopDataQuality(); });
     }
+
+    // ── IPFS backpressure drain loop ──────────────────────────────────────
+    // Runs independently of ledger ingestion so slow/unavailable IPFS never
+    // delays chain event application. Interval is tunable via IPFS_DRAIN_INTERVAL_MS.
+    const ipfsDrainIntervalMs = parseInt(process.env.IPFS_DRAIN_INTERVAL_MS || '5000', 10);
+    const ipfsDrainTimer = setInterval(() => {
+      drainIpfsQueue().catch((err: unknown) => {
+        logger.warn('IPFS drain error (non-fatal)', {
+          err: err instanceof Error ? err.message : String(err),
+        });
+      });
+    }, ipfsDrainIntervalMs);
+    registerShutdownHook(async () => { clearInterval(ipfsDrainTimer); });
 
   // ── Keeper loop ───────────────────────────────────────────────────────────
   if (process.env.KEEPER_ENABLED === 'true') {

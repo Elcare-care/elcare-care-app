@@ -49,6 +49,29 @@ model SyncState {
   updatedAt        DateTime @updatedAt
 }
 
+// ── Distributed worker lease (coordination/lease.ts + fenced-lease.ts) ────────
+//
+// Each row represents one active lease for a worker role.
+// token: monotonically increasing fencing token — incremented on every renewal.
+//        Write operations guarded by the lease must include the current token
+//        as a precondition; a stale writer presenting an old token is rejected.
+// role_ownerId unique index: one row per (role, ownerId) — prevents the same
+//        worker from acquiring the same role twice.
+
+model WorkerLease {
+  id        Int      @id @default(autoincrement())
+  role      String   // 'poller' | 'reconciler' | 'backfill'
+  ownerId   String   // random per-process identifier
+  token     BigInt   @default(0)  // monotonically increasing fencing token
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([role, ownerId], name: "role_ownerId")
+  @@unique([role])            // only one active lease per role at a time
+  @@index([role, expiresAt])
+}
+
 // ── Dynamic contract registry ─────────────────────────────────────────────────
 //
 // Each row represents one Soroban contract being tracked by the indexer.
@@ -112,6 +135,9 @@ model Listing {
   title           String?
   description     String?
   artistName      String?
+  /// IPFS enrichment status: 'pending' | 'fetching' | 'done' | 'failed' | 'oversized' | 'unavailable' | 'deferred'
+  /// Null for rows ingested before IPFS backpressure was introduced.
+  ipfsStatus      String?
   // tsvector updated by the listing_search_vector_trigger in PostgreSQL.
   // Prisma cannot manage this column natively; it is marked Unsupported so
   // Prisma skips it in generated client writes — all updates go through the
@@ -359,6 +385,9 @@ model IpfsMetadata {
   attributes  Json?
   fetchedAt   DateTime @default(now())
   raw         Json
+  /// SHA-256 hex digest of the raw JSON body for content-integrity verification.
+  /// Null for rows fetched before content-hashing was introduced.
+  contentHash String?
 }
 
 // ── IPFS fetch queue ──────────────────────────────────────────────────────────

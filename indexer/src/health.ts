@@ -12,6 +12,8 @@ import prisma from './db.js';
 import redis from './redis.js';
 import { logger } from './logger.js';
 import { VERSION } from './config.js';
+import { getLeaseStatus } from './coordination/lease.js';
+import { getCurrentFencedLease } from './fenced-lease.js';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -163,6 +165,29 @@ export async function checkSyncLag(): Promise<HealthCheckResult & { lagLedgers: 
 }
 
 /**
+ * Returns the current distributed lease and fencing-token state.
+ * Useful for operators to see which worker holds the active lease
+ * and whether fencing tokens are advancing normally.
+ */
+export function checkLeaseState(): HealthCheckResult & {
+  coordinationLease: ReturnType<typeof getLeaseStatus>;
+  fencedLease: { held: boolean; token: string | null; role: string | null };
+} {
+  const coordination = getLeaseStatus();
+  const fenced = getCurrentFencedLease();
+  return {
+    status: 'ok',
+    latencyMs: 0,
+    coordinationLease: coordination,
+    fencedLease: {
+      held: fenced !== null,
+      token: fenced ? fenced.token.toString() : null,
+      role: fenced?.role ?? null,
+    },
+  };
+}
+
+/**
  * Issue #286: Report confirmation depth configuration and pending-confirmation
  * event count. This tells operators how many events are still provisional and
  * the configured depth threshold.
@@ -217,12 +242,15 @@ export async function runAllChecks(): Promise<AggregateHealth> {
     checkConfirmationDepth(),
   ]);
 
+  const leaseState = checkLeaseState();
+
   const checks: Record<string, HealthCheckResult> = {
     database: db,
     redis: redisCheck,
     stellar_rpc: stellarRpc,
     sync_lag: syncLag,
     confirmation_depth: confirmationDepth,
+    lease_state: leaseState,
   };
 
   const statuses = Object.values(checks).map((c) => c.status);
