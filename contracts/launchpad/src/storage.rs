@@ -142,6 +142,47 @@ pub fn mark_salt_used(env: &Env, secure_salt: &BytesN<32>) {
     );
 }
 
+/// Record the deployed address alongside the consumed salt for idempotent retries (#477).
+pub fn record_salt_deployment(env: &Env, secure_salt: &BytesN<32>, address: &Address) {
+    mark_salt_used(env, secure_salt);
+    env.storage()
+        .persistent()
+        .set(&DataKey::SaltAddress(secure_salt.clone()), address);
+    env.storage().persistent().extend_ttl(
+        &DataKey::SaltAddress(secure_salt.clone()),
+        TTL_THRESHOLD,
+        TTL_BUMP,
+    );
+}
+
+/// Returns the collection address that was deployed for `secure_salt`, or None
+/// if this salt has never been used (or was written before #477 idempotency) (#477).
+pub fn get_salt_deployment(env: &Env, secure_salt: &BytesN<32>) -> Option<Address> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::SaltAddress(secure_salt.clone()))
+}
+
+// ── Collection-level pause controls (Issue #478) ──────────────────────────────
+
+pub fn set_collection_paused(env: &Env, collection: &Address, paused: bool) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::CollectionPaused(collection.clone()), &paused);
+    env.storage().persistent().extend_ttl(
+        &DataKey::CollectionPaused(collection.clone()),
+        TTL_THRESHOLD,
+        TTL_BUMP,
+    );
+}
+
+pub fn is_collection_paused(env: &Env, collection: &Address) -> bool {
+    env.storage()
+        .persistent()
+        .get(&DataKey::CollectionPaused(collection.clone()))
+        .unwrap_or(false)
+}
+
 pub fn wasm_version(env: &Env) -> u32 {
     env.storage()
         .instance()

@@ -50,6 +50,9 @@ mod counter_offer_tests;
 #[cfg(test)]
 mod governance_quorum_tests;
 
+#[cfg(test)]
+mod erc1155_quantity_tests;
+
 pub use contract::MarketplaceContract;
 pub use types::{
     AuctionCancelReason, BatchItemError, BidRecord, CancelReason, CollectionStandard,

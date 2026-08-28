@@ -357,10 +357,30 @@ export interface ContractUnpausedData {
 /** Granular pause events (Issue #205 + narrowly-scoped pause follow-up) */
 export interface CollectionPausedData {
   collection: string;
+  /** Address of the actor who issued the pause (creator or admin). */
+  paused_by?: string;
 }
 
 export interface CollectionUnpausedData {
   collection: string;
+  /** Address of the actor who lifted the pause. */
+  unpaused_by?: string;
+}
+
+/** Emitted when a creator revokes a lazy-mint voucher nonce (#480). */
+export interface VoucherRevokedData {
+  /** The voucher nonce that was revoked. */
+  nonce: bigint;
+  /** Collection contract address the voucher belonged to. Absent on pre-#480 events. */
+  collection?: string;
+}
+
+/** Emitted when a deployment factory returns an existing address on identical retry (#477). */
+export interface DeployIdempotentData {
+  /** Creator address. */
+  creator: string;
+  /** Previously-deployed collection address being returned. */
+  address: string;
 }
 
 export interface FunctionPausedData {
@@ -742,12 +762,42 @@ export const CONTRACT_UNPAUSED_SCHEMA: ContractEventSchema = {
 
 export const COLLECTION_PAUSED_SCHEMA: ContractEventSchema = {
   type: 'COLLECTION_PAUSED',
-  data: [{ name: 'collection', type: 'string' }],
+  data: [
+    { name: 'collection', type: 'string' },
+    { name: 'paused_by', type: 'string', optional: true },
+  ],
 };
 
 export const COLLECTION_UNPAUSED_SCHEMA: ContractEventSchema = {
   type: 'COLLECTION_UNPAUSED',
-  data: [{ name: 'collection', type: 'string' }],
+  data: [
+    { name: 'collection', type: 'string' },
+    { name: 'unpaused_by', type: 'string', optional: true },
+  ],
+};
+
+// ── Voucher revocation (#480) ─────────────────────────────────────────────────
+//
+// The lazy-mint contracts emit: topics=("revoke",) data=nonce:u64 (scalar).
+// The decoder special-cases VOUCHER_REVOKED to wrap the scalar BigInt in an
+// object so the rest of the indexer pipeline treats it uniformly.
+
+export const VOUCHER_REVOKED_SCHEMA: ContractEventSchema = {
+  type: 'VOUCHER_REVOKED',
+  data: [
+    { name: 'nonce', type: 'bigint' },
+    { name: 'collection', type: 'string', optional: true },
+  ],
+};
+
+// ── Deploy idempotency (#477) ─────────────────────────────────────────────────
+
+export const DEPLOY_IDEMPOTENT_SCHEMA: ContractEventSchema = {
+  type: 'DEPLOY_IDEMPOTENT',
+  data: [
+    { name: 'creator', type: 'string' },
+    { name: 'address', type: 'string' },
+  ],
 };
 
 export const FUNCTION_PAUSED_SCHEMA: ContractEventSchema = {
@@ -872,6 +922,13 @@ export const SCHEMA_REGISTRY: Map<string, ContractEventSchema> = new Map([
   ['LISTING_OWNERSHIP_RECONCILED', LISTING_OWNERSHIP_RECONCILED_SCHEMA],
   // Issue #467: auction reserve price update
   ['AUCTION_RESERVE_UPDATED', AUCTION_RESERVE_UPDATED_SCHEMA],
+  // Issue #480: lazy-mint voucher revocation
+  ['VOUCHER_REVOKED', VOUCHER_REVOKED_SCHEMA],
+  // Issue #478: collection-level pause controls
+  ['COLLECTION_PAUSED', COLLECTION_PAUSED_SCHEMA],
+  ['COLLECTION_UNPAUSED', COLLECTION_UNPAUSED_SCHEMA],
+  // Issue #477: deployment idempotency
+  ['DEPLOY_IDEMPOTENT', DEPLOY_IDEMPOTENT_SCHEMA],
 ]);
 
 // ── Schema-driven decoder ─────────────────────────────────────────────────────
@@ -893,6 +950,40 @@ export function decodeWithSchema<T = unknown>(
   schema: ContractEventSchema,
   nativeData: unknown
 ): DecodeResult<T> {
+  // ── VOUCHER_REVOKED: data is a raw u64 nonce (scalar BigInt) ────────────────
+  if (eventType === 'VOUCHER_REVOKED') {
+    if (typeof nativeData !== 'bigint') {
+      return {
+        ok: false,
+        eventType,
+        reason: `VOUCHER_REVOKED data must be a bigint nonce, got ${typeof nativeData}`,
+        raw: nativeData,
+      };
+    }
+    return { ok: true, eventType, data: { nonce: nativeData } as T };
+  }
+
+  // ── DEPLOY_IDEMPOTENT: data is a 2-element tuple [creator, address] ──────────
+  if (eventType === 'DEPLOY_IDEMPOTENT') {
+    if (!Array.isArray(nativeData) || nativeData.length < 2) {
+      return {
+        ok: false,
+        eventType,
+        reason: `DEPLOY_IDEMPOTENT data must be a 2-element tuple, got ${Array.isArray(nativeData) ? nativeData.length : typeof nativeData}`,
+        raw: nativeData,
+      };
+    }
+    if (typeof nativeData[0] !== 'string' || typeof nativeData[1] !== 'string') {
+      return {
+        ok: false,
+        eventType,
+        reason: `DEPLOY_IDEMPOTENT tuple elements must be strings`,
+        raw: nativeData,
+      };
+    }
+    return { ok: true, eventType, data: { creator: nativeData[0], address: nativeData[1] } as T };
+  }
+
   // ── Deploy tuple path ─────────────────────────────────────────────────────
   if (
     eventType === 'DEPLOY_NORMAL_721' ||

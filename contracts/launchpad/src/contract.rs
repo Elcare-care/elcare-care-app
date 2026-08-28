@@ -472,6 +472,10 @@ impl Launchpad {
         creator.require_auth();
 
         let secure_salt = make_secure_salt(&env, &creator, &salt);
+        if let Some(existing_addr) = storage::get_salt_deployment(&env, &secure_salt) {
+            events::publish_deploy_idempotent(&env, &creator, &existing_addr);
+            return Ok(existing_addr);
+        }
         let wasm_opt = storage::get_wasm_normal_721(&env);
         let errors = validate_721_shape(
             &env,
@@ -512,7 +516,7 @@ impl Launchpad {
             &royalty_receiver,
         );
 
-        storage::mark_salt_used(&env, &secure_salt);
+        storage::record_salt_deployment(&env, &secure_salt, &addr);
         storage::record_collection(
             &env,
             &creator,
@@ -590,6 +594,10 @@ impl Launchpad {
         creator.require_auth();
 
         let secure_salt = make_secure_salt(&env, &creator, &salt);
+        if let Some(existing_addr) = storage::get_salt_deployment(&env, &secure_salt) {
+            events::publish_deploy_idempotent(&env, &creator, &existing_addr);
+            return Ok(existing_addr);
+        }
         let wasm_opt = storage::get_wasm_normal_1155(&env);
         let errors = validate_1155_shape(
             &env,
@@ -623,7 +631,7 @@ impl Launchpad {
             &royalty_receiver,
         );
 
-        storage::mark_salt_used(&env, &secure_salt);
+        storage::record_salt_deployment(&env, &secure_salt, &addr);
         let empty_symbol = String::from_str(&env, "");
         storage::record_collection(
             &env,
@@ -701,6 +709,10 @@ impl Launchpad {
         creator.require_auth();
 
         let secure_salt = make_secure_salt(&env, &creator, &salt);
+        if let Some(existing_addr) = storage::get_salt_deployment(&env, &secure_salt) {
+            events::publish_deploy_idempotent(&env, &creator, &existing_addr);
+            return Ok(existing_addr);
+        }
         let wasm_opt = storage::get_wasm_lazy_721(&env);
         let errors = validate_721_shape(
             &env,
@@ -743,7 +755,7 @@ impl Launchpad {
             &network_passphrase,
         );
 
-        storage::mark_salt_used(&env, &secure_salt);
+        storage::record_salt_deployment(&env, &secure_salt, &addr);
         storage::record_collection(
             &env,
             &creator,
@@ -819,6 +831,10 @@ impl Launchpad {
         creator.require_auth();
 
         let secure_salt = make_secure_salt(&env, &creator, &salt);
+        if let Some(existing_addr) = storage::get_salt_deployment(&env, &secure_salt) {
+            events::publish_deploy_idempotent(&env, &creator, &existing_addr);
+            return Ok(existing_addr);
+        }
         let wasm_opt = storage::get_wasm_lazy_1155(&env);
         let errors = validate_1155_shape(
             &env,
@@ -857,7 +873,7 @@ impl Launchpad {
             &network_passphrase,
         );
 
-        storage::mark_salt_used(&env, &secure_salt);
+        storage::record_salt_deployment(&env, &secure_salt, &addr);
         let empty_symbol = String::from_str(&env, "");
         storage::record_collection(
             &env,
@@ -1139,6 +1155,42 @@ impl Launchpad {
 
     pub fn wasm_version(env: Env) -> u32 {
         storage::wasm_version(&env)
+    }
+
+    // ── Idempotency query (Issue #477) ────────────────────────────────────────
+
+    /// Returns the collection address that was deployed for `(creator, raw_salt)`,
+    /// or None if that pair has never been used.
+    pub fn get_deployment_by_salt(env: Env, creator: Address, raw_salt: BytesN<32>) -> Option<Address> {
+        let secure_salt = make_secure_salt(&env, &creator, &raw_salt);
+        storage::get_salt_deployment(&env, &secure_salt)
+    }
+
+    // ── Collection-level pause controls (Issue #478) ──────────────────────────
+
+    /// Pauses a specific deployed collection.  Admin-only.
+    pub fn pause_collection(env: Env, admin: Address, collection: Address) -> Result<(), Error> {
+        storage::extend_instance_ttl(&env);
+        let _ = storage::require_admin(&env)?;
+        admin.require_auth();
+        storage::set_collection_paused(&env, &collection, true);
+        events::publish_collection_paused(&env, &collection, &admin);
+        Ok(())
+    }
+
+    /// Unpauses a specific deployed collection.  Admin-only.
+    pub fn unpause_collection(env: Env, admin: Address, collection: Address) -> Result<(), Error> {
+        storage::extend_instance_ttl(&env);
+        let _ = storage::require_admin(&env)?;
+        admin.require_auth();
+        storage::set_collection_paused(&env, &collection, false);
+        events::publish_collection_unpaused(&env, &collection, &admin);
+        Ok(())
+    }
+
+    /// Returns whether a specific collection is currently paused.
+    pub fn is_collection_paused(env: Env, collection: Address) -> bool {
+        storage::is_collection_paused(&env, &collection)
     }
 
 }

@@ -2561,3 +2561,273 @@ fn preflight_lazy_1155_predicts_the_deployed_address_and_matches_deploy_errors()
 
     assert_eq!(preflight.predicted_address, deployed);
 }
+
+// ── Issue #477: Collection deployment idempotency ─────────────────────────────
+
+#[test]
+fn idempotent_deploy_normal_721_returns_same_address() {
+    let env = Env::default();
+    env.ledger().with_mut(|li| li.sequence_number = 1);
+    let (client, _admin, _fee_receiver, creator) = setup_launchpad(&env);
+
+    let salt = BytesN::from_array(&env, &[77u8; 32]);
+    let royalty_receiver = Address::generate(&env);
+    let currency = setup_token(&env, &creator, 1_000_000);
+
+    let first = client.deploy_normal_721(
+        &creator,
+        &currency,
+        &String::from_str(&env, "Idem 721"),
+        &String::from_str(&env, "IDM"),
+        &100u64,
+        &500u32,
+        &royalty_receiver,
+        &0u32,
+        &salt,
+    );
+
+    // Identical retry — must return the same address, not deploy again.
+    let second = client.deploy_normal_721(
+        &creator,
+        &currency,
+        &String::from_str(&env, "Idem 721"),
+        &String::from_str(&env, "IDM"),
+        &100u64,
+        &500u32,
+        &royalty_receiver,
+        &0u32,
+        &salt,
+    );
+
+    assert_eq!(first, second);
+}
+
+#[test]
+fn idempotent_deploy_emits_dep_idem_event_on_retry() {
+    let env = Env::default();
+    env.ledger().with_mut(|li| li.sequence_number = 1);
+    let (client, _admin, _fee_receiver, creator) = setup_launchpad(&env);
+
+    let salt = BytesN::from_array(&env, &[78u8; 32]);
+    let royalty_receiver = Address::generate(&env);
+    let currency = setup_token(&env, &creator, 1_000_000);
+
+    let first = client.deploy_normal_721(
+        &creator,
+        &currency,
+        &String::from_str(&env, "Idem Event 721"),
+        &String::from_str(&env, "IEV"),
+        &100u64,
+        &500u32,
+        &royalty_receiver,
+        &0u32,
+        &salt,
+    );
+
+    // Clear events so we only inspect the retry's events.
+    env.events().all();
+
+    let _ = client.deploy_normal_721(
+        &creator,
+        &currency,
+        &String::from_str(&env, "Idem Event 721"),
+        &String::from_str(&env, "IEV"),
+        &100u64,
+        &500u32,
+        &royalty_receiver,
+        &0u32,
+        &salt,
+    );
+
+    let launchpad_id = client.address.clone();
+    assert!(
+        event_with_tag_present(&env, &launchpad_id, symbol_short!("dep_idem")),
+        "expected dep_idem event on idempotent retry; first deployed addr = {first:?}"
+    );
+}
+
+#[test]
+fn get_deployment_by_salt_returns_correct_address() {
+    let env = Env::default();
+    env.ledger().with_mut(|li| li.sequence_number = 1);
+    let (client, _admin, _fee_receiver, creator) = setup_launchpad(&env);
+
+    let salt = BytesN::from_array(&env, &[79u8; 32]);
+    let royalty_receiver = Address::generate(&env);
+    let currency = setup_token(&env, &creator, 1_000_000);
+
+    assert!(client.get_deployment_by_salt(&creator, &salt).is_none());
+
+    let deployed = client.deploy_normal_721(
+        &creator,
+        &currency,
+        &String::from_str(&env, "Salt Lookup"),
+        &String::from_str(&env, "SLK"),
+        &100u64,
+        &0u32,
+        &royalty_receiver,
+        &0u32,
+        &salt,
+    );
+
+    let looked_up = client.get_deployment_by_salt(&creator, &salt);
+    assert_eq!(looked_up, Some(deployed));
+}
+
+#[test]
+fn idempotent_deploy_different_salts_deploy_independently() {
+    let env = Env::default();
+    env.ledger().with_mut(|li| li.sequence_number = 1);
+    let (client, _admin, _fee_receiver, creator) = setup_launchpad(&env);
+
+    let salt_a = BytesN::from_array(&env, &[80u8; 32]);
+    let salt_b = BytesN::from_array(&env, &[81u8; 32]);
+    let royalty_receiver = Address::generate(&env);
+    let currency = setup_token(&env, &creator, 1_000_000);
+
+    let addr_a = client.deploy_normal_721(
+        &creator,
+        &currency,
+        &String::from_str(&env, "Salt A"),
+        &String::from_str(&env, "AAA"),
+        &100u64,
+        &0u32,
+        &royalty_receiver,
+        &0u32,
+        &salt_a,
+    );
+    let addr_b = client.deploy_normal_721(
+        &creator,
+        &currency,
+        &String::from_str(&env, "Salt B"),
+        &String::from_str(&env, "BBB"),
+        &100u64,
+        &0u32,
+        &royalty_receiver,
+        &0u32,
+        &salt_b,
+    );
+
+    assert_ne!(addr_a, addr_b, "different salts must yield distinct addresses");
+}
+
+// ── Issue #478: Collection-level pause controls ───────────────────────────────
+
+#[test]
+fn pause_collection_sets_paused_state() {
+    let env = Env::default();
+    env.ledger().with_mut(|li| li.sequence_number = 1);
+    let (client, admin, _fee_receiver, creator) = setup_launchpad(&env);
+
+    let salt = BytesN::from_array(&env, &[90u8; 32]);
+    let royalty_receiver = Address::generate(&env);
+    let currency = setup_token(&env, &creator, 1_000_000);
+
+    let collection = client.deploy_normal_721(
+        &creator,
+        &currency,
+        &String::from_str(&env, "Pausable"),
+        &String::from_str(&env, "PSB"),
+        &100u64,
+        &0u32,
+        &royalty_receiver,
+        &0u32,
+        &salt,
+    );
+
+    assert!(!client.is_collection_paused(&collection));
+    client.pause_collection(&admin, &collection);
+    assert!(client.is_collection_paused(&collection));
+}
+
+#[test]
+fn unpause_collection_clears_paused_state() {
+    let env = Env::default();
+    env.ledger().with_mut(|li| li.sequence_number = 1);
+    let (client, admin, _fee_receiver, creator) = setup_launchpad(&env);
+
+    let salt = BytesN::from_array(&env, &[91u8; 32]);
+    let royalty_receiver = Address::generate(&env);
+    let currency = setup_token(&env, &creator, 1_000_000);
+
+    let collection = client.deploy_normal_721(
+        &creator,
+        &currency,
+        &String::from_str(&env, "Pausable2"),
+        &String::from_str(&env, "PS2"),
+        &100u64,
+        &0u32,
+        &royalty_receiver,
+        &0u32,
+        &salt,
+    );
+
+    client.pause_collection(&admin, &collection);
+    assert!(client.is_collection_paused(&collection));
+
+    client.unpause_collection(&admin, &collection);
+    assert!(!client.is_collection_paused(&collection));
+}
+
+#[test]
+fn pause_collection_emits_c_psd_event() {
+    let env = Env::default();
+    env.ledger().with_mut(|li| li.sequence_number = 1);
+    let (client, admin, _fee_receiver, creator) = setup_launchpad(&env);
+
+    let salt = BytesN::from_array(&env, &[92u8; 32]);
+    let royalty_receiver = Address::generate(&env);
+    let currency = setup_token(&env, &creator, 1_000_000);
+
+    let collection = client.deploy_normal_721(
+        &creator,
+        &currency,
+        &String::from_str(&env, "EventPause"),
+        &String::from_str(&env, "EVP"),
+        &100u64,
+        &0u32,
+        &royalty_receiver,
+        &0u32,
+        &salt,
+    );
+
+    client.pause_collection(&admin, &collection);
+
+    let launchpad_id = client.address.clone();
+    assert!(
+        event_with_tag_present(&env, &launchpad_id, symbol_short!("c_psd")),
+        "expected c_psd event after pause_collection"
+    );
+}
+
+#[test]
+fn unpause_collection_emits_c_unpsd_event() {
+    let env = Env::default();
+    env.ledger().with_mut(|li| li.sequence_number = 1);
+    let (client, admin, _fee_receiver, creator) = setup_launchpad(&env);
+
+    let salt = BytesN::from_array(&env, &[93u8; 32]);
+    let royalty_receiver = Address::generate(&env);
+    let currency = setup_token(&env, &creator, 1_000_000);
+
+    let collection = client.deploy_normal_721(
+        &creator,
+        &currency,
+        &String::from_str(&env, "EventUnpause"),
+        &String::from_str(&env, "EUP"),
+        &100u64,
+        &0u32,
+        &royalty_receiver,
+        &0u32,
+        &salt,
+    );
+
+    client.pause_collection(&admin, &collection);
+    client.unpause_collection(&admin, &collection);
+
+    let launchpad_id = client.address.clone();
+    assert!(
+        event_with_tag_present(&env, &launchpad_id, symbol_short!("c_unpsd")),
+        "expected c_unpsd event after unpause_collection"
+    );
+}
