@@ -37,6 +37,8 @@ import { GuardButton } from "@/components/WalletGuard";
 import { ResourceState } from "@/components/PageStates";
 import { AuctionManagementPanel } from "@/components/AuctionManagementPanel";
 import { config } from "@/lib/config";
+import { getTokenConfigByAddress, getNativeTokenConfig } from "@/config/tokens";
+import { validateAmountInput, baseToDisplay } from "@/lib/amount";
 import {
   ArrowLeft,
   Clock,
@@ -630,6 +632,7 @@ export default function AuctionDetailPage() {
   const [pageError, setPageError] = useState<PageStateError | null>(null);
   const [activeTab, setActiveTab] = useState<"details" | "bids">("details");
   const [bidAmountXlm, setBidAmountXlm] = useState("");
+  const [bidValidationError, setBidValidationError] = useState<string | null>(null);
   const [bidSuccess, setBidSuccess] = useState(false);
   const [finalizeSuccess, setFinalizeSuccess] = useState(false);
 
@@ -700,6 +703,19 @@ export default function AuctionDetailPage() {
     loadData();
   }, [loadData]);
 
+  // Issue #522 — indexer freshness/health for this auction. Reuses the SSE
+  // subscription below (subscribeToEvents: false) rather than opening a
+  // second connection, so it's fed via reportSSEEvent/reportSSEConnected.
+  const freshness = useIndexerFreshness({
+    resourceType: "auction",
+    subscribeToEvents: false,
+    onRefresh: loadData,
+  });
+  useEffect(() => {
+    if (auction) freshness.markUpdated();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [auction]);
+
   // ── SSE subscription — live event streaming (ISSUE-021) ──
 
   useEffect(() => {
@@ -708,7 +724,14 @@ export default function AuctionDetailPage() {
 
     const sub = subscribeToMarketplaceEvents(config.indexerUrl, {
       debounceMs: 0,
+      onOpen: () => freshness.reportSSEConnected(true),
+      onClose: () => freshness.reportSSEConnected(false),
       onEvent(event) {
+        // Feed every event (including REORG/CRITICAL_REORG, which never
+        // carry an auctionId) into the freshness hook regardless of the
+        // per-auction filter below.
+        freshness.reportSSEEvent(event);
+
         // Only process events for this auction.
         if (event.auctionId !== undefined && event.auctionId !== auctionId) {
           return;
@@ -759,14 +782,31 @@ export default function AuctionDetailPage() {
     });
 
     return () => sub.close();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id, loadData]);
 
   // ── Handlers ──────────────────────────────────────────────
 
   const handleBid = async () => {
     if (!auction) return;
-    const amountXlm = parseFloat(bidAmountXlm);
-    if (!amountXlm || amountXlm <= 0) return;
+
+    // Bigint-safe parse/validate (Issue #521) instead of a bare `parseFloat`
+    // — rejects malformed input, excess decimal precision, and below-minimum
+    // bids in one pass, mirroring the shared BiddingPanel component.
+    const bidToken = getTokenConfigByAddress(auction.token) ?? getNativeTokenConfig();
+    const minimumNextBidBase =
+      auction.highest_bid > 0n ? auction.highest_bid + 1n : auction.reserve_price;
+    const result = validateAmountInput(bidAmountXlm, bidToken, minimumNextBidBase);
+    if (!result.valid || result.baseUnits === null) {
+      setBidValidationError(result.message);
+      return;
+    }
+    setBidValidationError(null);
+
+    // Re-express as a JS number only at the boundary of the existing
+    // numeric `bid()` hook API — the parse/validate step above never
+    // touches floating-point arithmetic.
+    const amountXlm = Number(baseToDisplay(result.baseUnits, bidToken));
     const ok = await bid(auction.auction_id, amountXlm);
     if (ok) {
       setBidSuccess(true);
@@ -881,6 +921,22 @@ export default function AuctionDetailPage() {
       </div>
 
       <div className="mx-auto max-w-6xl px-4 sm:px-6 pb-16">
+        {/* Issue #522 — non-blocking indexer freshness indicator. Critical
+            for auctions: the countdown and highest-bid figures come straight
+            from indexed events, so a lagging/unavailable indexer or a reorg
+            must never be silently trusted as final. */}
+        {freshness.status !== "healthy" && (
+          <div className="mb-6">
+            <StaleBanner
+              freshness={freshness.freshness}
+              status={freshness.status}
+              reorg={freshness.reorg}
+              onRefresh={freshness.refresh}
+              isRefreshing={freshness.isRefreshing}
+            />
+          </div>
+        )}
+
         <div className="grid gap-10 lg:grid-cols-[1fr_420px]">
           {/* Artwork image */}
           <div className="relative aspect-square overflow-hidden rounded-3xl bg-brand-50 shadow-md">
@@ -1039,7 +1095,10 @@ export default function AuctionDetailPage() {
                     step="0.0000001"
                     placeholder={`Min. ${reserveXlm} XLM`}
                     value={bidAmountXlm}
-                    onChange={(e) => setBidAmountXlm(e.target.value)}
+                    onChange={(e) => {
+                      setBidAmountXlm(e.target.value);
+                      setBidValidationError(null);
+                    }}
                     className="flex-1 rounded-xl border border-gray-200 bg-white px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-brand-400"
                   />
                   <GuardButton
@@ -1056,8 +1115,8 @@ export default function AuctionDetailPage() {
                     )}
                   </GuardButton>
                 </div>
-                {bidError && (
-                  <p className="text-xs text-red-500">{bidError}</p>
+                {(bidValidationError || bidError) && (
+                  <p className="text-xs text-red-500">{bidValidationError || bidError}</p>
                 )}
                 {bidSuccess && (
                   <p className="flex items-center gap-1 text-xs text-green-600">

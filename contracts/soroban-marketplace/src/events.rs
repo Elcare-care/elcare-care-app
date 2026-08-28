@@ -1822,3 +1822,57 @@ pub fn emit_governance_cancelled(env: &Env, proposal_id: u64, cancelled_by: Addr
     }
     .publish(env);
 }
+
+// ── Terminal-record cleanup event (Issue #474) ───────────────────────────────
+
+pub const TERMINAL_CLEANED: &str = "terminal_cleaned";
+
+/// Emitted once per terminal record processed by `cleanup_terminal_records`
+/// before the contract stops renewing that record's TTL.
+///
+/// The indexer should treat this event as a signal that the on-chain copy of
+/// the record may eventually become unavailable ("hot" storage lapses), while
+/// the indexer's own database copy remains the durable historical record.
+///
+/// Fields:
+///   `kind`   — "listing" | "offer"
+///   `id`     — the listing_id or offer_id processed
+///   `status` — numeric status discriminant as a string (for readability)
+///   `ledger_sequence` — ledger the cleanup was processed on
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TerminalCleanedEvent {
+    pub kind: soroban_sdk::Symbol,
+    pub id: u64,
+    pub ledger_sequence: u32,
+}
+
+impl TerminalCleanedEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, TERMINAL_CLEANED),), self);
+    }
+}
+
+// ── Terminal-record cleanup event (Issue #474) ───────────────────────────────
+
+pub const TERMINAL_CLEANED: &str = "terminal_cleaned";
+
+/// Emitted once per terminal record processed by `cleanup_terminal_records`
+/// before the contract stops renewing that record's TTL.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TerminalCleanedEvent {
+    pub kind: soroban_sdk::Symbol,
+    pub id: u64,
+    pub ledger_sequence: u32,
+}
+
+impl TerminalCleanedEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, TERMINAL_CLEANED),), self);
+    }
+}

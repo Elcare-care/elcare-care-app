@@ -22,6 +22,7 @@ import { Breadcrumb } from "@/components/Breadcrumb";
 import { useActivityFeed } from "@/hooks/useActivityFeed";
 import { ActivityFeedEvent, activityEventKey } from "@/lib/indexer";
 import { formatRelativeTime } from "@/lib/format";
+import { StaleBanner } from "@/components/StaleBanner";
 
 // ── Event type icon mapping ───────────────────────────────────────────────────
 
@@ -120,6 +121,20 @@ function ActivityRow({ event }: { event: ActivityFeedEvent }) {
             <>
               <span>·</span>
               <span className="font-mono">ledger {event.ledgerSequence.toLocaleString()}</span>
+            </>
+          )}
+          {event.txHash && (
+            <>
+              <span>·</span>
+              {/* Issue #522 — direct on-chain verification path, independent
+                  of whether the indexer's view of this event is current. */}
+              <Link
+                href={`/tx/${event.txHash}`}
+                className="inline-flex items-center gap-0.5 text-brand-400 hover:text-brand-300 transition-colors"
+              >
+                Verify on-chain
+                <ExternalLink size={9} />
+              </Link>
             </>
           )}
         </div>
@@ -385,6 +400,19 @@ export default function ActivityPage() {
             </button>
           </div>
         </div>
+
+        {/* Issue #522 — non-blocking indexer freshness indicator */}
+        {freshness.status !== "healthy" && (
+          <div className="mb-4">
+            <StaleBanner
+              freshness={freshness.freshness}
+              status={freshness.status}
+              reorg={freshness.reorg}
+              onRefresh={freshness.refresh}
+              isRefreshing={freshness.isRefreshing}
+            />
+          </div>
+        )}
 
         {/* Domain filter tabs */}
         <div className="flex gap-1 mb-4 flex-wrap" role="tablist" aria-label="Filter by domain">

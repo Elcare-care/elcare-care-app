@@ -15,6 +15,7 @@ import { getCollectionMetadata } from "@/lib/launchpad";
 import { DEFAULT_TOKEN } from "@/config/tokens";
 import { useSupportedTokens } from "@/hooks/useSupportedTokens";
 import { ensureTokenOption, getDefaultSupportedToken } from "@/lib/token-support";
+import { validateAmountInput, baseToDisplay } from "@/lib/amount";
 import posthog from "posthog-js";
 import { isValidStellarAddress } from "@/lib/validation";
 import { config } from "@/lib/config";
@@ -222,6 +223,10 @@ export function ListingForm({ listing, onSuccess, onCancel }: ListingFormProps) 
     recipients: [{ address: publicKey ?? "", percentage: 100 }],
   });
   const [touched, setTouched] = useState<Set<string>>(new Set());
+  // Set by the price field's onChange when the raw string fails bigint-safe
+  // parsing (e.g. more decimal places than the token supports) — surfaced
+  // in preference to the generic numeric bound message from `errors.price`.
+  const [priceInputError, setPriceInputError] = useState<string | null>(null);
   const [submitAttempted, setSubmitAttempted] = useState(false);
   const [successId, setSuccessId] = useState<number | null>(null);
   const [currentMetadata, setCurrentMetadata] = useState<ArtworkMetadata | null>(null);
@@ -484,7 +489,25 @@ export function ListingForm({ listing, onSuccess, onCancel }: ListingFormProps) 
             category: currentMetadata.category ?? "",
             currentMetadata,
           }),
-        { action: "Update listing" }
+        {
+          action: "Update listing",
+          // Issue #524 — fingerprint on the listing id + the fields that
+          // actually change on-chain, so editing a *different* listing (or
+          // a different price/token on the same one) is never deduplicated
+          // against an in-flight update of this one.
+          dedupe: {
+            account: publicKey,
+            network: config.networkPassphrase,
+            contract: config.contractId,
+            args: {
+              listingId: listing.listing_id,
+              price: form.price,
+              tokenAddress: form.tokenAddress,
+              collectionAddress: form.collectionAddress,
+              nftTokenId: form.nftTokenId,
+            },
+          },
+        }
       );
       if (success) {
         setSuccessId(listing.listing_id);
@@ -500,7 +523,21 @@ export function ListingForm({ listing, onSuccess, onCancel }: ListingFormProps) 
             tokenAddress: form.tokenAddress,
             recipients: form.recipients,
           }),
-        { action: "Create listing" }
+        {
+          action: "Create listing",
+          dedupe: {
+            account: publicKey,
+            network: config.networkPassphrase,
+            contract: config.contractId,
+            args: {
+              collectionAddress: form.collectionAddress,
+              nftTokenId: form.nftTokenId,
+              price: form.price,
+              tokenAddress: form.tokenAddress,
+              recipients: form.recipients,
+            },
+          },
+        }
       );
       if (id !== null) {
         setSuccessId(id as number);
@@ -546,6 +583,7 @@ export function ListingForm({ listing, onSuccess, onCancel }: ListingFormProps) 
                 setSuccessId(null);
                 setSubmitAttempted(false);
                 setTouched(new Set());
+                setPriceInputError(null);
                 setForm({
                   metadataCid: "",
                   collectionAddress: "",
@@ -779,15 +817,13 @@ export function ListingForm({ listing, onSuccess, onCancel }: ListingFormProps) 
                   min={MIN_PRICE_XLM}
                   max={MAX_PRICE_XLM}
                   step="any"
-                  value={form.price}
-                  onChange={(e) =>
-                    setForm({ ...form, price: parseFloat(e.target.value) })
-                  }
+                  value={Number.isNaN(form.price) ? "" : form.price}
+                  onChange={(e) => handlePriceChange(e.target.value, selectedToken)}
                   onBlur={() => markTouched("price")}
-                  aria-invalid={shouldShowError("price") && !!errors.price}
-                  aria-describedby={errors.price ? "err-price" : undefined}
+                  aria-invalid={shouldShowError("price") && !!(priceInputError || errors.price)}
+                  aria-describedby={priceInputError || errors.price ? "err-price" : undefined}
                   className={`w-full rounded-2xl border px-5 py-4 pr-16 text-base focus:outline-none transition-all shadow-sm font-inter ${
-                    shouldShowError("price") && errors.price
+                    shouldShowError("price") && (priceInputError || errors.price)
                       ? "border-red-400 bg-red-50/40 focus:border-red-500"
                       : "border-gray-200 bg-gray-50/50 focus:border-brand-500 focus:bg-white"
                   }`}
@@ -796,9 +832,9 @@ export function ListingForm({ listing, onSuccess, onCancel }: ListingFormProps) 
                   {selectedToken.symbol}
                 </span>
               </div>
-              {shouldShowError("price") && errors.price && (
+              {shouldShowError("price") && (priceInputError || errors.price) && (
                 <p id="err-price" className="text-sm text-red-600 mt-1" role="alert">
-                  {errors.price}
+                  {priceInputError || errors.price}
                 </p>
               )}
             </div>
@@ -910,6 +946,7 @@ export function ListingForm({ listing, onSuccess, onCancel }: ListingFormProps) 
               disabled={
                 isAnyLoading ||
                 !hasTokenOptions ||
+                !!priceInputError ||
                 (submitAttempted && !formIsValid) ||
                 (!isEdit && approvalStatus === false)
               }

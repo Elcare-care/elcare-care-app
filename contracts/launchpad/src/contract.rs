@@ -191,11 +191,20 @@ fn validate_721_shape(
     if name.len() == 0 {
         errors.push_back(Error::EmptyName);
     }
+    if name.len() > 64 {
+        errors.push_back(Error::NameTooLong);
+    }
     if symbol.len() == 0 {
         errors.push_back(Error::EmptySymbol);
     }
+    if symbol.len() > 16 {
+        errors.push_back(Error::SymbolTooLong);
+    }
     if max_supply == 0 {
         errors.push_back(Error::InvalidMaxSupply);
+    }
+    if max_supply > 1_000_000_000 {
+        errors.push_back(Error::MaxSupplyTooLarge);
     }
     if !wasm_set {
         errors.push_back(Error::WasmHashNotSet);
@@ -228,6 +237,9 @@ fn validate_1155_shape(
     }
     if name.len() == 0 {
         errors.push_back(Error::EmptyName);
+    }
+    if name.len() > 64 {
+        errors.push_back(Error::NameTooLong);
     }
     if !wasm_set {
         errors.push_back(Error::WasmHashNotSet);

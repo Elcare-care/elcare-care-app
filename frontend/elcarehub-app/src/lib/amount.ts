@@ -92,6 +92,32 @@ export function decimalStringToBase(input: string, decimals: number): bigint | n
   }
 }
 
+/**
+ * Parse a raw base-unit amount string returned by an API/indexer (e.g. an
+ * aggregate sum) into a bigint, without ever routing it through a JS
+ * float. Base units are always integers; some aggregate endpoints emit a
+ * trailing ".0" (or more), which is simply truncated — the same tolerant
+ * behaviour the previous ad hoc `split(".")[0]` call sites relied on.
+ *
+ * This exists because `BigInt(Math.round(parseFloat(raw)))` — a pattern
+ * that has crept into a few display call sites — silently loses precision
+ * for sums beyond `Number.MAX_SAFE_INTEGER` (~9e15 base units).
+ *
+ * @example
+ * baseUnitsStringToBigInt("15500000")   // 15_500_000n
+ * baseUnitsStringToBigInt("15500000.0") // 15_500_000n
+ * baseUnitsStringToBigInt("")           // 0n
+ */
+export function baseUnitsStringToBigInt(raw: string): bigint {
+  const trimmed = raw.trim();
+  if (!trimmed) return 0n;
+
+  const wholePart = trimmed.split(".")[0];
+  if (!/^-?\d*$/.test(wholePart) || wholePart === "" || wholePart === "-") return 0n;
+
+  return BigInt(wholePart);
+}
+
 // ── Public API ───────────────────────────────────────────────────────────────
 
 /**

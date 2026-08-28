@@ -111,6 +111,31 @@ export function AuctionForm({ onSuccess, onCancel }: AuctionFormProps) {
     });
   };
 
+  /**
+   * Parses the raw reserve-price input using bigint arithmetic (lib/amount.ts)
+   * instead of a bare `parseFloat`, rejecting malformed input and excess
+   * decimal precision for the selected token up front.
+   */
+  const handleReservePriceChange = (raw: string, token: TokenConfig) => {
+    if (raw.trim() === "") {
+      setReservePriceError(null);
+      setForm((cur) => ({ ...cur, reservePriceXlm: NaN }));
+      return;
+    }
+
+    const result = validateAmountInput(raw, token);
+    if (result.valid && result.baseUnits !== null) {
+      setReservePriceError(null);
+      setForm((cur) => ({
+        ...cur,
+        reservePriceXlm: Number(baseToDisplay(result.baseUnits!, token)),
+      }));
+    } else {
+      setReservePriceError(result.message);
+      setForm((cur) => ({ ...cur, reservePriceXlm: NaN }));
+    }
+  };
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!selectedFile || fileError) return;

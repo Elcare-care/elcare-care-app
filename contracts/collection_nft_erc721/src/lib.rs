@@ -22,6 +22,9 @@ use soroban_sdk::{
     Vec,
 };
 
+/// Shared metadata validation rules (Issue #476).
+pub mod metadata;
+
 const TTL_THRESHOLD: u32 = 50_000;
 const TTL_BUMP: u32 = 100_000;
 const MAX_BPS: u32 = 10_000; // 100% in basis points
@@ -61,12 +64,16 @@ pub enum Error {
     EmptyBatch = 18,
     /// Batch exceeds maximum size.
     BatchTooLarge = 19,
-    /// Succession proposal has expired (#484).
-    ProposalExpired = 20,
-    /// No pending creator proposal exists (#484).
-    NoPendingCreator = 21,
-    /// Caller is not the pending creator (#484).
-    NotPendingCreator = 22,
+    /// Collection name is empty (Issue #476).
+    EmptyName = 20,
+    /// Collection name exceeds maximum length (Issue #476).
+    NameTooLong = 21,
+    /// Collection symbol is empty (Issue #476).
+    EmptySymbol = 22,
+    /// Collection symbol exceeds maximum length (Issue #476).
+    SymbolTooLong = 23,
+    /// max_supply is zero or exceeds the platform cap (Issue #476).
+    InvalidMaxSupply = 24,
 }
 
 // ─── Storage Keys ─────────────────────────────────────────────────────────────
@@ -179,9 +186,13 @@ impl NormalNFT721 {
         if env.storage().instance().has(&DataKey::Initialized) {
             return Err(Error::AlreadyInitialized);
         }
-        if royalty_bps > MAX_BPS {
-            return Err(Error::InvalidBps);
-        }
+        // Issue #476: apply shared metadata validation rules before writing any
+        // state so an invalid combination cannot leave the collection partially
+        // initialised.
+        metadata::validate_name(&name, Error::EmptyName, Error::NameTooLong)?;
+        metadata::validate_symbol(&symbol, Error::EmptySymbol, Error::SymbolTooLong)?;
+        metadata::validate_max_supply(max_supply, Error::InvalidMaxSupply)?;
+        metadata::validate_royalty_bps(royalty_bps, Error::InvalidBps)?;
 
         env.storage().instance().set(&DataKey::Initialized, &true);
         env.storage().instance().set(&DataKey::Creator, &creator);

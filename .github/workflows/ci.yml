@@ -14,6 +14,21 @@ jobs:
       - run: cargo build --target wasm32v1-none --release -p collection-nft-erc721 -p collection-nft-erc1155 -p lazy-mint-erc721 -p lazy-mint-erc1155
       - run: cargo test --workspace
 
+  # ── Contract error catalog coverage gate (Issue #475) ────────────────────────
+  # Fails when a Rust error variant has no client-side catalog mapping, when a
+  # mapping is stale (code renumbered), or when a non-retryable financial error
+  # lacks an explicit operator action.
+  contract-error-coverage:
+    name: Contract Error Catalog Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Validate error catalog coverage
+        run: node scripts/contract-errors/validate-error-coverage.mjs
+
   # ── Migration safety gate ────────────────────────────────────────────────────
   # Runs on every push/PR that touches migration files.
   # Blocks merge when destructive SQL patterns are detected (DROP TABLE,

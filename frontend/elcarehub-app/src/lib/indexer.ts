@@ -146,6 +146,13 @@ interface RawMarketplaceEvent {
   data: Record<string, unknown>;
   ledgerSequence: number;
   ledgerTimestamp?: string;
+  /** Real Stellar transaction hash, when the indexer captured one. */
+  txHash?: string | null;
+}
+
+/** True for a well-formed 64-hex-character Stellar transaction hash. */
+function isRealTxHash(v: unknown): v is string {
+  return typeof v === "string" && /^[0-9a-fA-F]{64}$/.test(v);
 }
 
 function sleep(ms: number) {
@@ -327,7 +334,7 @@ function mapWalletEventToActivity(
     timestamp: ts,
     from: from || "—",
     to: to || "—",
-    tx_hash: `ledger_${ev.ledgerSequence}`,
+    tx_hash: isRealTxHash(ev.txHash) ? ev.txHash : `ledger_${ev.ledgerSequence}`,
   };
 }
 
@@ -1390,6 +1397,9 @@ export interface ActivityFeedEvent {
   data: Record<string, unknown>;
   ledgerSequence: number;
   ledgerTimestamp: string | null;
+  /** Real Stellar transaction hash, when the indexer captured one — usable
+   *  as a direct link to /tx/[hash] for on-chain verification. */
+  txHash?: string | null;
   /** Human-readable summary generated client-side */
   summary?: string;
 }

@@ -32,6 +32,12 @@ pub enum Error {
     AlreadyMigrated = 16,
     /// A collection address lookup returned no record.
     CollectionNotFound = 17,
+    /// Collection name exceeds the maximum allowed length (Issue #476).
+    NameTooLong = 18,
+    /// Collection symbol exceeds the maximum allowed length (Issue #476).
+    SymbolTooLong = 19,
+    /// max_supply exceeds the platform cap of 1,000,000,000 (Issue #476).
+    MaxSupplyTooLarge = 20,
 }
 
 // `#[contracterror]` in soroban-sdk 25.3.x does not emit `SorobanArbitrary`.

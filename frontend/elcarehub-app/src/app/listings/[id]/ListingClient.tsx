@@ -32,6 +32,7 @@ import { ReportContentButton } from "@/components/ReportContentButton";
 import { GuardButton } from "@/components/WalletGuard";
 import { ResourceState } from "@/components/PageStates";
 import { Breadcrumb } from "@/components/Breadcrumb";
+import { StaleBanner } from "@/components/StaleBanner";
 import { categorizePageError, PageStateError } from "@/lib/pageState";
 import { config } from "@/lib/config";
 import {
@@ -397,6 +398,20 @@ export default function ListingDetailPage({ id }: ListingClientProps) {
                 ]}
                 className="mb-8"
             />
+
+            {/* Issue #522 — non-blocking indexer freshness indicator */}
+            {freshness.status !== "healthy" && (
+                <div className="mb-8">
+                    <StaleBanner
+                        freshness={freshness.freshness}
+                        status={freshness.status}
+                        reorg={freshness.reorg}
+                        onRefresh={freshness.refresh}
+                        isRefreshing={freshness.isRefreshing}
+                        verifyHref={verifiableTxHash ? `/tx/${verifiableTxHash}` : undefined}
+                    />
+                </div>
+            )}
 
             <div className="grid gap-12 lg:grid-cols-2 lg:items-start">
                 {/* LEFT COLUMN: Media, Tabs & Description */}

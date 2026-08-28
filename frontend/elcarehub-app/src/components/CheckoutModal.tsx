@@ -41,6 +41,7 @@ import { ActionDisclosure } from "@/components/ActionDisclosure";
 import { useDisclosure } from "@/hooks/useDisclosure";
 import { buildExpectedBuyArtworkIntent } from "@/lib/tx-intent";
 import { getNetworkLabel } from "@/lib/preflight";
+import { config } from "@/lib/config";
 
 interface CheckoutModalProps {
   isOpen: boolean;
@@ -215,7 +216,23 @@ export function CheckoutModal({
 
       setStep("processing");
       resetTx();
-      const success = await runTx(() => onCryptoPurchase(), { action: "Purchase" });
+      const success = await runTx(() => onCryptoPurchase(), {
+        action: "Purchase",
+        // Issue #524 — fingerprint on the listing + buyer + price/token, so
+        // a double-tap of "Confirm & Pay" is deduplicated while buying a
+        // *different* listing (or the same one at a different price/token,
+        // e.g. after a preview refresh) is never blocked.
+        dedupe: {
+          account: buyerPublicKey,
+          network: config.networkPassphrase,
+          contract: config.contractId,
+          args: {
+            listingId: listing.listing_id,
+            price: listing.price,
+            token: selectedToken.address,
+          },
+        },
+      });
       if (success) {
         posthog.capture("Purchase Successful", {
           listing_id: listing.listing_id,
