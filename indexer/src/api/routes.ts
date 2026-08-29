@@ -2216,6 +2216,183 @@ router.get('/config/auction', cacheMiddleware(60), async (req: Request, res: Res
   }
 });
 
+// ── Dead-letter management endpoints ─────────────────────────────────────────
+//
+// GET  /admin/dead-letters           — paginated list with optional status filter
+// GET  /admin/dead-letters/:id       — full record including redacted payload + audit trail
+// POST /admin/dead-letters/:id/remediate  — set remediationReason before replay
+// POST /admin/dead-letters/:id/replay     — replay single record with idempotency
+// POST /admin/dead-letters/replay/batch   — batch replay up to 50 pending records
+
+router.get(
+  '/admin/dead-letters',
+  operationalRateLimiter,
+  authMiddleware('operator'),
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const { listDeadLetters } = await import('../dead-letter-service.js');
+      const status     = req.query.status     as string | undefined;
+      const limit      = Math.min(parseInt((req.query.limit  as string) || '50',  10), 200);
+      const offset     = Math.max(parseInt((req.query.offset as string) || '0',   10), 0);
+      const contractId = req.query.contractId as string | undefined;
+      const result     = await listDeadLetters({ status: status as any, limit, offset, contractId });
+      res.json({ ok: true, ...result });
+    } catch (err) { next(err); }
+  },
+);
+
+router.get(
+  '/admin/dead-letters/:id',
+  operationalRateLimiter,
+  authMiddleware('operator'),
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const { inspectDeadLetter } = await import('../dead-letter-service.js');
+      const id     = parseInt(req.params.id, 10);
+      if (isNaN(id)) return next(badRequest('id must be a number'));
+      const record = await inspectDeadLetter(id);
+      if (!record) return next(notFound(`Dead-letter record ${id} not found`));
+      res.json({ ok: true, record });
+    } catch (err) { next(err); }
+  },
+);
+
+router.post(
+  '/admin/dead-letters/:id/remediate',
+  operationalRateLimiter,
+  authMiddleware('operator'),
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const { remediateDeadLetter } = await import('../dead-letter-service.js');
+      const id     = parseInt(req.params.id, 10);
+      if (isNaN(id)) return next(badRequest('id must be a number'));
+      const reason = req.body?.remediationReason;
+      if (!reason || typeof reason !== 'string' || reason.trim().length === 0) {
+        return next(badRequest('remediationReason is required'));
+      }
+      const actor = (req.headers['x-operator-token'] as string | undefined) ?? req.ip ?? 'unknown';
+      await remediateDeadLetter(id, {
+        remediationReason: reason.trim(),
+        actor,
+        ipAddress: req.ip,
+      });
+      res.json({ ok: true, id });
+    } catch (err: any) {
+      if (err?.statusCode === 404) return next(notFound(err.message));
+      if (err?.statusCode === 409) return res.status(409).json({ ok: false, error: err.message });
+      next(err);
+    }
+  },
+);
+
+router.post(
+  '/admin/dead-letters/:id/replay',
+  operationalRateLimiter,
+  authMiddleware('operator'),
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const { replayDeadLetter } = await import('../dead-letter-service.js');
+      const id = parseInt(req.params.id, 10);
+      if (isNaN(id)) return next(badRequest('id must be a number'));
+      const actor          = (req.headers['x-operator-token'] as string | undefined) ?? req.ip ?? 'unknown';
+      const dryRun         = req.body?.dryRun === true;
+      const idempotencyKey = req.body?.idempotencyKey as string | undefined;
+      const result = await replayDeadLetter(id, {
+        actor,
+        dryRun,
+        idempotencyKey,
+        ipAddress:  req.ip,
+        userAgent:  req.headers['user-agent'] as string | undefined,
+      });
+      const status = result.outcome === 'success' ? 200 : result.outcome === 'duplicate' ? 200 : 422;
+      res.status(status).json({ ok: result.outcome === 'success' || result.outcome === 'duplicate', ...result });
+    } catch (err: any) {
+      if (err?.statusCode === 404) return next(notFound(err.message));
+      if (err?.statusCode === 409) return res.status(409).json({ ok: false, error: err.message });
+      next(err);
+    }
+  },
+);
+
+router.post(
+  '/admin/dead-letters/replay/batch',
+  operationalRateLimiter,
+  authMiddleware('operator'),
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const { replayDeadLetterBatch } = await import('../dead-letter-service.js');
+      const actor  = (req.headers['x-operator-token'] as string | undefined) ?? req.ip ?? 'unknown';
+      const dryRun = req.body?.dryRun === true;
+      const ids    = Array.isArray(req.body?.ids) ? (req.body.ids as number[]) : undefined;
+      const limit  = Math.min(parseInt(req.body?.limit ?? '10', 10), 50);
+      const status = req.body?.status as string | undefined;
+      const result = await replayDeadLetterBatch({
+        actor, dryRun, ids, limit, status: status as any,
+        ipAddress: req.ip,
+        userAgent: req.headers['user-agent'] as string | undefined,
+      });
+      res.json({ ok: true, ...result });
+    } catch (err) { next(err); }
+  },
+);
+
+// ── Snapshot endpoints ────────────────────────────────────────────────────────
+//
+// GET  /admin/snapshots          — list snapshots (latest first, operator only)
+// GET  /admin/snapshots/:id      — single snapshot detail
+// POST /admin/snapshots/:id/verify — trigger RPC verification of a snapshot
+
+router.get(
+  '/admin/snapshots',
+  operationalRateLimiter,
+  authMiddleware('operator'),
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const { listSnapshots } = await import('../snapshot.js');
+      const limit  = Math.min(parseInt((req.query.limit  as string) || '20', 10), 100);
+      const offset = Math.max(parseInt((req.query.offset as string) || '0',  10), 0);
+      const status = req.query.status as string | undefined;
+      const result = await listSnapshots({ limit, offset, status: status as any });
+      res.json({ ok: true, ...result });
+    } catch (err) { next(err); }
+  },
+);
+
+router.get(
+  '/admin/snapshots/:id',
+  operationalRateLimiter,
+  authMiddleware('operator'),
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const { getSnapshot } = await import('../snapshot.js');
+      const id     = parseInt(req.params.id, 10);
+      if (isNaN(id)) return next(badRequest('id must be a number'));
+      const record = await getSnapshot(id);
+      if (!record) return next(notFound(`Snapshot ${id} not found`));
+      res.json({ ok: true, snapshot: record });
+    } catch (err) { next(err); }
+  },
+);
+
+router.post(
+  '/admin/snapshots/:id/verify',
+  operationalRateLimiter,
+  authMiddleware('operator'),
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const { verifySnapshot } = await import('../snapshot.js');
+      const id = parseInt(req.params.id, 10);
+      if (isNaN(id)) return next(badRequest('id must be a number'));
+      const actor = (req.headers['x-operator-token'] as string | undefined) ?? req.ip ?? 'unknown';
+      const result = await verifySnapshot(id, { actor, ipAddress: req.ip });
+      res.json({ ok: true, ...result });
+    } catch (err: any) {
+      if (err?.statusCode === 404) return next(notFound(err.message));
+      next(err);
+    }
+  },
+);
+
 // ── GET /admin/query-cost ─────────────────────────────────────────────────────
 // Operator-only diagnostics: returns cost weights and budget limits.
 // No DB access — safe to call frequently for observability.

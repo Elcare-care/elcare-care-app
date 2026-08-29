@@ -324,7 +324,25 @@ export async function revertLedgers(safeAtLedger: number): Promise<void> {
       });
     }
 
-    // Remove listings that were first created after the safe checkpoint
+    // ── Royalty payments written past safe point ───────────────────────────
+    // RoyaltyPayment rows are created by ROYALTY_PAID events; delete any that
+    // arrived from ledgers that no longer exist on the canonical chain.
+    if (typeof (tx as any).royaltyPayment?.deleteMany === 'function') {
+      await (tx as any).royaltyPayment.deleteMany({
+        where: { ledgerSequence: { gt: safeAtLedger } },
+      });
+    }
+
+    // ── Deployment fees recorded past safe point ───────────────────────────
+    // DeploymentFee rows are appended on DEPLOY_* events via the launchpad.
+    // Remove any that fell in the reorg window.
+    if (typeof (tx as any).deploymentFee?.deleteMany === 'function') {
+      await (tx as any).deploymentFee.deleteMany({
+        where: { ledgerSequence: { gt: safeAtLedger } },
+      });
+    }
+
+    // ── Remove listings that were first created after the safe checkpoint ──
     await tx.listing.deleteMany({
       where: { createdAtLedger: { gt: safeAtLedger } },
     });
@@ -334,6 +352,39 @@ export async function revertLedgers(safeAtLedger: number): Promise<void> {
       where: { updatedAtLedger: { gt: safeAtLedger } },
       data: { status: 'Active' as const, updatedAtLedger: safeAtLedger },
     });
+
+    // ── Auctions created past the safe point ──────────────────────────────
+    // Auctions whose createdAtLedger > safeAtLedger never existed on the
+    // canonical chain — delete them entirely.
+    if (typeof (tx as any).auction?.deleteMany === 'function') {
+      await (tx as any).auction.deleteMany({
+        where: { createdAtLedger: { gt: safeAtLedger } },
+      });
+    }
+
+    // Auctions whose status changed after the safe checkpoint revert to Active
+    // (e.g. Finalized/Cancelled due to events in the reorg window).
+    if (typeof (tx as any).auction?.updateMany === 'function') {
+      await (tx as any).auction.updateMany({
+        where: { updatedAtLedger: { gt: safeAtLedger } },
+        data: { status: 'Active' as const, updatedAtLedger: safeAtLedger },
+      });
+    }
+
+    // ── WhitelistedToken: undo removals that happened in the reorg window ──
+    // TOKEN_REMOVED events that fall past safeAtLedger must be unwound:
+    // restore active=true and clear removedAtLedger / removedBy.
+    if (typeof (tx as any).whitelistedToken?.updateMany === 'function') {
+      await (tx as any).whitelistedToken.updateMany({
+        where: { active: false, removedAtLedger: { gt: safeAtLedger } },
+        data: { active: true, removedAtLedger: null, removedBy: null },
+      });
+      // TOKEN_WHITELISTED events in the reorg window: remove rows that were
+      // first added after the safe ledger (addedAtLedger > safeAtLedger).
+      await (tx as any).whitelistedToken.deleteMany({
+        where: { addedAtLedger: { gt: safeAtLedger } },
+      });
+    }
 
     // Reset collections deployed after the safe checkpoint
     await tx.collection.deleteMany({

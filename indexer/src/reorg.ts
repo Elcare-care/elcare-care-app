@@ -31,9 +31,17 @@
 
 import { logger } from './logger.js';
 import prisma from './prisma-write.js';
+import prismaRead from './db.js';
 import { emitSSEEvent } from './api/routes.js';
 import { bumpConfirmedVersion } from './api/etag-middleware.js';
-import { invalidateStats, invalidateAllActivity } from './cache-invalidation.js';
+import {
+  invalidateStats,
+  invalidateAllActivity,
+  invalidateListing,
+  invalidateAuction,
+  invalidateOffer,
+  invalidateCollection,
+} from './cache-invalidation.js';
 
 // ── Confirmation promotion ────────────────────────────────────────────────────
 
@@ -177,37 +185,141 @@ export async function rollbackReorg(
 
   logger.warn('reorg: rolling back domain state', { safeAtLedger });
 
-  // Reset offers whose status changed after the safe point
+  // ── 1. Offer rollback ────────────────────────────────────────────────────
+  // Collect affected offer IDs before the update so we can invalidate their
+  // individual cache entries.
+  const affectedOffers: Array<{ offerId: bigint; listingId: bigint }> = await (async () => {
+    try {
+      return await prismaRead.offer.findMany({
+        where:  { updatedAtLedger: { gt: safeAtLedger } },
+        select: { offerId: true, listingId: true },
+      });
+    } catch { return []; }
+  })();
+
   await db.offer.updateMany({
     where: { updatedAtLedger: { gt: safeAtLedger } },
-    data: { status: 'Pending', updatedAtLedger: safeAtLedger },
+    data:  { status: 'Pending', updatedAtLedger: safeAtLedger },
   });
 
-  // Remove bids placed after the safe point
+  // ── 2. Bid rollback ──────────────────────────────────────────────────────
+  // Collect affected auction IDs for targeted cache invalidation.
+  const affectedAuctionIds: bigint[] = await (async () => {
+    try {
+      const rows = await prismaRead.bid.findMany({
+        where:  { ledgerSequence: { gt: safeAtLedger } },
+        select: { auctionId: true },
+        distinct: ['auctionId'],
+      });
+      return rows.map((r: any) => r.auctionId);
+    } catch { return []; }
+  })();
+
   await db.bid.deleteMany({
     where: { ledgerSequence: { gt: safeAtLedger } },
   });
 
-  logger.info('reorg: domain rollback complete', { safeAtLedger });
+  // ── 3. Collect listing + collection IDs for targeted invalidation ────────
+  const affectedListingIds: bigint[] = await (async () => {
+    try {
+      const rows = await prismaRead.listing.findMany({
+        where:  { updatedAtLedger: { gt: safeAtLedger } },
+        select: { listingId: true },
+      });
+      return rows.map((r: any) => r.listingId);
+    } catch { return []; }
+  })();
 
-  // Issue #508: every cached ETag that was computed from data at ledgers
-  // > safeAtLedger is now invalid.  Bump the confirmed-version counter so
-  // subsequent requests (even for unchanged data) receive a new ETag and
-  // clients are forced to re-validate.
+  const affectedCollections: string[] = await (async () => {
+    try {
+      const rows = await prismaRead.collection.findMany({
+        where:  { deployedAtLedger: { gt: safeAtLedger } },
+        select: { contractAddress: true },
+      });
+      return rows.map((r: any) => r.contractAddress as string);
+    } catch { return []; }
+  })();
+
+  logger.info('reorg: domain rollback complete', {
+    safeAtLedger,
+    affectedListings:   affectedListingIds.length,
+    affectedAuctions:   affectedAuctionIds.length,
+    affectedOffers:     affectedOffers.length,
+    affectedCollections: affectedCollections.length,
+  });
+
+  // ── 4. ETag invalidation ─────────────────────────────────────────────────
   bumpConfirmedVersion();
 
-  // Broad cache purge: stats aggregates, activity feeds, and wallet views may
-  // all reference events that were just rolled back.
-  await Promise.all([
-    invalidateStats(),
-    invalidateAllActivity(),
-  ]).catch((err) => {
+  // ── 5. Per-entity cache invalidation ────────────────────────────────────
+  // Targeted invalidation is faster and avoids stampeding Redis with glob scans
+  // when only a small subset of entities was affected.
+  const cacheJobs: Promise<void>[] = [];
+
+  for (const id of affectedListingIds) {
+    cacheJobs.push(invalidateListing(id.toString()));
+  }
+  for (const id of affectedAuctionIds) {
+    cacheJobs.push(invalidateAuction(id.toString()));
+  }
+  for (const { offerId, listingId } of affectedOffers) {
+    cacheJobs.push(invalidateOffer(offerId.toString()));
+    cacheJobs.push(invalidateListing(listingId.toString()));
+  }
+  for (const addr of affectedCollections) {
+    cacheJobs.push(invalidateCollection(addr));
+  }
+
+  // Always do the broad purge on top of targeted invalidation — ensures stats,
+  // activity feeds, and wallet views that aggregate across entities are cleared.
+  cacheJobs.push(invalidateStats());
+  cacheJobs.push(invalidateAllActivity());
+
+  await Promise.all(cacheJobs).catch((err) => {
     logger.warn('reorg: cache invalidation after rollback failed', {
       err: err instanceof Error ? err.message : String(err),
     });
   });
 
-  // Emit SSE correction event so connected clients know to flush their state
+  // ── 6. SSE retraction — per-entity REORG_ENTITY deltas ──────────────────
+  // Emit lightweight per-entity SSE events so clients with entity-level
+  // subscriptions can invalidate specific cached state without a full flush.
+  try {
+    for (const id of affectedListingIds) {
+      emitSSEEvent({ eventType: 'REORG_ENTITY', entityType: 'listing', entityId: id.toString(), safeLedger: safeAtLedger });
+    }
+    for (const id of affectedAuctionIds) {
+      emitSSEEvent({ eventType: 'REORG_ENTITY', entityType: 'auction', entityId: id.toString(), safeLedger: safeAtLedger });
+    }
+    for (const { offerId } of affectedOffers) {
+      emitSSEEvent({ eventType: 'REORG_ENTITY', entityType: 'offer', entityId: offerId.toString(), safeLedger: safeAtLedger });
+    }
+  } catch (err) {
+    logger.warn('reorg: per-entity SSE retraction failed (non-fatal)', {
+      err: err instanceof Error ? err.message : String(err),
+    });
+  }
+
+  // ── 7. Projection rebuild from canonical range ───────────────────────────
+  // Trigger an async projection rebuild for the affected ledger range so that
+  // derived tables (Listing, Auction, Offer) are re-computed from the canonical
+  // MarketplaceEvent log rather than left in a partially-rolled-back state.
+  // This is fire-and-forget: the poller continues re-ingesting forward; the
+  // rebuild ensures existing rows converge to the correct values.
+  setImmediate(async () => {
+    try {
+      const { rebuildProjectionsForRange } = await import('./rebuild-projections.js');
+      await rebuildProjectionsForRange(safeAtLedger);
+      logger.info('reorg: projection rebuild from canonical range complete', { safeAtLedger });
+    } catch (rebuildErr) {
+      logger.warn('reorg: post-rollback projection rebuild failed (non-fatal)', {
+        safeAtLedger,
+        err: rebuildErr instanceof Error ? rebuildErr.message : String(rebuildErr),
+      });
+    }
+  });
+
+  // ── 8. Broadcast global REORG SSE event ─────────────────────────────────
   emitReorgSseEvent(safeAtLedger);
 }
 

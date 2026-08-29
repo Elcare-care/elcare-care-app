@@ -612,13 +612,54 @@ model DeadLetterEvent {
   parserVersion  String           @default("")
   status         DeadLetterStatus @default(Pending)
   attempts       Int              @default(0)
+  /// Optional human-readable reason supplied by the operator before replay.
+  /// Required before a Pending→Replayed transition via the admin API.
+  remediationReason String?
+  /// Operator identifier (wallet address or token-derived label) who triggered the last replay.
+  replayedBy     String?
+  /// ISO-8601 timestamp set when a replay attempt is in-flight; cleared on completion.
+  /// Prevents concurrent replays of the same record (optimistic lock).
+  lockedAt       DateTime?
+  /// Idempotency key supplied by the caller; duplicate requests with the same key
+  /// are detected and return the stored outcome without re-running replay logic.
+  idempotencyKey String?          @unique
   createdAt      DateTime         @default(now())
   updatedAt      DateTime         @updatedAt
+
+  /// All replay attempts for this dead-letter record (append-only audit trail).
+  replayAttempts DeadLetterReplayAttempt[]
 
   @@unique([contractId, ledgerSequence, txHash, eventIndex])
   @@index([status])
   @@index([contractId, ledgerSequence])
   @@index([createdAt])
+  @@index([lockedAt])
+}
+
+// ── Dead-letter replay attempt audit trail ────────────────────────────────────
+//
+// One append-only row per replay attempt.  Never modified after creation.
+// actor: operator wallet address or token-derived identifier.
+// outcome: "success" | "parse_null" | "parse_error" | "projection_error" | "duplicate"
+// projectionCommitted: true only when the event was re-projected into domain tables.
+
+model DeadLetterReplayAttempt {
+  id              Int             @id @default(autoincrement())
+  deadLetterId    Int
+  deadLetter      DeadLetterEvent @relation(fields: [deadLetterId], references: [id])
+  actor           String          // operator identifier
+  outcome         String          // "success" | "parse_null" | "parse_error" | "projection_error" | "duplicate"
+  errorMessage    String?         // set when outcome != success
+  parsedEventType String?         // event type returned by parser (null if parse returned null/threw)
+  projectionCommitted Boolean     @default(false)
+  dryRun          Boolean         @default(false)
+  idempotencyKey  String?         // echoed from the request
+  attemptedAt     DateTime        @default(now())
+  durationMs      Int?            // wall-clock duration of the attempt
+
+  @@index([deadLetterId])
+  @@index([actor])
+  @@index([attemptedAt])
 }
 
 // ── Reconciliation repairs (#288) ─────────────────────────────────────────────
@@ -905,6 +946,10 @@ enum AuditActionType {
   BackfillJob
   GapRepair
   DeadLetterReplay
+  DeadLetterRemediate
+  SnapshotWrite
+  SnapshotVerify
+  ReorgRollback
 }
 
 enum AuditOutcome {
@@ -1204,4 +1249,60 @@ model TokenMetadataHistory {
   @@unique([address, version])
   @@index([address])
   @@index([sourceLedger])
+}
+
+// ── Indexer snapshots (recovery + audit checkpoints) ─────────────────────────
+//
+// Immutable, append-only snapshots written after every N committed batches.
+// Each snapshot captures the full sync state at a given ledger so that
+// recovery tooling can identify the last trustworthy point without scanning
+// arbitrary rows.
+//
+// contractCursors: JSON map of { contractId → lastLedger } for every active
+//   contract at the time the snapshot was written.
+// schemaVersion:   Value of SCHEMA_VERSION constant from config.ts at write time.
+//                  A mismatch between the persisted version and the running
+//                  binary signals a schema-incompatible snapshot — do not use
+//                  for automated recovery without operator approval.
+// rpcVerified:     true when the snapshotted ledgerHash was cross-checked against
+//                  the Stellar RPC before the snapshot was written.
+// hashMismatch:    true when the RPC returned a different hash than what the
+//                  indexer persisted — triggers an operator-visible alert and
+//                  prevents automated rollback to this snapshot.
+
+enum SnapshotStatus {
+  Pending   // written but not yet RPC-verified
+  Verified  // ledgerHash confirmed against RPC
+  Mismatch  // RPC hash differs from stored hash — do not use for automated recovery
+  Invalid   // structural validation failed (e.g. missing cursors)
+}
+
+model IndexerSnapshot {
+  id               Int            @id @default(autoincrement())
+  /// Ledger sequence this snapshot represents (immutable after creation).
+  ledgerSequence   Int
+  /// Stellar ledger hash at ledgerSequence (hex or base64, as returned by RPC).
+  ledgerHash       String
+  /// Per-contract sync cursors at snapshot time: { [contractId]: lastLedger }.
+  contractCursors  Json
+  /// Total MarketplaceEvent rows in the DB at snapshot time.
+  eventCount       BigInt         @default(0)
+  /// Schema version string from the running binary (e.g. "v2.3.0").
+  schemaVersion    String
+  /// Whether the ledgerHash was cross-checked against the Stellar RPC.
+  rpcVerified      Boolean        @default(false)
+  /// Set to true and status→Mismatch when RPC returns a different hash.
+  hashMismatch     Boolean        @default(false)
+  /// The hash returned by the RPC when hashMismatch is true (null otherwise).
+  rpcHash          String?
+  status           SnapshotStatus @default(Pending)
+  /// Free-text note written by the operator or recovery tooling.
+  notes            String?
+  createdAt        DateTime       @default(now())
+
+  @@index([ledgerSequence])
+  @@index([status])
+  @@index([createdAt])
+  // Composite: recovery query pattern is "latest Verified snapshot at or before X"
+  @@index([status, ledgerSequence])
 }
