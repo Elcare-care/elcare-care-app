@@ -555,6 +555,26 @@ export const financialDriftOldestAgeSeconds = new client.Gauge({
   help: 'Age in seconds of the oldest unresolved financial drift (0 when none)',
 });
 
+// ── RPC pagination metrics (Issue #487) ──────────────────────────────────────
+
+/** Total RPC event pages fetched during ingestion. */
+export const rpcPagesFetchedTotal = new client.Counter({
+  name: 'indexer_rpc_pages_fetched_total',
+  help: 'Total RPC event pages fetched during ingestion',
+});
+
+/** Total times the poller was rate-limited (HTTP 429) by the RPC provider. */
+export const rpcRateLimitedTotal = new client.Counter({
+  name: 'indexer_rpc_rate_limited_total',
+  help: 'Total rate-limit (429) responses received from the RPC provider',
+});
+
+/** Current adaptive page size being used for RPC event queries. */
+export const rpcAdaptivePageSizeGauge = new client.Gauge({
+  name: 'indexer_rpc_adaptive_page_size',
+  help: 'Current adaptive page size used for RPC getEvents queries',
+});
+
 // ── Expose metrics handler ────────────────────────────────────────────────────
 
 export async function handleMetrics(req: express.Request, res: express.Response) {
