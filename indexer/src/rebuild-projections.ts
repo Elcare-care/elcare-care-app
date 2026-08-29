@@ -591,6 +591,36 @@ export async function getRebuildStatus(limit = 10) {
   });
 }
 
+/**
+ * Trigger a targeted projection rebuild from safeAtLedger to the current DB tip.
+ *
+ * Called by rollbackReorg() after a chain reorg to re-project events in the
+ * canonical range onto domain tables (Listing, Auction, Offer, Collection).
+ * Runs in the background (called via setImmediate in rollbackReorg).
+ *
+ * SSE broadcasts are suppressed during the rebuild.
+ */
+export async function rebuildProjectionsForRange(fromLedger: number): Promise<void> {
+  // Determine the current tip from SyncState
+  const syncState = await (prismaRead as any).syncState.findUnique({ where: { id: 1 } });
+  const toLedger  = syncState?.lastLedger ?? fromLedger;
+
+  if (toLedger < fromLedger) {
+    logger.info('rebuildProjectionsForRange: nothing to rebuild (toLedger < fromLedger)', { fromLedger, toLedger });
+    return;
+  }
+
+  logger.info('rebuildProjectionsForRange: starting post-reorg rebuild', { fromLedger, toLedger });
+
+  await runRebuild({
+    dryRun:      false,
+    silent:      true,
+    ledgerFrom:  fromLedger,
+    ledgerTo:    toLedger,
+    projections: ALL_PROJECTIONS,
+  });
+}
+
 // ── Standalone CLI entrypoint ─────────────────────────────────────────────────
 
 const isMain = process.argv[1]

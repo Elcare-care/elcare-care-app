@@ -241,6 +241,13 @@ export const OPERATOR_ROUTES = new Set([
   // Dead-letter management
   '/admin/dead-letters',
   '/admin/dead-letters/{id}/replay',
+  '/admin/dead-letters/{id}',
+  '/admin/dead-letters/{id}/remediate',
+  '/admin/dead-letters/replay/batch',
+  // Indexer snapshots
+  '/admin/snapshots',
+  '/admin/snapshots/{id}',
+  '/admin/snapshots/{id}/verify',
   // Query cost diagnostics (operator-only)
   '/admin/query-cost',
   // Abuse detection blocklist management
@@ -383,8 +390,14 @@ export const ROUTE_POLICY_MATRIX: Record<string, PolicyEntry> = {
   '/admin/poller/halt':            { policy: 'operator', description: 'Manually halt the poller' },
   '/admin/poller/revert':          { policy: 'operator', description: 'Revert poller to earlier ledger' },
   '/admin/gap-repair/trigger':     { policy: 'operator', description: 'Trigger gap repair for a specific gap' },
-  '/admin/dead-letters':           { policy: 'operator', description: 'Dead-letter event queue view' },
-  '/admin/dead-letters/{id}/replay':{ policy: 'operator', description: 'Replay a dead-letter event' },
+  '/admin/dead-letters':                    { policy: 'operator', description: 'Dead-letter event queue view' },
+  '/admin/dead-letters/{id}':               { policy: 'operator', description: 'Single dead-letter record with redacted payload and audit trail' },
+  '/admin/dead-letters/{id}/replay':        { policy: 'operator', description: 'Replay a dead-letter event with idempotency and audit' },
+  '/admin/dead-letters/{id}/remediate':     { policy: 'operator', description: 'Set remediation reason on a dead-letter record before replay' },
+  '/admin/dead-letters/replay/batch':       { policy: 'operator', description: 'Batch replay up to 50 pending dead-letter records' },
+  '/admin/snapshots':                       { policy: 'operator', description: 'List immutable indexer ledger snapshots' },
+  '/admin/snapshots/{id}':                  { policy: 'operator', description: 'Single snapshot detail' },
+  '/admin/snapshots/{id}/verify':           { policy: 'operator', description: 'Trigger RPC verification of a snapshot ledger hash' },
   '/admin/query-cost':             { policy: 'operator', description: 'Query cost model diagnostics' },
   '/admin/abuse/block':            { policy: 'operator', description: 'Add a temporary abuse blocklist entry' },
   '/admin/abuse/block/{key}':      { policy: 'operator', description: 'Remove or check a blocklist entry by key' },

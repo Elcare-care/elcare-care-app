@@ -28,6 +28,7 @@
 
 import { logger } from './logger.js';
 import prisma from './prisma-write.js';
+import { maybeWriteSnapshot } from './snapshot.js';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -144,6 +145,37 @@ export async function commitCheckpoint(
     windowEnd: checkpoint.windowEnd,
     eventCount,
   });
+
+  // ── Periodic immutable snapshot (fire-and-forget, outside the tx) ─────────
+  // Run after the transaction so the snapshot reflects state already committed
+  // to the DB. Non-fatal: a snapshot failure must never stall the poller.
+  if (ledgerHash) {
+    // Gather per-contract cursors asynchronously — best-effort
+    setImmediate(async () => {
+      try {
+        const contracts = await prisma.trackedContract.findMany({
+          where:  { active: true },
+          select: { contractId: true, lastLedger: true },
+        });
+        const cursors: Record<string, number> = {};
+        for (const c of contracts) cursors[c.contractId] = c.lastLedger;
+
+        const totalEvents = await (prisma as any).marketplaceEvent.count();
+
+        await maybeWriteSnapshot({
+          ledgerSequence:  checkpoint.windowEnd,
+          ledgerHash:      ledgerHash,
+          contractCursors: cursors,
+          eventCount:      BigInt(totalEvents),
+        });
+      } catch (snapshotErr) {
+        logger.warn('checkpoint: snapshot write failed (non-fatal)', {
+          checkpointId: checkpoint.id,
+          err: snapshotErr instanceof Error ? snapshotErr.message : String(snapshotErr),
+        });
+      }
+    });
+  }
 }
 
 // ── Fail a checkpoint ─────────────────────────────────────────────────────────

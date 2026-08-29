@@ -448,6 +448,43 @@ export const deadLetterOldestAgeSeconds = new client.Gauge({
   help: 'Age in seconds of the oldest unresolved (Pending) dead-letter event',
 });
 
+/**
+ * Total dead-letter replay attempts, by outcome.
+ * outcome label values: "success" | "parse_null" | "parse_error" | "projection_error" | "duplicate"
+ */
+export const deadLetterReplayAttemptsTotal = new client.Counter({
+  name: 'indexer_dead_letter_replay_attempts_total',
+  help: 'Total dead-letter replay attempts, by outcome',
+  labelNames: ['outcome'],
+});
+
+/** Total dead-letter records successfully re-projected into domain tables. */
+export const deadLetterReplayProjectedTotal = new client.Counter({
+  name: 'indexer_dead_letter_replay_projected_total',
+  help: 'Total dead-letter records whose events were successfully re-projected',
+});
+
+// ── Snapshot metrics ──────────────────────────────────────────────────────────
+
+/** Total IndexerSnapshot rows written. */
+export const snapshotsWrittenTotal = new client.Counter({
+  name: 'indexer_snapshots_written_total',
+  help: 'Total immutable ledger snapshots written',
+});
+
+/** Total snapshot RPC verifications, by result. */
+export const snapshotVerificationsTotal = new client.Counter({
+  name: 'indexer_snapshot_verifications_total',
+  help: 'Total snapshot RPC verifications, by result (match | mismatch | error)',
+  labelNames: ['result'],
+});
+
+/** Gauge set to 1 when the most-recent snapshot has a hash mismatch, 0 otherwise. */
+export const snapshotHashMismatchGauge = new client.Gauge({
+  name: 'indexer_snapshot_hash_mismatch',
+  help: '1 when the most-recent verified snapshot has a hash mismatch; requires operator action',
+});
+
 // ── Reconciliation metrics (#288) ─────────────────────────────────────────────
 
 /** Total field-level discrepancies found per reconciliation run, by model and field. */
