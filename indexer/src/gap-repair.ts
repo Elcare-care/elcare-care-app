@@ -36,6 +36,8 @@ import { logger } from './logger.js';
 import {
   openGapsGauge,
   openGapLedgersTotalGauge,
+  openGapsCountGauge,
+  openGapsLedgersTotalGauge,
 } from './metrics.js';
 import { recoveryFSM } from './recovery-state-machine.js';
 import {
@@ -207,8 +209,10 @@ export async function runRepairCycle(): Promise<GapRepairResult[]> {
     select: { fromLedger: true, toLedger: true },
   });
   openGapsGauge.set(openGaps.length);
+  openGapsCountGauge.set(openGaps.length);
   const totalLedgers = openGaps.reduce((a, g) => a + (g.toLedger - g.fromLedger + 1), 0);
   openGapLedgersTotalGauge.set(totalLedgers);
+  openGapsLedgersTotalGauge.set(totalLedgers);
 
   if (openGaps.length === 0) {
     logger.debug('gap-repair: no open gaps this cycle');

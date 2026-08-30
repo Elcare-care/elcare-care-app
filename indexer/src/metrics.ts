@@ -263,6 +263,56 @@ export const cacheInvalidationFailuresTotal = new client.Counter({
   labelNames: ['resource'],
 });
 
+// ── SSE metrics ───────────────────────────────────────────────────────────────
+
+/** Total SSE connections opened (ever). */
+export const sseConnectionsTotal = new client.Counter({
+  name: 'elcarehub_sse_connections_total',
+  help: 'Total SSE connections opened since the indexer started',
+});
+
+/** Current number of active SSE client connections. */
+export const sseConnectedClientsGauge = new client.Gauge({
+  name: 'elcarehub_sse_active_connections',
+  help: 'Current number of active SSE client connections',
+});
+
+/** Total events delivered via SSE. */
+export const sseEventsDeliveredTotal = new client.Counter({
+  name: 'elcarehub_sse_events_delivered_total',
+  help: 'Total SSE events delivered to clients',
+});
+
+/** Total SSE events dropped due to slow clients (queue overflow). */
+export const sseEventsDroppedTotal = new client.Counter({
+  name: 'elcarehub_sse_events_dropped_total',
+  help: 'Total SSE events dropped due to client queue overflow',
+});
+
+/** Total SSE replay requests (clients resuming from lastEventId). */
+export const sseReplayRequestsTotal = new client.Counter({
+  name: 'elcarehub_sse_replay_requests_total',
+  help: 'Total SSE replay requests (clients resuming from lastEventId)',
+});
+
+/** Total Redis publish failures (degraded fallback mode triggered). */
+export const sseRedisPublishFailuresTotal = new client.Counter({
+  name: 'elcarehub_sse_redis_publish_failures_total',
+  help: 'Total Redis publish failures (degraded fallback mode triggered)',
+});
+
+/** Total degraded-fallback events (Redis unavailable). */
+export const sseDegradedFallbackTotal = new client.Counter({
+  name: 'elcarehub_sse_degraded_fallback_total',
+  help: 'Total events delivered via degraded fallback (in-memory ring buffer)',
+});
+
+/** Total subscriber reconnects (Redis pub/sub reconnection events). */
+export const sseSubscriberReconnectsTotal = new client.Counter({
+  name: 'elcarehub_sse_subscriber_reconnects_total',
+  help: 'Total subscriber reconnect events (Redis pub/sub reconnection)',
+});
+
 // ── Worker lease metrics ───────────────────────────────────────────────────────
 
 export const indexerLeaseAcquisitionsTotal = new client.Counter({
@@ -623,3 +673,86 @@ export async function handleMetrics(req: express.Request, res: express.Response)
     res.status(500).end('Failed to retrieve metrics');
   }
 }
+
+// ── Autoscaling-friendly metrics (normalized gauges with bounded labels) ─────
+
+/**
+ * Normalized lag behind network tip (ledgers).
+ * Scale-out signal: increasing lag over time indicates need for more indexer instances.
+ * Recovery signal: sudden spike followed by decline indicates gap repair or re-org recovery.
+ */
+export const ledgerLagGauge = new client.Gauge({
+  name: 'indexer_ledger_lag',
+  help: 'Current number of ledgers the indexer is behind the network tip',
+});
+
+/**
+ * Number of unresolved LedgerGap rows.
+ * Scale-out signal: stable/low count is healthy; gaps fill naturally as indexer catches up.
+ * Recovery signal: sudden increase indicates chain re-org or RPC window skip; requires operator review.
+ */
+export const openGapsCountGauge = new client.Gauge({
+  name: 'indexer_open_gaps_count',
+  help: 'Current number of unresolved LedgerGap rows',
+});
+
+/**
+ * Total ledgers covered by open gaps.
+ * Scale-out signal: not a direct scaling signal (gaps are fixed sequentially).
+ * Recovery signal: large values indicate significant catch-up work needed.
+ */
+export const openGapsLedgersTotalGauge = new client.Gauge({
+  name: 'indexer_open_gaps_ledgers_total',
+  help: 'Total number of ledgers covered by all open LedgerGap rows',
+});
+
+/**
+ * RPC call latency histogram (seconds).
+ * Scale-out signal: sustained high latency may indicate need for more indexer instances to spread load.
+ * Recovery signal: latency spikes during gap repair/recovery are expected and transient.
+ */
+export const rpcLatencySeconds = new client.Histogram({
+  name: 'indexer_rpc_latency_seconds',
+  help: 'RPC call latency in seconds (histogram for p50/p95/p99)',
+  buckets: [0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30],
+});
+
+/**
+ * Current number of connections in use from the database connection pool.
+ * Scale-out signal: pool saturation (接近 connection_limit) indicates need for more indexer instances.
+ * Recovery signal: not a direct scaling signal, but sustained saturation slows all operations.
+ */
+export const dbPoolConnectionsUsedGauge = new client.Gauge({
+  name: 'indexer_db_pool_connections_used',
+  help: 'Current number of connections in use from the read DB pool',
+});
+
+/**
+ * Current number of active SSE client connections.
+ * Scale-out signal: this is per-instance; for Kubernetes HPA, use the ratio to target connections per pod.
+ */
+export const sseConnectionsGauge = new client.Gauge({
+  name: 'indexer_sse_connections',
+  help: 'Current number of active SSE client connections',
+});
+
+/**
+ * Current number of pending jobs in the metadata (IPFS) queue.
+ * Scale-out signal: sustained backlog indicates need for more indexer instances.
+ * Recovery signal: transient spikes during gap repair or batch backfill are expected.
+ */
+export const metadataQueueDepthGauge = new client.Gauge({
+  name: 'indexer_metadata_queue_depth',
+  help: 'Current number of pending jobs in the metadata enrichment queue',
+});
+
+/**
+ * Metadata queue depth broken down by priority tier (high, normal, low).
+ * Scale-out signal: high-priority backlog indicates real-time content is backing up.
+ * Recovery signal: low-priority backlog growing during gap repair is expected.
+ */
+export const metadataQueueDepthByPriorityGauge = new client.Gauge({
+  name: 'indexer_metadata_queue_depth_by_priority',
+  help: 'Metadata queue depth by priority tier (high, normal, low)',
+  labelNames: ['priority'],
+});

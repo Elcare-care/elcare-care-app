@@ -28,6 +28,7 @@ import {
   sseRedisPublishFailuresTotal,
   sseDegradedFallbackTotal,
   sseSubscriberReconnectsTotal,
+  sseConnectionsGauge,
 } from '../metrics.js';
 import { logger } from '../logger.js';
 import { compareEventIds, exclusiveRangeStart, isValidEventId } from './stream-ids.js';
@@ -275,6 +276,7 @@ export class RealtimeHub {
     };
     this.clients.set(sink, state);
     sseConnectedClientsGauge.set(this.clients.size);
+    sseConnectionsGauge.set(this.clients.size);
 
     if (this.heartbeatTimer === null && this.heartbeatMs > 0) {
       this.heartbeatTimer = setInterval(() => this.heartbeat(), this.heartbeatMs);
@@ -312,6 +314,7 @@ export class RealtimeHub {
     state.closed = true;
     this.clients.delete(sink);
     sseConnectedClientsGauge.set(this.clients.size);
+    sseConnectionsGauge.set(this.clients.size);
     if (this.clients.size === 0 && this.heartbeatTimer !== null) {
       clearInterval(this.heartbeatTimer);
       this.heartbeatTimer = null;
@@ -457,6 +460,7 @@ export class RealtimeHub {
     }
     this.clients.clear();
     sseConnectedClientsGauge.set(0);
+    sseConnectionsGauge.set(0);
 
     const sub = this.subscriber;
     this.subscriber = null;

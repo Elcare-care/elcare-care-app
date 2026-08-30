@@ -2,6 +2,8 @@
 // lib/config.ts — centralised runtime configuration
 // ─────────────────────────────────────────────────────────────
 
+import { loadConfig as sharedLoadConfig } from '@elcarehub/config';
+
 export const config = {
   contractId: process.env.NEXT_PUBLIC_CONTRACT_ID ?? "",
   launchpadContractId: process.env.NEXT_PUBLIC_LAUNCHPAD_CONTRACT_ID ?? "",
@@ -30,6 +32,8 @@ export const config = {
   isDevelopment: process.env.NODE_ENV === "development",
   /** True when targeting Stellar mainnet — gates mainnet-only guards in the UI. */
   isMainnet: (process.env.NEXT_PUBLIC_STELLAR_NETWORK ?? "testnet") === "mainnet",
+  // Cross-component consistency checks
+  ...sharedLoadConfig(),
 } as const;
 
 // Required on both client and server.

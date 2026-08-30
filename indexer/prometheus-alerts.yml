@@ -437,3 +437,123 @@ groups:
             This exceeds the 30-minute threshold and may indicate the backup
             artifact has grown too large for the current restore budget, or
             that the ephemeral restore environment is under-resourced.
+
+      # ── Autoscaling-friendly alerts ──────────────────────────────────────────
+
+      - alert: IndexerLedgerLagRising
+        expr: indexer_ledger_lag > 200
+        for: 5m
+        labels:
+          severity: warning
+          owner: indexer-team
+        annotations:
+          summary: "Indexer sync lag is growing (200+ ledgers)"
+          description: >
+            Sync lag is {{ $value }} ledgers and has persisted for 5 minutes.
+            This may indicate the indexer is falling behind. Consider scaling
+            up indexer instances or checking for RPC/database bottlenecks.
+            Runbook: https://github.com/elcarehub/elcare-care-app/wiki/Runbook-Scaling#ledger-lag
+
+      - alert: IndexerLedgerLagCritical
+        expr: indexer_ledger_lag > 1000
+        for: 10m
+        labels:
+          severity: critical
+          owner: indexer-team
+        annotations:
+          summary: "Indexer sync lag is critically high (1000+ ledgers)"
+          description: >
+            Sync lag is {{ $value }} ledgers — more than 1,000 ledgers behind
+            the network tip. This indicates sustained indexer degradation.
+            Immediate action required. Runbook:
+            https://github.com/elcarehub/elcare-care-app/wiki/Runbook-Scaling#ledger-lag
+
+      - alert: IndexerOpenGapsGrowing
+        expr: indexer_open_gaps_count > 5
+        for: 5m
+        labels:
+          severity: warning
+          owner: indexer-team
+        annotations:
+          summary: "Indexer has growing number of unresolved gaps"
+          description: >
+            There are {{ $value }} open LedgerGap rows. Gaps indicate the
+            indexer missed ledger ranges (RPC window skip or reorg recovery).
+            While gaps will be repaired automatically, a growing count may
+            indicate chain instability or indexer resource constraints.
+            Runbook: https://github.com/elcarehub/elcare-care-app/wiki/Runbook-Scaling#open-gaps
+
+      - alert: IndexerOpenGapsCritical
+        expr: indexer_open_gaps_ledgers_total > 50000
+        for: 5m
+        labels:
+          severity: critical
+          owner: indexer-team
+        annotations:
+          summary: "Large backlog of ledger gaps (50k+ ledgers)"
+          description: >
+            {{ $value }} ledgers are in open gaps. This indicates a significant
+            catch-up workload. The indexer will repair gaps sequentially; consider
+            scaling up gap-repair capacity or temporarily increasing the
+            backfill batch size. Runbook:
+            https://github.com/elcarehub/elcare-care-app/wiki/Runbook-Scaling#open-gaps
+
+      - alert: DbPoolConnectionsHigh
+        expr: indexer_db_pool_connections_used > 8
+        for: 5m
+        labels:
+          severity: warning
+          owner: indexer-team
+        annotations:
+          summary: "Database connection pool is nearly saturated"
+          description: >
+            {{ $value }} DB connections are in use (pool limit: 10). Sustained
+            pool saturation will cause query timeouts and slow down the indexer.
+            Consider scaling up indexer instances or tuning DB pool settings.
+            Runbook: https://github.com/elcarehub/elcare-care-app/wiki/Runbook-Scaling#db-pool
+
+      - alert: RpcLatencyHigh
+        expr: >
+          histogram_quantile(0.99,
+            rate(indexer_rpc_latency_seconds_bucket[5m])
+          ) > 5
+        for: 5m
+        labels:
+          severity: warning
+          owner: indexer-team
+        annotations:
+          summary: "RPC latency p99 exceeds 5 seconds"
+          description: >
+            The 99th-percentile RPC call latency is {{ $value | humanizeDuration }}
+            over the last 5 minutes. High RPC latency may indicate network issues,
+            RPC provider overload, or the need for additional indexer instances
+            to distribute load. Runbook:
+            https://github.com/elcarehub/elcare-care-app/wiki/Runbook-Scaling#rpc-latency
+
+      - alert: MetadataQueueDepthHigh
+        expr: indexer_metadata_queue_depth > 200
+        for: 5m
+        labels:
+          severity: warning
+          owner: indexer-team
+        annotations:
+          summary: "Metadata enrichment queue is backing up"
+          description: >
+            {{ $value }} jobs are pending in the metadata queue. A sustained
+            backlog may indicate IPFS gateway issues or indexer under-provisioning.
+            Scale up indexer instances to drain the queue faster.
+            Runbook: https://github.com/elcarehub/elcare-care-app/wiki/Runbook-Scaling#metadata-queue
+
+      - alert: IndexerSseConnectionsHighPerInstance
+        expr: indexer_sse_connections > 80
+        for: 5m
+        labels:
+          severity: warning
+          owner: indexer-team
+        annotations:
+          summary: "SSE connection count is high per indexer instance"
+          description: >
+            This indexer instance has {{ $value }} active SSE connections.
+            If you are using HPA with a target of ~75 connections per pod,
+            consider scaling up to maintain latency and reduce reconnects.
+            Runbook: https://github.com/elcarehub/elcare-care-app/wiki/Runbook-Scaling#sse-connections

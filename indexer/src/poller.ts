@@ -227,6 +227,8 @@ function updateSyncMetrics(processedLedger: number, networkLatestLedger: number)
   latestLedgerProcessedGauge.set(processedLedger);
   networkLatestLedgerGauge.set(networkLatestLedger);
   syncLatencyGauge.set(Math.max(0, networkLatestLedger - processedLedger));
+  // Update normalized autoscaling-friendly metrics
+  ledgerLagGauge.set(Math.max(0, networkLatestLedger - processedLedger));
 }
 
 function setupSignalHandlers() {
