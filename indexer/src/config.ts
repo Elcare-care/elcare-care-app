@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { loadConfig as sharedLoadConfig, ValidationError, MissingEnvError } from '@elcarehub/config';
 
 // ── Version metadata ─────────────────────────────────────────────────────────
 // Sourced from versions.toml at build time.  Dockerfile and CI set these via
@@ -145,6 +146,16 @@ export function validateRequiredEnv(): void {
       `[indexer] Missing required environment variables: ${missing.join(', ')}.\n` +
         'Check indexer/.env and ensure all required vars are set (see README for the full table).'
     );
+  }
+
+  // Validate using shared config module (cross-component consistency)
+  try {
+    sharedLoadConfig();
+  } catch (err) {
+    if (err instanceof ValidationError || err instanceof MissingEnvError) {
+      throw new Error(`[indexer] Configuration validation failed:\n${err.message}`);
+    }
+    throw err;
   }
 }
 

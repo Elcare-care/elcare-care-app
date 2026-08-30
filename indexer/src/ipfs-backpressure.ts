@@ -29,6 +29,10 @@ import prisma from './db.js';
 import { enqueueIpfsFetch, fetchIpfsMetadata } from './ipfs-cache.js';
 import { logger } from './logger.js';
 import client from 'prom-client';
+import {
+  metadataQueueDepthGauge,
+  metadataQueueDepthByPriorityGauge,
+} from './metrics.js';
 
 // ── Prometheus ─────────────────────────────────────────────────────────────────
 
@@ -334,4 +338,10 @@ function updateDepthGauges(): void {
   for (const [priority, depth] of Object.entries(depths)) {
     ipfsQueueDepthGauge.labels(priority).set(depth);
   }
+  // Update new autoscaling-friendly metrics
+  const totalDepth = depths.high + depths.normal + depths.low;
+  metadataQueueDepthGauge.set(totalDepth);
+  metadataQueueDepthByPriorityGauge.labels('high').set(depths.high);
+  metadataQueueDepthByPriorityGauge.labels('normal').set(depths.normal);
+  metadataQueueDepthByPriorityGauge.labels('low').set(depths.low);
 }
