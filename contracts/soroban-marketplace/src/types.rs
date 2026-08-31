@@ -251,6 +251,81 @@ pub enum ListingStatus {
     Cancelled,
 }
 
+/// A formal listing lifecycle transition.
+///
+/// Concrete transitions are validated by [`ListingStatus::transition`]; the
+/// returned [`ListingTransitionEffect`] describes the escrow/refund side effects
+/// that must be applied atomically when the transition is committed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ListingTransition {
+    /// Active -> Sold (direct purchase or offer acceptance).
+    Sold,
+    /// Active -> Cancelled (owner, expiry, or admin revocation).
+    Cancelled(CancelReason),
+}
+
+/// Side effects associated with a committed listing transition.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ListingTransitionEffect {
+    pub to: ListingStatus,
+    pub cancel_reason: Option<CancelReason>,
+    /// The NFT held in marketplace escrow must be released to the buyer (Sold)
+    /// or returned to the seller (Cancelled).
+    pub release_escrow: bool,
+    /// All remaining Pending offers must be rejected and their escrowed funds
+    /// returned to the offerers before the transition is considered complete.
+    pub refund_pending_offers: bool,
+}
+
+impl ListingStatus {
+    pub fn is_active(&self) -> bool {
+        matches!(self, &ListingStatus::Active)
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, &ListingStatus::Sold | &ListingStatus::Cancelled)
+    }
+
+    pub fn can_transition_to(&self, to: &ListingStatus) -> bool {
+        matches!(
+            (self, to),
+            (&ListingStatus::Active, &ListingStatus::Sold)
+                | (&ListingStatus::Active, &ListingStatus::Cancelled)
+        )
+    }
+
+    pub fn require_transition_to(&self, to: &ListingStatus) -> Result<(), MarketplaceError> {
+        if self.can_transition_to(to) {
+            Ok(())
+        } else {
+            Err(MarketplaceError::ListingNotActive)
+        }
+    }
+
+    pub fn transition(
+        &self,
+        transition: ListingTransition,
+    ) -> Result<ListingTransitionEffect, MarketplaceError> {
+        match (self, transition) {
+            (&ListingStatus::Active, ListingTransition::Sold) => Ok(ListingTransitionEffect {
+                to: ListingStatus::Sold,
+                cancel_reason: None,
+                release_escrow: true,
+                refund_pending_offers: true,
+            }),
+            (&ListingStatus::Active, ListingTransition::Cancelled(reason)) => {
+                Ok(ListingTransitionEffect {
+                    to: ListingStatus::Cancelled,
+                    cancel_reason: Some(reason),
+                    release_escrow: true,
+                    refund_pending_offers: true,
+                })
+            }
+            _ => Err(MarketplaceError::ListingNotActive),
+        }
+    }
+}
+
 /// Discriminant carried in the ListingCancelledEvent to indicate why a listing
 /// was cancelled.
 #[contracttype]
@@ -400,12 +475,105 @@ pub struct Listing {
     pub reservation_end: Option<u64>,
 }
 
+impl Listing {
+    /// Validates the transition against the current status and, if allowed,
+    /// commits the new status. The returned effect tells the caller which
+    /// escrow/refund obligations must be executed atomically with the status
+    /// change.
+    pub fn apply_transition(
+        &mut self,
+        transition: ListingTransition,
+    ) -> Result<ListingTransitionEffect, MarketplaceError> {
+        let effect = self.status.transition(transition)?;
+        self.status = effect.to.clone();
+        Ok(effect)
+    }
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AuctionStatus {
     Active,
     Finalized,
     Cancelled,
+}
+
+/// A formal auction lifecycle transition.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AuctionTransition {
+    /// Active -> Finalized after the auction ends with a winning bid.
+    Finalized,
+    /// Active -> Cancelled (creator no-bid cancellation, admin, or emergency).
+    Cancelled(AuctionCancelReason),
+}
+
+/// Side effects associated with a committed auction transition.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuctionTransitionEffect {
+    pub to: AuctionStatus,
+    pub cancel_reason: Option<AuctionCancelReason>,
+    /// The auctioned NFT must leave marketplace escrow.
+    pub release_escrow: bool,
+    /// Losing bids must be refunded. `false` for normal finalization, `true`
+    /// for every cancellation path (the winning/highest bid is also refunded
+    /// because no sale occurs).
+    pub refund_bids: bool,
+    /// The winning bidder's escrowed payment must be released to the seller on
+    /// finalization.
+    pub pay_winner: bool,
+}
+
+impl AuctionStatus {
+    pub fn is_active(&self) -> bool {
+        matches!(self, &AuctionStatus::Active)
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, &AuctionStatus::Finalized | &AuctionStatus::Cancelled)
+    }
+
+    pub fn can_transition_to(&self, to: &AuctionStatus) -> bool {
+        matches!(
+            (self, to),
+            (&AuctionStatus::Active, &AuctionStatus::Finalized)
+                | (&AuctionStatus::Active, &AuctionStatus::Cancelled)
+        )
+    }
+
+    pub fn require_transition_to(&self, to: &AuctionStatus) -> Result<(), MarketplaceError> {
+        if self.can_transition_to(to) {
+            Ok(())
+        } else {
+            Err(MarketplaceError::InvalidAuctionState)
+        }
+    }
+
+    pub fn transition(
+        &self,
+        transition: AuctionTransition,
+    ) -> Result<AuctionTransitionEffect, MarketplaceError> {
+        match (self, transition) {
+            (&AuctionStatus::Active, AuctionTransition::Finalized) => {
+                Ok(AuctionTransitionEffect {
+                    to: AuctionStatus::Finalized,
+                    cancel_reason: None,
+                    release_escrow: true,
+                    refund_bids: false,
+                    pay_winner: true,
+                })
+            }
+            (&AuctionStatus::Active, AuctionTransition::Cancelled(reason)) => {
+                Ok(AuctionTransitionEffect {
+                    to: AuctionStatus::Cancelled,
+                    cancel_reason: Some(reason),
+                    release_escrow: true,
+                    refund_bids: true,
+                    pay_winner: false,
+                })
+            }
+            _ => Err(MarketplaceError::InvalidAuctionState),
+        }
+    }
 }
 
 #[contracttype]
@@ -447,6 +615,25 @@ pub struct Auction {
     pub original_end_time: u64,
 }
 
+impl Auction {
+    /// Validates and commits an auction lifecycle transition.
+    ///
+    /// The status-machine layer determines whether the transition is legal;
+    /// this helper then refines the payout side effect for auctions that end
+    /// without a winning bid (e.g. an expired no-bid auction that is finalized).
+    pub fn apply_transition(
+        &mut self,
+        transition: AuctionTransition,
+    ) -> Result<AuctionTransitionEffect, MarketplaceError> {
+        let mut effect = self.status.transition(transition)?;
+        if effect.pay_winner {
+            effect.pay_winner = self.highest_bidder.is_some() && self.highest_bid > 0;
+        }
+        self.status = effect.to.clone();
+        Ok(effect)
+    }
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BidRecord {
@@ -466,6 +653,59 @@ pub enum OfferStatus {
     Expired,
 }
 
+/// A formal offer lifecycle transition.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum OfferTransition {
+    Accept,
+    Reject,
+    Withdraw,
+    Expire,
+}
+
+impl OfferStatus {
+    pub fn is_pending(&self) -> bool {
+        matches!(self, &OfferStatus::Pending)
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            &OfferStatus::Accepted
+                | &OfferStatus::Rejected
+                | &OfferStatus::Withdrawn
+                | &OfferStatus::Expired
+        )
+    }
+
+    pub fn can_transition_to(&self, to: &OfferStatus) -> bool {
+        matches!(
+            (self, to),
+            (&OfferStatus::Pending, &OfferStatus::Accepted)
+                | (&OfferStatus::Pending, &OfferStatus::Rejected)
+                | (&OfferStatus::Pending, &OfferStatus::Withdrawn)
+                | (&OfferStatus::Pending, &OfferStatus::Expired)
+        )
+    }
+
+    pub fn require_transition_to(&self, to: &OfferStatus) -> Result<(), MarketplaceError> {
+        if self.can_transition_to(to) {
+            Ok(())
+        } else {
+            Err(MarketplaceError::InvalidOfferState)
+        }
+    }
+
+    pub fn transition(&self, transition: OfferTransition) -> Result<OfferStatus, MarketplaceError> {
+        match (self, transition) {
+            (&OfferStatus::Pending, OfferTransition::Accept) => Ok(OfferStatus::Accepted),
+            (&OfferStatus::Pending, OfferTransition::Reject) => Ok(OfferStatus::Rejected),
+            (&OfferStatus::Pending, OfferTransition::Withdraw) => Ok(OfferStatus::Withdrawn),
+            (&OfferStatus::Pending, OfferTransition::Expire) => Ok(OfferStatus::Expired),
+            _ => Err(MarketplaceError::InvalidOfferState),
+        }
+    }
+}
+
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct Offer {
@@ -477,6 +717,18 @@ pub struct Offer {
     pub status: OfferStatus,
     pub created_at: u32,
     pub expires_at: Option<u64>,
+}
+
+impl Offer {
+    /// Validates and commits an offer lifecycle transition.
+    pub fn apply_transition(
+        &mut self,
+        transition: OfferTransition,
+    ) -> Result<(), MarketplaceError> {
+        let to = self.status.transition(transition)?;
+        self.status = to;
+        Ok(())
+    }
 }
 
 // ── Role inventory types (Issue #473) ────────────────────────────────────────
