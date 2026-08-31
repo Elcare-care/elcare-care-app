@@ -94,6 +94,120 @@ fn create_test_listing(
     )
 }
 
+// SECTION: Lifecycle state machine transition invariants
+
+#[test]
+fn test_lifecycle_listing_cancel_is_terminal() {
+    let (env, client, artist, _, token_id, _, _) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&artist, &token_id);
+    let id = create_test_listing(&env, &client, &artist, &token_id);
+
+    client.cancel_listing(&artist, &id);
+    let listing = client.get_listing(&id);
+    assert_eq!(listing.status, ListingStatus::Cancelled);
+    assert!(client.try_cancel_listing(&artist, &id).is_err());
+    assert!(client.try_buy_artwork(&artist, &id).is_err());
+}
+
+#[test]
+fn test_lifecycle_listing_sold_is_terminal() {
+    let (env, client, artist, buyer, token_id, _, _) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&artist, &token_id);
+    let id = create_test_listing(&env, &client, &artist, &token_id);
+
+    client.buy_artwork(&buyer, &id);
+    let listing = client.get_listing(&id);
+    assert_eq!(listing.status, ListingStatus::Sold);
+    assert!(client.try_buy_artwork(&buyer, &id).is_err());
+    assert!(client.try_cancel_listing(&artist, &id).is_err());
+}
+
+#[test]
+fn test_lifecycle_offer_withdrawn_is_terminal() {
+    let (env, client, artist, buyer, token_id, _, _) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&artist, &token_id);
+    let listing_id = create_test_listing(&env, &client, &artist, &token_id);
+    let offer_id = client.make_offer(&buyer, &listing_id, &3_000_000_i128, &token_id, &None);
+
+    client.withdraw_offer(&buyer, &offer_id);
+    assert_eq!(client.get_offer(&offer_id).status, OfferStatus::Withdrawn);
+    assert!(client.try_withdraw_offer(&buyer, &offer_id).is_err());
+    assert!(client.try_reject_offer(&artist, &offer_id).is_err());
+    assert!(client.try_accept_offer(&artist, &offer_id).is_err());
+    assert_eq!(TokenClient::new(&env, &token_id).balance(&buyer), 100_000_000_000_i128);
+}
+
+#[test]
+fn test_lifecycle_offer_rejected_is_terminal() {
+    let (env, client, artist, buyer, token_id, _, _) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&artist, &token_id);
+    let listing_id = create_test_listing(&env, &client, &artist, &token_id);
+    let offer_id = client.make_offer(&buyer, &listing_id, &3_000_000_i128, &token_id, &None);
+
+    client.reject_offer(&artist, &offer_id);
+    assert_eq!(client.get_offer(&offer_id).status, OfferStatus::Rejected);
+    assert!(client.try_accept_offer(&artist, &offer_id).is_err());
+    assert!(client.try_withdraw_offer(&buyer, &offer_id).is_err());
+    assert!(client.try_reject_offer(&artist, &offer_id).is_err());
+    assert_eq!(TokenClient::new(&env, &token_id).balance(&buyer), 100_000_000_000_i128);
+}
+
+#[test]
+fn test_lifecycle_offer_accepted_is_terminal() {
+    let (env, client, artist, buyer, token_id, _, _) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&artist, &token_id);
+    let listing_id = create_test_listing(&env, &client, &artist, &token_id);
+    let offer_id = client.make_offer(&buyer, &listing_id, &5_000_000_i128, &token_id, &None);
+
+    client.accept_offer(&artist, &offer_id);
+    assert_eq!(client.get_offer(&offer_id).status, OfferStatus::Accepted);
+    assert!(client.try_accept_offer(&artist, &offer_id).is_err());
+    assert!(client.try_withdraw_offer(&buyer, &offer_id).is_err());
+    assert!(client.try_reject_offer(&artist, &offer_id).is_err());
+}
+
+#[test]
+fn test_lifecycle_auction_finalized_is_terminal() {
+    let (env, client, artist, buyer, token_id, _, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&artist, &token_id);
+    let auction_id = client.create_auction(
+        &artist, &token_id, &collection_id, &1u64,
+        &1_000_000_i128, &3600u64, &valid_recipients(&env, &artist),
+    );
+    client.place_bid(&buyer, &auction_id, &1_500_000_i128);
+    env.ledger().set_timestamp(env.ledger().timestamp() + 3601);
+    client.finalize_auction(&buyer, &auction_id);
+
+    let auction = client.get_auction(&auction_id);
+    assert_eq!(auction.status, AuctionStatus::Finalized);
+    assert!(client.try_place_bid(&buyer, &auction_id, &2_000_000_i128).is_err());
+    assert!(client.try_finalize_auction(&buyer, &auction_id).is_err());
+}
+
+#[test]
+fn test_lifecycle_auction_cancelled_no_bids_is_terminal() {
+    let (env, client, artist, buyer, token_id, _, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&artist, &token_id);
+    let auction_id = client.create_auction(
+        &artist, &token_id, &collection_id, &1u64,
+        &1_000_000_i128, &3600u64, &valid_recipients(&env, &artist),
+    );
+    env.ledger().set_timestamp(env.ledger().timestamp() + 3601);
+    client.finalize_auction(&artist, &auction_id);
+
+    let auction = client.get_auction(&auction_id);
+    assert_eq!(auction.status, AuctionStatus::Cancelled);
+    assert!(client.try_place_bid(&buyer, &auction_id, &2_000_000_i128).is_err());
+    assert!(client.try_finalize_auction(&artist, &auction_id).is_err());
+}
+
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // SECTION 1: Treasury & Protocol Fee
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
