@@ -282,6 +282,8 @@ impl AuctionCancelledEvent {
     pub fn publish(self, env: &Env) {
         env.events().publish((soroban_sdk::Symbol::new(env, AUCTION_CANCELLED),), self);
     }
+}LED),), self);
+    }
 }
 
 /// Emitted when a losing bidder's escrowed funds are returned.
