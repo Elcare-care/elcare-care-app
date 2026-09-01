@@ -10,6 +10,7 @@ pub mod escrow;
 pub mod math;
 pub mod storage;
 mod types;
+mod lifecycle;
 
 #[cfg(test)]
 mod test;

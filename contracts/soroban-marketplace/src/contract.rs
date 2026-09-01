@@ -210,6 +210,122 @@ struct BidInvariantResult {
     pub extension: Option<(u64, u32)>,
 }
 
+// ── Formal lifecycle/state-machine layer (Issue #480) ───────────────────────
+//
+// Listings, offers, and auctions are the three stateful entities in the
+// marketplace. Every mutating public path must route its status change through
+// the matching helper below so the allowed-transition table, invariants, and
+// cross-entity side effects (refunds, escrow release, active-index removal)
+// live in exactly one place.
+
+#[allow(dead_code)]
+fn assert_listing_transition(env: &Env, current: &ListingStatus, target: &ListingStatus) {
+    let allowed = match target {
+        ListingStatus::Sold => matches!(current, ListingStatus::Active),
+        ListingStatus::Cancelled => matches!(current, ListingStatus::Active),
+        _ => false,
+    };
+    if !allowed {
+        panic_with_error!(env, MarketplaceError::ListingNotActive);
+    }
+}
+
+#[allow(dead_code)]
+fn assert_offer_transition(env: &Env, current: &OfferStatus, target: &OfferStatus) {
+    let allowed = match target {
+        OfferStatus::Rejected => matches!(current, OfferStatus::Pending),
+        OfferStatus::Accepted => matches!(current, OfferStatus::Pending),
+        OfferStatus::Withdrawn => matches!(current, OfferStatus::Pending),
+        _ => false,
+    };
+    if !allowed {
+        panic_with_error!(env, MarketplaceError::OfferNotPending);
+    }
+}
+
+#[allow(dead_code)]
+fn assert_auction_active(env: &Env, status: &AuctionStatus) {
+    if *status != AuctionStatus::Active {
+        panic_with_error!(env, MarketplaceError::AuctionNotActive);
+    }
+}
+
+#[allow(dead_code)]
+fn assert_auction_transition(env: &Env, current: &AuctionStatus, target: &AuctionStatus) {
+    let allowed = match target {
+        AuctionStatus::Finalized => matches!(current, AuctionStatus::Active),
+        AuctionStatus::Cancelled => matches!(current, AuctionStatus::Active),
+        _ => false,
+    };
+    if !allowed {
+        panic_with_error!(env, MarketplaceError::AuctionAlreadyFinalized);
+    }
+}
+
+#[allow(dead_code)]
+fn transition_offer_status(env: &Env, offer: &mut Offer, target: OfferStatus) {
+    assert_offer_transition(env, &offer.status, &target);
+    offer.status = target;
+    save_offer(env, offer);
+}
+
+#[allow(dead_code)]
+fn transition_listing_to_cancelled(
+    env: &Env,
+    listing: &mut Listing,
+    listing_id: u64,
+    cancelled_by: Address,
+    reason: CancelReason,
+    refund_pending_offers: bool,
+) {
+    assert_listing_transition(env, &listing.status, &ListingStatus::Cancelled);
+    if refund_pending_offers {
+        for offer_id in load_pending_offer_ids(env, listing_id).iter() {
+            if let Some(mut offer) = load_offer(env, offer_id) {
+                if offer.status == OfferStatus::Pending {
+                    transition_offer_status(env, &mut offer, OfferStatus::Rejected);
+                    TokenClient::new(env, &offer.token).transfer(
+                        &env.current_contract_address(),
+                        &offer.offerer,
+                        &offer.amount,
+                    );
+                }
+            }
+        }
+        clear_pending_offers(env, listing_id);
+    }
+    listing.status = ListingStatus::Cancelled;
+    save_listing(env, listing);
+    remove_from_active_listings(env, listing_id);
+    ListingCancelledEvent {
+        listing_id,
+        cancelled_by,
+        reason,
+        ledger_sequence: env.ledger().sequence(),
+    }
+    .publish(env);
+    if listing.quantity > 1 {
+        escrow::release_nft_with_quantity(
+            env,
+            &listing.collection,
+            listing.token_id,
+            listing.quantity,
+            &listing.artist,
+            env.ledger().sequence(),
+            listing_id,
+        );
+    } else {
+        escrow::release_nft(
+            env,
+            &listing.collection,
+            listing.token_id,
+            &listing.artist,
+            env.ledger().sequence(),
+            listing_id,
+        );
+    }
+}
+
 #[contract]
 pub struct MarketplaceContract;
 
@@ -1602,44 +1718,14 @@ impl MarketplaceContract {
             cursor += 1;
             if let Some(mut listing) = load_listing(&env, listing_id) {
                 if listing.status == ListingStatus::Active {
-                    // Refund-then-cancel: sweep the bounded pending-offer set.
-                    for offer_id in load_pending_offer_ids(&env, listing_id).iter() {
-                        if let Some(mut offer) = load_offer(&env, offer_id) {
-                            if offer.status == OfferStatus::Pending {
-                                offer.status = OfferStatus::Rejected;
-                                save_offer(&env, &offer);
-                                // Interaction: refund
-                                TokenClient::new(&env, &offer.token).transfer(
-                                    &env.current_contract_address(),
-                                    &offer.offerer,
-                                    &offer.amount,
-                                );
-                            }
-                        }
-                    }
-                    clear_pending_offers(&env, listing_id);
-
-                    listing.status = ListingStatus::Cancelled;
-                    save_listing(&env, &listing);
-                    remove_from_active_listings(&env, listing_id);
-                    ListingCancelledEvent {
+                    transition_listing_to_cancelled(
+                        &env,
+                        &mut listing,
                         listing_id,
-                        cancelled_by: admin.clone(),
-                        reason: CancelReason::AdminRevoked,
-                        ledger_sequence: env.ledger().sequence(),
-                    }.publish(&env);
-                    // Interaction: return NFT from escrow to artist
-                    if listing.quantity > 1 {
-                        escrow::release_nft_with_quantity(
-                            &env, &listing.collection, listing.token_id,
-                            listing.quantity, &listing.artist, env.ledger().sequence(), listing_id,
-                        );
-                    } else {
-                        escrow::release_nft(
-                            &env, &listing.collection, listing.token_id,
-                            &listing.artist, env.ledger().sequence(), listing_id,
-                        );
-                    }
+                        admin.clone(),
+                        CancelReason::AdminRevoked,
+                        true,
+                    );
                 }
             }
         }
@@ -4281,22 +4367,14 @@ impl MarketplaceContract {
         }
         clear_pending_offers(env, listing_id);
 
-        listing.status = ListingStatus::Cancelled;
-        save_listing(env, &listing);
-        remove_from_active_listings(env, listing_id);
-        ListingCancelledEvent {
+        transition_listing_to_cancelled(
+            env,
+            &mut listing,
             listing_id,
-            cancelled_by: artist.clone(),
-            reason: CancelReason::Owner,
-            ledger_sequence: env.ledger().sequence(),
-        }.publish(env);
-        if listing.quantity > 1 {
-            escrow::release_nft_with_quantity(env, &listing.collection, listing.token_id,
-                listing.quantity, artist, env.ledger().sequence(), listing_id);
-        } else {
-            escrow::release_nft(env, &listing.collection, listing.token_id,
-                artist, env.ledger().sequence(), listing_id);
-        }
+            artist.clone(),
+            CancelReason::Owner,
+            false,
+        );
         true
     }
 
@@ -4349,9 +4427,7 @@ impl MarketplaceContract {
         amount: i128,
     ) -> BidInvariantResult {
         // B — must be Active
-        if auction.status != AuctionStatus::Active {
-            panic_with_error!(env, MarketplaceError::AuctionNotActive);
-        }
+        assert_auction_active(env, &auction.status);
         let now = env.ledger().timestamp();
         // C — must be before end_time
         if now >= auction.end_time {
@@ -4423,9 +4499,7 @@ impl MarketplaceContract {
     /// B  Auction must be Active.
     /// H  `end_time` must have passed.
     fn check_finalize_invariants(env: &Env, auction: &Auction) {
-        if auction.status != AuctionStatus::Active {
-            panic_with_error!(env, MarketplaceError::AuctionAlreadyFinalized);
-        }
+        assert_auction_transition(env, &auction.status, &AuctionStatus::Finalized);
         if env.ledger().timestamp() < auction.end_time {
             panic_with_error!(env, MarketplaceError::AuctionNotEnded);
         }
@@ -4441,9 +4515,7 @@ impl MarketplaceContract {
         if auction.creator != *caller {
             panic_with_error!(env, MarketplaceError::Unauthorized);
         }
-        if auction.status != AuctionStatus::Active {
-            panic_with_error!(env, MarketplaceError::AuctionAlreadyFinalized);
-        }
+        assert_auction_transition(env, &auction.status, &AuctionStatus::Cancelled);
         if auction.highest_bidder.is_some() {
             panic_with_error!(env, MarketplaceError::AuctionHasBids);
         }

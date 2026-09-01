@@ -831,6 +831,125 @@ pub fn load_offer(env: &Env, offer_id: u64) -> Option<Offer> {
     res
 }
 
+// ── Lifecycle state machine ──────────────────────────────────
+//
+// Every listing, auction, and offer moves through a small number of explicit
+// states. This table is the single source of truth for which transitions are
+// legal; all marketplace entry points must consult it before mutating a
+// record. Terminal states have no outgoing transitions; the cross-entity
+// cleanup helpers below centralize the side effects that accompany a
+// terminal listing or auction transition.
+/// Entity whose lifecycle is being validated.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LifecycleEntity {
+    Listing,
+    Auction,
+    Offer,
+}
+
+/// Canonical states shared by listings, auctions, and offers.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LifecycleState {
+    Active,
+    Pending,
+    Sold,
+    Finalized,
+    Cancelled,
+    Accepted,
+    Rejected,
+    Withdrawn,
+    Superseded,
+}
+
+/// Explicit transition metadata.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LifecycleTransition {
+    pub entity: LifecycleEntity,
+    pub from: LifecycleState,
+    pub to: LifecycleState,
+}
+
+/// Check whether `transition` is one of the allowed lifecycle moves.
+pub fn is_lifecycle_transition_allowed(transition: &LifecycleTransition) -> bool {
+    match (transition.entity, transition.from, transition.to) {
+        (LifecycleEntity::Listing, LifecycleState::Active, LifecycleState::Sold) => true,
+        (LifecycleEntity::Listing, LifecycleState::Active, LifecycleState::Cancelled) => true,
+        (LifecycleEntity::Auction, LifecycleState::Active, LifecycleState::Finalized) => true,
+        (LifecycleEntity::Auction, LifecycleState::Active, LifecycleState::Cancelled) => true,
+        (LifecycleEntity::Offer, LifecycleState::Pending, LifecycleState::Accepted) => true,
+        (LifecycleEntity::Offer, LifecycleState::Pending, LifecycleState::Rejected) => true,
+        (LifecycleEntity::Offer, LifecycleState::Pending, LifecycleState::Withdrawn) => true,
+        (LifecycleEntity::Offer, LifecycleState::Pending, LifecycleState::Superseded) => true,
+        _ => false,
+    }
+}
+
+/// Panic if `transition` is not allowed.
+pub fn assert_lifecycle_transition_allowed(env: &Env, transition: &LifecycleTransition) {
+    if !is_lifecycle_transition_allowed(transition) {
+        panic_with_error!(env, MarketplaceError::InvalidStateTransition);
+    }
+}
+
+/// Returns true for terminal states (no outgoing transitions).
+pub fn is_terminal_lifecycle_state(state: &LifecycleState) -> bool {
+    match *state {
+        LifecycleState::Sold
+        | LifecycleState::Finalized
+        | LifecycleState::Cancelled
+        | LifecycleState::Accepted
+        | LifecycleState::Rejected
+        | LifecycleState::Withdrawn
+        | LifecycleState::Superseded => true,
+        _ => false,
+    }
+}
+
+/// Enumerate every allowed transition for exhaustive/property-style tests.
+pub fn allowed_lifecycle_transitions(env: &Env) -> Vec<LifecycleTransition> {
+    let mut transitions = Vec::new(env);
+    for (entity, from, to) in [
+        (LifecycleEntity::Listing, LifecycleState::Active, LifecycleState::Sold),
+        (LifecycleEntity::Listing, LifecycleState::Active, LifecycleState::Cancelled),
+        (LifecycleEntity::Auction, LifecycleState::Active, LifecycleState::Finalized),
+        (LifecycleEntity::Auction, LifecycleState::Active, LifecycleState::Cancelled),
+        (LifecycleEntity::Offer, LifecycleState::Pending, LifecycleState::Accepted),
+        (LifecycleEntity::Offer, LifecycleState::Pending, LifecycleState::Rejected),
+        (LifecycleEntity::Offer, LifecycleState::Pending, LifecycleState::Withdrawn),
+        (LifecycleEntity::Offer, LifecycleState::Pending, LifecycleState::Superseded),
+    ] {
+        transitions.push_back(LifecycleTransition { entity, from, to });
+    }
+    transitions
+}
+
+/// Cross-entity side effects shared by every terminal listing transition.
+pub fn clear_listing_cross_entity_state(
+    env: &Env,
+    listing_id: u64,
+    collection: &Address,
+    token_id: u64,
+) {
+    remove_from_active_listings(env, listing_id);
+    clear_pending_offers(env, listing_id);
+    clear_escrow_record(env, collection, token_id);
+}
+
+/// Cross-entity side effects shared by every terminal auction transition.
+pub fn clear_auction_cross_entity_state(
+    env: &Env,
+    auction_id: u64,
+    collection: &Address,
+    token_id: u64,
+) {
+    clear_escrow_record(env, collection, token_id);
+    let empty_bidders: Vec<Address> = Vec::new(env);
+    save_blocked_bidders(env, auction_id, &empty_bidders);
+}
+
 // ── Indices (paged) ──────────────────────────────────────────
 
 pub fn add_artist_listing_id(env: &Env, artist: &Address, listing_id: u64) {
