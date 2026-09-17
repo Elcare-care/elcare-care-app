@@ -78,6 +78,8 @@ export interface RecoveryState {
   lastReorgSafeLedger: number | null;
   /** Depth of the last detected reorg, or null. */
   lastReorgDepth: number | null;
+  /** Number of domain entities affected by the last reorg rollback. */
+  lastReorgAffectedCount: number | null;
   /** Gap ID currently being repaired, or null. */
   activeGapId: number | null;
   /** Total completed reorg rollbacks since startup. */
@@ -95,6 +97,7 @@ const INITIAL_STATE: RecoveryState = {
   consecutiveRetries: 0,
   lastReorgSafeLedger: null,
   lastReorgDepth: null,
+  lastReorgAffectedCount: null,
   activeGapId: null,
   totalReorgRollbacks: 0,
   totalGapRepairs: 0,
@@ -223,12 +226,13 @@ class RecoveryStateMachine {
   /**
    * Re-org rollback committed successfully; resume normal sync.
    */
-  reorgRollbackComplete(safeLedger: number): void {
+  reorgRollbackComplete(safeLedger: number, affectedCount: number = 0): void {
     const total = this.state.totalReorgRollbacks + 1;
     this.transition('sync', {
       consecutiveRetries: 0,
+      lastReorgAffectedCount: affectedCount,
       totalReorgRollbacks: total,
-    }, `reorg rollback complete, resumed from ledger ${safeLedger}`);
+    }, `reorg rollback complete, resumed from ledger ${safeLedger} (affected=${affectedCount})`);
   }
 
   /**
@@ -261,6 +265,7 @@ class RecoveryStateMachine {
     consecutiveRetries: number;
     lastReorgDepth: number | null;
     lastReorgSafeLedger: number | null;
+    lastReorgAffectedCount: number | null;
     activeGapId: number | null;
     totalReorgRollbacks: number;
     totalGapRepairs: number;
@@ -276,6 +281,7 @@ class RecoveryStateMachine {
       consecutiveRetries: s.consecutiveRetries,
       lastReorgDepth: s.lastReorgDepth,
       lastReorgSafeLedger: s.lastReorgSafeLedger,
+      lastReorgAffectedCount: s.lastReorgAffectedCount,
       activeGapId: s.activeGapId,
       totalReorgRollbacks: s.totalReorgRollbacks,
       totalGapRepairs: s.totalGapRepairs,
