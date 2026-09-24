@@ -94,3 +94,6 @@ const _: () = {
         "ReentrancyGuard discriminant must remain 22 — update docs if intentionally changed"
     );
 };
+
+#[cfg(test)]
+mod resource_budget_regression_tests;
