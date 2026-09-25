@@ -8,6 +8,7 @@ import { config } from "./config";
 const DEFAULT_TIMEOUT_MS = 12_000;
 const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 500;
+const RETRY_MAX_DELAY_MS = 30_000;
 
 // ─────────────────────────────────────────────────────────────
 // Issue #309 / #44 — Freshness metadata
@@ -193,7 +194,7 @@ async function fetchWithRetryFull<T>(path: string): Promise<{ data: T; headers: 
       if (!retry) {
         throw e instanceof Error ? e : new Error(String(e));
       }
-      await sleep(RETRY_DELAY_MS * (attempt + 1));
+      await sleep(Math.min(RETRY_DELAY_MS * Math.pow(2, attempt), RETRY_MAX_DELAY_MS));
     }
   }
   // Unreachable: the final attempt always throws inside the loop.
@@ -213,7 +214,7 @@ async function fetchWithRetry<T>(path: string): Promise<T> {
       if (!retry) {
         throw e instanceof Error ? e : new Error(String(e));
       }
-      await sleep(RETRY_DELAY_MS * (attempt + 1));
+      await sleep(Math.min(RETRY_DELAY_MS * Math.pow(2, attempt), RETRY_MAX_DELAY_MS));
     }
   }
   throw lastErr instanceof Error
