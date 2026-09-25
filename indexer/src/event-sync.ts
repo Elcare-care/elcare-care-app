@@ -14,6 +14,7 @@ import { logger } from './logger.js';
 import prismaWrite from './prisma-write.js';
 
 export const MAX_LEDGER_WINDOW = 17_000;
+// Stellar RPC allows up to 200 events per page; 100 is conservative to limit response size.
 export const EVENT_PAGE_LIMIT = 100;
 const MIN_PAGE_SIZE = 10;
 const DEFAULT_RATE_LIMIT_BACKOFF_MS = 5_000;

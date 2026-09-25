@@ -252,11 +252,14 @@ describe('checkpoint lifecycle', () => {
       id: 1, contractId: 'CTEST', windowStart: 100, windowEnd: 200,
       ledgerHash: null, eventCount: 0, status: 'fetched',
     };
-    await markApplying(cp);
+    const updated = await markApplying(cp);
     expect(mockTx.ledgerCheckpoint.update).toHaveBeenCalledWith(
       expect.objectContaining({ data: { status: 'applying' } })
     );
-    expect(cp.status).toBe('applying');
+    // Original object must NOT be mutated.
+    expect(cp.status).toBe('fetched');
+    // Returned object reflects the new status.
+    expect(updated.status).toBe('applying');
   });
 
   it('commitCheckpoint advances cursor and marks committed', async () => {
