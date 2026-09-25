@@ -87,7 +87,7 @@ describe('Error envelope shape', () => {
       () => badRequest('bad'),
       () => notFound('nope'),
       () => unauthorized(),
-      () => forbidden(),
+      () => forbidden('Insufficient permissions'),
       () => internalError(),
       () => conflict('dup'),
       () => serviceUnavailable(),
@@ -134,7 +134,7 @@ describe('HTTP status codes', () => {
     expect((await request(buildApp((_r,_s,n) => n(unauthorized()))).get('/test')).status).toBe(401);
   });
   it('forbidden → 403', async () => {
-    expect((await request(buildApp((_r,_s,n) => n(forbidden()))).get('/test')).status).toBe(403);
+    expect((await request(buildApp((_r,_s,n) => n(forbidden('Insufficient permissions')))).get('/test')).status).toBe(403);
   });
   it('internalError → 500', async () => {
     expect((await request(buildApp((_r,_s,n) => n(internalError()))).get('/test')).status).toBe(500);
@@ -151,7 +151,7 @@ describe('HTTP status codes', () => {
 
 describe('Error classification (class field)', () => {
   it('4xx errors have class CLIENT_ERROR', async () => {
-    const cases = [badRequest('x'), notFound('x'), unauthorized(), forbidden(), conflict('x')];
+    const cases = [badRequest('x'), notFound('x'), unauthorized(), forbidden('Insufficient permissions'), conflict('x')];
     for (const err of cases) {
       const app = buildApp((_req, _res, next) => next(err));
       const res = await request(app).get('/test');
@@ -184,7 +184,7 @@ describe('Stable error codes', () => {
     [ErrorCode.BAD_REQUEST,         () => badRequest('x')],
     [ErrorCode.NOT_FOUND,           () => notFound('x')],
     [ErrorCode.UNAUTHORIZED,        () => unauthorized()],
-    [ErrorCode.FORBIDDEN,           () => forbidden()],
+    [ErrorCode.FORBIDDEN,           () => forbidden('Insufficient permissions')],
     [ErrorCode.INTERNAL,            () => internalError()],
     [ErrorCode.CONFLICT,            () => conflict('x')],
     [ErrorCode.SERVICE_UNAVAILABLE, () => serviceUnavailable()],

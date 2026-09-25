@@ -68,10 +68,12 @@ export interface FieldError {
 }
 
 function zodIssuesToFieldErrors(issues: ZodIssue[]): FieldError[] {
-  return issues.map((issue) => ({
-    field:   issue.path.length > 0 ? issue.path.join('.') : '_root',
-    message: issue.message,
-  }));
+  return issues
+    .filter(issue => issue.path[0] !== '_internal')
+    .map((issue) => ({
+      field:   issue.path.length > 0 ? issue.path.join('.') : '_root',
+      message: issue.message,
+    }));
 }
 
 export class ApiError extends Error {
@@ -98,7 +100,7 @@ export function unauthorized(message = 'Missing or invalid credentials'): ApiErr
   return new ApiError(401, ErrorCode.UNAUTHORIZED, message);
 }
 
-export function forbidden(message = 'Insufficient permissions'): ApiError {
+export function forbidden(message: string): ApiError {
   return new ApiError(403, ErrorCode.FORBIDDEN, message);
 }
 
@@ -132,8 +134,11 @@ function prismaErrorToApiError(err: unknown): ApiError | null {
       return conflict('A record with the provided values already exists');
 
     // Record not found (findUniqueOrThrow / update / delete)
-    case 'P2025':
-      return notFound('The requested record does not exist');
+    case 'P2025': {
+      const meta = prismaErr.meta as { modelName?: string } | undefined;
+      const resource = meta?.modelName ?? 'Resource';
+      return notFound(`${resource} not found`);
+    }
 
     // Foreign key constraint violation
     case 'P2003':
@@ -169,8 +174,9 @@ function toApiError(err: unknown): ApiError {
 
   // ZodError — validation failure with field-level detail
   if (err instanceof ZodError) {
-    const fieldErrors = zodIssuesToFieldErrors(err.issues);
-    const message = err.issues
+    const publicIssues = err.issues.filter(issue => issue.path[0] !== '_internal');
+    const fieldErrors = zodIssuesToFieldErrors(publicIssues);
+    const message = publicIssues
       .map((e) => `${e.path.join('.') || '_root'}: ${e.message}`)
       .join('; ');
     return new ApiError(400, ErrorCode.BAD_REQUEST, message, { fieldErrors });
@@ -197,20 +203,10 @@ export function errorHandler(
   // Structured operational log — server errors include the original cause so
   // on-call engineers can triage without accessing raw stdout.
   if (apiErr.statusCode >= 500) {
-    logger.error('request error', {
-      requestId,
-      errorClass,
-      statusCode: apiErr.statusCode,
-      code: apiErr.code,
-      message: apiErr.message,
-      path: req.path,
-      method: req.method,
-      // Safe: only include stack when not in production so CI logs are useful
-      // but production logs never contain internal file paths.
-      ...(process.env.NODE_ENV !== 'production' && err instanceof Error
-        ? { stack: err.stack }
-        : {}),
-    });
+    logger.error(
+      { err: apiErr, cause: err, requestId, errorClass, path: req.path, method: req.method },
+      'Unhandled API error',
+    );
   } else {
     logger.debug('client error', {
       requestId,
