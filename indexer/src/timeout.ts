@@ -161,10 +161,10 @@ function combineAbortSignals(signals: (AbortSignal | undefined)[]): AbortSignal 
 /**
  * Create an AbortSignal that aborts after the specified timeout.
  */
-function createTimeoutSignal(timeoutMs: number): { signal: AbortSignal; clear: () => void } {
+function createTimeoutSignal(timeoutMs: number, operationName: string): { signal: AbortSignal; clear: () => void } {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => {
-    controller.abort(new TimeoutError('timeout', timeoutMs));
+    controller.abort(new TimeoutError(operationName, timeoutMs));
   }, timeoutMs);
   
   return {
@@ -203,7 +203,7 @@ export async function withTimeout<T>(
   const { budget, signal: parentSignal, dependency, operation } = options;
   
   // Create timeout signal
-  const { signal: timeoutSignal, clear } = createTimeoutSignal(budget.operationTimeoutMs);
+  const { signal: timeoutSignal, clear } = createTimeoutSignal(budget.operationTimeoutMs, operation);
   
   // Combine parent signal with timeout signal
   const combinedSignal = combineAbortSignals([parentSignal, timeoutSignal]);
@@ -226,7 +226,7 @@ export async function withTimeout<T>(
         });
         throw reason;
       } else {
-        cancellationCounter.inc({ dependency, reason: String(reason) || 'unknown' });
+        cancellationCounter.inc({ dependency, reason: reason != null ? String(reason) : 'unknown' });
         logger.warn(`[cancellation] ${dependency}:${operation} cancelled`, {
           dependency,
           operation,
