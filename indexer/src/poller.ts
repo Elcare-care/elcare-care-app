@@ -787,7 +787,7 @@ async function pollContract(
         );
 
         // ── Step 4: Mark applying before opening the DB transaction ───────
-        await markApplying(checkpoint);
+        checkpoint = await markApplying(checkpoint);
 
         // ── Step 5: Commit domain writes + cursor in ONE transaction ───────
         let newEvents: any[] = [];

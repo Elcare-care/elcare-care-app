@@ -30,6 +30,10 @@ import { logger } from './logger.js';
 import prisma from './prisma-write.js';
 import { maybeWriteSnapshot } from './snapshot.js';
 
+// ── Module-level constants ────────────────────────────────────────────────────
+
+const CHECKPOINT_CRASH_RESET_REASON = 'reset after crash during apply phase';
+
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 export type CheckpointStatus = 'fetched' | 'applying' | 'committed' | 'failed';
@@ -42,6 +46,30 @@ export interface Checkpoint {
   ledgerHash: string | null;
   eventCount: number;
   status: CheckpointStatus;
+}
+
+// ── Runtime shape assertion ───────────────────────────────────────────────────
+
+/**
+ * Assert that an unknown DB row conforms to the Checkpoint shape.
+ * Throws a descriptive Error rather than silently lying about the type.
+ */
+function assertCheckpointShape(row: unknown): Checkpoint {
+  if (
+    row === null ||
+    typeof row !== 'object' ||
+    typeof (row as any).id !== 'number' ||
+    typeof (row as any).contractId !== 'string' ||
+    typeof (row as any).windowStart !== 'number' ||
+    typeof (row as any).windowEnd !== 'number' ||
+    typeof (row as any).eventCount !== 'number' ||
+    !['fetched', 'applying', 'committed', 'failed'].includes((row as any).status)
+  ) {
+    throw new Error(
+      `assertCheckpointShape: row does not match Checkpoint interface — ${JSON.stringify(row)}`
+    );
+  }
+  return row as Checkpoint;
 }
 
 // ── Open a new checkpoint ─────────────────────────────────────────────────────
@@ -76,13 +104,13 @@ export async function openCheckpoint(
  * if the process dies after this call but before the transaction commits, the
  * checkpoint stays in "applying" state and startup recovery replays the window.
  */
-export async function markApplying(checkpoint: Checkpoint): Promise<void> {
+export async function markApplying(checkpoint: Checkpoint): Promise<Checkpoint> {
   await prisma.ledgerCheckpoint.update({
     where: { id: checkpoint.id },
     data: { status: 'applying' },
   });
-  checkpoint.status = 'applying';
   logger.debug('checkpoint: applying', { id: checkpoint.id });
+  return { ...checkpoint, status: 'applying' as const };
 }
 
 // ── Commit checkpoint inside the domain transaction ───────────────────────────
@@ -231,7 +259,7 @@ export async function findIncompleteCheckpoints(
     },
     orderBy: { windowStart: 'asc' },
   });
-  return rows as unknown as Checkpoint[];
+  return (rows as unknown[]).map(assertCheckpointShape);
 }
 
 /**
@@ -244,7 +272,7 @@ export async function findIncompleteCheckpoints(
 export async function resetApplyingCheckpoint(checkpoint: Checkpoint): Promise<void> {
   await prisma.ledgerCheckpoint.update({
     where: { id: checkpoint.id },
-    data: { status: 'fetched', error: 'reset after crash during apply phase' },
+    data: { status: 'fetched', error: CHECKPOINT_CRASH_RESET_REASON },
   });
   checkpoint.status = 'fetched';
   logger.info('checkpoint: reset stale applying checkpoint', {
