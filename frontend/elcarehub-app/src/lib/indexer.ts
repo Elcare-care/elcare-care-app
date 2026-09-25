@@ -534,7 +534,7 @@ export async function getListingHistory(
       return empty;
     }
 
-    return { events, total, hasMore: offset + events.length < total };
+    return { events, total, hasMore: events.length === limit };
   } catch (e) {
     console.warn(
       "[indexer] getListingHistory:",
