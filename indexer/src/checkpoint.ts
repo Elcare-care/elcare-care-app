@@ -29,6 +29,11 @@
 import { logger } from './logger.js';
 import prisma from './prisma-write.js';
 import { maybeWriteSnapshot } from './snapshot.js';
+import { snapshotsWrittenTotal } from './metrics.js';
+
+// Maximum length of the error message stored on a failed checkpoint.
+// Matches the application-side guard for the LedgerCheckpoint.error column.
+const MAX_CHECKPOINT_ERROR_LENGTH = 2048;
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -45,6 +50,22 @@ export interface Checkpoint {
 }
 
 // ── Open a new checkpoint ─────────────────────────────────────────────────────
+
+/**
+ * Runtime shape assertion for database rows returned as Checkpoint.
+ * Replaces the `as unknown as Checkpoint` double-cast anti-pattern so that
+ * schema drift (e.g. a migration renaming a column) is caught at the boundary
+ * rather than silently passing through and crashing downstream.
+ */
+function assertCheckpointShape(row: unknown): Checkpoint {
+  if (!row || typeof row !== 'object') throw new Error('checkpoint: row is not an object');
+  const r = row as Record<string, unknown>;
+  if (typeof r.id !== 'number') throw new Error('checkpoint: missing or invalid id');
+  if (typeof r.status !== 'string') throw new Error('checkpoint: missing status');
+  if (typeof r.windowStart !== 'number') throw new Error('checkpoint: missing windowStart');
+  if (typeof r.windowEnd !== 'number') throw new Error('checkpoint: missing windowEnd');
+  return row as Checkpoint;
+}
 
 /**
  * Create a checkpoint row in "fetched" state.
@@ -65,7 +86,7 @@ export async function openCheckpoint(
     },
   });
   logger.debug('checkpoint: opened', { id: row.id, contractId, windowStart, windowEnd });
-  return row as unknown as Checkpoint;
+  return assertCheckpointShape(row);
 }
 
 // ── Advance checkpoint to "applying" ─────────────────────────────────────────
@@ -168,6 +189,7 @@ export async function commitCheckpoint(
           contractCursors: cursors,
           eventCount:      BigInt(totalEvents),
         });
+        snapshotsWrittenTotal.inc();
       } catch (snapshotErr) {
         logger.warn('checkpoint: snapshot write failed (non-fatal)', {
           checkpointId: checkpoint.id,
@@ -194,7 +216,7 @@ export async function failCheckpoint(
   try {
     await prisma.ledgerCheckpoint.update({
       where: { id: checkpoint.id },
-      data: { status: 'failed', error: message.slice(0, 2048) },
+      data: { status: 'failed', error: message.slice(0, MAX_CHECKPOINT_ERROR_LENGTH) },
     });
     checkpoint.status = 'failed';
   } catch (updateErr) {
@@ -231,7 +253,7 @@ export async function findIncompleteCheckpoints(
     },
     orderBy: { windowStart: 'asc' },
   });
-  return rows as unknown as Checkpoint[];
+  return rows.map(assertCheckpointShape);
 }
 
 /**
