@@ -113,12 +113,21 @@ export const REDIS_RETRY_CONFIG: RetryConfig = {
   baseDelayMs: 50,
   maxDelayMs: 2_000,
   jitterFactor: 0.2,
-  retryable: isDbRetryable, // Similar retry logic to DB
+  retryable: isRedisRetryable,
   operation: 'redis',
   timeoutBudget: TIMEOUT_BUDGETS.redis,
 };
 
 // ── Retryability predicates ───────────────────────────────────────────────────
+
+/** True for transient Redis connection errors; false for command-level errors that should never be retried. */
+export function isRedisRetryable(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  const code = (err as any).code as string | undefined;
+  if (code === 'WRONGTYPE' || code === 'NOAUTH') return false;
+  return /ECONNREFUSED|ECONNRESET|ETIMEDOUT|LOADING/i.test(err.message) ||
+    code === 'ECONNREFUSED' || code === 'ECONNRESET' || code === 'ETIMEDOUT';
+}
 
 /** True for network-level errors or HTTP 429 from the Stellar RPC. */
 export function isRpcRetryable(err: unknown): boolean {
@@ -309,6 +318,10 @@ function computeDelay(
   maxDelayMs: number,
   jitterFactor: number,
 ): number {
+  if (!Number.isFinite(baseDelayMs) || baseDelayMs < 0) {
+    throw new RangeError(`computeDelay: baseDelayMs must be a non-negative finite number, got ${baseDelayMs}`);
+  }
+  // baseDelayMs = 0 is valid: every computed delay will be 0 regardless of attempt.
   const jitter = jitterFactor > 0 ? Math.random() * jitterFactor : 0;
   // Cap the exponent at 20 (2^20 * any realistic base far exceeds maxDelayMs) to prevent Infinity.
   return Math.min(baseDelayMs * Math.pow(2, Math.min(attempt, 20)) * (1 + jitter), maxDelayMs);
