@@ -357,6 +357,9 @@ export function calculateRetryAttempts(
   maxDelayMs: number,
   maxAttempts: number
 ): number {
+  // Zero-delay retries don't consume budget, so skip the budget check entirely.
+  if (baseDelayMs <= 0) return maxAttempts;
+
   let totalEstimate = 0;
   let attempts = 1; // Start with 1 (initial attempt)
   

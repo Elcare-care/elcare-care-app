@@ -54,7 +54,7 @@
  *   const result = await getCached('stats:global', 60, () => expensiveQuery(), { distributed: true });
  */
 
-import redis from '../redis.js';
+import redis, { invalidateKey } from '../redis.js';
 import { logger } from '../logger.js';
 import client from 'prom-client';
 
@@ -99,6 +99,12 @@ function envInt(name: string, def: number): number {
   return isNaN(n) ? def : n;
 }
 
+/** How often (ms) a waiter polls Redis while a cache-fill lock is held. */
+const LOCK_POLL_INTERVAL_MS = 50;
+
+/** Display/label truncation limit for keys that lack a colon-separated prefix. */
+const KEY_PREFIX_FALLBACK_LENGTH = 20;
+
 /** Maximum time (ms) to wait for an origin fetch before aborting. */
 export function fetchTimeoutMs(): number {
   return envInt('CACHE_FETCH_TIMEOUT_MS', 30_000);
@@ -106,7 +112,7 @@ export function fetchTimeoutMs(): number {
 
 /** Time (ms) a distributed lock loser waits between Redis re-reads. */
 export function lockPollIntervalMs(): number {
-  return envInt('CACHE_LOCK_POLL_MS', 50);
+  return envInt('CACHE_LOCK_POLL_MS', LOCK_POLL_INTERVAL_MS);
 }
 
 const LOCK_POLL_JITTER_MS = 20;
@@ -201,7 +207,7 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): 
 function keyPrefix(key: string): string {
   // Use the first two slash-separated segments as label to bound cardinality.
   const parts = key.replace(/^cache:/, '').split('/').filter(Boolean);
-  return parts.slice(0, 2).join('/') || key.slice(0, 20);
+  return parts.slice(0, 2).join('/') || key.slice(0, KEY_PREFIX_FALLBACK_LENGTH);
 }
 
 // ── Core getCached ────────────────────────────────────────────────────────────
@@ -366,7 +372,9 @@ async function waitForCachedValue<T>(
     if (value !== null) {
       try {
         return JSON.parse(value) as T;
-      } catch {
+      } catch (err) {
+        logger.warn({ key, err }, 'cache-service: corrupted Redis value — evicting key');
+        await invalidateKey(key);
         return undefined;
       }
     }
