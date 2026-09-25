@@ -203,12 +203,10 @@ async function fetchWithRetryFull<T>(path: string): Promise<{ data: T; headers: 
 
 async function fetchWithRetry<T>(path: string): Promise<T> {
   const url = `${config.indexerUrl}${path}`;
-  let lastErr: unknown;
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
     try {
       return await httpGet<T>(url);
     } catch (e) {
-      lastErr = e;
       const retry =
         attempt < MAX_RETRIES - 1 && isTransientAxiosError(e as AxiosError);
       if (!retry) {
@@ -217,9 +215,8 @@ async function fetchWithRetry<T>(path: string): Promise<T> {
       await sleep(Math.min(RETRY_DELAY_MS * Math.pow(2, attempt), RETRY_MAX_DELAY_MS));
     }
   }
-  throw lastErr instanceof Error
-    ? lastErr
-    : new Error("Indexer request failed");
+  // Unreachable: the final attempt always throws inside the loop.
+  throw new Error("Indexer request failed");
 }
 
 function isNonEmptyString(v: unknown): v is string {
