@@ -109,6 +109,9 @@ export function lockPollIntervalMs(): number {
   return envInt('CACHE_LOCK_POLL_MS', 50);
 }
 
+const LOCK_POLL_JITTER_MS = 20;
+const LOCK_MAX_WAIT_MS = 5_000;
+
 /** Maximum time (ms) a lock loser waits before issuing its own fetch. */
 export function lockWaitTimeoutMs(): number {
   return envInt('CACHE_LOCK_WAIT_MS', 5_000);
@@ -349,12 +352,15 @@ async function waitForCachedValue<T>(
   key: string,
   lockKey: string,
   prefix: string,
+  maxWaitMs = LOCK_MAX_WAIT_MS,
 ): Promise<T | undefined> {
   const deadline = Date.now() + lockWaitTimeoutMs();
   const pollInterval = lockPollIntervalMs();
+  const startTime = Date.now();
 
   while (Date.now() < deadline) {
-    await sleep(pollInterval);
+    if (Date.now() - startTime > maxWaitMs) return undefined;
+    await sleep(pollInterval + Math.floor(Math.random() * LOCK_POLL_JITTER_MS));
 
     const value = await redisGet(key);
     if (value !== null) {
