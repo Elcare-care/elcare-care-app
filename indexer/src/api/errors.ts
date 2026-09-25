@@ -52,8 +52,11 @@ function retryGuidanceForCode(code: ErrorCode, statusCode: number): RetryGuidanc
       // 5xx errors are potentially transient — clients may retry with back-off.
       return { retryable: true, retryAfterSeconds: 10 };
     default:
-      // All 4xx except rate-limit and 5xx server errors are not retryable.
-      return { retryable: statusCode >= 500 };
+      // All 4xx except rate-limit are not retryable; 5xx errors are retryable
+      // and must include an explicit delay so clients do not spin immediately.
+      return statusCode >= 500
+        ? { retryable: true, retryAfterSeconds: 10 }
+        : { retryable: false };
   }
 }
 
