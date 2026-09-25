@@ -174,6 +174,32 @@ async function httpGet<T>(url: string): Promise<T> {
   return res.data;
 }
 
+async function httpGetFull<T>(url: string): Promise<{ data: T; headers: Record<string, string> }> {
+  const res = await axios.get<T>(url, {
+    timeout: DEFAULT_TIMEOUT_MS,
+    validateStatus: (s) => s < 400,
+  });
+  return { data: res.data, headers: res.headers as Record<string, string> };
+}
+
+async function fetchWithRetryFull<T>(path: string): Promise<{ data: T; headers: Record<string, string> }> {
+  const url = `${config.indexerUrl}${path}`;
+  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    try {
+      return await httpGetFull<T>(url);
+    } catch (e) {
+      const retry =
+        attempt < MAX_RETRIES - 1 && isTransientAxiosError(e as AxiosError);
+      if (!retry) {
+        throw e instanceof Error ? e : new Error(String(e));
+      }
+      await sleep(RETRY_DELAY_MS * (attempt + 1));
+    }
+  }
+  // Unreachable: the final attempt always throws inside the loop.
+  throw new Error("Indexer request failed");
+}
+
 async function fetchWithRetry<T>(path: string): Promise<T> {
   const url = `${config.indexerUrl}${path}`;
   let lastErr: unknown;
@@ -647,11 +673,9 @@ export async function fetchListings(options: FetchListingsOptions = {}): Promise
     options.collection.forEach(c => params.append('collection', c));
   }
   const q = params.toString();
-
-  const url = `${config.indexerUrl}/listings${q ? `?${q}` : ''}`;
-  const res = await axios.get(url, { timeout: DEFAULT_TIMEOUT_MS, validateStatus: (s) => s < 400 });
-  const raw = res.data;
-  const nextCursor = res.headers?.['x-next-cursor'] ?? '';
+  const path = `/listings${q ? `?${q}` : ''}`;
+  const { data: raw, headers } = await fetchWithRetryFull<unknown>(path);
+  const nextCursor = headers?.['x-next-cursor'] ?? '';
 
   if (raw == null) return { listings: [], nextCursor };
   if (typeof raw === 'object' && (raw as any).listings) {
