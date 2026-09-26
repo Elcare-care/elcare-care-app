@@ -29,10 +29,10 @@ import { logger } from './logger.js';
 const RPC_URL                = process.env.STELLAR_RPC_URL              || 'https://soroban-testnet.stellar.org';
 const CONTRACT_ID            = process.env.MARKETPLACE_CONTRACT_ID       || '';
 const LAUNCHPAD_CONTRACT_ID  = process.env.LAUNCHPAD_CONTRACT_ID         || '';
-const SAMPLE_SIZE            = parseInt(process.env.RECONCILE_SAMPLE_SIZE   || '50');
-const RECONCILE_INTERVAL_MS  = parseInt(process.env.RECONCILE_INTERVAL_MS   || '300000');
+const SAMPLE_SIZE            = parseInt(process.env.RECONCILE_SAMPLE_SIZE   || '50', 10);
+const RECONCILE_INTERVAL_MS  = parseInt(process.env.RECONCILE_INTERVAL_MS   || '300000', 10);
 const AUTO_REPAIR            = process.env.RECONCILER_AUTO_REPAIR === 'true';
-const BUDGET_PER_RUN         = parseInt(process.env.RECONCILER_BUDGET_PER_RUN || '200');
+const BUDGET_PER_RUN         = parseInt(process.env.RECONCILER_BUDGET_PER_RUN || '200', 10);
 
 // ── Public types ──────────────────────────────────────────────────────────────
 

@@ -24,10 +24,10 @@ import {
 
 // ── Configuration ───────────────────────────────────────────────────────────────
 
-const CONFIRMATION_DEPTH = parseInt(process.env.FINANCIAL_RECONCILE_CONFIRMATION_DEPTH || '32');
-const DEFAULT_TOLERANCE_BPS = parseInt(process.env.FINANCIAL_RECONCILE_TOLERANCE_BPS || '100'); // 1%
-const PROVISIONAL_TOLERANCE_BPS = parseInt(process.env.FINANCIAL_RECONCILE_PROVISIONAL_TOLERANCE_BPS || '500'); // 5%
-const ALERT_THRESHOLD_BPS = parseInt(process.env.FINANCIAL_RECONCILE_ALERT_THRESHOLD_BPS || '200'); // 2%
+const CONFIRMATION_DEPTH = parseInt(process.env.FINANCIAL_RECONCILE_CONFIRMATION_DEPTH || '32', 10);
+const DEFAULT_TOLERANCE_BPS = parseInt(process.env.FINANCIAL_RECONCILE_TOLERANCE_BPS || '100', 10); // 1%
+const PROVISIONAL_TOLERANCE_BPS = parseInt(process.env.FINANCIAL_RECONCILE_PROVISIONAL_TOLERANCE_BPS || '500', 10); // 5%
+const ALERT_THRESHOLD_BPS = parseInt(process.env.FINANCIAL_RECONCILE_ALERT_THRESHOLD_BPS || '200', 10); // 2%
 
 // ── Public Types ───────────────────────────────────────────────────────────────
 

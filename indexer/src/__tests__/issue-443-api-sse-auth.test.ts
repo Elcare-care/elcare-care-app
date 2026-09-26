@@ -352,7 +352,7 @@ describe('[#443] Rate limiting — per-wallet key, classified response', () => {
     } as any);
 
     // Fill all concurrent slots for the wallet key (default limit = 5)
-    const limit = parseInt(process.env.SSE_CONCURRENT_PER_KEY || '5');
+    const limit = parseInt(process.env.SSE_CONCURRENT_PER_KEY || '5', 10);
     for (let i = 0; i < limit; i++) {
       const n = vi.fn();
       sseConcurrencyGuard(mockReq('GTEST_CONCURRENCY'), mockRes(), n);

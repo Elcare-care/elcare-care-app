@@ -348,7 +348,7 @@ describe('Issue #683 — Spoofed proxy headers cannot bypass limits', () => {
 // ── Issue #683 — SSE concurrency cap ──────────────────────────────────────────
 
 describe('Issue #683 — SSE concurrency guard per key', () => {
-  const SSE_PER_KEY = parseInt(process.env.SSE_CONCURRENT_PER_KEY || '5');
+  const SSE_PER_KEY = parseInt(process.env.SSE_CONCURRENT_PER_KEY || '5', 10);
 
   it('allows up to SSE_CONCURRENT_PER_KEY connections per wallet key', async () => {
     const wallet = 'GWALLET_SSE_ALLOW_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
@@ -721,7 +721,7 @@ describe('Issue #683 — Resource usage remains bounded', () => {
 
   it('SSE connection rejection does not leak server-side connection state', async () => {
     const wallet = 'GWALLET_LEAK_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
-    const SSE_PER_KEY = parseInt(process.env.SSE_CONCURRENT_PER_KEY || '5');
+    const SSE_PER_KEY = parseInt(process.env.SSE_CONCURRENT_PER_KEY || '5', 10);
     const connections: Array<{ req: http.ClientRequest; res: http.IncomingMessage }> = [];
 
     // Fill to cap
