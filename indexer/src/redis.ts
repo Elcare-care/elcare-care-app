@@ -7,7 +7,8 @@ const REDIS_RECONNECT_MAX_DELAY_MS = 3000;
 const REDIS_RECONNECT_JITTER_MS = 100;
 
 export function calculateRedisReconnectDelay(retries: number, jitterMs = 0) {
-    const exponentialBackoff = REDIS_RECONNECT_BASE_DELAY_MS * (2 ** retries);
+    // Cap the exponent so the intermediate value never overflows to Infinity.
+    const exponentialBackoff = REDIS_RECONNECT_BASE_DELAY_MS * (2 ** Math.min(retries, 20));
     return Math.min(exponentialBackoff + jitterMs, REDIS_RECONNECT_MAX_DELAY_MS);
 }
 
@@ -62,11 +63,14 @@ export async function invalidatePattern(pattern: string): Promise<void> {
     const client = redis as any;
     if (!isClientReady(client)) return;
     try {
-        // Use keys() for simplicity; for very large datasets consider SCAN cursor.
-        const keys: string[] = await client.keys(pattern);
-        if (keys.length > 0) {
-            await client.del(keys);
-        }
+        let cursor = 0;
+        do {
+            const reply = await client.scan(cursor, { MATCH: pattern, COUNT: 100 });
+            cursor = reply.cursor;
+            if (reply.keys.length > 0) {
+                await client.del(reply.keys);
+            }
+        } while (cursor !== 0);
     } catch (err) {
         logger.warn({ err, pattern, component: 'redis' }, 'Redis invalidatePattern failed');
     }
