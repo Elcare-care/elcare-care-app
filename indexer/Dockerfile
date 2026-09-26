@@ -1,22 +1,30 @@
 # ── Stage 1: builder ─────────────────────────────────────────────────────────
+# Base image digest pinning for reproducibility and security
+# To pin: docker pull node:20-alpine && docker inspect node:20-alpine --format '{{index .RepoDigests 0}}'
+# Update FROM line to: FROM node:20-alpine@sha256:<digest> AS builder
+# Schedule: review and rotate base images at least monthly
 FROM node:20-alpine AS builder
 
 WORKDIR /build
 
-# Install openssl (needed by Prisma at generate time)
+# Install build dependencies
 RUN apk add --no-cache openssl
 
 # Install dependencies (including devDeps for TypeScript compilation)
-COPY package*.json ./
+COPY indexer/package*.json ./
 RUN npm ci
 
-COPY tsconfig.json ./
-COPY prisma ./prisma/
+COPY indexer/tsconfig.json ./
+COPY indexer/prisma ./prisma/
 
 # Generate Prisma client for the target platform
 RUN npx prisma generate
 
-COPY src ./src/
+COPY indexer/src ./src/
+
+# Copy shared config package (for cross-component validation)
+COPY packages/config ./packages/config
+RUN cd packages/config && npm install --omit=dev && npm run build
 
 # Compile TypeScript with build-time version metadata
 ARG BUILD_SHA=unknown
@@ -32,23 +40,34 @@ RUN BUILD_SHA="$BUILD_SHA" BUILD_TIME="$BUILD_TIME" \
     npm run build
 
 # ── Stage 2: runtime ─────────────────────────────────────────────────────────
+# Base image digest pinning for reproducibility and security
+# To pin: docker pull node:20-alpine && docker inspect node:20-alpine --format '{{index .RepoDigests 0}}'
+# Update FROM line to: FROM node:20-alpine@sha256:<digest> AS runtime
+# Schedule: review and rotate base images at least monthly
 FROM node:20-alpine AS runtime
 
 WORKDIR /app
 
 # Runtime system deps: openssl (Prisma), wget is provided by busybox (health probe)
-RUN apk add --no-cache openssl \
+# Minimal package set to reduce attack surface
+RUN apk add --no-cache openssl nodejs npm \
  && addgroup -S appgroup \
  && adduser  -S appuser -G appgroup
 
 # Install production-only deps
-COPY package*.json ./
+COPY indexer/package*.json ./
 RUN npm ci --omit=dev
 
 # Copy compiled output and Prisma artifacts
 COPY --from=builder /build/dist               ./dist
 COPY --from=builder /build/prisma             ./prisma
 COPY --from=builder /build/node_modules/.prisma ./node_modules/.prisma
+COPY --from=builder /build/packages/config    ./packages/config
+
+# Copy config validation scripts
+COPY scripts/validate-config.js      ./scripts/validate-config.js
+COPY scripts/docker/init-config-check.sh ./scripts/docker/init-config-check.sh
+RUN chmod +x ./scripts/docker/init-config-check.sh
 
 # Transfer all /app ownership to the non-root runtime user before switching context.
 # This ensures appuser can read node_modules (installed as root above) and execute
@@ -88,6 +107,6 @@ STOPSIGNAL SIGTERM
 
 USER appuser
 
-# Run migrations then start the indexer as PID 1 (exec form — no sh wrapper).
-# exec ensures SIGTERM is delivered directly to node, not swallowed by a shell.
-CMD ["sh", "-c", "npx prisma migrate deploy && exec node dist/index.js"]
+# Run config validation then migrations then start the indexer as PID 1.
+# Validation happens before migrations to catch config errors early.
+CMD ["sh", "-c", "node scripts/validate-config.js && npx prisma migrate deploy && exec node dist/index.js"]

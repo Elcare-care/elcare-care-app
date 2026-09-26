@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { loadConfig as sharedLoadConfig, ValidationError, MissingEnvError } from '@elcarehub/config';
 
 // ── Version metadata ─────────────────────────────────────────────────────────
 // Sourced from versions.toml at build time.  Dockerfile and CI set these via
@@ -79,7 +80,7 @@ export function parseTrackedContracts(): TrackedContractConfig[] {
     for (const [i, item] of parsed.entries()) {
       const result = trackedContractSchema.safeParse(item);
       if (!result.success) {
-        const msgs = result.error.errors.map((e) => `${e.path.join('.')}: ${e.message}`).join('; ');
+        const msgs = result.error.issues.map((e: any) => `${e.path.join('.')}: ${e.message}`).join('; ');
         throw new Error(`[indexer] TRACKED_CONTRACTS[${i}] is invalid: ${msgs}`);
       }
       contracts.push(result.data as TrackedContractConfig);
@@ -146,6 +147,16 @@ export function validateRequiredEnv(): void {
         'Check indexer/.env and ensure all required vars are set (see README for the full table).'
     );
   }
+
+  // Validate using shared config module (cross-component consistency)
+  try {
+    sharedLoadConfig();
+  } catch (err) {
+    if (err instanceof ValidationError || err instanceof MissingEnvError) {
+      throw new Error(`[indexer] Configuration validation failed:\n${err.message}`);
+    }
+    throw err;
+  }
 }
 
 export function loadConfig() {
@@ -168,6 +179,14 @@ export function loadConfig() {
     pollIntervalMs: parsePositiveInt('POLL_INTERVAL_MS', process.env.POLL_INTERVAL_MS, 5000),
     maxLedgersPerCycle: parsePositiveInt('MAX_LEDGERS_PER_CYCLE', process.env.MAX_LEDGERS_PER_CYCLE, 1000),
     shutdownTimeoutMs: parsePositiveInt('SHUTDOWN_TIMEOUT_MS', process.env.SHUTDOWN_TIMEOUT_MS, 30_000),
+    // ── Stall detection thresholds ────────────────────────────────────────
+    // Time without ledger progress before the stall monitor escalates:
+    //   warning  → emit metric + log (non-paged)
+    //   critical → emit metric + log (on-call alert)
+    //   fatal    → poller halts, SSE CRITICAL_REORG emitted
+    stallWarningMs:  parsePositiveInt('STALL_WARNING_MS',  process.env.STALL_WARNING_MS,  30_000),   // 30 s
+    stallCriticalMs: parsePositiveInt('STALL_CRITICAL_MS', process.env.STALL_CRITICAL_MS, 120_000),  // 2 min
+    stallFatalMs:    parsePositiveInt('STALL_FATAL_MS',    process.env.STALL_FATAL_MS,    300_000),  // 5 min
     // ── Reconciler config ──────────────────────────────────────────────────
     /**
      * When true, the reconciler writes DB corrections when chain state disagrees.

@@ -11,6 +11,7 @@ import {
   formatAmount,
   buildFeePreview,
   MAX_I128,
+  MAX_PROTOCOL_FEE_BPS,
 } from "@/lib/amount";
 import type { TokenConfig } from "@/config/tokens";
 
@@ -73,11 +74,11 @@ describe("baseToDecimalString", () => {
     expect(baseToDecimalString(500_000n, 7)).toBe("0.05");
   });
 
-  test("very large amount near i128 max", () => {
-    // Just test it doesn't throw and produces a long string
+  test("very large amount near i128 max keeps full precision", () => {
+    // MAX_I128 far exceeds Number.MAX_SAFE_INTEGER — the conversion must
+    // remain exact and not route through a JS float.
     const result = baseToDecimalString(MAX_I128, 7);
-    expect(typeof result).toBe("string");
-    expect(result.length).toBeGreaterThan(10);
+    expect(result).toBe("17014118346046923173168730371588.4105727");
   });
 });
 
@@ -267,6 +268,13 @@ describe("formatAmount", () => {
   test("zero amount", () => {
     expect(formatAmount(0n, XLM)).toBe("0 XLM");
   });
+
+  test("large stroop value formats without precision loss", () => {
+    // MAX_I128 is far beyond Number.MAX_SAFE_INTEGER; the whole part is
+    // grouped via BigInt so the display stays exact.
+    const result = formatAmount(MAX_I128, XLM);
+    expect(result).toBe("17,014,118,346,046,923,173,168,730,371,588.4105727 XLM");
+  });
 });
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -314,7 +322,7 @@ describe("buildFeePreview", () => {
 
   test("maximum fee (100%) doubles price", () => {
     const price = 10_000_000n;
-    const preview = buildFeePreview(price, 10_000, XLM);
+    const preview = buildFeePreview(price, MAX_PROTOCOL_FEE_BPS, XLM);
     expect(preview.protocolFee.baseUnits).toBe(price);
     expect(preview.total.baseUnits).toBe(price * 2n);
   });

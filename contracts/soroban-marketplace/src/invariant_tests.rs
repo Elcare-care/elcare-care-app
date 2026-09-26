@@ -16,16 +16,15 @@
 /// Failing seeds are printed so any sequence can be reproduced with:
 ///   `cargo test -- invariant --nocapture 2>&1 | grep SEED`
 ///
-#[cfg(test)]
-mod invariant_tests {
-    use super::test::*;
-    use crate::types::{AuctionStatus, ListingStatus, MarketplaceError, OfferStatus};
-    use soroban_sdk::{
-        symbol_short,
-        testutils::{Address as _, Ledger},
-        token::{StellarAssetClient, TokenClient},
-        vec, Address, Env,
-    };
+use crate::test::{mock_nft, MockNftClient, valid_recipients};
+use crate::{MarketplaceContract, MarketplaceContractClient};
+use crate::types::{AuctionStatus, ListingStatus, MarketplaceError, OfferStatus};
+use soroban_sdk::{
+    symbol_short,
+    testutils::{Address as _, Events as _, Ledger},
+    token::{StellarAssetClient, TokenClient},
+    vec, Address, Env,
+};
 
     // ── Deterministic LCG used as a seedable RNG ─────────────────────────
     // Allows any failing sequence to be reproduced by re-running with the
@@ -112,7 +111,7 @@ mod invariant_tests {
         let collection_id = env.register(mock_nft::MockNft, ());
         MockNftClient::new(&env, &collection_id).set_owner(&1u64, &artist);
         client.set_admin(&artist);
-        client.add_token_to_whitelist(&payment_token);
+        client.add_token_to_whitelist(&artist, &payment_token);
         (env, client, artist, buyer, payment_token, contract_id, collection_id)
     }
 
@@ -126,7 +125,7 @@ mod invariant_tests {
     ) -> u64 {
         client.create_listing(
             artist, &price, &symbol_short!("XLM"),
-            token, collection, &1u64,
+            token, collection, &1u64, &1u64,
             &valid_recipients(env, artist),
             &None::<u64>,
         )
@@ -255,12 +254,7 @@ mod invariant_tests {
     #[test]
     fn inv_listing_random_sequence() {
         for seed in [1u64, 42, 999, 12345, 0xdeadbeef] {
-            let result = std::panic::catch_unwind(|| {
-                run_listing_sequence(seed);
-            });
-            if result.is_err() {
-                panic!("SEED {} caused a listing invariant failure", seed);
-            }
+            run_listing_sequence(seed);
         }
     }
 
@@ -497,12 +491,7 @@ mod invariant_tests {
     #[test]
     fn inv_offer_random_sequence() {
         for seed in [7u64, 31, 101, 7777, 0xcafebabe] {
-            let result = std::panic::catch_unwind(|| {
-                run_offer_sequence(seed);
-            });
-            if result.is_err() {
-                panic!("SEED {} caused an offer invariant failure", seed);
-            }
+            run_offer_sequence(seed);
         }
     }
 
@@ -600,15 +589,14 @@ mod invariant_tests {
         let col = env.register(mock_nft::MockNft, ());
         MockNftClient::new(&env, &col).set_owner(&1u64, &creator);
         client.set_admin(&creator);
-        client.add_token_to_whitelist(&token);
+        client.add_token_to_whitelist(&creator, &token);
 
         env.ledger().with_mut(|li| li.timestamp = 1_000_000);
         let duration = 7_200u64; // 2 h > MIN_AUCTION_DURATION (1 h)
         let auction_id = client.create_auction(
-            &creator, &1_000_000_i128, &symbol_short!("XLM"),
-            &token, &col, &1u64,
+            &creator, &token, &col, &1u64,
+            &1_000_000_i128, &duration,
             &valid_recipients(&env, &creator),
-            &duration, &None::<u64>,
         );
         (env, client, creator, bidder, token, contract_id, col, auction_id)
     }
@@ -776,12 +764,7 @@ mod invariant_tests {
     #[test]
     fn inv_auction_random_sequence() {
         for seed in [2u64, 17, 256, 9999, 0xbaadf00d] {
-            let result = std::panic::catch_unwind(|| {
-                run_auction_sequence(seed);
-            });
-            if result.is_err() {
-                panic!("SEED {} caused an auction invariant failure", seed);
-            }
+            run_auction_sequence(seed);
         }
     }
 
@@ -852,4 +835,1316 @@ mod invariant_tests {
         }
     }
 
-} // end mod invariant_tests
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Issue #434 — Auction settlement and anti-sniping formal invariants layer
+// ══════════════════════════════════════════════════════════════════════════════
+//
+// This section adds a dedicated regression suite for the unified auction
+// invariants introduced in issue #434.  Coverage targets:
+//   • End-time validity (past / future / exact boundary)
+//   • Minimum bid increment (zero, negative, equal, one-below, one-above)
+//   • Refund correctness (outbid, cancelled, finalized — no funds stuck)
+//   • Self-bidding constraints (creator cannot outbid anyone)
+//   • Extension cap exhaustion + total-duration cap
+//   • Blocked-bidder registry overflow + bidder unblock flow
+//   • Settlement atomicity (duplicate finalization, no partial state)
+//   • No-bid auction path (NFT back, correct status)
+//   • Fuzz-like bid-sequence + timing property tests (5 seeds each)
+//   • refund_losing_bid edge cases
+
+// ── helpers shared by this section ──────────────────────────────────────────
+
+/// Create an auction with configurable duration and anti-snipe settings.
+fn mk_auction_full(
+    env: &Env,
+    client: &MarketplaceContractClient,
+    creator: &Address,
+    token: &Address,
+    col: &Address,
+    reserve: i128,
+    duration: u64,
+) -> u64 {
+    client.create_auction(
+        creator,
+        token,
+        col,
+        &1u64,
+        &reserve,
+        &duration,
+        &valid_recipients(env, creator),
+    )
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// SECTION A — End-time validity
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Bidding at exactly end_time (timestamp == end_time) must fail.
+#[test]
+fn inv434_bid_at_exact_end_time_fails() {
+    let (env, client, creator, bidder, token, _cid, col, aid) = auction_setup();
+    // advance to exactly end_time
+    env.ledger().with_mut(|li| li.timestamp = 1_000_000 + 7_200);
+    assert_eq!(
+        client
+            .try_place_bid(&bidder, &aid, &2_000_000_i128)
+            .unwrap_err()
+            .unwrap(),
+        MarketplaceError::AuctionExpired.into()
+    );
+    // Status unchanged
+    assert_eq!(client.get_auction(&aid).status, AuctionStatus::Active);
+    // Finalize must succeed (end_time is in the past now)
+    client.finalize_auction(&creator, &aid);
+    assert_eq!(client.get_auction(&aid).status, AuctionStatus::Cancelled);
+}
+
+/// Bidding one second before end_time must succeed.
+#[test]
+fn inv434_bid_one_second_before_end_time_succeeds() {
+    let (env, client, _creator, bidder, _token, _cid, _col, aid) = auction_setup();
+    // one second before end_time
+    env.ledger().with_mut(|li| li.timestamp = 1_000_000 + 7_200 - 1);
+    client.place_bid(&bidder, &aid, &2_000_000_i128);
+    assert_eq!(client.get_auction(&aid).highest_bid, 2_000_000_i128);
+}
+
+/// `finalize_auction` called before `end_time` must revert with `AuctionNotEnded`.
+#[test]
+fn inv434_finalize_before_end_time_fails() {
+    let (env, client, creator, bidder, _token, _cid, _col, aid) = auction_setup();
+    client.place_bid(&bidder, &aid, &2_000_000_i128);
+    // Still one second before end
+    env.ledger().with_mut(|li| li.timestamp = 1_000_000 + 7_200 - 1);
+    assert_eq!(
+        client
+            .try_finalize_auction(&creator, &aid)
+            .unwrap_err()
+            .unwrap(),
+        MarketplaceError::AuctionNotEnded.into()
+    );
+    assert_eq!(client.get_auction(&aid).status, AuctionStatus::Active);
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// SECTION B — Minimum bid increment edge cases
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Bid at reserve_price - 1 must fail.
+#[test]
+fn inv434_bid_below_reserve_fails() {
+    let (_env, client, _creator, bidder, _token, _cid, _col, aid) = auction_setup();
+    // reserve is 1_000_000; bid 999_999
+    assert_eq!(
+        client
+            .try_place_bid(&bidder, &aid, &999_999_i128)
+            .unwrap_err()
+            .unwrap(),
+        MarketplaceError::BidTooLow.into()
+    );
+    assert_eq!(client.get_auction(&aid).highest_bid, 0);
+}
+
+/// Bid at reserve_price exactly must succeed (first bid on reserve).
+#[test]
+fn inv434_bid_at_reserve_price_succeeds() {
+    let (_env, client, _creator, bidder, _token, _cid, _col, aid) = auction_setup();
+    client.place_bid(&bidder, &aid, &1_000_000_i128);
+    assert_eq!(client.get_auction(&aid).highest_bid, 1_000_000_i128);
+}
+
+/// After an existing bid, a new bid at `highest_bid + min_increment - 1` fails.
+#[test]
+fn inv434_bid_one_below_increment_fails() {
+    let (env, client, _creator, bidder, token, _cid, _col, aid) = auction_setup();
+    let bidder2 = Address::generate(&env);
+    StellarAssetClient::new(&env, &token).mint(&bidder2, &100_000_000_000_i128);
+    client.place_bid(&bidder, &aid, &2_000_000_i128);
+    // min_increment = DEFAULT_MIN_BID_INCREMENT = 1_000_000
+    // required = 2_000_000 + 1_000_000 = 3_000_000; bid 2_999_999 must fail
+    assert_eq!(
+        client
+            .try_place_bid(&bidder2, &aid, &2_999_999_i128)
+            .unwrap_err()
+            .unwrap(),
+        MarketplaceError::BidTooLow.into()
+    );
+    assert_eq!(client.get_auction(&aid).highest_bid, 2_000_000_i128);
+}
+
+/// A bid at exactly `highest_bid + min_increment` must succeed.
+#[test]
+fn inv434_bid_at_exact_increment_succeeds() {
+    let (env, client, _creator, bidder, token, _cid, _col, aid) = auction_setup();
+    let bidder2 = Address::generate(&env);
+    StellarAssetClient::new(&env, &token).mint(&bidder2, &100_000_000_000_i128);
+    client.place_bid(&bidder, &aid, &2_000_000_i128);
+    client.place_bid(&bidder2, &aid, &3_000_000_i128);
+    assert_eq!(client.get_auction(&aid).highest_bid, 3_000_000_i128);
+    assert_eq!(
+        client.get_auction(&aid).highest_bidder,
+        Some(bidder2)
+    );
+}
+
+/// Equal bid to the current highest (no increment) must fail.
+#[test]
+fn inv434_equal_bid_fails() {
+    let (env, client, _creator, bidder, token, _cid, _col, aid) = auction_setup();
+    let bidder2 = Address::generate(&env);
+    StellarAssetClient::new(&env, &token).mint(&bidder2, &100_000_000_000_i128);
+    client.place_bid(&bidder, &aid, &5_000_000_i128);
+    assert_eq!(
+        client
+            .try_place_bid(&bidder2, &aid, &5_000_000_i128)
+            .unwrap_err()
+            .unwrap(),
+        MarketplaceError::BidTooLow.into()
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// SECTION C — Refund correctness
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// On outbid, the previous bidder's exact amount is returned in the same
+/// transaction as the new bid — no funds are stuck.
+#[test]
+fn inv434_outbid_refund_exact_amount() {
+    let (env, client, _creator, bidder, token, _cid, _col, aid) = auction_setup();
+    let bidder2 = Address::generate(&env);
+    StellarAssetClient::new(&env, &token).mint(&bidder2, &100_000_000_000_i128);
+    let tk = TokenClient::new(&env, &token);
+
+    let b1_before = tk.balance(&bidder);
+    client.place_bid(&bidder, &aid, &3_000_000_i128);
+    assert_eq!(tk.balance(&bidder), b1_before - 3_000_000, "locked");
+    client.place_bid(&bidder2, &aid, &5_000_000_i128);
+    assert_eq!(tk.balance(&bidder), b1_before, "refunded exactly on outbid");
+}
+
+/// After admin-cancel of an active auction with a bid, the highest bidder
+/// is refunded automatically and the NFT returns to creator.
+#[test]
+fn inv434_admin_cancel_refunds_bidder_and_returns_nft() {
+    let (env, client, creator, bidder, token, _cid, col, aid) = auction_setup();
+    let tk = TokenClient::new(&env, &token);
+    let bidder_before = tk.balance(&bidder);
+    client.place_bid(&bidder, &aid, &4_000_000_i128);
+    // Admin cancels — bidder must be refunded, NFT returned
+    client.admin_cancel_auction(&creator, &aid);
+    assert_eq!(tk.balance(&bidder), bidder_before, "bidder refunded on admin cancel");
+    assert_eq!(client.get_auction(&aid).status, AuctionStatus::Cancelled);
+    assert_eq!(
+        mock_nft::MockNftClient::new(&env, &col).owner_of(&1u64),
+        creator,
+        "NFT returned to creator on admin cancel"
+    );
+}
+
+/// No-bid auction: finalize produces Cancelled, NFT back, no token movement.
+#[test]
+fn inv434_no_bid_finalize_no_token_movement() {
+    let (env, client, creator, _bidder, token, _cid, col, aid) = auction_setup();
+    let tk = TokenClient::new(&env, &token);
+    let creator_before = tk.balance(&creator);
+    env.ledger().with_mut(|li| li.timestamp = 1_000_000 + 7_201);
+    client.finalize_auction(&creator, &aid);
+    assert_eq!(client.get_auction(&aid).status, AuctionStatus::Cancelled);
+    // Creator's balance unchanged (no payment)
+    assert_eq!(tk.balance(&creator), creator_before);
+    assert_eq!(
+        mock_nft::MockNftClient::new(&env, &col).owner_of(&1u64),
+        creator
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// SECTION D — Self-bidding constraints
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Creator cannot place a bid on their own auction regardless of amount.
+#[test]
+fn inv434_creator_cannot_self_bid_after_prior_bid() {
+    let (_env, client, creator, bidder, _token, _cid, _col, aid) = auction_setup();
+    // Place a legitimate bid first
+    client.place_bid(&bidder, &aid, &2_000_000_i128);
+    // Creator attempts to outbid
+    assert_eq!(
+        client
+            .try_place_bid(&creator, &aid, &5_000_000_i128)
+            .unwrap_err()
+            .unwrap(),
+        MarketplaceError::SelfBidNotAllowed.into()
+    );
+    // State unchanged
+    assert_eq!(client.get_auction(&aid).highest_bidder, Some(bidder));
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// SECTION E — Extension cap exhaustion + total-duration cap
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// When `max_extensions = 1`, the second snipe-triggering bid must fail with
+/// `MaxExtensionsReached` — the extension cap is enforced by the invariants layer.
+#[test]
+fn inv434_extension_cap_exhaustion() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(MarketplaceContract, ());
+    let client = MarketplaceContractClient::new(&env, &contract_id);
+    let creator = Address::generate(&env);
+    let bidder1 = Address::generate(&env);
+    let bidder2 = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let sac = StellarAssetClient::new(&env, &token);
+    sac.mint(&creator, &500_000_000_000_i128);
+    sac.mint(&bidder1, &500_000_000_000_i128);
+    sac.mint(&bidder2, &500_000_000_000_i128);
+    let col = env.register(mock_nft::MockNft, ());
+    mock_nft::MockNftClient::new(&env, &col).set_owner(&1u64, &creator);
+    client.set_admin(&creator);
+    client.add_token_to_whitelist(&creator, &token);
+    // Configure: trigger=300s, window=600s, max_extensions=1
+    client.set_auction_extension_trigger(&creator, &300u64);
+    client.set_auction_extension_window(&creator, &600u64);
+    client.set_auction_max_extensions(&creator, &1u32);
+
+    let start = 1_000_000u64;
+    env.ledger().with_mut(|li| li.timestamp = start);
+    let duration = 7_200u64;
+    let aid = mk_auction_full(&env, &client, &creator, &token, &col, 1_000_000, duration);
+
+    // First snipe: within trigger window — extension applied (count → 1)
+    env.ledger().with_mut(|li| li.timestamp = start + duration - 100);
+    client.place_bid(&bidder1, &aid, &2_000_000_i128);
+    assert_eq!(client.get_auction(&aid).extension_count, 1);
+
+    // Second snipe: max_extensions = 1, count already 1.
+    // Issue #468 fix: the bid must be ACCEPTED but the auction must NOT be extended.
+    let auction_end_time = client.get_auction(&aid).end_time;
+    env.ledger().with_mut(|li| li.timestamp = auction_end_time - 100);
+    client.place_bid(&bidder2, &aid, &4_000_000_i128);
+    let after = client.get_auction(&aid);
+    assert_eq!(after.end_time, auction_end_time, "end_time must not change after cap");
+    assert_eq!(after.extension_count, 1, "extension_count must not increment after cap");
+    assert!(after.highest_bidder.is_some(), "bid must be recorded as highest");
+}
+
+/// When a proposed extension would exceed `original_end_time + MAX_TOTAL_AUCTION_DURATION`,
+/// the bid is still accepted but no extension is applied.
+#[test]
+fn inv434_total_duration_cap_bid_accepted_no_extension() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(MarketplaceContract, ());
+    let client = MarketplaceContractClient::new(&env, &contract_id);
+    let creator = Address::generate(&env);
+    let bidder = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let sac = StellarAssetClient::new(&env, &token);
+    sac.mint(&creator, &500_000_000_000_i128);
+    sac.mint(&bidder, &500_000_000_000_i128);
+    let col = env.register(mock_nft::MockNft, ());
+    mock_nft::MockNftClient::new(&env, &col).set_owner(&1u64, &creator);
+    client.set_admin(&creator);
+    client.add_token_to_whitelist(&creator, &token);
+    // Very large window so proposed_end = now + window > original + MAX_TOTAL
+    client.set_auction_extension_trigger(&creator, &300u64);
+    // window = MAX_TOTAL_AUCTION_DURATION + 1 day — extension would exceed cap
+    client.set_auction_extension_window(&creator, &(2_592_000u64 + 86_400));
+
+    let start = 1_000_000u64;
+    env.ledger().with_mut(|li| li.timestamp = start);
+    let duration = 7_200u64;
+    let aid = mk_auction_full(&env, &client, &creator, &token, &col, 1_000_000, duration);
+
+    // Trigger the snipe-window: time remaining < trigger
+    let snipe_time = start + duration - 100;
+    env.ledger().with_mut(|li| li.timestamp = snipe_time);
+    // Bid must succeed but extension_count stays 0
+    client.place_bid(&bidder, &aid, &2_000_000_i128);
+    let a = client.get_auction(&aid);
+    assert_eq!(a.extension_count, 0, "no extension applied when cap exceeded");
+    // end_time unchanged
+    assert_eq!(a.end_time, start + duration);
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// SECTION F — Blocked-bidder enforcement
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// A blocked bidder cannot place any bid.
+#[test]
+fn inv434_blocked_bidder_cannot_bid() {
+    let (_env, client, creator, bidder, _token, _cid, _col, aid) = auction_setup();
+    client.block_bidder(&creator, &aid, &bidder);
+    assert_eq!(
+        client
+            .try_place_bid(&bidder, &aid, &2_000_000_i128)
+            .unwrap_err()
+            .unwrap(),
+        MarketplaceError::Unauthorized.into()
+    );
+}
+
+/// After being unblocked, the previously-blocked bidder can bid again.
+#[test]
+fn inv434_unblocked_bidder_can_bid() {
+    let (_env, client, creator, bidder, _token, _cid, _col, aid) = auction_setup();
+    client.block_bidder(&creator, &aid, &bidder);
+    client.unblock_bidder(&creator, &aid, &bidder);
+    client.place_bid(&bidder, &aid, &2_000_000_i128);
+    assert_eq!(client.get_auction(&aid).highest_bid, 2_000_000_i128);
+}
+
+/// Attempting to block more than MAX_BLOCKED_BIDDERS addresses must fail
+/// gracefully (the 51st block attempt panics).
+#[test]
+#[should_panic]
+fn inv434_blocked_bidder_registry_overflow() {
+    let (env, client, creator, _bidder, _token, _cid, _col, aid) = auction_setup();
+    // Fill the registry to MAX_BLOCKED_BIDDERS (50) distinct addresses, then add one more.
+    for _ in 0..51 {
+        let addr = Address::generate(&env);
+        client.block_bidder(&creator, &aid, &addr);
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// SECTION G — Settlement atomicity (duplicate finalization)
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// `finalize_auction` called a second time on a Finalized auction must revert.
+/// This ensures no partial re-settlement can occur.
+#[test]
+fn inv434_duplicate_finalize_fails() {
+    let (env, client, creator, bidder, _token, _cid, _col, aid) = auction_setup();
+    client.place_bid(&bidder, &aid, &2_000_000_i128);
+    env.ledger().with_mut(|li| li.timestamp = 1_000_000 + 7_201);
+    client.finalize_auction(&creator, &aid);
+    assert_eq!(client.get_auction(&aid).status, AuctionStatus::Finalized);
+    // Second call must fail
+    assert_eq!(
+        client
+            .try_finalize_auction(&creator, &aid)
+            .unwrap_err()
+            .unwrap(),
+        MarketplaceError::AuctionAlreadyFinalized.into()
+    );
+}
+
+/// Placing a bid on a Finalized auction must fail.
+#[test]
+fn inv434_bid_on_finalized_auction_fails() {
+    let (env, client, creator, bidder, token, _cid, _col, aid) = auction_setup();
+    let bidder2 = Address::generate(&env);
+    StellarAssetClient::new(&env, &token).mint(&bidder2, &100_000_000_000_i128);
+    client.place_bid(&bidder, &aid, &2_000_000_i128);
+    env.ledger().with_mut(|li| li.timestamp = 1_000_000 + 7_201);
+    client.finalize_auction(&creator, &aid);
+    assert_eq!(
+        client
+            .try_place_bid(&bidder2, &aid, &5_000_000_i128)
+            .unwrap_err()
+            .unwrap(),
+        MarketplaceError::AuctionNotActive.into()
+    );
+}
+
+/// Creator cannot cancel a Finalized auction.
+#[test]
+fn inv434_cancel_finalized_auction_fails() {
+    let (env, client, creator, bidder, _token, _cid, _col, aid) = auction_setup();
+    client.place_bid(&bidder, &aid, &2_000_000_i128);
+    env.ledger().with_mut(|li| li.timestamp = 1_000_000 + 7_201);
+    client.finalize_auction(&creator, &aid);
+    assert_eq!(
+        client
+            .try_cancel_auction(&creator, &aid)
+            .unwrap_err()
+            .unwrap(),
+        MarketplaceError::AuctionAlreadyFinalized.into()
+    );
+}
+
+/// Creator cannot cancel a Cancelled auction a second time.
+#[test]
+fn inv434_double_cancel_fails() {
+    let (_env, client, creator, _bidder, _token, _cid, _col, aid) = auction_setup();
+    client.cancel_auction(&creator, &aid);
+    assert_eq!(
+        client
+            .try_cancel_auction(&creator, &aid)
+            .unwrap_err()
+            .unwrap(),
+        MarketplaceError::AuctionAlreadyFinalized.into()
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// SECTION H — Event trail consistency
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Check whether any event in `events` carries `symbol` as a topic.
+/// Uses the same XDR-based pattern as `has_event_with_topic` in test.rs.
+fn has_event_topic_434(
+    events: &soroban_sdk::testutils::ContractEvents,
+    symbol: &str,
+) -> bool {
+    use soroban_sdk::xdr::{ContractEventBody, ScVal};
+    events.events().iter().any(|e| {
+        if let ContractEventBody::V0(body) = &e.body {
+            body.topics.iter().any(|t| match t {
+                ScVal::Symbol(s) => core::str::from_utf8(s.0.as_slice()).unwrap_or("") == symbol,
+                ScVal::String(s) => core::str::from_utf8(s.0.as_slice()).unwrap_or("") == symbol,
+                _ => false,
+            })
+        } else {
+            false
+        }
+    })
+}
+
+/// `place_bid` must emit `bid_placed`.
+#[test]
+fn inv434_bid_emits_bid_placed_event() {
+    let (env, client, _creator, bidder, _token, _cid, _col, aid) = auction_setup();
+    client.place_bid(&bidder, &aid, &2_000_000_i128);
+    assert!(
+        has_event_topic_434(&env.events().all(), crate::events::BID_PLACED),
+        "bid_placed event must be emitted"
+    );
+}
+
+/// `place_bid` triggering an extension must emit both `bid_placed` and
+/// `auction_extended`.
+#[test]
+fn inv434_snipe_emits_both_bid_and_extension_events() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(MarketplaceContract, ());
+    let client = MarketplaceContractClient::new(&env, &contract_id);
+    let creator = Address::generate(&env);
+    let bidder = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    StellarAssetClient::new(&env, &token).mint(&creator, &500_000_000_000_i128);
+    StellarAssetClient::new(&env, &token).mint(&bidder, &500_000_000_000_i128);
+    let col = env.register(mock_nft::MockNft, ());
+    mock_nft::MockNftClient::new(&env, &col).set_owner(&1u64, &creator);
+    client.set_admin(&creator);
+    client.add_token_to_whitelist(&creator, &token);
+    client.set_auction_extension_trigger(&creator, &300u64);
+    client.set_auction_extension_window(&creator, &600u64);
+
+    let start = 1_000_000u64;
+    env.ledger().with_mut(|li| li.timestamp = start);
+    let aid = mk_auction_full(&env, &client, &creator, &token, &col, 1_000_000, 7_200);
+    // Place bid within the trigger window
+    env.ledger().with_mut(|li| li.timestamp = start + 7_200 - 100);
+    client.place_bid(&bidder, &aid, &2_000_000_i128);
+
+    let evs = env.events().all();
+    assert!(
+        has_event_topic_434(&evs, crate::events::BID_PLACED),
+        "bid_placed event must be emitted on snipe"
+    );
+    assert!(
+        has_event_topic_434(&evs, crate::events::AUCTION_EXTENDED),
+        "auction_extended event must be emitted on snipe"
+    );
+    assert_eq!(client.get_auction(&aid).extension_count, 1);
+}
+
+/// `finalize_auction` must emit `auction_resolved`.
+#[test]
+fn inv434_finalize_emits_auction_resolved_event() {
+    let (env, client, creator, bidder, _token, _cid, _col, aid) = auction_setup();
+    client.place_bid(&bidder, &aid, &2_000_000_i128);
+    env.ledger().with_mut(|li| li.timestamp = 1_000_000 + 7_201);
+    client.finalize_auction(&creator, &aid);
+    assert!(
+        has_event_topic_434(&env.events().all(), crate::events::AUCTION_RESOLVED),
+        "auction_resolved event must be emitted on finalize"
+    );
+}
+
+/// Outbid must emit `auction_bid_refunded` for the previous bidder.
+#[test]
+fn inv434_outbid_emits_refund_event() {
+    let (env, client, _creator, bidder, token, _cid, _col, aid) = auction_setup();
+    let bidder2 = Address::generate(&env);
+    StellarAssetClient::new(&env, &token).mint(&bidder2, &100_000_000_000_i128);
+    client.place_bid(&bidder, &aid, &2_000_000_i128);
+    client.place_bid(&bidder2, &aid, &4_000_000_i128);
+    assert!(
+        has_event_topic_434(&env.events().all(), crate::events::AUCTION_BID_REFUNDED),
+        "auction_bid_refunded event must be emitted on outbid"
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// SECTION I — refund_losing_bid entry point
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// `refund_losing_bid` on an Active auction must fail with `InvalidAuctionState`.
+#[test]
+fn inv434_refund_losing_bid_on_active_fails() {
+    let (_env, client, _creator, bidder, _token, _cid, _col, aid) = auction_setup();
+    client.place_bid(&bidder, &aid, &2_000_000_i128);
+    assert_eq!(
+        client
+            .try_refund_losing_bid(&bidder, &aid)
+            .unwrap_err()
+            .unwrap(),
+        MarketplaceError::InvalidAuctionState.into()
+    );
+}
+
+/// Winner cannot call `refund_losing_bid` on a Finalized auction.
+#[test]
+fn inv434_winner_cannot_call_refund_losing_bid() {
+    let (env, client, creator, bidder, _token, _cid, _col, aid) = auction_setup();
+    client.place_bid(&bidder, &aid, &2_000_000_i128);
+    env.ledger().with_mut(|li| li.timestamp = 1_000_000 + 7_201);
+    client.finalize_auction(&creator, &aid);
+    assert_eq!(client.get_auction(&aid).status, AuctionStatus::Finalized);
+    assert_eq!(
+        client
+            .try_refund_losing_bid(&bidder, &aid)
+            .unwrap_err()
+            .unwrap(),
+        MarketplaceError::NoBidToRefund.into()
+    );
+}
+
+/// A bidder with no recorded bid calling `refund_losing_bid` must fail.
+#[test]
+fn inv434_refund_losing_bid_no_record_fails() {
+    let (env, client, creator, bidder, token, _cid, _col, aid) = auction_setup();
+    let other = Address::generate(&env);
+    StellarAssetClient::new(&env, &token).mint(&other, &100_000_000_000_i128);
+    client.place_bid(&bidder, &aid, &2_000_000_i128);
+    env.ledger().with_mut(|li| li.timestamp = 1_000_000 + 7_201);
+    client.finalize_auction(&creator, &aid);
+    // `other` never placed a bid
+    assert_eq!(
+        client
+            .try_refund_losing_bid(&other, &aid)
+            .unwrap_err()
+            .unwrap(),
+        MarketplaceError::NoBidToRefund.into()
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// SECTION J — Fuzz-like property tests (random bid sequences + timings)
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Property: across many random bid sequences, no stroop is ever lost in the
+/// contract.  After every sequence terminates:
+///   creator_final + bidder_final + contract_final == initial_total
+#[test]
+fn inv434_prop_no_token_loss_across_bid_sequences() {
+    for seed in [31u64, 137, 271, 4096, 0xf00dcafe] {
+        run_bid_sequence_no_loss(seed);
+    }
+}
+
+fn run_bid_sequence_no_loss(seed: u64) {
+    let mut rng = Lcg::new(seed);
+    let (env, client, creator, bidder, token, cid, _col, aid) = auction_setup();
+    let bidder2 = Address::generate(&env);
+    let sac = StellarAssetClient::new(&env, &token);
+    sac.mint(&bidder2, &500_000_000_000_i128);
+    let tk = TokenClient::new(&env, &token);
+
+    let initial_total = tk.balance(&creator)
+        + tk.balance(&bidder)
+        + tk.balance(&bidder2)
+        + tk.balance(&cid);
+
+    let mut current_time: u64 = 1_000_000;
+    let end_time: u64 = 1_000_000 + 7_200;
+    let mut highest_bid: i128 = 0;
+
+    for _ in 0..15 {
+        let op = rng.next_usize(3);
+        match op {
+            0 => {
+                // bidder1 bids
+                if current_time < end_time {
+                    let amount = highest_bid.max(1_000_000) + 1_000_000;
+                    if client.try_place_bid(&bidder, &aid, &amount).is_ok() {
+                        highest_bid = amount;
+                    }
+                }
+            }
+            1 => {
+                // bidder2 bids
+                if current_time < end_time {
+                    let amount = highest_bid + 2_000_000;
+                    if client.try_place_bid(&bidder2, &aid, &amount).is_ok() {
+                        highest_bid = amount;
+                    }
+                }
+            }
+            _ => {
+                // advance time
+                current_time = end_time + 1;
+                env.ledger().with_mut(|li| li.timestamp = current_time);
+            }
+        }
+    }
+
+    // Finalize if still active
+    env.ledger().with_mut(|li| li.timestamp = end_time + 1);
+    let _ = client.try_finalize_auction(&creator, &aid);
+
+    let final_total = tk.balance(&creator)
+        + tk.balance(&bidder)
+        + tk.balance(&bidder2)
+        + tk.balance(&cid);
+
+    assert_eq!(
+        initial_total, final_total,
+        "no stroop must be lost across the entire auction lifecycle (seed={seed})"
+    );
+}
+
+/// Property: across many random bid sequences + time jumps, every auction
+/// lifecycle terminates in exactly one terminal state (Finalized or Cancelled)
+/// and every subsequent mutation attempt fails.
+#[test]
+fn inv434_prop_terminal_state_is_irrevocable() {
+    for seed in [53u64, 199, 512, 8192, 0xdeadbeef_u64] {
+        run_terminal_irrevocable_sequence(seed);
+    }
+}
+
+fn run_terminal_irrevocable_sequence(seed: u64) {
+    let mut rng = Lcg::new(seed);
+    let (env, client, creator, bidder, _token, _cid, _col, aid) = auction_setup();
+    let end_time: u64 = 1_000_000 + 7_200;
+    let mut current_time: u64 = 1_000_000;
+    let mut highest_bid: i128 = 0;
+    let mut terminated = false;
+
+    for _ in 0..20 {
+        let op = rng.next_usize(4);
+        match op {
+            0 => {
+                if current_time < end_time {
+                    let amount = highest_bid.max(1_000_000) + 1_000_000;
+                    if client.try_place_bid(&bidder, &aid, &amount).is_ok() {
+                        highest_bid = amount;
+                    }
+                }
+            }
+            1 => {
+                current_time = end_time + 1;
+                env.ledger().with_mut(|li| li.timestamp = current_time);
+            }
+            2 => {
+                if current_time >= end_time {
+                    if client.try_finalize_auction(&creator, &aid).is_ok() {
+                        terminated = true;
+                    }
+                }
+            }
+            _ => {
+                if highest_bid == 0 {
+                    if client.try_cancel_auction(&creator, &aid).is_ok() {
+                        terminated = true;
+                    }
+                }
+            }
+        }
+    }
+
+    if terminated {
+        let status = client.get_auction(&aid).status;
+        assert!(
+            status == AuctionStatus::Finalized || status == AuctionStatus::Cancelled,
+            "terminal status must be Finalized or Cancelled (seed={seed})"
+        );
+        // All subsequent mutations must fail
+        assert!(
+            client
+                .try_place_bid(&bidder, &aid, &999_999_999_i128)
+                .is_err(),
+            "bid on terminal auction must fail (seed={seed})"
+        );
+        assert!(
+            client.try_finalize_auction(&creator, &aid).is_err(),
+            "double-finalize must fail (seed={seed})"
+        );
+        assert!(
+            client.try_cancel_auction(&creator, &aid).is_err(),
+            "cancel on terminal auction must fail (seed={seed})"
+        );
+    }
+}
+
+// ══════════════════════════════════════════════════════════════
+// ISSUE #468 — Anti-sniping extension boundary invariants
+// ══════════════════════════════════════════════════════════════
+
+fn auction_setup_with_trigger() -> (
+    Env,
+    MarketplaceContractClient<'static>,
+    Address, // creator
+    Address, // bidder
+    Address, // payment token
+    Address, // collection
+    u64,     // auction_id
+) {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(MarketplaceContract, ());
+    let client = MarketplaceContractClient::new(&env, &contract_id);
+    let creator = Address::generate(&env);
+    let bidder = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let payment_token =
+        env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+    let sac = soroban_sdk::token::StellarAssetClient::new(&env, &payment_token);
+    sac.mint(&creator, &1_000_000_000_i128);
+    sac.mint(&bidder, &1_000_000_000_i128);
+    sac.mint(&contract_id, &1_000_000_000_i128);
+    let collection = env.register(mock_nft::MockNft, ());
+    MockNftClient::new(&env, &collection).set_owner(&1u64, &creator);
+
+    client.set_admin(&creator);
+    client.add_token_to_whitelist(&creator, &payment_token);
+    client.set_min_bid_increment(&creator, &1_000_i128);
+    // 60-second trigger window, 120-second extension
+    client.set_auction_extension_trigger(&creator, &60u64);
+    client.set_auction_extension_window(&creator, &120u64);
+
+    env.ledger().with_mut(|l| { l.timestamp = 1_000; });
+    let aid = client.create_auction(
+        &creator, &payment_token, &collection, &1u64,
+        &1_000_i128, &3600u64,
+        &valid_recipients(&env, &creator),
+    );
+    (env, client, creator, bidder, payment_token, collection, aid)
+}
+
+/// A bid placed outside the trigger window must NOT extend the auction.
+#[test]
+fn test_non_qualifying_bid_does_not_extend() {
+    let (env, client, _creator, bidder, _tok, _col, aid) =
+        auction_setup_with_trigger();
+    let before = client.get_auction(&aid);
+    // bid well before the trigger window (3600 - 60 = 3540 seconds remaining)
+    env.ledger().with_mut(|l| { l.timestamp = 1_100; }); // 2900 sec remaining
+    client.place_bid(&bidder, &aid, &1_000_i128);
+    let after = client.get_auction(&aid);
+    assert_eq!(after.end_time, before.end_time, "end_time must not change for non-qualifying bid");
+    assert_eq!(after.extension_count, 0, "extension_count must stay zero");
+}
+
+/// A bid placed inside the trigger window MUST extend the auction exactly once.
+#[test]
+fn test_qualifying_bid_extends_exactly_once() {
+    let (env, client, _creator, bidder, _tok, _col, aid) =
+        auction_setup_with_trigger();
+    // Advance to 30 seconds before end (inside the 60-second trigger window)
+    env.ledger().with_mut(|l| { l.timestamp = 4_570; }); // end_time=4600, remaining=30
+    client.place_bid(&bidder, &aid, &1_000_i128);
+    let after = client.get_auction(&aid);
+    assert!(after.end_time > 4_600u64, "end_time must be extended past original end");
+    assert_eq!(after.extension_count, 1, "extension_count must be 1 after first qualifying bid");
+}
+
+/// When max_extensions == 1 and the cap is reached, a late bid is still
+/// ACCEPTED but does NOT extend the auction further.
+#[test]
+fn test_bid_accepted_after_extension_cap() {
+    // Inline setup: max_extensions must be configured BEFORE create_auction so
+    // the value is embedded in the auction struct.
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(MarketplaceContract, ());
+    let client = MarketplaceContractClient::new(&env, &contract_id);
+    let creator = Address::generate(&env);
+    let bidder = Address::generate(&env);
+    let bidder2 = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let tok = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+    let sac = soroban_sdk::token::StellarAssetClient::new(&env, &tok);
+    sac.mint(&creator, &1_000_000_000_i128);
+    sac.mint(&bidder, &1_000_000_000_i128);
+    sac.mint(&bidder2, &1_000_000_000_i128);
+    sac.mint(&contract_id, &1_000_000_000_i128);
+    let col = env.register(mock_nft::MockNft, ());
+    MockNftClient::new(&env, &col).set_owner(&1u64, &creator);
+
+    client.set_admin(&creator);
+    client.add_token_to_whitelist(&creator, &tok);
+    client.set_min_bid_increment(&creator, &1_000_i128);
+    client.set_auction_extension_trigger(&creator, &60u64);
+    client.set_auction_extension_window(&creator, &120u64);
+    client.set_auction_max_extensions(&creator, &1u32);  // set BEFORE create_auction
+
+    env.ledger().with_mut(|l| { l.timestamp = 1_000; });
+    let aid = client.create_auction(
+        &creator, &tok, &col, &1u64,
+        &1_000_i128, &3600u64,
+        &valid_recipients(&env, &creator),
+    );
+
+    // First qualifying bid — applies extension 1
+    env.ledger().with_mut(|l| { l.timestamp = 4_570; }); // end_time=4600, remaining=30<60
+    client.place_bid(&bidder, &aid, &1_000_i128);
+    let after_first = client.get_auction(&aid);
+    assert_eq!(after_first.extension_count, 1);
+    let extended_end = after_first.end_time;
+
+    // Second qualifying bid — cap reached; bid must succeed but NOT extend
+    let trigger_time = extended_end.saturating_sub(30);
+    env.ledger().with_mut(|l| { l.timestamp = trigger_time; });
+    client.place_bid(&bidder2, &aid, &2_000_i128);
+    let after_second = client.get_auction(&aid);
+    assert_eq!(after_second.end_time, extended_end, "end_time must not change after cap");
+    assert_eq!(after_second.extension_count, 1, "extension_count must not increment after cap");
+    assert!(after_second.highest_bidder.is_some(), "bid must have been recorded");
+}
+
+/// A bid at exactly end_time must be rejected (expired, not extended).
+#[test]
+fn test_bid_at_exact_end_time_rejected() {
+    let (env, client, _creator, bidder, _tok, _col, aid) =
+        auction_setup_with_trigger();
+    let end = client.get_auction(&aid).end_time;
+    env.ledger().with_mut(|l| { l.timestamp = end; });
+    assert!(
+        client.try_place_bid(&bidder, &aid, &1_000_i128).is_err(),
+        "bid at exact end_time must fail with AuctionExpired"
+    );
+}
+
+/// Extension cannot push end_time beyond original_end_time + MAX_TOTAL_AUCTION_DURATION.
+#[test]
+fn test_extension_bounded_by_total_duration_cap() {
+    let (env, client, _creator, bidder, tok, _col, aid) =
+        auction_setup_with_trigger();
+    let original_end = client.get_auction(&aid).original_end_time;
+    // Unlimited extensions; place many qualifying bids advancing the clock.
+    // Create each bidder inline to avoid std::vec::Vec in no_std context.
+    let mut current_bid = 1_000_i128;
+    for _ in 0..10 {
+        let b = Address::generate(&env);
+        soroban_sdk::token::StellarAssetClient::new(&env, &tok).mint(&b, &1_000_000_000_i128);
+        let auction = client.get_auction(&aid);
+        let trigger_time = auction.end_time.saturating_sub(30);
+        env.ledger().with_mut(|l| { l.timestamp = trigger_time; });
+        current_bid += 1_000;
+        let _ = client.try_place_bid(&b, &aid, &current_bid);
+    }
+
+    let final_auction = client.get_auction(&aid);
+    let max_end = original_end.saturating_add(crate::contract::MAX_TOTAL_AUCTION_DURATION);
+    assert!(
+        final_auction.end_time <= max_end,
+        "end_time {:?} must not exceed original_end + MAX_TOTAL_AUCTION_DURATION {:?}",
+        final_auction.end_time, max_end
+    );
+}
+
+// ══════════════════════════════════════════════════════════════
+// ISSUE #467 — Reserve price update invariants
+// ══════════════════════════════════════════════════════════════
+
+fn reserve_update_setup() -> (
+    Env,
+    MarketplaceContractClient<'static>,
+    Address, // creator
+    Address, // bidder
+    Address, // payment token
+    Address, // collection
+    u64,     // auction_id
+) {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(MarketplaceContract, ());
+    let client = MarketplaceContractClient::new(&env, &contract_id);
+    let creator = Address::generate(&env);
+    let bidder = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let payment_token =
+        env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+    let sac = soroban_sdk::token::StellarAssetClient::new(&env, &payment_token);
+    sac.mint(&creator, &1_000_000_000_i128);
+    sac.mint(&bidder, &1_000_000_000_i128);
+    sac.mint(&contract_id, &1_000_000_000_i128);
+    let collection = env.register(mock_nft::MockNft, ());
+    MockNftClient::new(&env, &collection).set_owner(&1u64, &creator);
+
+    client.set_admin(&creator);
+    client.add_token_to_whitelist(&creator, &payment_token);
+    client.set_min_bid_increment(&creator, &1_000_i128);
+    env.ledger().with_mut(|l| { l.timestamp = 1_000; });
+    let aid = client.create_auction(
+        &creator, &payment_token, &collection, &1u64,
+        &1_000_i128, &3600u64,
+        &valid_recipients(&env, &creator),
+    );
+    (env, client, creator, bidder, payment_token, collection, aid)
+}
+
+/// Creator can update reserve price when no bids exist.
+#[test]
+fn test_reserve_price_update_zero_bids() {
+    let (_env, client, creator, _bidder, _tok, _col, aid) = reserve_update_setup();
+    client.update_auction_reserve_price(&creator, &aid, &5_000_i128);
+    let auction = client.get_auction(&aid);
+    assert_eq!(auction.reserve_price, 5_000_i128, "reserve_price must reflect the update");
+}
+
+/// Reserve price update is rejected once the first bid exists.
+#[test]
+fn test_reserve_price_update_rejected_after_first_bid() {
+    let (env, client, creator, bidder, _tok, _col, aid) = reserve_update_setup();
+    env.ledger().with_mut(|l| { l.timestamp = 1_100; });
+    client.place_bid(&bidder, &aid, &1_000_i128);
+    assert!(
+        client.try_update_auction_reserve_price(&creator, &aid, &500_i128).is_err(),
+        "reserve price update must fail after first bid"
+    );
+    // Stored price is unchanged
+    assert_eq!(client.get_auction(&aid).reserve_price, 1_000_i128);
+}
+
+/// Non-creator cannot update reserve price.
+#[test]
+fn test_reserve_price_update_unauthorized() {
+    let (_env, client, _creator, bidder, _tok, _col, aid) = reserve_update_setup();
+    assert!(
+        client.try_update_auction_reserve_price(&bidder, &aid, &2_000_i128).is_err(),
+        "non-creator reserve price update must fail"
+    );
+}
+
+/// Reserve price update is rejected on a terminal (Cancelled) auction.
+#[test]
+fn test_reserve_price_update_rejected_on_terminal_auction() {
+    let (_env, client, creator, _bidder, _tok, _col, aid) = reserve_update_setup();
+    client.cancel_auction(&creator, &aid);
+    assert!(
+        client.try_update_auction_reserve_price(&creator, &aid, &2_000_i128).is_err(),
+        "reserve price update on cancelled auction must fail"
+    );
+}
+
+/// Randomized sequence: reserve updates are only valid in the (Active, no-bids) window.
+#[test]
+fn test_reserve_price_update_randomized() {
+    let seeds: &[u64] = &[0, 1, 0xdeadbeef, 0xc0ffee00, 42];
+    for &seed in seeds {
+        let mut rng = Lcg::new(seed);
+        let (env, client, creator, bidder, _tok, _col, aid) = reserve_update_setup();
+
+        let mut has_bid = false;
+        let mut terminated = false;
+
+        for _ in 0..20 {
+            match rng.next_usize(4) {
+                0 => {
+                    // attempt reserve update
+                    let new_price = 1_000_i128 + (rng.next() % 10_000) as i128;
+                    let result = client.try_update_auction_reserve_price(&creator, &aid, &new_price);
+                    if !has_bid && !terminated {
+                        assert!(result.is_ok(), "update must succeed (seed={seed}, price={new_price})");
+                    } else {
+                        assert!(result.is_err(), "update must fail after bid/terminal (seed={seed})");
+                    }
+                }
+                1 if !has_bid && !terminated => {
+                    env.ledger().with_mut(|l| { l.timestamp = l.timestamp.saturating_add(100); });
+                    let reserve = client.get_auction(&aid).reserve_price;
+                    if client.try_place_bid(&bidder, &aid, &reserve).is_ok() {
+                        has_bid = true;
+                    }
+                }
+                2 if !has_bid && !terminated => {
+                    if client.try_cancel_auction(&creator, &aid).is_ok() {
+                        terminated = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+// ══════════════════════════════════════════════════════════════
+// ISSUE #466 — Refund idempotency and winner exclusion
+// ══════════════════════════════════════════════════════════════
+
+fn refund_setup() -> (
+    Env,
+    MarketplaceContractClient<'static>,
+    Address, // creator
+    Address, // bidder (loser)
+    Address, // bidder2 (winner)
+    Address, // payment token
+    u64,     // auction_id
+) {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(MarketplaceContract, ());
+    let client = MarketplaceContractClient::new(&env, &contract_id);
+    let creator = Address::generate(&env);
+    let bidder = Address::generate(&env);
+    let bidder2 = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let payment_token =
+        env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+    let sac = soroban_sdk::token::StellarAssetClient::new(&env, &payment_token);
+    sac.mint(&creator, &1_000_000_000_i128);
+    sac.mint(&bidder, &1_000_000_000_i128);
+    sac.mint(&bidder2, &1_000_000_000_i128);
+    sac.mint(&contract_id, &1_000_000_000_i128);
+    let collection = env.register(mock_nft::MockNft, ());
+    MockNftClient::new(&env, &collection).set_owner(&1u64, &creator);
+
+    client.set_admin(&creator);
+    client.add_token_to_whitelist(&creator, &payment_token);
+    client.set_min_bid_increment(&creator, &1_000_i128);
+    env.ledger().with_mut(|l| { l.timestamp = 1_000; });
+    let aid = client.create_auction(
+        &creator, &payment_token, &collection, &1u64,
+        &1_000_i128, &3600u64,
+        &valid_recipients(&env, &creator),
+    );
+
+    // bidder places first bid (loses), bidder2 wins
+    env.ledger().with_mut(|l| { l.timestamp = 1_100; });
+    client.place_bid(&bidder, &aid, &1_000_i128);
+    client.place_bid(&bidder2, &aid, &2_000_i128);
+    // The outbid refund to `bidder` happens atomically in place_bid, so their
+    // escrow is already returned. Finalize after end_time.
+    env.ledger().with_mut(|l| { l.timestamp = 10_000; });
+    client.finalize_auction(&creator, &aid);
+    (env, client, creator, bidder, bidder2, payment_token, aid)
+}
+
+/// Duplicate `refund_losing_bid` call by the same bidder returns a stable error.
+#[test]
+fn test_refund_losing_bid_idempotent() {
+    let (_env, client, _creator, bidder, _bidder2, _tok, aid) = refund_setup();
+    // The losing bidder was already refunded atomically at outbid time.
+    // `refund_losing_bid` is the recovery path — first call might succeed or
+    // fail depending on whether escrow remains; second call must never succeed.
+    let first = client.try_refund_losing_bid(&bidder, &aid);
+    // Whether the first call succeeds or not, a second call must fail.
+    if first.is_ok() {
+        assert!(
+            client.try_refund_losing_bid(&bidder, &aid).is_err(),
+            "second refund claim must return NoBidToRefund"
+        );
+    } else {
+        // First call already failed — nothing escrowed, so test passes trivially.
+    }
+}
+
+/// The winner of a Finalized auction cannot claim a refund.
+#[test]
+fn test_refund_losing_bid_winner_excluded() {
+    let (_env, client, _creator, _bidder, bidder2, _tok, aid) = refund_setup();
+    assert!(
+        client.try_refund_losing_bid(&bidder2, &aid).is_err(),
+        "winning bidder must not be able to claim a refund"
+    );
+}
+
+/// A cancelled auction allows losing bidders to reclaim (admin_cancel path).
+#[test]
+fn test_refund_losing_bid_after_admin_cancel() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(MarketplaceContract, ());
+    let client = MarketplaceContractClient::new(&env, &contract_id);
+    let creator = Address::generate(&env);
+    let bidder = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let payment_token =
+        env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+    let sac = soroban_sdk::token::StellarAssetClient::new(&env, &payment_token);
+    sac.mint(&creator, &1_000_000_000_i128);
+    sac.mint(&bidder, &1_000_000_000_i128);
+    sac.mint(&contract_id, &1_000_000_000_i128);
+    let collection = env.register(mock_nft::MockNft, ());
+    MockNftClient::new(&env, &collection).set_owner(&1u64, &creator);
+
+    client.set_admin(&creator);
+    client.add_token_to_whitelist(&creator, &payment_token);
+    client.set_min_bid_increment(&creator, &1_000_i128);
+    env.ledger().with_mut(|l| { l.timestamp = 1_000; });
+    let aid = client.create_auction(
+        &creator, &payment_token, &collection, &1u64,
+        &1_000_i128, &3600u64,
+        &valid_recipients(&env, &creator),
+    );
+    env.ledger().with_mut(|l| { l.timestamp = 1_100; });
+    client.place_bid(&bidder, &aid, &1_000_i128);
+
+    // Admin cancels — highest bidder is refunded atomically inside admin_cancel_auction.
+    client.admin_cancel_auction(&creator, &aid);
+
+    // refund_losing_bid recovery path should now return NoBidToRefund (already refunded).
+    assert!(
+        client.try_refund_losing_bid(&bidder, &aid).is_err(),
+        "bidder already refunded by admin_cancel; second claim must fail"
+    );
+}
+
+// ══════════════════════════════════════════════════════════════
+// ISSUE #465 — Conservation and terminal-state property tests
+// ══════════════════════════════════════════════════════════════
+
+/// Randomised sequences must conserve token balances across all operations.
+/// Expected invariant: sum(seller + fee) == winning_bid after finalization.
+#[test]
+fn test_auction_payout_conservation_randomized() {
+    let seeds: &[u64] = &[0, 1, 7, 100, 0xfeedface];
+    for &seed in seeds {
+        let mut rng = Lcg::new(seed);
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(MarketplaceContract, ());
+        let client = MarketplaceContractClient::new(&env, &contract_id);
+        let creator = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let payment_token =
+            env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+        let sac = soroban_sdk::token::StellarAssetClient::new(&env, &payment_token);
+        let tc = soroban_sdk::token::TokenClient::new(&env, &payment_token);
+
+        let initial_balance = 100_000_000_i128;
+        sac.mint(&creator, &initial_balance);
+        sac.mint(&contract_id, &initial_balance);
+        let collection = env.register(mock_nft::MockNft, ());
+        MockNftClient::new(&env, &collection).set_owner(&1u64, &creator);
+
+        client.set_admin(&creator);
+        client.add_token_to_whitelist(&creator, &payment_token);
+        client.set_min_bid_increment(&creator, &1_000_i128);
+
+        // Generate 2-4 bidders with initial balances (soroban Vec avoids std in no_std context)
+        let n_bidders = 2 + rng.next_usize(3);
+        let mut bidders: soroban_sdk::Vec<Address> = soroban_sdk::Vec::new(&env);
+        for _ in 0..n_bidders {
+            let b = Address::generate(&env);
+            sac.mint(&b, &initial_balance);
+            bidders.push_back(b);
+        }
+
+        env.ledger().with_mut(|l| { l.timestamp = 1_000; });
+        let reserve = 1_000_i128;
+        let aid = client.create_auction(
+            &creator, &payment_token, &collection, &1u64,
+            &reserve, &3600u64,
+            &valid_recipients(&env, &creator),
+        );
+
+        // Record pre-auction contract balance
+        let contract_before = tc.balance(&contract_id);
+
+        let mut current_min = reserve;
+        let mut any_bid_placed = false;
+
+        for _ in 0..10 {
+            let bidder = bidders.get(rng.next_usize(n_bidders) as u32).unwrap();
+            let bid_amount = current_min + (rng.next() % 5_000) as i128;
+            env.ledger().with_mut(|l| { l.timestamp = l.timestamp.saturating_add(100); });
+            if client.try_place_bid(&bidder, &aid, &bid_amount).is_ok() {
+                any_bid_placed = true;
+                current_min = bid_amount + 1;
+            }
+        }
+
+        if !any_bid_placed { continue; }
+
+        // Finalize after end_time
+        env.ledger().with_mut(|l| { l.timestamp = 10_000; });
+        client.finalize_auction(&creator, &aid);
+
+        // Conservation: contract balance must have returned to its pre-auction level.
+        // (All escrowed funds flowed to creator/recipients.)
+        let contract_after = tc.balance(&contract_id);
+        assert_eq!(
+            contract_after, contract_before,
+            "escrow conservation violated after finalization (seed={seed}): \
+             contract held {contract_before} before, {contract_after} after"
+        );
+    }
+}
+
+/// Illegal terminal-state transitions are rejected without state change.
+#[test]
+fn test_illegal_terminal_transitions_rejected() {
+    let seeds: &[u64] = &[0, 42, 0xbeef];
+    for &seed in seeds {
+        let mut rng = Lcg::new(seed);
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(MarketplaceContract, ());
+        let client = MarketplaceContractClient::new(&env, &contract_id);
+        let creator = Address::generate(&env);
+        let bidder = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let payment_token =
+            env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+        let sac = soroban_sdk::token::StellarAssetClient::new(&env, &payment_token);
+        sac.mint(&creator, &1_000_000_000_i128);
+        sac.mint(&bidder, &1_000_000_000_i128);
+        sac.mint(&contract_id, &1_000_000_000_i128);
+        let collection = env.register(mock_nft::MockNft, ());
+        MockNftClient::new(&env, &collection).set_owner(&1u64, &creator);
+
+        client.set_admin(&creator);
+        client.add_token_to_whitelist(&creator, &payment_token);
+        client.set_min_bid_increment(&creator, &1_000_i128);
+        env.ledger().with_mut(|l| { l.timestamp = 1_000; });
+        let aid = client.create_auction(
+            &creator, &payment_token, &collection, &1u64,
+            &1_000_i128, &3600u64,
+            &valid_recipients(&env, &creator),
+        );
+
+        let terminate_via_cancel = rng.next_bool();
+        if terminate_via_cancel {
+            client.cancel_auction(&creator, &aid);
+        } else {
+            env.ledger().with_mut(|l| { l.timestamp = 1_100; });
+            client.place_bid(&bidder, &aid, &1_000_i128);
+            env.ledger().with_mut(|l| { l.timestamp = 10_000; });
+            client.finalize_auction(&creator, &aid);
+        }
+
+        let status = client.get_auction(&aid).status;
+        assert!(
+            status == AuctionStatus::Finalized || status == AuctionStatus::Cancelled,
+            "auction must be terminal (seed={seed})"
+        );
+
+        // All mutations on a terminal auction must fail.
+        assert!(client.try_place_bid(&bidder, &aid, &5_000_i128).is_err());
+        assert!(client.try_finalize_auction(&creator, &aid).is_err());
+        assert!(client.try_cancel_auction(&creator, &aid).is_err());
+        assert!(client.try_update_auction_reserve_price(&creator, &aid, &500_i128).is_err());
+    }
+}

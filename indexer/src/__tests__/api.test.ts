@@ -25,6 +25,9 @@ const mockPrisma = vi.hoisted(() => ({
   bid: {
     findMany: vi.fn(),
   },
+  whitelistedToken: {
+    findMany: vi.fn(),
+  },
 }));
 
 const mockRedis = vi.hoisted(() => ({
@@ -725,5 +728,137 @@ describe('GET /auctions/:id/blocked-bidders', () => {
       },
       orderBy: [{ ledgerSequence: 'asc' }, { id: 'asc' }],
     });
+  });
+});
+
+// ── GET /tokens ───────────────────────────────────────────────────────────────
+
+describe('GET /tokens', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  const sampleToken = {
+    address: 'CTOKEN123',
+    addedAtLedger: 100,
+    addedBy: 'GADMIN',
+    active: true,
+  };
+
+  it('returns all whitelisted tokens as JSON', async () => {
+    mockPrisma.whitelistedToken.findMany.mockResolvedValue([sampleToken]);
+
+    const res = await request(app).get('/tokens');
+
+    expect(res.status).toBe(200);
+    expect(Array.isArray(res.body)).toBe(true);
+    expect(res.body).toHaveLength(1);
+    expect(res.body[0].address).toBe('CTOKEN123');
+    expect(res.body[0].active).toBe(true);
+  });
+
+  it('returns only active tokens when active=true query param is provided', async () => {
+    mockPrisma.whitelistedToken.findMany.mockResolvedValue([sampleToken]);
+
+    await request(app).get('/tokens?active=true');
+
+    expect(mockPrisma.whitelistedToken.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { active: true } })
+    );
+  });
+
+  it('returns empty array when no tokens are whitelisted', async () => {
+    mockPrisma.whitelistedToken.findMany.mockResolvedValue([]);
+
+    const res = await request(app).get('/tokens');
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual([]);
+  });
+
+  it('returns 500 when Prisma throws', async () => {
+    mockPrisma.whitelistedToken.findMany.mockRejectedValue(new Error('DB down'));
+
+    const res = await request(app).get('/tokens');
+    expect(res.status).toBe(500);
+    expect(res.body.error).toBeDefined();
+  });
+});
+
+// ── GET /tokens/:address/history ────────────────────────────────────────────────
+
+describe('GET /tokens/:address/history', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  const sampleTokenEvent = {
+    id: 1,
+    eventType: 'TOKEN_WHITELISTED',
+    actor: 'GADMIN',
+    data: { address: 'CTOKEN123' },
+    ledgerSequence: 100,
+    ledgerTimestamp: new Date('2024-01-01T00:00:00Z'),
+  };
+
+  it('returns the event history for a token', async () => {
+    mockPrisma.marketplaceEvent.findMany.mockResolvedValue([sampleTokenEvent]);
+    mockPrisma.marketplaceEvent.count.mockResolvedValue(1);
+
+    const res = await request(app).get('/tokens/CTOKEN123/history');
+
+    expect(res.status).toBe(200);
+    expect(res.body.events).toBeDefined();
+    expect(Array.isArray(res.body.events)).toBe(true);
+    expect(res.body.total).toBe(1);
+    expect(res.body.events[0].eventType).toBe('TOKEN_WHITELISTED');
+  });
+
+  it('queries by the correct token address in data', async () => {
+    mockPrisma.marketplaceEvent.findMany.mockResolvedValue([]);
+    mockPrisma.marketplaceEvent.count.mockResolvedValue(0);
+
+    await request(app).get('/tokens/CTOKEN456/history');
+
+    expect(mockPrisma.marketplaceEvent.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: {
+          eventType: { in: ['TOKEN_WHITELISTED', 'TOKEN_REMOVED'] },
+          data: {
+            path: ['address'],
+            equals: 'CTOKEN456',
+          },
+        },
+      })
+    );
+  });
+
+  it('returns empty array when no events exist for the token', async () => {
+    mockPrisma.marketplaceEvent.findMany.mockResolvedValue([]);
+    mockPrisma.marketplaceEvent.count.mockResolvedValue(0);
+
+    const res = await request(app).get('/tokens/CTOKEN789/history');
+    expect(res.status).toBe(200);
+    expect(res.body.events).toEqual([]);
+    expect(res.body.total).toBe(0);
+  });
+
+  it('orders events by ledger sequence ascending', async () => {
+    mockPrisma.marketplaceEvent.findMany.mockResolvedValue([
+      sampleTokenEvent,
+      { ...sampleTokenEvent, id: 2, eventType: 'TOKEN_REMOVED', ledgerSequence: 150 },
+    ]);
+    mockPrisma.marketplaceEvent.count.mockResolvedValue(2);
+
+    await request(app).get('/tokens/CTOKEN123/history');
+
+    expect(mockPrisma.marketplaceEvent.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        orderBy: [{ ledgerSequence: 'asc' }, { id: 'asc' }],
+      })
+    );
+  });
+
+  it('returns 500 when Prisma throws', async () => {
+    mockPrisma.marketplaceEvent.findMany.mockRejectedValue(new Error('DB down'));
+
+    const res = await request(app).get('/tokens/CTOKEN123/history');
+    expect(res.status).toBe(500);
+    expect(res.body.error).toBeDefined();
   });
 });

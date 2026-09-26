@@ -29,6 +29,7 @@ import {
   backfillBatchInserted,
   backfillLockContentions,
 } from './metrics.js';
+import { runReconciliation } from './reconciler.js';
 
 dotenv.config();
 
@@ -71,6 +72,12 @@ export interface RunBackfillOptions {
   concurrency?: number;
   /** Suppress CLI progress bar output (useful in tests / API calls). */
   silent?: boolean;
+  /**
+   * When true, run a reconciliation sample after the job completes to verify
+   * the backfilled range against on-chain state.  Discrepancies are logged
+   * and included in BackfillResult.reconciliationDiscrepancies.
+   */
+  reconcileOnCompletion?: boolean;
 }
 
 export interface BackfillResult {
@@ -80,6 +87,8 @@ export interface BackfillResult {
   totalInserted: number;
   processedLedger: number;
   status: BackfillJobStatus;
+  /** Set when reconcileOnCompletion=true. Number of discrepancies found. */
+  reconciliationDiscrepancies?: number;
 }
 
 // ── In-process status (exported for /backfill/status endpoint) ────────────────
@@ -491,7 +500,42 @@ export async function runBackfill(opts: RunBackfillOptions = {}): Promise<Backfi
 
     _currentStatus = { ..._currentStatus, running: false, percentage: 100 };
 
-    return { jobId: job.id, startLedger, endLedger, totalInserted, processedLedger, status: 'Completed' };
+    // ── Optional post-completion reconciliation ─────────────────────────────
+    let reconciliationDiscrepancies: number | undefined;
+    if (opts.reconcileOnCompletion) {
+      try {
+        const recResult = await runReconciliation(
+          server,
+          process.env.MARKETPLACE_CONTRACT_ID || '',
+          // Use a small sample to avoid blocking — backfill may be called
+          // in bulk and we don't want reconciliation to become the bottleneck.
+          Math.min(20, Math.ceil(totalInserted / 10)),
+          undefined,
+          undefined,
+          true,   // always dry-run: backfill reconciliation is read-only
+        );
+        reconciliationDiscrepancies = recResult.discrepancies.length;
+        if (reconciliationDiscrepancies > 0) {
+          logger.warn('backfill: post-completion reconciliation found discrepancies', {
+            jobId: job.id,
+            discrepancies: reconciliationDiscrepancies,
+          });
+        } else {
+          logger.info('backfill: post-completion reconciliation clean', { jobId: job.id });
+        }
+      } catch (err) {
+        logger.error('backfill: post-completion reconciliation failed (non-fatal)', {
+          jobId: job.id,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
+    return {
+      jobId: job.id, startLedger, endLedger, totalInserted, processedLedger,
+      status: 'Completed',
+      ...(reconciliationDiscrepancies !== undefined ? { reconciliationDiscrepancies } : {}),
+    };
 
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);

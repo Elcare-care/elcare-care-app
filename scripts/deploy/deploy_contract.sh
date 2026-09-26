@@ -5,12 +5,34 @@
 # contract to Stellar Testnet.
 # Requires: fund_account.sh to have been run first.
 #
-# Usage: ./deploy_contract.sh [--dry-run] [--help]
+# Usage: ./deploy_contract.sh [--dry-run] [--skip-verification] [--help]
 #
 # Flags:
-#   --dry-run   Validate prerequisites and print what would
-#               happen, but make no on-chain changes.
-#   --help      Show this message and exit.
+#   --dry-run            Validate prerequisites and print what would
+#                         happen, but make no on-chain changes.
+#   --skip-verification  Skip the release artifact verification gate
+#                         (see below). UNSAFE — local/dev use only.
+#                         Refused when DEPLOY_ENV=production.
+#   --help                Show this message and exit.
+#
+# Release artifact verification (issue #540):
+#   If RELEASE_ARTIFACTS_DIR is set, this script treats it as a
+#   downloaded, signed GitHub Release (see
+#   .github/workflows/release.yml and docs/RELEASE_VERIFICATION.md)
+#   and runs scripts/release/verify-artifact.sh against it before
+#   building or deploying anything. Deployment aborts if verification
+#   fails. This does NOT change what gets deployed (the contract is
+#   still built fresh from source in this script) — it is a
+#   provenance gate so an operator promoting a specific tagged
+#   release cannot proceed on tampered or unverifiable artifacts.
+#
+#   RELEASE_ARTIFACTS_DIR unset -> verification is skipped (the
+#   common case: building straight from a working tree for testnet
+#   iteration, not promoting a signed release).
+#
+#   DEPLOY_ENV=production (or PRODUCTION=true) -> --skip-verification
+#   is rejected outright, and RELEASE_ARTIFACTS_DIR + a clean
+#   verification pass become mandatory.
 # ============================================================
 set -euo pipefail
 
@@ -25,6 +47,11 @@ WASM_WORKSPACE="$REPO_ROOT/target/wasm32v1-none/release/soroban_marketplace.wasm
 WASM="$WASM_WORKSPACE"
 FRONTEND_ENV="$REPO_ROOT/frontend/elcarehub-app/.env.local"
 DRY_RUN=false
+SKIP_VERIFICATION=false
+RELEASE_ARTIFACTS_DIR="${RELEASE_ARTIFACTS_DIR:-}"
+RELEASE_REPO="${RELEASE_REPO:-your-org/elcarehub}"
+DEPLOY_ENV="${DEPLOY_ENV:-}"
+PRODUCTION="${PRODUCTION:-false}"
 
 usage() {
   grep '^#' "$0" | grep -v '^#!/' | sed 's/^# \{0,1\}//'
@@ -33,15 +60,60 @@ usage() {
 for arg in "$@"; do
   case "$arg" in
     --dry-run) DRY_RUN=true ;;
+    --skip-verification) SKIP_VERIFICATION=true ;;
     -h|--help) usage; exit 0 ;;
     *) echo "ERROR: Unknown flag: $arg"; usage; exit 1 ;;
   esac
 done
 
+IS_PRODUCTION=false
+if [[ "$DEPLOY_ENV" == "production" || "$PRODUCTION" == "true" ]]; then
+  IS_PRODUCTION=true
+fi
+
+if $SKIP_VERIFICATION && $IS_PRODUCTION; then
+  echo "ERROR: --skip-verification is not allowed when DEPLOY_ENV=production (or PRODUCTION=true)."
+  echo "       Production deployments must verify release artifacts. See docs/RELEASE_VERIFICATION.md."
+  exit 1
+fi
+
+if $IS_PRODUCTION && [[ -z "$RELEASE_ARTIFACTS_DIR" ]]; then
+  echo "ERROR: DEPLOY_ENV=production requires RELEASE_ARTIFACTS_DIR to point at a"
+  echo "       downloaded, signed release (see docs/RELEASE_VERIFICATION.md)."
+  exit 1
+fi
+
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "  ELCARE-HUB — Deploy Soroban Contract to Testnet"
 if $DRY_RUN; then echo "  (DRY RUN — no on-chain changes will be made)"; fi
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+# ── Release artifact verification gate ───────────────────────
+if [[ -n "$RELEASE_ARTIFACTS_DIR" ]]; then
+  if $SKIP_VERIFICATION; then
+    echo "WARNING: --skip-verification passed — SKIPPING release artifact verification."
+    echo "         This is UNSAFE and must never be used for a production deployment."
+  else
+    echo ""
+    echo "Verifying release artifacts in $RELEASE_ARTIFACTS_DIR ..."
+    if $DRY_RUN; then
+      echo "DRY RUN: Would run: $SCRIPT_DIR/../release/verify-artifact.sh --dir $RELEASE_ARTIFACTS_DIR --repo $RELEASE_REPO"
+    elif ! "$SCRIPT_DIR/../release/verify-artifact.sh" --dir "$RELEASE_ARTIFACTS_DIR" --repo "$RELEASE_REPO"; then
+      echo "ERROR: Release artifact verification FAILED. Refusing to deploy unverified artifacts."
+      echo "       Use --skip-verification only for local/dev debugging (never in production)."
+      exit 1
+    fi
+    echo "Release artifact verification passed."
+  fi
+elif $IS_PRODUCTION; then
+  # Unreachable given the guard above, but kept as defense-in-depth.
+  echo "ERROR: Production deployment with no RELEASE_ARTIFACTS_DIR set."
+  exit 1
+else
+  echo "NOTE: RELEASE_ARTIFACTS_DIR not set — building from source, skipping release"
+  echo "      artifact verification (only applies when deploying a downloaded,"
+  echo "      signed release; see docs/RELEASE_VERIFICATION.md)."
+fi
 
 # ── Check prerequisites ─────────────────────────────────────
 for cmd in stellar cargo jq; do

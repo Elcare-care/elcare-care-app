@@ -69,17 +69,93 @@ export function mapSorobanErrorMessage(raw: string): string | null {
   return mapped ? `${mapped} (code ${code})` : null;
 }
 
+/**
+ * Default user-facing fallback message used by `getReadableErrorMessage` and
+ * any UI component that needs a generic error string. Centralised here so
+ * copy changes only need to happen in one place.
+ */
+export const DEFAULT_ERROR_MESSAGE = "Something went wrong. Please try again.";
+
 export function getReadableErrorMessage(
   error: unknown,
-  fallback = "Something went wrong. Please try again."
+  fallback = DEFAULT_ERROR_MESSAGE
 ): string {
   if (error instanceof Error) {
     const mapped = mapSorobanErrorMessage(error.message);
-    return mapped ?? error.message ?? fallback;
+    return mapped ?? (error.message || fallback);
   }
   if (typeof error === "string") {
     const mapped = mapSorobanErrorMessage(error);
     return mapped ?? error;
   }
   return fallback;
+}
+
+/**
+ * Returns true when the error represents a network-level failure — i.e. the
+ * request never received an HTTP response (no connectivity, DNS failure, CORS
+ * block, request timeout, etc.). Distinct from `isServerError`, which
+ * indicates the server responded with a 5xx status.
+ *
+ * Only recognises Axios errors. All other values (plain Error, string,
+ * unknown) return false.
+ */
+export function isNetworkError(err: unknown): boolean {
+  return (
+    isAxiosError(err) &&
+    err.response === undefined &&
+    err.request !== undefined
+  );
+}
+
+/**
+ * Returns true when the error is an Axios error with an HTTP response whose
+ * status code is 500 or higher (server-side error). These warrant a "try
+ * again later" UI message, distinct from network errors ("check your
+ * connection") and 4xx client errors (actionable by the user).
+ *
+ * Only recognises Axios errors. All other values return false.
+ */
+export function isServerError(err: unknown): boolean {
+  return isAxiosError(err) && (err.response?.status ?? 0) >= 500;
+}
+
+// ── Internal Axios type guard ─────────────────────────────────
+
+/** Lightweight type guard that identifies Axios errors without importing axios. */
+interface AxiosLikeError {
+  isAxiosError: true;
+  response?: { status: number };
+  request?: unknown;
+}
+
+function isAxiosError(err: unknown): err is AxiosLikeError {
+  return (
+    typeof err === "object" &&
+    err !== null &&
+    (err as Record<string, unknown>).isAxiosError === true
+  );
+}
+
+/**
+ * Structured logger for React error boundaries.
+ *
+ * Call this inside a class component's `componentDidCatch` to produce a
+ * consistent, searchable log entry that includes both the error details and
+ * the React component stack. Using a centralised helper means every error
+ * boundary in the app emits the same shape, making log aggregation and
+ * alerting rules straightforward.
+ *
+ * @param error - The Error object caught by the boundary.
+ * @param info  - The React ErrorInfo object containing `componentStack`.
+ */
+export function onErrorBoundary(
+  error: Error,
+  info: { componentStack: string }
+): void {
+  console.error("[ErrorBoundary]", {
+    error: error.message,
+    stack: error.stack,
+    componentStack: info.componentStack,
+  });
 }

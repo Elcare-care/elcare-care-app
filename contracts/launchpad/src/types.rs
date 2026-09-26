@@ -28,6 +28,33 @@ pub enum Error {
     InvalidMaxSupply = 14,
     /// Creator's balance of `currency` is insufficient to cover the deploy fee (#277).
     InsufficientFee = 15,
+    /// migrate() was called for a version whose marker is already recorded.
+    AlreadyMigrated = 16,
+    /// A collection address lookup returned no record.
+    CollectionNotFound = 17,
+    /// Collection name exceeds the maximum allowed length (Issue #476).
+    NameTooLong = 18,
+    /// Collection symbol exceeds the maximum allowed length (Issue #476).
+    SymbolTooLong = 19,
+    /// max_supply exceeds the platform cap of 1,000,000,000 (Issue #476).
+    MaxSupplyTooLarge = 20,
+}
+
+// `#[contracterror]` in soroban-sdk 25.3.x does not emit `SorobanArbitrary`.
+// We add it manually so `Vec<Error>` inside `PreflightResult` compiles in test mode.
+#[cfg(any(test, feature = "testutils"))]
+impl soroban_sdk::TryFromVal<soroban_sdk::Env, u32> for Error {
+    type Error = soroban_sdk::ConversionError;
+    fn try_from_val(_env: &soroban_sdk::Env, v: &u32) -> Result<Self, Self::Error> {
+        soroban_sdk::Error::from_contract_error(*v)
+            .try_into()
+            .map_err(|_| soroban_sdk::ConversionError)
+    }
+}
+
+#[cfg(any(test, feature = "testutils"))]
+impl soroban_sdk::testutils::arbitrary::SorobanArbitrary for Error {
+    type Prototype = u32;
 }
 
 /// Which of the four collection types was deployed.
@@ -40,7 +67,7 @@ pub enum CollectionKind {
     LazyMint1155,
 }
 
-/// A record stored for every deployed collection (issues #37 + #38).
+/// A record stored for every deployed collection (issues #37 + #38 + #482).
 #[contracttype]
 #[derive(Clone)]
 pub struct CollectionRecord {
@@ -51,6 +78,12 @@ pub struct CollectionRecord {
     pub symbol: String,
     pub ledger: u32,
     pub platform_fee_bps: u32,
+    /// Collection-level default royalty in basis points (0–10 000) (#482).
+    /// Snapshotted at deploy time; used by the marketplace as the fallback
+    /// royalty when no per-listing override is present.
+    pub royalty_bps: u32,
+    /// Royalty receiver address snapshotted at deploy time (#482).
+    pub royalty_receiver: Address,
 }
 
 /// The four collection WASM hashes plus a monotonically increasing version,
@@ -88,7 +121,8 @@ pub struct PreflightResult {
     /// Every validation failure that the matching `deploy_*` call would
     /// raise given identical inputs. Empty means the deployment is expected
     /// to succeed.
-    pub errors: Vec<Error>,
+    /// Error codes are the u32 discriminants of the `Error` enum.
+    pub errors: Vec<u32>,
 }
 
 #[contracttype]
@@ -109,6 +143,8 @@ pub enum DataKey {
     WasmLazy1155,
     /// Active WASM hash for a specific collection kind.
     CollectionWasmHash(CollectionKind),
+    /// Semantic on-chain contract version key (migrate-written).
+    ContractVersion,
     /// Incremented on every `set_wasm_hashes`.
     WasmVersion,
     CollectionCount,
@@ -122,4 +158,19 @@ pub enum DataKey {
     /// Marks a (creator, raw_salt) pair — hashed into the secure salt — as
     /// already consumed by a successful deployment (#277).
     SaltUsed(BytesN<32>),
+    /// Migration completion marker for a version (version string → bool).
+    MigrationDone(soroban_sdk::String),
+    /// Resumable migration cursor (version string → MigrationProgress).
+    MigrationCursor(soroban_sdk::String),
+    /// Explicit holder of the `EmergencyPause` role (Issue #267). Absent
+    /// until `set_emergency_pauser` is called; `pause`/`unpause` fall back to
+    /// `Admin` while absent so existing single-admin deployments are
+    /// unaffected until an operator opts into a separate emergency signer.
+    EmergencyPauser,
+    /// Deployed collection address for a consumed secure salt — enables
+    /// idempotent retries of `deploy_*` after a successful deployment (#477).
+    SaltAddress(BytesN<32>),
+    /// Per-collection pause flag — set by either the collection creator or a
+    /// launchpad admin via the emergency pause path (#478).
+    CollectionPaused(Address),
 }

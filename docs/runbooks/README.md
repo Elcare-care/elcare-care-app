@@ -14,6 +14,7 @@ Each runbook covers: detection, containment, diagnosis, recovery, and post-incid
 | [database-outage.md](./database-outage.md) | PostgreSQL unavailable | CRITICAL |
 | [redis-outage.md](./redis-outage.md) | Redis cache unavailable | MEDIUM |
 | [compromised-admin-key.md](./compromised-admin-key.md) | Admin Stellar key exposed or stolen | CRITICAL |
+| [role-rotation.md](./role-rotation.md) | Role-holder rotation procedure (Issue #473) | HIGH |
 | [contract-pause.md](./contract-pause.md) | Emergency pause / unpause procedure | CRITICAL |
 | [pinata-outage.md](./pinata-outage.md) | Pinata/IPFS unavailable | MEDIUM |
 | [wallet-incompatibility.md](./wallet-incompatibility.md) | Freighter or Magic.link failures | HIGH |
@@ -21,6 +22,7 @@ Each runbook covers: detection, containment, diagnosis, recovery, and post-incid
 | [tabletop-exercises.md](./tabletop-exercises.md) | Exercise records and scenarios | — |
 
 **Secret inventory:** [../secret-inventory.md](../secret-inventory.md)  
+**Reliability reviews & backlog:** [../reliability/README.md](../reliability/README.md)  
 **Existing incident runbook:** [../INCIDENT_RUNBOOK.md](../INCIDENT_RUNBOOK.md) (contract pause, key rotation, keeper)
 
 ---
@@ -76,4 +78,5 @@ Each runbook includes a post-incident review template. Completed reviews are sto
 1. Update the runbook when the system changes
 2. Complete the post-incident review template after every real incident
 3. Use tabletop exercises to validate runbooks quarterly
-4. Update escalation contacts in [tabletop-exercises.md](./tabletop-exercises.md) when team changes
+4. Feed exercise and incident outcomes into the [reliability backlog](../reliability/backlog.md)
+5. Update escalation contacts in [tabletop-exercises.md](./tabletop-exercises.md) when team changes

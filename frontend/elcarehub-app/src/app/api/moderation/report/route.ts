@@ -1,17 +1,22 @@
 // ─────────────────────────────────────────────────────────────
 // app/api/moderation/report/route.ts
 //
-// Issue #308 / #43 — Content report endpoint
+// Issue #308 / #43, extended by Issue #542 — Content report endpoint
+//
+// Proxies to the indexer's POST /moderation/reports and GET
+// /moderation/cases/:cid (see lib/moderation.ts), falling back to an
+// in-memory store only if the indexer is unreachable.
 //
 // POST /api/moderation/report
 //   Accepts a user content report for an IPFS CID.
 //   Advances moderation state to QUARANTINED when the
-//   report threshold (3) is reached.
+//   report threshold (3) is reached. Never echoes reporterAddress back.
+//   See docs/MODERATION_POLICY.md for the full workflow.
 //
 // GET /api/moderation/report?cid=<CID>
 //   Returns the current moderation record for a CID.
-//   Audit trail and internal reason fields are omitted
-//   from the public response.
+//   Audit trail, reporter identity, and internal reason fields are
+//   omitted from the public response.
 // ─────────────────────────────────────────────────────────────
 
 import { NextRequest, NextResponse } from "next/server";
@@ -96,7 +101,7 @@ export async function POST(req: NextRequest) {
     reporterAddress: typeof obj.reporterAddress === "string" ? obj.reporterAddress : undefined,
   };
 
-  const record = applyReport(request);
+  const record = await applyReport(request);
 
   // Return the public-safe subset (no internal reason or reviewer identity)
   return NextResponse.json(
@@ -120,7 +125,7 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ error: "Query param 'cid' is required." }, { status: 400 });
   }
 
-  const record = getModerationRecord(cid.trim());
+  const record = await getModerationRecord(cid.trim());
   if (!record) {
     return NextResponse.json({ error: "No moderation record found for this CID." }, { status: 404 });
   }

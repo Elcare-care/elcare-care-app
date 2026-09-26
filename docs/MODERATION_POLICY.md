@@ -85,6 +85,37 @@ All state changes are recorded in a tamper-evident audit log with actor, timesta
 
 ---
 
+## 4a. Moderation API (Issue #542)
+
+The workflow above is implemented by the indexer's `/moderation` endpoints
+(`indexer/src/api/moderation-routes.ts`), persisted in Postgres via Prisma
+(`ModerationCase`, `ModerationReport`, `ModerationDecision`, `ModerationAppeal`
+in `indexer/prisma/schema.prisma`):
+
+| Endpoint | Access | Purpose |
+|---|---|---|
+| `POST /moderation/reports` | Public | Submit a report. Never echoes the reporter's address. Deduplicates by (cid, reporterAddress). |
+| `GET /moderation/cases/:cid` | Public | State + report count only — no reporter identity, no evidence text, no internal reason. |
+| `GET /moderation/cases` | Operator | Paginated triage list, filterable by state. |
+| `GET /moderation/cases/:cid/full` | Operator | Full case: reports (with evidence + reporter address), decisions, appeals. |
+| `POST /moderation/cases/:cid/decision` | Operator | Set state (`APPROVED` / `QUARANTINED` / `REJECTED`), writes a `ModerationDecision`. |
+| `POST /moderation/cases/:cid/appeals` | Authenticated | Uploader/creator appeals a `QUARANTINED` or `REJECTED` case. |
+| `POST /moderation/appeals/:id/decision` | Operator | Resolve an appeal — `UPHELD` keeps the rejection, `OVERTURNED` reinstates the case's state. |
+
+Operator routes require the `OPERATOR_TOKEN` credential (see
+`indexer/src/api/auth-middleware.ts`). The frontend never holds this token in
+the browser bundle — the admin UI (`/admin`) calls it through a Next.js
+server-side proxy (`frontend/elcarehub-app/src/app/api/moderation/admin/*`).
+
+Listing responses (`GET /listings`, `GET /listings/:id`, `GET /search`)
+include a `moderationState` field derived from the associated
+`ModerationCase` by `listingId`. Listings in a `QUARANTINED` or `REJECTED`
+state are excluded from default public list/search results but remain
+fetchable by id — the record itself, including all provenance fields, is
+never deleted or rewritten.
+
+---
+
 ## 5. Blocked-Content Presentation
 
 When a page detects that an asset's state is `QUARANTINED` or `REJECTED`:
@@ -116,6 +147,8 @@ If you are a rights holder seeking a formal DMCA takedown or equivalent, please 
 | 3 | Admin reviews audit log within 48 hours |
 | 4 | Admin sets final state: `APPROVED` (false positive) or `REJECTED` (confirmed violation) |
 | 5 | For CSAM or credible threats, escalate to NCMEC / local law enforcement immediately |
+| 6 | The uploader/creator may file an appeal via `POST /moderation/cases/:cid/appeals` against a `QUARANTINED` or `REJECTED` decision |
+| 7 | An admin resolves the appeal via `POST /moderation/appeals/:id/decision` — `UPHELD` keeps the decision, `OVERTURNED` reinstates the case |
 
 ---
 

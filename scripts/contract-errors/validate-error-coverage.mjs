@@ -207,7 +207,32 @@ function main() {
     }
 
     if (stale.length > 0) {
-      report.push(`  ⚠ ${contract.key}: ${stale.length} catalog entr${stale.length === 1 ? "y" : "ies"} no longer present in the contract (safe to remove): ${stale.map((s) => `${s.name}=${s.code}`).join(", ")}`);
+      hasFailure = true;
+      report.push(`✗ ${contract.key}: ${stale.length} stale catalog entr${stale.length === 1 ? "y" : "ies"} that no longer exist in the contract — remove them to keep codes unambiguous: ${stale.map((s) => `${s.name}=${s.code}`).join(", ")}`);
+    }
+  }
+
+  // Issue #475: every non-retryable marketplace entry that involves a financial
+  // operation (settlement, royalty, escrow) must have a defined operator action
+  // (not "none" or undefined) so runbooks and alerts can reference it.
+  const FINANCIAL_ERROR_NAMES = new Set([
+    "ArithmeticOverflow",
+    "RoyaltyExceedsLimit",
+    "RoyaltyAlreadyClaimed",
+    "RoyaltyClaimNotFound",
+    "TokenAlreadyEscrowed",
+    "NotTokenOwner",
+  ]);
+  // Re-read the catalog for the financial-error policy check
+  const catalogTs = readFileSync(CATALOG_TS_PATH, "utf8");
+  // Extract the inline retryable+action values for marketplace errors.
+  const financialPolicyPattern = /\{\s*code:\s*(\d+),\s*name:\s*"([^"]+)",\s*message:\s*"[^"]*",\s*retryable:\s*(true|false),\s*action:\s*"([^"]+)"\s*\}/g;
+  let m;
+  while ((m = financialPolicyPattern.exec(catalogTs)) !== null) {
+    const [, , name, retryable, action] = m;
+    if (FINANCIAL_ERROR_NAMES.has(name) && retryable === "false" && action === "none") {
+      hasFailure = true;
+      report.push(`✗ marketplace: non-retryable financial error "${name}" has action "none" — assign "contact_support" or a more specific action so operators have guidance.`);
     }
   }
 

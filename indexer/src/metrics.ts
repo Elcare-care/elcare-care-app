@@ -1,6 +1,13 @@
 import client from 'prom-client';
 import express from 'express';
 import { logger } from './logger.js';
+import { requestIdMiddleware } from './api/request-id-middleware.js';
+
+// Re-exported under its old name for backwards compatibility with existing
+// call sites/imports. The plain-text console.log implementation that used to
+// live here has been replaced by the structured JSON + correlation-ID
+// middleware in ./api/request-id-middleware.ts — see that file for behavior.
+export { requestIdMiddleware as requestLogger };
 
 // Enable default metrics (CPU, memory, etc.)
 client.collectDefaultMetrics();
@@ -37,6 +44,19 @@ export const eventDecodeErrorsCounter = new client.Counter({
   name: 'indexer_decode_errors_by_type_total',
   help: 'Total XDR event decode errors by event type',
   labelNames: ['event_type'],
+});
+
+/**
+ * Counts events whose `schema_version` is higher than what this indexer
+ * build understands (Issue #278). Distinct from `eventDecodeErrorsCounter`:
+ * the event decoded structurally fine, it's just a version the indexer
+ * hasn't been updated to recognize as safe — a signal that the indexer is
+ * behind the deployed contract and needs investigation/upgrade.
+ */
+export const unsupportedSchemaVersionCounter = new client.Counter({
+  name: 'indexer_unsupported_schema_version_total',
+  help: 'Total events skipped because their schema_version is not recognized by this indexer build, by event type and version',
+  labelNames: ['event_type', 'schema_version'],
 });
 
 export const duplicateEventsCounter = new client.Counter({
@@ -178,24 +198,8 @@ export const eventProcessingDurationHistogram = new client.Histogram({
   buckets: [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1],
 });
 
-// Request logging middleware
-export function requestLogger(req: express.Request, res: express.Response, next: express.NextFunction) {
-  const startTime = Date.now();
-
-  res.on('finish', () => {
-    const latency = Date.now() - startTime;
-    const statusClass = res.statusCode < 400 ? '2xx/3xx' : res.statusCode < 500 ? '4xx' : '5xx';
-    
-    // Skip logging for health checks and metrics
-    if (req.path !== '/health' && req.path !== '/metrics' && req.path !== '/readyz') {
-      console.log(
-        `${req.method} ${req.path} ${res.statusCode} ${latency}ms`
-      );
-    }
-  });
-
-  next();
-}
+// Structured request logging (JSON, with correlation IDs) lives in
+// ./api/request-id-middleware.ts — this file only owns Prometheus metrics.
 
 // Middleware to track HTTP response times
 export function metricsMiddleware(req: express.Request, res: express.Response, next: express.NextFunction) {
@@ -220,6 +224,113 @@ export function metricsMiddleware(req: express.Request, res: express.Response, n
   
   next();
 }
+
+// ── Cache metrics ─────────────────────────────────────────────────────────────
+
+export const cacheHitsTotal = new client.Counter({
+  name: 'elcarehub_cache_hits_total',
+  help: 'Total cache hits by resource kind',
+  labelNames: ['resource'],
+});
+
+export const cacheMissesTotal = new client.Counter({
+  name: 'elcarehub_cache_misses_total',
+  help: 'Total cache misses by resource kind',
+  labelNames: ['resource'],
+});
+
+export const cacheStaleBypassTotal = new client.Counter({
+  name: 'elcarehub_cache_stale_bypass_total',
+  help: 'Total stale cache bypasses by resource kind',
+  labelNames: ['resource'],
+});
+
+export const cacheBypassTotal = new client.Counter({
+  name: 'elcarehub_cache_bypass_total',
+  help: 'Total cache bypasses (Redis unavailable) by resource kind',
+  labelNames: ['resource'],
+});
+
+export const cacheInvalidationsTotal = new client.Counter({
+  name: 'elcarehub_cache_invalidations_total',
+  help: 'Total cache invalidations by resource kind',
+  labelNames: ['resource'],
+});
+
+export const cacheInvalidationFailuresTotal = new client.Counter({
+  name: 'elcarehub_cache_invalidation_failures_total',
+  help: 'Total cache invalidation failures by resource kind',
+  labelNames: ['resource'],
+});
+
+// ── SSE metrics ───────────────────────────────────────────────────────────────
+
+/** Total events delivered via SSE. */
+export const sseEventsDeliveredTotal = new client.Counter({
+  name: 'elcarehub_sse_events_delivered_total',
+  help: 'Total SSE events delivered to clients',
+});
+
+/** Total SSE events dropped due to slow clients (queue overflow). */
+export const sseEventsDroppedTotal = new client.Counter({
+  name: 'elcarehub_sse_events_dropped_total',
+  help: 'Total SSE events dropped due to client queue overflow',
+});
+
+/** Total SSE replay requests (clients resuming from lastEventId). */
+export const sseReplayRequestsTotal = new client.Counter({
+  name: 'elcarehub_sse_replay_requests_total',
+  help: 'Total SSE replay requests (clients resuming from lastEventId)',
+});
+
+/** Total Redis publish failures (degraded fallback mode triggered). */
+export const sseRedisPublishFailuresTotal = new client.Counter({
+  name: 'elcarehub_sse_redis_publish_failures_total',
+  help: 'Total Redis publish failures (degraded fallback mode triggered)',
+});
+
+/** Total degraded-fallback events (Redis unavailable). */
+export const sseDegradedFallbackTotal = new client.Counter({
+  name: 'elcarehub_sse_degraded_fallback_total',
+  help: 'Total events delivered via degraded fallback (in-memory ring buffer)',
+});
+
+/** Total subscriber reconnects (Redis pub/sub reconnection events). */
+export const sseSubscriberReconnectsTotal = new client.Counter({
+  name: 'elcarehub_sse_subscriber_reconnects_total',
+  help: 'Total subscriber reconnect events (Redis pub/sub reconnection)',
+});
+
+// ── Worker lease metrics ───────────────────────────────────────────────────────
+
+export const indexerLeaseAcquisitionsTotal = new client.Counter({
+  name: 'elcarehub_lease_acquisitions_total',
+  help: 'Total successful lease acquisitions',
+  labelNames: ['role'],
+});
+
+export const indexerLeaseRenewalsTotal = new client.Counter({
+  name: 'elcarehub_lease_renewals_total',
+  help: 'Total successful lease renewals',
+  labelNames: ['role'],
+});
+
+export const indexerLeaseLostTotal = new client.Counter({
+  name: 'elcarehub_lease_lost_total',
+  help: 'Total times a worker lost its lease',
+  labelNames: ['role'],
+});
+
+export const indexerLeaseContentionTotal = new client.Counter({
+  name: 'elcarehub_lease_contention_total',
+  help: 'Total lease acquisition contentions',
+  labelNames: ['role'],
+});
+
+export const indexerWorkerLeaseGauge = new client.Gauge({
+  name: 'elcarehub_worker_lease_held',
+  help: '1 when this instance holds the active worker lease, 0 otherwise',
+});
 
 // ── Keeper metrics ────────────────────────────────────────────────────────────
 //
@@ -280,6 +391,12 @@ export const keeperFeeBumpsTotal = new client.Counter({
   labelNames: ['entry_point'],
 });
 
+/** Number of storage entries within 50,000 ledgers of TTL expiry (Issue #280). */
+export const elcarehubEntriesNearExpiry = new client.Gauge({
+  name: 'elcarehub_entries_near_expiry',
+  help: 'Number of listings, auctions, and offers within 50,000 ledgers of their TTL expiry',
+});
+
 // ── Backfill / gap-repair metrics ─────────────────────────────────────────────
 
 /** Number of Open LedgerGap rows currently in the DB (set each gap-repair cycle). */
@@ -335,6 +452,19 @@ export const backfillLockContentions = new client.Counter({
   help: 'Number of times a BackfillJob advisory lock was already held by another worker',
 });
 
+// ── User-facing transaction error metrics (#417) ──────────────────────────────
+
+/**
+ * Counts every user-facing transaction error by category.
+ * Increment whenever a write action (listing, purchase, bid, offer, deploy)
+ * fails and the error is surfaced to the user. Labels match TxErrorCategory.
+ */
+export const txSubmissionErrorsTotal = new client.Counter({
+  name: 'elcarehub_tx_submission_errors_total',
+  help: 'Total user-facing transaction submission errors, by category',
+  labelNames: ['category'],
+});
+
 // ── Dead-letter metrics (#287) ────────────────────────────────────────────────
 
 /** Total events that failed to parse and were persisted to dead-letter storage. */
@@ -354,6 +484,43 @@ export const deadLetterPendingGauge = new client.Gauge({
 export const deadLetterOldestAgeSeconds = new client.Gauge({
   name: 'indexer_dead_letter_oldest_age_seconds',
   help: 'Age in seconds of the oldest unresolved (Pending) dead-letter event',
+});
+
+/**
+ * Total dead-letter replay attempts, by outcome.
+ * outcome label values: "success" | "parse_null" | "parse_error" | "projection_error" | "duplicate"
+ */
+export const deadLetterReplayAttemptsTotal = new client.Counter({
+  name: 'indexer_dead_letter_replay_attempts_total',
+  help: 'Total dead-letter replay attempts, by outcome',
+  labelNames: ['outcome'],
+});
+
+/** Total dead-letter records successfully re-projected into domain tables. */
+export const deadLetterReplayProjectedTotal = new client.Counter({
+  name: 'indexer_dead_letter_replay_projected_total',
+  help: 'Total dead-letter records whose events were successfully re-projected',
+});
+
+// ── Snapshot metrics ──────────────────────────────────────────────────────────
+
+/** Total IndexerSnapshot rows written. */
+export const snapshotsWrittenTotal = new client.Counter({
+  name: 'indexer_snapshots_written_total',
+  help: 'Total immutable ledger snapshots written',
+});
+
+/** Total snapshot RPC verifications, by result. */
+export const snapshotVerificationsTotal = new client.Counter({
+  name: 'indexer_snapshot_verifications_total',
+  help: 'Total snapshot RPC verifications, by result (match | mismatch | error)',
+  labelNames: ['result'],
+});
+
+/** Gauge set to 1 when the most-recent snapshot has a hash mismatch, 0 otherwise. */
+export const snapshotHashMismatchGauge = new client.Gauge({
+  name: 'indexer_snapshot_hash_mismatch',
+  help: '1 when the most-recent verified snapshot has a hash mismatch; requires operator action',
 });
 
 // ── Reconciliation metrics (#288) ─────────────────────────────────────────────
@@ -392,6 +559,140 @@ export const reconcilerSkippedTotal = new client.Counter({
   labelNames: ['reason'],
 });
 
+// ── Financial reconciliation metrics (Issue #XXX) ─────────────────────────────
+
+/** Total financial reconciliation runs completed, by outcome. */
+export const financialReconcileRunsTotal = new client.Counter({
+  name: 'financial_reconcile_runs_total',
+  help: 'Total financial reconciliation runs completed, by outcome (ok | error)',
+  labelNames: ['outcome', 'dry_run'],
+});
+
+/** Total financial drifts detected, by entity type and severity. */
+export const financialDriftsDetectedTotal = new client.Counter({
+  name: 'financial_drifts_detected_total',
+  help: 'Total financial drifts detected during reconciliation, by entity type and severity',
+  labelNames: ['entity_type', 'severity'],
+});
+
+/** Total financial alerts raised, by entity type. */
+export const financialAlertsRaisedTotal = new client.Counter({
+  name: 'financial_alerts_raised_total',
+  help: 'Total financial alerts raised during reconciliation, by entity type',
+  labelNames: ['entity_type'],
+});
+
+/** Current number of unresolved financial drifts, by severity. */
+export const financialDriftsOpenGauge = new client.Gauge({
+  name: 'financial_drifts_open',
+  help: 'Current number of unresolved financial drifts, by severity',
+  labelNames: ['severity'],
+});
+
+/** Protocol-level aggregate totals for reconciliation verification. */
+export const financialProtocolAggregateGauge = new client.Gauge({
+  name: 'financial_protocol_aggregate',
+  help: 'Protocol-level aggregate totals for financial reconciliation verification',
+  labelNames: ['metric'], // protocol_fees, royalties, sales, refunds
+});
+
+/** Per-token aggregate totals for reconciliation verification. */
+export const financialTokenAggregateGauge = new client.Gauge({
+  name: 'financial_token_aggregate',
+  help: 'Per-token aggregate totals for financial reconciliation verification',
+  labelNames: ['token', 'metric'],
+});
+
+/** Per-collection aggregate totals for reconciliation verification. */
+export const financialCollectionAggregateGauge = new client.Gauge({
+  name: 'financial_collection_aggregate',
+  help: 'Per-collection aggregate totals for financial reconciliation verification',
+  labelNames: ['collection', 'metric'],
+});
+
+/** Per-ledger aggregate totals for reconciliation verification. */
+export const financialLedgerAggregateGauge = new client.Gauge({
+  name: 'financial_ledger_aggregate',
+  help: 'Per-ledger aggregate totals for financial reconciliation verification',
+  labelNames: ['ledger_sequence', 'metric'],
+});
+
+/** Duration of financial reconciliation runs in seconds. */
+export const financialReconcileDurationSeconds = new client.Histogram({
+  name: 'financial_reconcile_duration_seconds',
+  help: 'Duration of financial reconciliation runs in seconds',
+  buckets: [1, 5, 10, 30, 60, 120, 300],
+});
+
+/** Age in seconds of the oldest unresolved financial drift. */
+export const financialDriftOldestAgeSeconds = new client.Gauge({
+  name: 'financial_drift_oldest_age_seconds',
+  help: 'Age in seconds of the oldest unresolved financial drift (0 when none)',
+});
+
+// ── RPC pagination metrics (Issue #487) ──────────────────────────────────────
+
+/** Total RPC event pages fetched during ingestion. */
+export const rpcPagesFetchedTotal = new client.Counter({
+  name: 'indexer_rpc_pages_fetched_total',
+  help: 'Total RPC event pages fetched during ingestion',
+});
+
+/** Total times the poller was rate-limited (HTTP 429) by the RPC provider. */
+export const rpcRateLimitedTotal = new client.Counter({
+  name: 'indexer_rpc_rate_limited_total',
+  help: 'Total rate-limit (429) responses received from the RPC provider',
+});
+
+/** Current adaptive page size being used for RPC event queries. */
+export const rpcAdaptivePageSizeGauge = new client.Gauge({
+  name: 'indexer_rpc_adaptive_page_size',
+  help: 'Current adaptive page size used for RPC getEvents queries',
+});
+
+// ── Abuse / anomaly detection metrics (Issue #539) ────────────────────────────
+//
+// route_family: 'search' | 'sse' | 'wallet-activity' | 'tx-lookup'
+// key_type:     'wallet' | 'ip_hash' — the label is always the KIND of key,
+//               never the raw wallet address or IP itself, so metric labels
+//               never become a long-lived per-user identity log. A wallet
+//               address is a public blockchain identifier, not verified
+//               identity — see indexer/src/api/abuse-detection.ts.
+
+/** Total requests rejected for exceeding a per-route-family abuse quota. */
+export const abuseQuotaExceededTotal = new client.Counter({
+  name: 'elcarehub_abuse_quota_exceeded_total',
+  help: 'Total requests rejected for exceeding a per-route-family abuse quota, by route family and key type',
+  labelNames: ['route_family', 'key_type'],
+});
+
+/** Total abuse anomaly signals detected (quota breaches, blocklist hits, etc). */
+export const abuseAnomalyDetectedTotal = new client.Counter({
+  name: 'elcarehub_abuse_anomaly_detected_total',
+  help: 'Total abuse anomaly signals detected, by route family, key type, and reason',
+  labelNames: ['route_family', 'key_type', 'reason'],
+});
+
+/** Total requests rejected because the key was on the temporary abuse blocklist. */
+export const abuseBlockedRequestsTotal = new client.Counter({
+  name: 'elcarehub_abuse_blocked_requests_total',
+  help: 'Total requests rejected because the key was on the temporary abuse blocklist, by route family and key type',
+  labelNames: ['route_family', 'key_type'],
+});
+
+/** Current number of keys (wallet or IP hash) on the temporary abuse blocklist. */
+export const abuseBlocklistActiveGauge = new client.Gauge({
+  name: 'elcarehub_abuse_blocklist_active',
+  help: 'Current number of keys (wallet or IP hash) on the temporary abuse blocklist',
+});
+
+/** Total times abuse detection failed open because Redis was unavailable. */
+export const abuseDetectionRedisFailureTotal = new client.Counter({
+  name: 'elcarehub_abuse_detection_redis_failures_total',
+  help: 'Total times abuse detection failed open (request allowed) because Redis was unavailable, by operation',
+  labelNames: ['operation'],
+});
+
 // ── Expose metrics handler ────────────────────────────────────────────────────
 
 export async function handleMetrics(req: express.Request, res: express.Response) {
@@ -403,3 +704,86 @@ export async function handleMetrics(req: express.Request, res: express.Response)
     res.status(500).end('Failed to retrieve metrics');
   }
 }
+
+// ── Autoscaling-friendly metrics (normalized gauges with bounded labels) ─────
+
+/**
+ * Normalized lag behind network tip (ledgers).
+ * Scale-out signal: increasing lag over time indicates need for more indexer instances.
+ * Recovery signal: sudden spike followed by decline indicates gap repair or re-org recovery.
+ */
+export const ledgerLagGauge = new client.Gauge({
+  name: 'indexer_ledger_lag',
+  help: 'Current number of ledgers the indexer is behind the network tip',
+});
+
+/**
+ * Number of unresolved LedgerGap rows.
+ * Scale-out signal: stable/low count is healthy; gaps fill naturally as indexer catches up.
+ * Recovery signal: sudden increase indicates chain re-org or RPC window skip; requires operator review.
+ */
+export const openGapsCountGauge = new client.Gauge({
+  name: 'indexer_open_gaps_count',
+  help: 'Current number of unresolved LedgerGap rows',
+});
+
+/**
+ * Total ledgers covered by open gaps.
+ * Scale-out signal: not a direct scaling signal (gaps are fixed sequentially).
+ * Recovery signal: large values indicate significant catch-up work needed.
+ */
+export const openGapsLedgersTotalGauge = new client.Gauge({
+  name: 'indexer_open_gaps_ledgers_total',
+  help: 'Total number of ledgers covered by all open LedgerGap rows',
+});
+
+/**
+ * RPC call latency histogram (seconds).
+ * Scale-out signal: sustained high latency may indicate need for more indexer instances to spread load.
+ * Recovery signal: latency spikes during gap repair/recovery are expected and transient.
+ */
+export const rpcLatencySeconds = new client.Histogram({
+  name: 'indexer_rpc_latency_seconds',
+  help: 'RPC call latency in seconds (histogram for p50/p95/p99)',
+  buckets: [0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30],
+});
+
+/**
+ * Current number of connections in use from the database connection pool.
+ * Scale-out signal: pool saturation (接近 connection_limit) indicates need for more indexer instances.
+ * Recovery signal: not a direct scaling signal, but sustained saturation slows all operations.
+ */
+export const dbPoolConnectionsUsedGauge = new client.Gauge({
+  name: 'indexer_db_pool_connections_used',
+  help: 'Current number of connections in use from the read DB pool',
+});
+
+/**
+ * Current number of active SSE client connections.
+ * Scale-out signal: this is per-instance; for Kubernetes HPA, use the ratio to target connections per pod.
+ */
+export const sseConnectionsGauge = new client.Gauge({
+  name: 'indexer_sse_connections',
+  help: 'Current number of active SSE client connections',
+});
+
+/**
+ * Current number of pending jobs in the metadata (IPFS) queue.
+ * Scale-out signal: sustained backlog indicates need for more indexer instances.
+ * Recovery signal: transient spikes during gap repair or batch backfill are expected.
+ */
+export const metadataQueueDepthGauge = new client.Gauge({
+  name: 'indexer_metadata_queue_depth',
+  help: 'Current number of pending jobs in the metadata enrichment queue',
+});
+
+/**
+ * Metadata queue depth broken down by priority tier (high, normal, low).
+ * Scale-out signal: high-priority backlog indicates real-time content is backing up.
+ * Recovery signal: low-priority backlog growing during gap repair is expected.
+ */
+export const metadataQueueDepthByPriorityGauge = new client.Gauge({
+  name: 'indexer_metadata_queue_depth_by_priority',
+  help: 'Metadata queue depth by priority tier (high, normal, low)',
+  labelNames: ['priority'],
+});

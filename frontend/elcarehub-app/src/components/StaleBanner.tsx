@@ -13,36 +13,171 @@
 // ─────────────────────────────────────────────────────────────
 
 import React, { useState, useEffect, useRef, useCallback } from "react";
-import { RefreshCw, WifiOff, Clock, X } from "lucide-react";
+import Link from "next/link";
+import { RefreshCw, WifiOff, Clock, X, ServerCrash, AlertTriangle } from "lucide-react";
 import {
   FreshnessMetadata,
   isDataStale,
   STALE_THRESHOLDS_MS,
   makeFreshness,
 } from "@/lib/indexer";
+import type { IndexerFreshnessStatus, ReorgNotice } from "@/hooks/useIndexerFreshness";
 import { config } from "@/lib/config";
 
 // ── StaleBanner ───────────────────────────────────────────────
+//
+// Non-blocking status indicator for indexer-backed views.
+//
+// Two ways to drive it:
+//   1. Pass `status` (+ optionally `reorg`) from useIndexerFreshness — the
+//      hook's classification (healthy/lagging/unavailable/critical_reorg)
+//      decides what renders. This is the preferred path for new call sites.
+//   2. Omit `status` and pass only `freshness`/`resourceType` — legacy
+//      two-state behaviour (stale / SSE-disconnected) is preserved for any
+//      existing caller that predates the status-aware hook.
+//
+// In every state, the banner communicates via text + role="status"/"alert"
+// and an icon — never color alone — and never blocks interaction with the
+// rest of the page.
 
 interface StaleBannerProps {
   freshness: FreshnessMetadata | null;
   resourceType?: keyof typeof STALE_THRESHOLDS_MS;
   onRefresh: () => void;
   isRefreshing?: boolean;
+  /** Classification from useIndexerFreshness. When provided, this drives
+   *  which variant renders instead of the legacy stale/SSE-down check. */
+  status?: IndexerFreshnessStatus;
+  /** Reorg details, used to enrich the "critical_reorg" message. */
+  reorg?: ReorgNotice | null;
+  /** Path to a transaction-status page (e.g. `/tx/<hash>`) for direct
+   *  on-chain verification. Shown as a link on transaction-critical
+   *  screens so users aren't stuck trusting only the indexer. */
+  verifyHref?: string;
 }
+
+const STATUS_COPY: Record<
+  Exclude<IndexerFreshnessStatus, "healthy">,
+  { label: string; defaultMessage: string }
+> = {
+  lagging: {
+    label: "Data may be out of date",
+    defaultMessage: "The indexer is behind. Refresh before taking action.",
+  },
+  unavailable: {
+    label: "Indexer unavailable",
+    defaultMessage:
+      "The indexer is unreachable right now. What you see here may be significantly out of date — verify on-chain before relying on it.",
+  },
+  critical_reorg: {
+    label: "Chain reorganization detected",
+    defaultMessage:
+      "A chain reorganization was detected. Recent confirmations may be reverted — do not treat recent activity as final until this clears.",
+  },
+};
 
 export function StaleBanner({
   freshness,
   resourceType = "default",
   onRefresh,
   isRefreshing = false,
+  status,
+  reorg = null,
+  verifyHref,
 }: StaleBannerProps) {
   const [dismissed, setDismissed] = useState(false);
 
   // Reset dismissal whenever new fresh data arrives
   useEffect(() => {
     setDismissed(false);
-  }, [freshness?.fetchedAt]);
+  }, [freshness?.fetchedAt, status]);
+
+  // ── Status-driven variant (preferred) ────────────────────────
+  if (status !== undefined) {
+    // Critical reorg is never dismissible — it's the one state where
+    // silently hiding the warning could let a user treat reverted state
+    // as final.
+    if (status !== "critical_reorg" && dismissed) return null;
+    if (status === "healthy") return null;
+
+    const copy = STATUS_COPY[status];
+    const isUrgent = status === "critical_reorg" || status === "unavailable";
+    const ageSeconds = freshness
+      ? Math.round((Date.now() - freshness.fetchedAt) / 1000)
+      : null;
+
+    const message =
+      status === "critical_reorg" && reorg
+        ? `A chain reorganization (depth ${reorg.depth}) was detected${
+            reorg.message ? `: ${reorg.message}` : ""
+          }. Recent confirmations may be reverted — do not treat recent activity as final until this clears.`
+        : status === "lagging" && ageSeconds !== null
+        ? `${copy.defaultMessage} Data is ${ageSeconds}s old.`
+        : copy.defaultMessage;
+
+    const Icon =
+      status === "critical_reorg"
+        ? AlertTriangle
+        : status === "unavailable"
+        ? ServerCrash
+        : status === "lagging" && freshness && !freshness.sseConnected
+        ? WifiOff
+        : Clock;
+
+    const palette = isUrgent
+      ? "border-red-300 bg-red-50 text-red-800"
+      : "border-amber-200 bg-amber-50 text-amber-800";
+    const buttonPalette = isUrgent
+      ? "bg-red-100 hover:bg-red-200"
+      : "bg-amber-100 hover:bg-amber-200";
+
+    return (
+      <div
+        role={isUrgent ? "alert" : "status"}
+        aria-live={isUrgent ? "assertive" : "polite"}
+        className={`flex flex-wrap items-center gap-3 rounded-xl border px-4 py-3 text-sm ${palette}`}
+      >
+        <Icon size={16} className="shrink-0" aria-hidden="true" />
+
+        <span className="flex-1 min-w-[12rem]">
+          <span className="font-semibold">{copy.label}.</span> {message}
+        </span>
+
+        <button
+          type="button"
+          onClick={onRefresh}
+          disabled={isRefreshing}
+          className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 font-semibold transition disabled:opacity-50 shrink-0 ${buttonPalette}`}
+          aria-label="Retry indexer refresh"
+        >
+          <RefreshCw size={14} className={isRefreshing ? "animate-spin" : ""} aria-hidden="true" />
+          {isRefreshing ? "Checking…" : "Retry"}
+        </button>
+
+        {verifyHref && (
+          <Link
+            href={verifyHref}
+            className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 font-semibold transition shrink-0 underline decoration-dotted underline-offset-2 hover:no-underline`}
+          >
+            Verify on-chain
+          </Link>
+        )}
+
+        {!isUrgent && (
+          <button
+            type="button"
+            onClick={() => setDismissed(true)}
+            className="rounded-full p-1 hover:bg-amber-100 transition shrink-0"
+            aria-label="Dismiss stale warning"
+          >
+            <X size={14} aria-hidden="true" />
+          </button>
+        )}
+      </div>
+    );
+  }
+
+  // ── Legacy freshness-driven variant ──────────────────────────
 
   const stale = freshness ? isDataStale(freshness, resourceType) : false;
   const sseDown = freshness ? !freshness.sseConnected : false;

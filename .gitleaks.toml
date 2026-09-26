@@ -1,0 +1,100 @@
+title = "elcare-care-app gitleaks config"
+
+# Secret scanning config for issue #537 ("Add secret scanning to all CI
+# paths"). Used by:
+#   - .github/workflows/secret-scan.yml (PR scan, weekly full-history scan,
+#     and a pre-build scan of the indexer Docker build context)
+#
+# See SECURITY_SCANNING_TRIAGE.md for how a finding here gets triaged.
+
+[extend]
+# Start from gitleaks' built-in ruleset — this already covers generic
+# high-entropy secrets plus common cloud provider key formats (AWS, GCP,
+# Azure, Slack, Stripe, npm, GitHub tokens, private key blocks, etc).
+useDefault = true
+
+# ─────────────────────────────────────────────────────────────────────────
+# Custom rules for secret shapes specific to this project
+# ─────────────────────────────────────────────────────────────────────────
+
+[[rules]]
+id = "stellar-secret-key"
+description = "Stellar/Soroban secret (seed) key — starts with 'S', 56-char base32"
+regex = '''\bS[A-Z2-7]{55}\b'''
+tags = ["stellar", "secret-key"]
+
+[[rules]]
+id = "database-connection-string"
+description = "Database connection string with embedded credentials (postgres/mysql)"
+regex = '''(?i)\b(postgres(?:ql)?|mysql):\/\/[^:\s"'<>]+:[^@\s"'<>]+@[^\s"'<>]+'''
+tags = ["database", "credentials"]
+
+[[rules]]
+id = "pinata-jwt"
+description = "Pinata JWT (PINATA_JWT env var) — JWT-shaped credential used for IPFS pin/upload"
+regex = '''(?i)pinata[_-]?(jwt|api[_-]?key|secret[_-]?api[_-]?key)["'\s:=]{1,5}["']?eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}["']?'''
+tags = ["pinata", "jwt"]
+
+[[rules]]
+id = "pinata-api-key"
+description = "Pinata API key / secret API key (PINATA_API_KEY / PINATA_SECRET_API_KEY) assigned as a bare token"
+regex = '''(?i)pinata[_-]?(api[_-]?key|secret[_-]?api[_-]?key)["'\s:=]{1,5}["'][a-f0-9]{16,64}["']'''
+tags = ["pinata", "api-key"]
+
+[[rules]]
+id = "generic-bearer-or-api-token"
+description = "Generic bearer/API/auth token assigned to a suspiciously-named variable or header"
+regex = '''(?i)(api[_-]?key|access[_-]?token|auth[_-]?token|secret[_-]?token|bearer)["'\s:=]{1,5}["'][A-Za-z0-9_\-\.]{24,}["']'''
+tags = ["generic", "token"]
+
+# ─────────────────────────────────────────────────────────────────────────
+# Allowlist — clearly-synthetic fixtures only.
+#
+# Preference order: allowlist the exact fake value (regexes) over an entire
+# file/path wherever the file is otherwise real source (so a genuine secret
+# accidentally added next to a fixture is still caught). Path-based entries
+# are reserved for files that are templates/vendored code by construction
+# and can never legitimately contain a live secret.
+# ─────────────────────────────────────────────────────────────────────────
+
+[allowlist]
+description = "Synthetic test fixtures and non-source paths — see SECURITY_SCANNING_TRIAGE.md"
+
+regexes = [
+  # Local-only docker-compose Postgres creds (docker-compose.yml,
+  # docker-compose.live-e2e.yml, load-tests/docker-compose.load-test.yml):
+  # fixed, disposable passwords tied to containers on an isolated compose
+  # network, never used outside `docker compose up` on a laptop/CI runner.
+  '''postgres:postgres@(postgres|db):5432''',
+  '''ltuser:ltpass@lt-db:5432''',
+
+  # Synthetic Stellar test secret key (indexer/src/__tests__/keeper-unit.test.ts)
+  # — repeated "A"s, not a real or derivable account key.
+  '''SAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA3''',
+
+  # Synthetic Pinata JWT/API-key placeholders used only in frontend tests
+  # (src/__tests__/config.test.ts, playwright.config.ts) — never valid
+  # credentials, only exercise config-presence checks.
+  '''pj_test_secret''',
+  '''e2e-test-pinata-jwt''',
+]
+
+paths = [
+  # .env.example files are committed templates: every value is either blank
+  # or an obviously-placeholder literal (e.g. "user:password@localhost").
+  '''(^|/)\.env\.example$''',
+
+  # Vendored upstream crate source (a local patch override for
+  # soroban-env-host), not code we authored. Any "secret" here is a public
+  # test vector from the upstream Stellar SDK test suite.
+  '''^patches/soroban-env-host-25\.0\.1/''',
+
+  # Generated / vendored build output — never committed, but excluded so an
+  # incidental local scan (or a future change to what's gitignored) doesn't
+  # burn scan time on it.
+  '''(^|/)node_modules/''',
+  '''(^|/)target/''',
+  '''(^|/)\.next/''',
+  '''(^|/)dist/''',
+  '''(^|/)coverage/''',
+]

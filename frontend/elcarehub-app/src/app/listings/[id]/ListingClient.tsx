@@ -4,7 +4,7 @@
 
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { useRouter } from "next/navigation";
 import Image from "next/image";
 import {
@@ -22,13 +22,19 @@ import { useListingOffers, useMakeOffer } from "@/hooks/useOffers";
 import { useListingActivity } from "@/hooks/useUserActivity";
 import { useListingHistory } from "@/hooks/useListingHistory";
 import { getListingPriceHistory, PriceHistoryPoint } from "@/lib/indexer";
+import { useReconciliation, generatePendingId } from "@/hooks/useReconciliation";
+import { ProvisionalBadge } from "@/components/ProvisionalBadge";
 import { ProvenanceTimeline } from "@/components/ProvenanceTimeline";
 import { OfferPanel } from "@/components/OfferPanel";
 import { PriceHistoryChart } from "@/components/PriceHistoryChart";
 import { SocialShare } from "@/components/SocialShare";
+import { ReportContentButton } from "@/components/ReportContentButton";
 import { GuardButton } from "@/components/WalletGuard";
 import { ResourceState } from "@/components/PageStates";
+import { Breadcrumb } from "@/components/Breadcrumb";
+import { StaleBanner } from "@/components/StaleBanner";
 import { categorizePageError, PageStateError } from "@/lib/pageState";
+import { config } from "@/lib/config";
 import {
     ArrowLeft,
     ExternalLink,
@@ -37,12 +43,14 @@ import {
     Calendar,
     Hash,
     Clock,
+    Hourglass,
     Gavel,
     History,
     ShieldCheck,
     CheckCircle2,
     AlertCircle,
     TrendingUp,
+    Lock,
 } from "lucide-react";
 
 interface ListingClientProps {
@@ -85,10 +93,44 @@ export default function ListingDetailPage({ id }: ListingClientProps) {
     const [pageError, setPageError] = useState<PageStateError | null>(null);
     const [activeTab, setActiveTab] = useState<'details' | 'history' | 'offers'>('details');
 
+    // Stable ref to the latest loadData implementation, so callbacks created
+    // before loadData is defined (e.g. the reorg-reset handler below) always
+    // invoke the current version rather than a stale closure.
+    const loadDataRef = useRef<() => void>(() => {});
+
     // Hooks
-    const { buy, isBuying, error: buyError } = useBuyArtwork(publicKey);
-    const { bid, isBidding, error: bidError } = usePlaceBid(publicKey);
+    const { buy, isBuying, error: buyError, txHash: buyTxHash } = useBuyArtwork(publicKey);
+    const { bid, isBidding, error: bidError, txHash: bidTxHash } = usePlaceBid(publicKey);
     const { offers, isLoading: isLoadingOffers, refresh: refreshOffers } = useListingOffers(id ? Number(id) : null);
+
+    // Issue #520 — Optimistic listing/auction updates with reorg rollback.
+    //
+    // Tracks a provisional (not-yet-indexer-confirmed) mutation for the
+    // buy/bid actions on this page, keyed by the *real* transaction hash
+    // once it's known (see useTxToast/useTxLifecycle). A REORG/CRITICAL_REORG
+    // SSE event triggers a full reset of this local state plus a re-fetch of
+    // confirmed truth, so a reorg can never leave a stale optimistic value
+    // on screen.
+    const recon = useReconciliation<Listing>({
+        mutationTtlMs: 45_000,
+        reorgIndexerUrl: config.indexerUrl || null,
+        onReorgReset: () => loadDataRef.current(),
+    });
+    const reconAuction = useReconciliation<Auction>({
+        mutationTtlMs: 45_000,
+        reorgIndexerUrl: config.indexerUrl || null,
+        onReorgReset: () => loadDataRef.current(),
+    });
+
+    // Keep a live ref to the latest tx hash for each action — the handlers
+    // below are plain async functions defined once per render, but by the
+    // time a submitted transaction resolves, several state transitions
+    // (broadcasting → confirming → indexer_pending → success) have already
+    // happened, so the ref is guaranteed to be current at that point.
+    const buyTxHashRef = useRef<string | null>(null);
+    useEffect(() => { buyTxHashRef.current = buyTxHash; }, [buyTxHash]);
+    const bidTxHashRef = useRef<string | null>(null);
+    useEffect(() => { bidTxHashRef.current = bidTxHash; }, [bidTxHash]);
     // Kept for existing consumers / mocks
     useListingActivity(id ? Number(id) : null);
     const {
@@ -98,6 +140,8 @@ export default function ListingDetailPage({ id }: ListingClientProps) {
         error: historyError,
         hasMore,
         loadMore,
+        refresh: refreshHistory,
+        reorgDetected,
     } = useListingHistory(id ? Number(id) : null);
 
     // Price history (for sparkline chart)
@@ -170,22 +214,93 @@ export default function ListingDetailPage({ id }: ListingClientProps) {
         loadData();
     }, [loadData]);
 
+    useEffect(() => {
+        loadDataRef.current = loadData;
+    }, [loadData]);
+
+    // Seed the reconciler's confirmed snapshot whenever a fresh listing
+    // loads (initial load, manual refetch, or reorg-triggered reload) so
+    // getResourceState() below has a confirmed value to fall back to.
+    const prevListingRef = useRef<Listing | null>(null);
+    useEffect(() => {
+        if (!listing || listing === prevListingRef.current) return;
+        prevListingRef.current = listing;
+        recon.applyConfirmedData([
+            {
+                resourceId: String(listing.listing_id),
+                data: listing,
+                ledger: (listing as unknown as { updatedAtLedger?: number }).updatedAtLedger ?? 0,
+            },
+        ]);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [listing]);
+
+    const prevAuctionRef = useRef<Auction | null>(null);
+    useEffect(() => {
+        if (!auction || auction === prevAuctionRef.current) return;
+        prevAuctionRef.current = auction;
+        reconAuction.applyConfirmedData([
+            {
+                resourceId: String(auction.auction_id),
+                data: auction,
+                ledger: (auction as unknown as { updatedAtLedger?: number }).updatedAtLedger ?? 0,
+            },
+        ]);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [auction]);
+
     const handleBuy = async () => {
         if (!listing) return;
+
+        // Optimistically mark the listing "Sold" the moment the purchase is
+        // submitted — the provisional badge in the JSX below reflects this
+        // until the buy resolves and the local pending mutation is
+        // confirmed or rejected.
+        const pendingId = generatePendingId("listing-buy");
+        recon.addMutation({
+            pendingId,
+            txHash: buyTxHashRef.current,
+            kind: "listing",
+            resourceId: String(listing.listing_id),
+            optimisticValue: { ...listing, status: "Sold" as Listing["status"] },
+        });
+
         const success = await buy(listing.listing_id);
         if (success) {
+            // Reconcile against the real transaction hash now that it's
+            // known (it was still null when the mutation was created above).
+            recon.resolveMutation(pendingId, buyTxHashRef.current ?? undefined);
             const updated = await getListing(listing.listing_id);
             setListing(updated);
+        } else {
+            recon.rejectMutation(pendingId, buyError ?? "Purchase failed");
         }
     };
 
     const handleBid = async () => {
         if (!auction || !bidAmount) return;
+
+        const pendingId = generatePendingId("auction-bid");
+        reconAuction.addMutation({
+            pendingId,
+            txHash: bidTxHashRef.current,
+            kind: "auction",
+            resourceId: String(auction.auction_id),
+            optimisticValue: {
+                ...auction,
+                highest_bid: BigInt(Math.round(Number(bidAmount) * 1e7)),
+                highest_bidder: publicKey,
+            },
+        });
+
         const success = await bid(auction.auction_id, Number(bidAmount));
         if (success) {
+            reconAuction.resolveMutation(pendingId, bidTxHashRef.current ?? undefined);
             const updated = await getAuction(auction.auction_id);
             setAuction(updated);
             setBidAmount("");
+        } else {
+            reconAuction.rejectMutation(pendingId, bidError ?? "Bid failed");
         }
     };
 
@@ -247,6 +362,7 @@ export default function ListingDetailPage({ id }: ListingClientProps) {
     const isOwn = publicKey === artist;
     const status = listing?.status || auction?.status;
     const isActive = status === "Active";
+    const isExpired = status === "Cancelled" && !!listing?.expires_at && listing.expires_at < Date.now() / 1000;
 
     const priceDisplay = listing
         ? stroopsToXlm(listing.price)
@@ -256,6 +372,16 @@ export default function ListingDetailPage({ id }: ListingClientProps) {
 
     const royaltyPercent = "0.0";
 
+    // Issue #520 — provisional record state for the item this page displays.
+    // "confirmed" (the default) renders no badge at all; anything else means
+    // a locally-submitted transaction hasn't been confirmed by the indexer
+    // yet (or was rolled back), so the UI must not present it as final.
+    const provisionalRecordState = listing
+        ? recon.getResourceState(String(listing.listing_id), "listing").recordState
+        : auction
+        ? reconAuction.getResourceState(String(auction.auction_id), "auction").recordState
+        : "confirmed";
+
     // Listing URL for sharing
     const listingUrl =
         typeof window !== "undefined"
@@ -264,6 +390,28 @@ export default function ListingDetailPage({ id }: ListingClientProps) {
 
     return (
         <div className="min-h-screen bg-midnight-950 text-white pb-20 pt-24 px-4 sm:px-6 lg:px-8">
+            {/* Breadcrumb */}
+            <Breadcrumb
+                items={[
+                    { label: "Discover", href: "/explore" },
+                    { label: metadata?.title ?? `Artwork #${id}` },
+                ]}
+                className="mb-8"
+            />
+
+            {/* Issue #522 — non-blocking indexer freshness indicator */}
+            {freshness.status !== "healthy" && (
+                <div className="mb-8">
+                    <StaleBanner
+                        freshness={freshness.freshness}
+                        status={freshness.status}
+                        reorg={freshness.reorg}
+                        onRefresh={freshness.refresh}
+                        isRefreshing={freshness.isRefreshing}
+                        verifyHref={verifiableTxHash ? `/tx/${verifiableTxHash}` : undefined}
+                    />
+                </div>
+            )}
 
             <div className="grid gap-12 lg:grid-cols-2 lg:items-start">
                 {/* LEFT COLUMN: Media, Tabs & Description */}
@@ -273,7 +421,11 @@ export default function ListingDetailPage({ id }: ListingClientProps) {
                         {imageUrl ? (
                             <Image
                                 src={imageUrl}
-                                alt={metadata?.title ?? "Artwork"}
+                                alt={
+                                    metadata?.isDecorativeImage
+                                        ? ""
+                                        : (metadata?.altText ?? metadata?.title ?? "Artwork")
+                                }
                                 fill
                                 className="object-cover transition-transform duration-700 group-hover:scale-105"
                                 priority
@@ -286,14 +438,30 @@ export default function ListingDetailPage({ id }: ListingClientProps) {
                             </div>
                         )}
 
-                        {/* Status Badge */}
-                        <div className={`absolute top-6 right-6 px-4 py-1.5 rounded-full text-xs font-bold tracking-widest uppercase backdrop-blur-md shadow-xl border ${
-                            status === "Active" ? "bg-mint-500/20 text-mint-400 border-mint-500/30" :
-                            status === "Sold" || status === "Finalized" ? "bg-brand-500/20 text-brand-400 border-brand-500/30" :
-                            "bg-terracotta-500/20 text-terracotta-400 border-terracotta-500/30"
-                        }`}>
-                            {status}
+                        {/* Status Badge (+ provisional marker, Issue #520) */}
+                        <div className="absolute top-6 right-6 flex flex-col items-end gap-2">
+                            <div className={`px-4 py-1.5 rounded-full text-xs font-bold tracking-widest uppercase backdrop-blur-md shadow-xl border ${
+                                status === "Active" ? "bg-mint-500/20 text-mint-400 border-mint-500/30" :
+                                status === "Sold" || status === "Finalized" ? "bg-brand-500/20 text-brand-400 border-brand-500/30" :
+                                isExpired ? "bg-orange-500/20 text-orange-400 border-orange-500/30" :
+                                "bg-terracotta-500/20 text-terracotta-400 border-terracotta-500/30"
+                            }`}>
+                                {isExpired ? "Expired" : status}
+                            </div>
+                            {/* Never rendered for "confirmed" state — see ProvisionalBadge. This
+                                is the explicit, non-final marker required by Issue #520: a
+                                successful buy/bid shows here immediately and switches off once
+                                indexed data confirms it, without ever claiming finality itself. */}
+                            <ProvisionalBadge recordState={provisionalRecordState} className="shadow-xl" />
                         </div>
+
+                        {/* Metadata Immutable Badge */}
+                        {metadata?.isMetadataFrozen && (
+                            <div className="absolute top-16 right-6 px-3 py-1 rounded-full text-xs font-bold tracking-widest uppercase backdrop-blur-md shadow-xl border bg-gray-900/80 text-gray-200 border-gray-700 flex items-center gap-1.5">
+                                <Lock size={10} />
+                                Metadata Immutable
+                            </div>
+                        )}
 
                         {/* Type Badge */}
                         <div className="absolute top-6 left-6 px-4 py-1.5 rounded-full text-xs font-bold bg-white/10 backdrop-blur-md text-white border border-white/20">
@@ -400,6 +568,8 @@ export default function ListingDetailPage({ id }: ListingClientProps) {
                                     error={historyError}
                                     hasMore={hasMore}
                                     onLoadMore={loadMore}
+                                    reorgDetected={reorgDetected}
+                                    onRefresh={refreshHistory}
                                 />
                             </div>
                         )}
@@ -557,6 +727,15 @@ export default function ListingDetailPage({ id }: ListingClientProps) {
                                     </div>
                                 )}
 
+                                {isExpired && (
+                                    <div className="p-6 rounded-2xl bg-orange-500/10 border border-orange-500/20 text-center flex items-center justify-center gap-3" data-testid="expired-banner">
+                                        <Hourglass size={18} className="text-orange-400" />
+                                        <p className="text-orange-400 font-bold italic">
+                                            This listing has expired and is no longer available.
+                                        </p>
+                                    </div>
+                                )}
+
                                 {(buyError || bidError) && (
                                     <div className="p-4 rounded-xl bg-terracotta-500/10 border border-terracotta-500/20 text-terracotta-400 text-xs flex items-center gap-3">
                                         <AlertCircle size={16} />
@@ -564,8 +743,8 @@ export default function ListingDetailPage({ id }: ListingClientProps) {
                                     </div>
                                 )}
 
-                                {/* Secondary Actions: Share + Provenance */}
-                                <div className="flex gap-3 pt-6">
+                                {/* Secondary Actions: Share + Provenance + Report */}
+                                <div className="flex gap-3 pt-6 flex-wrap">
                                     {/* Social share buttons */}
                                     <SocialShare
                                         title={metadata?.title ?? `Listing #${id}`}
@@ -582,6 +761,24 @@ export default function ListingDetailPage({ id }: ListingClientProps) {
                                         <History size={14} />
                                         <span className="hidden sm:inline">Provenance</span>
                                     </button>
+                                    {/* Work item B: link to support center with pre-filled context */}
+                                    <a
+                                        href={`/support?listing_id=${id}${listing?.metadata_cid ? `&cid=${listing.metadata_cid}` : ''}`}
+                                        title="Report an issue with this listing"
+                                        data-testid="report-issue-link"
+                                        className="h-11 px-4 rounded-xl bg-white/5 hover:bg-white/10 transition-all border border-white/10 flex items-center gap-2 text-xs font-bold text-white/60"
+                                    >
+                                        <AlertCircle size={14} />
+                                        <span className="hidden sm:inline">Report Issue</span>
+                                    </a>
+                                    {/* Formal moderation report — see docs/MODERATION_POLICY.md (Issue #542) */}
+                                    {(listing?.metadata_cid || auction?.metadata_cid) && (
+                                        <ReportContentButton
+                                            cid={(listing?.metadata_cid || auction?.metadata_cid) as string}
+                                            kind="METADATA"
+                                            reporterAddress={publicKey ?? undefined}
+                                        />
+                                    )}
                                 </div>
                             </div>
                         </div>

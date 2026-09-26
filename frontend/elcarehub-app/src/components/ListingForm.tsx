@@ -4,19 +4,25 @@
 
 "use client";
 
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useMemo, useCallback } from "react";
 import { useCreateListing, useUpdateListing } from "@/hooks/useMarketplace";
 import { useWalletContext } from "@/context/WalletContext";
-import { Upload, CheckCircle, Loader2, Save, Plus, Trash2, ShieldCheck, ShieldAlert } from "lucide-react";
+import { Upload, CheckCircle, Loader2, Save, ShieldCheck, ShieldAlert, X } from "lucide-react";
 import { GuardButton } from "./WalletGuard";
 import { ArtworkMetadata, fetchMetadata } from "@/lib/ipfs";
-import { Listing, stroopsToXlm, checkAndApproveMarketplace, isApprovedForAll } from "@/lib/contract";
+import { Listing, stroopsToXlm, checkAndApproveMarketplace, isApprovedForAll, getProtocolFee } from "@/lib/contract";
+import { getCollectionMetadata } from "@/lib/launchpad";
 import { DEFAULT_TOKEN } from "@/config/tokens";
 import { useSupportedTokens } from "@/hooks/useSupportedTokens";
 import { ensureTokenOption, getDefaultSupportedToken } from "@/lib/token-support";
+import { validateAmountInput, baseToDisplay } from "@/lib/amount";
 import posthog from "posthog-js";
 import { isValidStellarAddress } from "@/lib/validation";
 import { config } from "@/lib/config";
+import { useTxLifecycle, txStateLabel } from "@/hooks/useTxLifecycle";
+import { TxErrorPanel } from "@/components/TxErrorPanel";
+import Link from "next/link";
+import { RoyaltySplitEditor, validateRecipients } from "@/components/RoyaltySplitEditor";
 
 export const ART_CATEGORIES = [
   "Painting",
@@ -47,6 +53,7 @@ interface FormState {
   metadataCid: string;
   collectionAddress: string;
   nftTokenId: number;
+  quantity: number;
   price: number;
   tokenAddress: string;
   recipients: RecipientInput[];
@@ -56,6 +63,7 @@ interface FieldErrors {
   metadataCid?: string;
   collectionAddress?: string;
   nftTokenId?: string;
+  quantity?: string;
   price?: string;
   tokenAddress?: string;
   recipients?: string;
@@ -66,6 +74,43 @@ interface ListingFormProps {
   listing?: Listing; // If provided, we are in EDIT mode
   onSuccess?: (listingId: number) => void;
   onCancel?: () => void;
+}
+
+// ── Draft persistence (create mode only) ─────────────────────
+// Mirrors CollectionForm's localStorage draft pattern so an in-progress
+// listing — including its royalty split — survives a page reload before
+// the creator has signed anything.
+
+const LISTING_DRAFT_KEY = "elcarehub:listing-draft";
+
+interface ListingDraft {
+  metadataCid: string;
+  collectionAddress: string;
+  nftTokenId: number;
+  price: number;
+  tokenAddress: string;
+  recipients: RecipientInput[];
+}
+
+function loadListingDraft(publicKey: string | null): ListingDraft | null {
+  if (!publicKey || typeof localStorage === "undefined") return null;
+  try {
+    const raw = localStorage.getItem(`${LISTING_DRAFT_KEY}:${publicKey}`);
+    if (!raw) return null;
+    return JSON.parse(raw) as ListingDraft;
+  } catch {
+    return null;
+  }
+}
+
+function saveListingDraft(publicKey: string, draft: ListingDraft): void {
+  if (typeof localStorage === "undefined") return;
+  localStorage.setItem(`${LISTING_DRAFT_KEY}:${publicKey}`, JSON.stringify(draft));
+}
+
+function clearListingDraft(publicKey: string): void {
+  if (typeof localStorage === "undefined") return;
+  localStorage.removeItem(`${LISTING_DRAFT_KEY}:${publicKey}`);
 }
 
 // ── Validation ────────────────────────────────────────────────
@@ -109,39 +154,19 @@ export function validateListingForm(form: FormState): FieldErrors {
     errors.tokenAddress = "A payment token must be selected.";
   }
 
-  // Recipients — must have 1–4 rows, each a valid address, and sum to exactly 100%
-  if (form.recipients.length === 0) {
-    errors.recipients = "At least one recipient is required.";
-  } else if (form.recipients.length > MAX_RECIPIENTS) {
-    errors.recipients = `A maximum of ${MAX_RECIPIENTS} recipients is allowed.`;
-  } else {
-    const rowErrors: Array<{ address?: string; percentage?: string }> =
-      form.recipients.map((r) => {
-        const rowErr: { address?: string; percentage?: string } = {};
-        if (!r.address.trim()) {
-          rowErr.address = "Address is required.";
-        } else if (!isValidStellarAddress(r.address.trim())) {
-          rowErr.address = "Must be a valid Stellar address.";
-        }
-        if (!Number.isFinite(r.percentage) || r.percentage <= 0) {
-          rowErr.percentage = "Must be greater than 0.";
-        } else if (r.percentage > REQUIRED_SPLIT_SUM) {
-          rowErr.percentage = `Cannot exceed ${REQUIRED_SPLIT_SUM}%.`;
-        }
-        return rowErr;
-      });
-
-    const hasRowErrors = rowErrors.some(
-      (e) => e.address !== undefined || e.percentage !== undefined
-    );
-    if (hasRowErrors) {
-      errors.recipientRows = rowErrors;
-    }
-
-    const total = form.recipients.reduce((sum, r) => sum + (r.percentage || 0), 0);
-    if (Math.round(total) !== REQUIRED_SPLIT_SUM) {
-      errors.recipients = `Recipient percentages must sum to exactly ${REQUIRED_SPLIT_SUM}% (currently ${total.toFixed(2)}%).`;
-    }
+  // Recipients — must have 1–4 rows, each a valid & non-duplicate address, and
+  // sum to exactly 100%. Delegates to the shared RoyaltySplitEditor validator
+  // so the split editor's inline errors and the form's submit gate always
+  // agree (and both mirror the contract's validate_recipients invariants).
+  const recipientsValidation = validateRecipients(form.recipients, MAX_RECIPIENTS);
+  if (recipientsValidation.summary) {
+    errors.recipients = recipientsValidation.summary;
+  }
+  const hasRecipientRowErrors = recipientsValidation.rows.some(
+    (r) => r.address !== undefined || r.percentage !== undefined
+  );
+  if (hasRecipientRowErrors) {
+    errors.recipientRows = recipientsValidation.rows;
   }
 
   return errors;
@@ -175,6 +200,20 @@ export function ListingForm({ listing, onSuccess, onCancel }: ListingFormProps) 
   const { update, isUpdating, progress: updateProgress, error: updateError } =
     useUpdateListing(publicKey);
 
+  // Typed lifecycle — surfaces wallet-rejection vs chain-failure in TxErrorPanel
+  // and provides a tx hash recovery link after submission.
+  const {
+    txState: listingTxState,
+    isActive: isListingTxActive,
+    run: runListingTx,
+    reset: resetListingTx,
+  } = useTxLifecycle({
+    persistKey: isEdit
+      ? `updateListing:${listing?.listing_id}`
+      : "createListing",
+    action: isEdit ? "Update listing" : "Create listing",
+  });
+
   const [form, setForm] = useState<FormState>({
     metadataCid: "",
     collectionAddress: "",
@@ -184,10 +223,25 @@ export function ListingForm({ listing, onSuccess, onCancel }: ListingFormProps) 
     recipients: [{ address: publicKey ?? "", percentage: 100 }],
   });
   const [touched, setTouched] = useState<Set<string>>(new Set());
+  // Set by the price field's onChange when the raw string fails bigint-safe
+  // parsing (e.g. more decimal places than the token supports) — surfaced
+  // in preference to the generic numeric bound message from `errors.price`.
+  const [priceInputError, setPriceInputError] = useState<string | null>(null);
   const [submitAttempted, setSubmitAttempted] = useState(false);
   const [successId, setSuccessId] = useState<number | null>(null);
   const [currentMetadata, setCurrentMetadata] = useState<ArtworkMetadata | null>(null);
   const [isFetchingMetadata, setIsFetchingMetadata] = useState(false);
+
+  // ── Draft persistence (create mode only) ──────────────────────────────
+  const [hasDraft, setHasDraft] = useState(false);
+
+  // ── Collection royalty default + protocol fee (Issue #529) ───────────
+  // Seeds the split editor with the collection's single-receiver royalty
+  // default, and shows the protocol fee as contextual info alongside the
+  // recipient split (the protocol fee is deducted separately on-chain and
+  // is not part of the 100% recipient split).
+  const [collectionDefault, setCollectionDefault] = useState<{ address: string; bps: number } | null>(null);
+  const [protocolFeeBps, setProtocolFeeBps] = useState<number | undefined>(undefined);
 
   // ── Marketplace approval state ────────────────────────────────────────
   // Before listing, the marketplace must have operator approval on the
@@ -258,6 +312,88 @@ export function ListingForm({ listing, onSuccess, onCancel }: ListingFormProps) 
     }
   }, [form.tokenAddress, isEdit, tokenOptions]);
 
+  // ── Draft persistence (create mode only) ──────────────────────────────
+  // Detect a saved draft once the wallet connects.
+  useEffect(() => {
+    if (isEdit || !publicKey) return;
+    if (loadListingDraft(publicKey)) setHasDraft(true);
+  }, [isEdit, publicKey]);
+
+  const restoreDraft = useCallback(() => {
+    if (!publicKey) return;
+    const draft = loadListingDraft(publicKey);
+    if (!draft) return;
+    setForm((prev) => ({ ...prev, ...draft }));
+    setHasDraft(false);
+  }, [publicKey]);
+
+  const discardDraft = useCallback(() => {
+    if (!publicKey) return;
+    clearListingDraft(publicKey);
+    setHasDraft(false);
+  }, [publicKey]);
+
+  // Auto-save the draft (including the recipient split) whenever it changes.
+  useEffect(() => {
+    if (isEdit || !publicKey) return;
+    saveListingDraft(publicKey, {
+      metadataCid: form.metadataCid,
+      collectionAddress: form.collectionAddress,
+      nftTokenId: form.nftTokenId,
+      price: form.price,
+      tokenAddress: form.tokenAddress,
+      recipients: form.recipients,
+    });
+  }, [
+    isEdit,
+    publicKey,
+    form.metadataCid,
+    form.collectionAddress,
+    form.nftTokenId,
+    form.price,
+    form.tokenAddress,
+    form.recipients,
+  ]);
+
+  // ── Collection royalty default (seeds the split editor) ───────────────
+  useEffect(() => {
+    const addr = form.collectionAddress.trim();
+    if (!isValidStellarAddress(addr)) {
+      setCollectionDefault(null);
+      return;
+    }
+    let cancelled = false;
+    getCollectionMetadata(addr)
+      .then((meta) => {
+        if (!cancelled && meta.royaltyReceiver) {
+          setCollectionDefault({ address: meta.royaltyReceiver, bps: meta.royaltyBps });
+        } else if (!cancelled) {
+          setCollectionDefault(null);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setCollectionDefault(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [form.collectionAddress]);
+
+  // ── Protocol fee (contextual info alongside the split editor) ─────────
+  useEffect(() => {
+    let cancelled = false;
+    getProtocolFee()
+      .then((bps) => {
+        if (!cancelled) setProtocolFeeBps(bps);
+      })
+      .catch(() => {
+        if (!cancelled) setProtocolFeeBps(undefined);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   // ── Approval pre-check (create mode only) ────────────────────────────
   // Re-run whenever the collection address or the connected wallet changes.
   useEffect(() => {
@@ -321,34 +457,6 @@ export function ListingForm({ listing, onSuccess, onCancel }: ListingFormProps) 
     return submitAttempted || touched.has(field);
   }
 
-  // ── Recipients helpers ────────────────────────────────────
-
-  function addRecipient() {
-    if (form.recipients.length >= MAX_RECIPIENTS) return;
-    setForm((cur) => ({
-      ...cur,
-      recipients: [...cur.recipients, { address: "", percentage: 0 }],
-    }));
-  }
-
-  function removeRecipient(index: number) {
-    if (form.recipients.length <= 1) return;
-    setForm((cur) => ({
-      ...cur,
-      recipients: cur.recipients.filter((_, i) => i !== index),
-    }));
-  }
-
-  function updateRecipient(index: number, field: "address" | "percentage", value: string | number) {
-    setForm((cur) => ({
-      ...cur,
-      recipients: cur.recipients.map((r, i) =>
-        i === index ? { ...r, [field]: value } : r
-      ),
-    }));
-    markTouched(`recipient_${index}_${field}`);
-  }
-
   // ── Submit ────────────────────────────────────────────────
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -361,46 +469,96 @@ export function ListingForm({ listing, onSuccess, onCancel }: ListingFormProps) 
     // can create a listing (it needs to call transfer_from at escrow time).
     if (!isEdit && approvalStatus === false) return;
 
+    // Reset any previous lifecycle error before starting a new submission.
+    resetListingTx();
+
     if (isEdit && listing && currentMetadata) {
-      const success = await update({
-        listingId: listing.listing_id,
-        originalTokenAddress: listing.token,
-        collectionAddress: form.collectionAddress,
-        nftTokenId: form.nftTokenId,
-        price: form.price,
-        tokenAddress: form.tokenAddress,
-        title: currentMetadata.title ?? "",
-        description: currentMetadata.description ?? "",
-        artistName: currentMetadata.artist ?? "",
-        year: currentMetadata.year ?? "",
-        category: currentMetadata.category ?? "",
-        currentMetadata,
-      });
+      const success = await runListingTx(
+        () =>
+          update({
+            listingId: listing.listing_id,
+            originalTokenAddress: listing.token,
+            collectionAddress: form.collectionAddress,
+            nftTokenId: form.nftTokenId,
+            price: form.price,
+            tokenAddress: form.tokenAddress,
+            title: currentMetadata.title ?? "",
+            description: currentMetadata.description ?? "",
+            artistName: currentMetadata.artist ?? "",
+            year: currentMetadata.year ?? "",
+            category: currentMetadata.category ?? "",
+            currentMetadata,
+          }),
+        {
+          action: "Update listing",
+          // Issue #524 — fingerprint on the listing id + the fields that
+          // actually change on-chain, so editing a *different* listing (or
+          // a different price/token on the same one) is never deduplicated
+          // against an in-flight update of this one.
+          dedupe: {
+            account: publicKey,
+            network: config.networkPassphrase,
+            contract: config.contractId,
+            args: {
+              listingId: listing.listing_id,
+              price: form.price,
+              tokenAddress: form.tokenAddress,
+              collectionAddress: form.collectionAddress,
+              nftTokenId: form.nftTokenId,
+            },
+          },
+        }
+      );
       if (success) {
         setSuccessId(listing.listing_id);
         onSuccess?.(listing.listing_id);
       }
     } else if (!isEdit) {
-      const id = await create({
-        collectionAddress: form.collectionAddress,
-        nftTokenId: form.nftTokenId,
-        price: form.price,
-        tokenAddress: form.tokenAddress,
-        recipients: form.recipients,
-      });
+      const id = await runListingTx(
+        () =>
+          create({
+            collectionAddress: form.collectionAddress,
+            nftTokenId: form.nftTokenId,
+            price: form.price,
+            tokenAddress: form.tokenAddress,
+            recipients: form.recipients,
+          }),
+        {
+          action: "Create listing",
+          dedupe: {
+            account: publicKey,
+            network: config.networkPassphrase,
+            contract: config.contractId,
+            args: {
+              collectionAddress: form.collectionAddress,
+              nftTokenId: form.nftTokenId,
+              price: form.price,
+              tokenAddress: form.tokenAddress,
+              recipients: form.recipients,
+            },
+          },
+        }
+      );
       if (id !== null) {
-        setSuccessId(id);
+        setSuccessId(id as number);
         posthog.capture("Listing Created", { listing_id: id, price_xlm: form.price });
-        onSuccess?.(id);
+        // Draft fulfilled — clear it so the next listing starts fresh.
+        if (publicKey) clearListingDraft(publicKey);
+        onSuccess?.(id as number);
       }
     }
   };
 
-  const isLoading = isCreating || isUpdating || isFetchingMetadata;
+  const isLoading = isCreating || isUpdating || isFetchingMetadata || isListingTxActive;
   /** True when any async operation is in flight (including approval). */
   const isAnyLoading = isLoading || isCheckingApproval || isApprovingMarketplace;
-  const progress = isEdit ? updateProgress : createProgress;
-  const error = isEdit ? updateError : createError;
+  const progress = isListingTxActive
+    ? txStateLabel(listingTxState.state)
+    : isEdit
+    ? updateProgress
+    : createProgress;
+  // Show typed error from lifecycle when available, fall back to hook error string
+  const hookError = isEdit ? updateError : createError;
 
   // ── Success screen ────────────────────────────────────────
 
@@ -425,6 +583,7 @@ export function ListingForm({ listing, onSuccess, onCancel }: ListingFormProps) 
                 setSuccessId(null);
                 setSubmitAttempted(false);
                 setTouched(new Set());
+                setPriceInputError(null);
                 setForm({
                   metadataCid: "",
                   collectionAddress: "",
@@ -452,10 +611,46 @@ export function ListingForm({ listing, onSuccess, onCancel }: ListingFormProps) 
 
   // ── Main render ───────────────────────────────────────────
 
-  const recipientSum = form.recipients.reduce((s, r) => s + (r.percentage || 0), 0);
-
   return (
     <div className="max-w-3xl mx-auto px-4 py-8">
+      {/* Draft restore banner (create mode only) */}
+      {!isEdit && hasDraft && (
+        <div
+          role="alert"
+          data-testid="draft-restore-banner"
+          className="mb-6 flex items-start justify-between gap-4 rounded-2xl border border-brand-100 bg-brand-50/60 px-5 py-4"
+        >
+          <div className="flex items-start gap-3">
+            <Save size={18} className="mt-0.5 text-brand-500 shrink-0" />
+            <div>
+              <p className="text-sm font-bold text-brand-700">Unsaved draft found</p>
+              <p className="text-xs text-brand-600 mt-0.5">
+                You have a saved listing draft, including your revenue split. Restore it or
+                start fresh.
+              </p>
+            </div>
+          </div>
+          <div className="flex items-center gap-2 shrink-0">
+            <button
+              type="button"
+              onClick={restoreDraft}
+              className="rounded-xl bg-brand-500 px-4 py-2 text-xs font-bold text-white hover:bg-brand-600 transition-colors"
+              data-testid="restore-draft-btn"
+            >
+              Restore
+            </button>
+            <button
+              type="button"
+              onClick={discardDraft}
+              className="rounded-xl border border-gray-200 px-3 py-2 text-xs font-bold text-gray-600 hover:bg-gray-50 transition-colors"
+              data-testid="discard-draft-btn"
+            >
+              <X size={12} />
+            </button>
+          </div>
+        </div>
+      )}
+
       <div className="bg-white rounded-3xl shadow-2xl shadow-brand-900/5 border border-brand-100/50 p-6 md:p-10">
         <header className="mb-10 text-center">
           <h2 className="text-4xl font-display font-bold text-gray-900 mb-2">
@@ -622,15 +817,13 @@ export function ListingForm({ listing, onSuccess, onCancel }: ListingFormProps) 
                   min={MIN_PRICE_XLM}
                   max={MAX_PRICE_XLM}
                   step="any"
-                  value={form.price}
-                  onChange={(e) =>
-                    setForm({ ...form, price: parseFloat(e.target.value) })
-                  }
+                  value={Number.isNaN(form.price) ? "" : form.price}
+                  onChange={(e) => handlePriceChange(e.target.value, selectedToken)}
                   onBlur={() => markTouched("price")}
-                  aria-invalid={shouldShowError("price") && !!errors.price}
-                  aria-describedby={errors.price ? "err-price" : undefined}
+                  aria-invalid={shouldShowError("price") && !!(priceInputError || errors.price)}
+                  aria-describedby={priceInputError || errors.price ? "err-price" : undefined}
                   className={`w-full rounded-2xl border px-5 py-4 pr-16 text-base focus:outline-none transition-all shadow-sm font-inter ${
-                    shouldShowError("price") && errors.price
+                    shouldShowError("price") && (priceInputError || errors.price)
                       ? "border-red-400 bg-red-50/40 focus:border-red-500"
                       : "border-gray-200 bg-gray-50/50 focus:border-brand-500 focus:bg-white"
                   }`}
@@ -639,9 +832,9 @@ export function ListingForm({ listing, onSuccess, onCancel }: ListingFormProps) 
                   {selectedToken.symbol}
                 </span>
               </div>
-              {shouldShowError("price") && errors.price && (
+              {shouldShowError("price") && (priceInputError || errors.price) && (
                 <p id="err-price" className="text-sm text-red-600 mt-1" role="alert">
-                  {errors.price}
+                  {priceInputError || errors.price}
                 </p>
               )}
             </div>
@@ -685,136 +878,54 @@ export function ListingForm({ listing, onSuccess, onCancel }: ListingFormProps) 
           </div>
 
           {/* ── Royalty Recipients ── */}
-          <div className="space-y-4">
-            <div className="flex items-center justify-between">
-              <div>
-                <label className="block text-sm font-bold text-gray-950 uppercase tracking-wider font-inter">
-                  Revenue Split *
-                </label>
-                <p className="text-xs text-gray-500 mt-0.5 font-inter">
-                  Percentages must sum to exactly 100%. Max {MAX_RECIPIENTS} recipients.
-                </p>
-              </div>
-              {form.recipients.length < MAX_RECIPIENTS && (
-                <button
-                  type="button"
-                  onClick={addRecipient}
-                  className="flex items-center gap-1.5 rounded-xl border border-brand-200 bg-brand-50 px-3 py-2 text-sm font-semibold text-brand-700 hover:bg-brand-100 transition-all"
-                >
-                  <Plus size={14} />
-                  Add Recipient
-                </button>
-              )}
-            </div>
+          <RoyaltySplitEditor
+            recipients={form.recipients}
+            onChange={(recipients) => setForm((cur) => ({ ...cur, recipients }))}
+            maxRecipients={MAX_RECIPIENTS}
+            protocolFeeBps={protocolFeeBps}
+            collectionDefault={collectionDefault}
+            disabled={isAnyLoading}
+            forceShowErrors={submitAttempted}
+          />
 
-            <div className="space-y-3">
-              {form.recipients.map((recipient, idx) => {
-                const rowErrors = errors.recipientRows?.[idx];
-                const addressTouched = shouldShowError(`recipient_${idx}_address`);
-                const pctTouched = shouldShowError(`recipient_${idx}_percentage`);
-                return (
-                  <div key={idx} className="flex flex-col sm:flex-row gap-3 items-start">
-                    <div className="w-full sm:flex-1 space-y-1">
-                      <input
-                        value={recipient.address}
-                        onChange={(e) => updateRecipient(idx, "address", e.target.value)}
-                        onBlur={() => markTouched(`recipient_${idx}_address`)}
-                        placeholder="Stellar address (G...)"
-                        aria-label={`Recipient ${idx + 1} address`}
-                        aria-invalid={addressTouched && !!rowErrors?.address}
-                        className={`w-full rounded-2xl border px-4 py-3 text-sm focus:outline-none transition-all font-inter ${
-                          addressTouched && rowErrors?.address
-                            ? "border-red-400 bg-red-50/40 focus:border-red-500"
-                            : "border-gray-200 bg-gray-50/50 focus:border-brand-500 focus:bg-white"
-                        }`}
-                      />
-                      {addressTouched && rowErrors?.address && (
-                        <p className="text-xs text-red-600" role="alert">
-                          {rowErrors.address}
-                        </p>
-                      )}
-                    </div>
-                    <div className="w-full sm:w-28 space-y-1">
-                      <div className="relative">
-                        <input
-                          type="number"
-                          min={1}
-                          max={100}
-                          step={1}
-                          value={recipient.percentage}
-                          onChange={(e) =>
-                            updateRecipient(idx, "percentage", parseFloat(e.target.value) || 0)
-                          }
-                          onBlur={() => markTouched(`recipient_${idx}_percentage`)}
-                          aria-label={`Recipient ${idx + 1} percentage`}
-                          aria-invalid={pctTouched && !!rowErrors?.percentage}
-                          className={`w-full rounded-2xl border px-4 py-3 pr-8 text-sm focus:outline-none transition-all font-inter ${
-                            pctTouched && rowErrors?.percentage
-                              ? "border-red-400 bg-red-50/40 focus:border-red-500"
-                              : "border-gray-200 bg-gray-50/50 focus:border-brand-500 focus:bg-white"
-                          }`}
-                        />
-                        <span className="absolute right-3 top-1/2 -translate-y-1/2 text-xs font-bold text-gray-400">
-                          %
-                        </span>
-                      </div>
-                      {pctTouched && rowErrors?.percentage && (
-                        <p className="text-xs text-red-600" role="alert">
-                          {rowErrors.percentage}
-                        </p>
-                      )}
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() => removeRecipient(idx)}
-                      disabled={form.recipients.length <= 1}
-                      aria-label={`Remove recipient ${idx + 1}`}
-                      className="mt-2.5 rounded-xl p-2.5 text-gray-400 hover:bg-red-50 hover:text-red-500 transition-all disabled:opacity-30 disabled:cursor-not-allowed"
-                    >
-                      <Trash2 size={16} />
-                    </button>
-                  </div>
-                );
-              })}
-            </div>
-
-            {/* Split sum indicator */}
-            <div className="flex items-center justify-between text-sm">
-              <span className="text-gray-500 font-inter">Total split:</span>
-              <span
-                className={`font-bold tabular-nums ${
-                  Math.round(recipientSum) === REQUIRED_SPLIT_SUM
-                    ? "text-green-600"
-                    : "text-red-600"
-                }`}
-                aria-label={`Total recipient split: ${recipientSum}%`}
-              >
-                {recipientSum.toFixed(2)}%{" "}
-                {Math.round(recipientSum) !== REQUIRED_SPLIT_SUM && (
-                  <span className="text-xs font-normal text-red-500">
-                    (must be 100%)
-                  </span>
-                )}
-              </span>
-            </div>
-
-            {(shouldShowError("recipients") || submitAttempted) && errors.recipients && (
-              <p className="text-sm text-red-600 mt-1" role="alert">
-                {errors.recipients}
-              </p>
-            )}
-          </div>
-
-          {/* Progress / server error */}
+          {/* Progress / lifecycle state label */}
           {isLoading && progress && (
             <div className="flex items-center gap-3 rounded-2xl bg-brand-50 px-6 py-4 text-sm font-semibold text-brand-700 animate-pulse">
               <Loader2 size={20} className="animate-spin" />
               {progress}
             </div>
           )}
-          {error && (
+
+          {/* Typed transaction error — distinguishes wallet rejection, simulation
+              failure, and chain failure with per-category recovery instructions */}
+          {listingTxState.state === "error" && listingTxState.error && (
+            <TxErrorPanel
+              error={listingTxState.error}
+              txHash={listingTxState.txHash}
+              onRetry={resetListingTx}
+              onDismiss={resetListingTx}
+            />
+          )}
+
+          {/* Tx hash recovery link — visible once hash is known */}
+          {listingTxState.txHash && listingTxState.state !== "success" && (
+            <p className="text-xs text-gray-400 text-center">
+              Transaction:{" "}
+              <Link
+                href={`/tx/${listingTxState.txHash}`}
+                className="font-mono text-blue-500 hover:underline"
+                target="_blank"
+              >
+                {listingTxState.txHash.slice(0, 12)}…
+              </Link>
+            </p>
+          )}
+
+          {/* Fallback hook error string (e.g. IPFS upload failures that happen
+              before the tx is submitted) */}
+          {hookError && listingTxState.state !== "error" && (
             <p className="rounded-2xl bg-red-50 px-6 py-4 text-sm font-bold text-red-600 border border-red-100">
-              {error}
+              {hookError}
             </p>
           )}
 
@@ -835,6 +946,7 @@ export function ListingForm({ listing, onSuccess, onCancel }: ListingFormProps) 
               disabled={
                 isAnyLoading ||
                 !hasTokenOptions ||
+                !!priceInputError ||
                 (submitAttempted && !formIsValid) ||
                 (!isEdit && approvalStatus === false)
               }

@@ -7,16 +7,17 @@
 import { useState, useEffect } from "react";
 import Link from "next/link";
 import { useWalletContext } from "@/context/WalletContext";
-import { useOffererOffers, useWithdrawOffer, useReclaimOffer } from "@/hooks/useOffers";
-import { stroopsToXlm, Offer } from "@/lib/contract";
-import { ShoppingBag, Clock, CheckCircle, XCircle, ArrowUpRight, History, Activity, TrendingUp, Loader2, Inbox, CalendarClock, Timer, Coins, AlertTriangle, X } from "lucide-react";
+import { useOffersWithReconciliation, useWithdrawOffer, useReclaimOffer } from "@/hooks/useOffers";
+import { stroopsToXlm, Offer, deriveOfferUIStatus } from "@/lib/contract";
+import { ShoppingBag, Clock, CheckCircle, XCircle, ArrowUpRight, History, Activity, TrendingUp, Loader2, Inbox, CalendarClock, Timer, Coins, AlertTriangle, X, ExternalLink, AlertOctagon } from "lucide-react";
 import { WalletGuard } from "@/components/WalletGuard";
 import { ResourceState } from "@/components/PageStates";
 import { categorizePageError } from "@/lib/pageState";
 import { SUPPORTED_TOKENS } from "@/config/tokens";
+import { OfferStatusBadge } from "@/components/OfferStatusBadge";
 import { clsx } from "clsx";
 
-type Tab = "all" | "Pending" | "Accepted" | "Rejected" | "Withdrawn";
+type Tab = "all" | "Pending" | "Expired" | "Accepted" | "Rejected" | "Withdrawn";
 
 // Format the time remaining until an offer's expiry as a compact countdown.
 // Returns null once the deadline has passed.
@@ -35,7 +36,16 @@ function formatCountdown(expiresAtSec: number, nowMs: number): string | null {
 
 export default function OffersPage() {
   const { publicKey } = useWalletContext();
-  const { offers, isLoading, error, refresh } = useOffererOffers(publicKey);
+  const {
+    offers,
+    isLoading,
+    error,
+    refresh,
+    addOfferMutation,
+    getOfferState,
+    resolveMutation,
+    rejectMutation,
+  } = useOffersWithReconciliation(publicKey);
   const { withdraw, isWithdrawing, error: withdrawError } = useWithdrawOffer(publicKey);
   const { reclaim, isReclaiming } = useReclaimOffer(publicKey);
   const [tab, setTab] = useState<Tab>("all");
@@ -48,18 +58,49 @@ export default function OffersPage() {
     return () => clearInterval(id);
   }, []);
 
-  const handleReclaim = async () => {
-    if (!confirmOffer) return;
-    const ok = await reclaim(confirmOffer.offer_id);
-    setConfirmOffer(null);
-    if (ok) refresh();
+  // Optimistic transition with rollback (Issue #528 / #302 infra): flip the
+  // offer to its terminal status immediately on submit, and only persist
+  // that view once the tx confirms via refresh(); a failed tx rolls back to
+  // the last confirmed snapshot automatically via useReconciliation.
+  const handleWithdraw = async (o: Offer) => {
+    const pendingId = addOfferMutation("withdraw", { ...o, status: "Withdrawn" });
+    const ok = await withdraw(o.offer_id);
+    if (ok) {
+      resolveMutation(pendingId);
+      refresh();
+    } else {
+      rejectMutation(pendingId);
+    }
   };
 
-  const pendingCnt = offers.filter((o: Offer) => o.status === "Pending").length;
+  const handleReclaim = async () => {
+    if (!confirmOffer) return;
+    const pendingId = addOfferMutation("reclaim", { ...confirmOffer, status: "Withdrawn" });
+    const ok = await reclaim(confirmOffer.offer_id);
+    setConfirmOffer(null);
+    if (ok) {
+      resolveMutation(pendingId);
+      refresh();
+    } else {
+      rejectMutation(pendingId);
+    }
+  };
+
+  const pendingCnt = offers.filter((o: Offer) => deriveOfferUIStatus(o, now) === "Pending").length;
   const acceptedCnt = offers.filter((o: Offer) => o.status === "Accepted").length;
+  const expiredCnt = offers.filter((o: Offer) => deriveOfferUIStatus(o, now) === "Expired").length;
 
   const filtered =
-    tab === "all" ? offers : offers.filter((o: Offer) => o.status === tab);
+    tab === "all"
+      ? offers
+      : tab === "Expired"
+      ? offers.filter((o: Offer) => deriveOfferUIStatus(o, now) === "Expired")
+      : tab === "Pending"
+      ? offers.filter((o: Offer) => {
+          const s = deriveOfferUIStatus(o, now);
+          return s === "Pending" || s === "Stale";
+        })
+      : offers.filter((o: Offer) => o.status === tab);
 
   const getTokenSymbol = (address: string) => {
     return SUPPORTED_TOKENS.find(t => t.address === address)?.symbol || "Tokens";
@@ -68,6 +109,7 @@ export default function OffersPage() {
   const tabs: { key: Tab; label: string; icon: any }[] = [
     { key: "all", label: "All Offers", icon: History },
     { key: "Pending", label: "Pending", icon: Clock },
+    { key: "Expired", label: "Expired", icon: AlertOctagon },
     { key: "Accepted", label: "Accepted", icon: CheckCircle },
     { key: "Rejected", label: "Rejected", icon: XCircle },
     { key: "Withdrawn", label: "Withdrawn", icon: History },
@@ -171,11 +213,20 @@ export default function OffersPage() {
             ))}
           </div>
 
-          {/* Navigational Tabs */}
-          <div className="mb-10 flex flex-wrap gap-2 border-b border-white/5 pb-px overflow-x-auto no-scrollbar scroll-smooth">
+          {/* Navigational Tabs — status filter, exposed as an accessible tablist */}
+          <div
+            role="tablist"
+            aria-label="Filter offers by status"
+            className="mb-10 flex flex-wrap gap-2 border-b border-white/5 pb-px overflow-x-auto no-scrollbar scroll-smooth"
+          >
             {tabs.map(({ key, label, icon: Icon }) => (
               <button
                 key={key}
+                role="tab"
+                id={`offers-tab-${key}`}
+                aria-selected={tab === key}
+                aria-controls="offers-tabpanel"
+                tabIndex={tab === key ? 0 : -1}
                 onClick={() => setTab(key)}
                 className={clsx(
                   "group relative flex items-center gap-3 px-6 sm:px-8 py-5 text-sm font-bold transition-all duration-500 whitespace-nowrap",
@@ -205,7 +256,12 @@ export default function OffersPage() {
           )}
 
           {/* Content area */}
-          <div className="animate-fade-in duration-700">
+          <div
+            className="animate-fade-in duration-700"
+            role="tabpanel"
+            id="offers-tabpanel"
+            aria-labelledby={`offers-tab-${tab}`}
+          >
             {error ? (
               <ResourceState
                 isLoading={false}
@@ -238,7 +294,14 @@ export default function OffersPage() {
               />
             ) : (
               <div className="grid gap-6 sm:grid-cols-2 lg:grid-cols-3">
-                {filtered.map((o) => (
+                {filtered.map((raw) => {
+                  // Show the optimistic value while a mutation is in flight;
+                  // falls back to the confirmed/raw offer otherwise.
+                  const o = (getOfferState(raw.offer_id).data as Offer) ?? raw;
+                  const uiStatus = deriveOfferUIStatus(o, now);
+                  const isExpired = uiStatus === "Expired";
+                  const isPending = uiStatus === "Pending" || uiStatus === "Stale";
+                  return (
                   <div key={o.offer_id} data-testid={`offer-card-${o.offer_id}`} className="group relative flex flex-col rounded-[2.5rem] bg-white/[0.03] hover:bg-white/[0.07] hover:border-white/10 transition-all duration-500 border border-white/5 p-6 shadow-2xl overflow-hidden">
                     {/* Background Pattern Hint */}
                     <div className="absolute -top-10 -right-10 tribal-pattern opacity-[0.03] scale-50 group-hover:rotate-12 transition-transform duration-700" />
@@ -247,15 +310,10 @@ export default function OffersPage() {
                       <div className="h-12 w-12 rounded-[1rem] bg-white/5 flex items-center justify-center text-white/40 border border-white/10 shadow-inner">
                         <span className="font-bold text-sm font-mono">#{o.offer_id}</span>
                       </div>
-                      <span className={clsx(
-                        "px-4 py-1.5 rounded-full text-[10px] font-bold uppercase tracking-[0.2em] border",
-                        o.status === "Pending" ? "bg-brand-500/10 text-brand-400 border-brand-500/20" :
-                          o.status === "Accepted" ? "bg-mint-500/10 text-mint-400 border-mint-500/20" :
-                            o.status === "Rejected" ? "bg-terracotta-500/10 text-terracotta-400 border-terracotta-500/20" :
-                              "bg-white/5 text-white/40 border-white/10"
-                      )}>
-                        {o.status}
-                      </span>
+                      <OfferStatusBadge
+                        uiStatus={uiStatus}
+                        data-testid={`offer-status-badge-${o.offer_id}`}
+                      />
                     </div>
 
                     <div className="flex flex-col gap-1 mb-8">
@@ -264,6 +322,14 @@ export default function OffersPage() {
                         <span className="font-display text-4xl font-bold text-white">{stroopsToXlm(o.amount)}</span>
                         <span className="text-[11px] font-bold text-brand-400 uppercase tracking-widest">{getTokenSymbol(o.token)}</span>
                       </div>
+                      {o.parent_offer_id != null && (
+                        <span
+                          className="mt-1 text-[10px] font-bold text-white/30 uppercase tracking-widest"
+                          data-testid={`counter-offer-indicator-${o.offer_id}`}
+                        >
+                          Counter-offer to offer #{o.parent_offer_id}
+                        </span>
+                      )}
                     </div>
 
                     <div className="mt-auto space-y-6">
@@ -291,69 +357,110 @@ export default function OffersPage() {
                           <span className="text-[10px] uppercase font-bold text-white/20 tracking-widest">Listing Expiry</span>
                         </div>
                         <span className="text-xs text-white/40">
-                          {o.listing?.expires_at
-                            ? new Date(o.listing.expires_at * 1000).toLocaleDateString()
+                          {(o as any).listing?.expires_at
+                            ? new Date((o as any).listing.expires_at * 1000).toLocaleDateString()
                             : "No expiry"}
                         </span>
                       </div>
 
                       {/* Offer Expiry Countdown — the offer's own deadline */}
-                      {o.status === "Pending" && o.expires_at != null && (
+                      {o.expires_at != null && (
                         <div
                           data-testid={`offer-countdown-${o.offer_id}`}
                           className="flex items-center justify-between rounded-2xl bg-white/[0.03] border border-white/10 px-4 py-3"
                         >
                           <div className="flex items-center gap-2">
-                            <Timer size={13} className={clsx(o.expires_at * 1000 <= now ? "text-terracotta-400" : "text-mint-400")} />
+                            <Timer size={13} className={clsx(isExpired ? "text-terracotta-400" : "text-mint-400")} />
                             <span className="text-[10px] uppercase font-bold text-white/30 tracking-widest">Offer Expiry</span>
                           </div>
-                          <span className={clsx("text-xs font-mono font-bold", o.expires_at * 1000 <= now ? "text-terracotta-400" : "text-mint-400")}>
+                          <span className={clsx("text-xs font-mono font-bold", isExpired ? "text-terracotta-400" : "text-mint-400")}>
                             {formatCountdown(o.expires_at, now) ?? "Expired"}
                           </span>
                         </div>
                       )}
 
-                      {o.status === "Pending" && (
-                        o.expires_at != null && o.expires_at * 1000 <= now ? (
-                          <button
-                            data-testid={`reclaim-btn-${o.offer_id}`}
-                            onClick={() => setConfirmOffer(o)}
-                            disabled={isReclaiming}
-                            className="w-full flex items-center justify-center gap-2 rounded-2xl bg-brand-500/15 hover:bg-brand-500/25 py-4 text-xs font-bold text-brand-300 border border-brand-500/30 hover:border-brand-500/50 transition-all shadow-xl group/btn"
-                          >
-                            {isReclaiming ? (
-                              <Loader2 size={16} className="animate-spin" />
-                            ) : (
-                              <>
-                                <Coins size={16} className="group-hover/btn:scale-110 transition-transform" />
-                                Reclaim Funds
-                              </>
-                            )}
-                          </button>
-                        ) : (
-                          <button
-                            data-testid={`withdraw-btn-${o.offer_id}`}
-                            onClick={async () => {
-                              const ok = await withdraw(o.offer_id);
-                              if (ok) refresh();
-                            }}
-                            disabled={isWithdrawing}
-                            className="w-full flex items-center justify-center gap-2 rounded-2xl bg-white/5 hover:bg-terracotta-500/20 py-4 text-xs font-bold text-terracotta-400 border border-white/10 hover:border-terracotta-500/30 transition-all shadow-xl group/btn"
-                          >
-                            {isWithdrawing ? (
-                              <Loader2 size={16} className="animate-spin" />
-                            ) : (
-                              <>
-                                <XCircle size={16} className="group-hover/btn:scale-110 transition-transform" />
-                                Withdraw Offer
-                              </>
-                            )}
-                          </button>
-                        )
+                      {/* Escrow / refund transaction links */}
+                      {(o.escrow_tx_hash || o.refund_tx_hash) && (
+                        <div className="flex flex-col gap-1 pt-2 border-t border-white/5">
+                          {o.escrow_tx_hash && (
+                            <div
+                              className="flex items-center gap-2 text-[10px] text-white/30"
+                              data-testid={`escrow-tx-${o.offer_id}`}
+                            >
+                              <span className="uppercase font-bold tracking-widest text-white/20">Escrow:</span>
+                              <span className="font-mono">{o.escrow_tx_hash.slice(0, 8)}…</span>
+                              <a
+                                href={`https://stellar.expert/explorer/testnet/tx/${o.escrow_tx_hash}`}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                aria-label="View escrow transaction on Stellar Expert"
+                                className="hover:text-brand-400 transition-colors"
+                              >
+                                <ExternalLink size={10} />
+                              </a>
+                            </div>
+                          )}
+                          {o.refund_tx_hash && (
+                            <div
+                              className="flex items-center gap-2 text-[10px] text-white/30"
+                              data-testid={`refund-tx-${o.offer_id}`}
+                            >
+                              <span className="uppercase font-bold tracking-widest text-white/20">
+                                {o.status === "Accepted" ? "Payment:" : "Refund:"}
+                              </span>
+                              <span className="font-mono">{o.refund_tx_hash.slice(0, 8)}…</span>
+                              <a
+                                href={`https://stellar.expert/explorer/testnet/tx/${o.refund_tx_hash}`}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                aria-label="View refund transaction on Stellar Expert"
+                                className="hover:text-mint-400 transition-colors"
+                              >
+                                <ExternalLink size={10} />
+                              </a>
+                            </div>
+                          )}
+                        </div>
                       )}
+
+                      {/* Action buttons — only shown for Pending/Expired */}
+                      {isExpired ? (
+                        <button
+                          data-testid={`reclaim-btn-${o.offer_id}`}
+                          onClick={() => setConfirmOffer(o)}
+                          disabled={isReclaiming}
+                          className="w-full flex items-center justify-center gap-2 rounded-2xl bg-brand-500/15 hover:bg-brand-500/25 py-4 text-xs font-bold text-brand-300 border border-brand-500/30 hover:border-brand-500/50 transition-all shadow-xl group/btn"
+                        >
+                          {isReclaiming ? (
+                            <Loader2 size={16} className="animate-spin" />
+                          ) : (
+                            <>
+                              <Coins size={16} className="group-hover/btn:scale-110 transition-transform" />
+                              Reclaim Funds
+                            </>
+                          )}
+                        </button>
+                      ) : isPending ? (
+                        <button
+                          data-testid={`withdraw-btn-${o.offer_id}`}
+                          onClick={() => handleWithdraw(o)}
+                          disabled={isWithdrawing}
+                          className="w-full flex items-center justify-center gap-2 rounded-2xl bg-white/5 hover:bg-terracotta-500/20 py-4 text-xs font-bold text-terracotta-400 border border-white/10 hover:border-terracotta-500/30 transition-all shadow-xl group/btn"
+                        >
+                          {isWithdrawing ? (
+                            <Loader2 size={16} className="animate-spin" />
+                          ) : (
+                            <>
+                              <XCircle size={16} className="group-hover/btn:scale-110 transition-transform" />
+                              Withdraw Offer
+                            </>
+                          )}
+                        </button>
+                      ) : null}
                     </div>
                   </div>
-                ))}
+                  );
+                })}
               </div>
             )}
           </div>

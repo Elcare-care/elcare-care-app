@@ -12,6 +12,7 @@
 #   cap_drop ALL — drops every Linux capability; the indexer needs none.
 #   security_opt — prevents setuid/setgid privilege escalation.
 #   restart      — always restart so a crash doesn't leave the service dark.
+#   tmpfs        — additional tmpfs mounts for write-only paths.
 #
 # Base-image update process:
 #   1. Run: docker pull node:20-alpine && docker inspect node:20-alpine --format '{{index .RepoDigests 0}}'
@@ -26,17 +27,24 @@ services:
     restart: always
     security_opt:
       - "no-new-privileges:true"
+    # PostgreSQL requires writable data directory, handled by volume mount
+    # No additional hardening needed beyond security_opt
 
   redis:
     restart: always
     security_opt:
       - "no-new-privileges:true"
     command: ["redis-server", "--save", "", "--appendonly", "no"]
+    # Redis requires writable data directory, handled by volume mount
+    # No additional hardening needed beyond security_opt
 
   indexer:
     restart: always
     read_only: true
     tmpfs:
+      # Indexer needs writable /tmp for temporary files and health check operations
       - /tmp:size=64m,mode=1777
+      # Prisma may need writable cache directories during migrations
+      - /app/prisma:size=32m,mode=1777
     environment:
       - NODE_ENV=production

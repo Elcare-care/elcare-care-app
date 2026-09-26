@@ -38,10 +38,16 @@ use soroban_sdk::{
     token::Client as TokenClient, xdr::ToXdr, Address, Bytes, BytesN, Env, Map, String, Vec,
 };
 
+/// Shared metadata validation rules (Issue #476).
+pub mod metadata;
+
 const TTL_THRESHOLD: u32 = 50_000;
 const TTL_BUMP: u32 = 100_000;
 /// Maximum number of vouchers accepted by a single redeem_batch call (#274).
 const MAX_BATCH_SIZE: u32 = 100;
+const MAX_BPS: u32 = 10_000;
+/// Maximum allowed byte length for a token URI (#481).
+const MAX_URI_LEN: u32 = 2048;
 
 // ─── Errors ──────────────────────────────────────────────────────────────────
 
@@ -67,6 +73,36 @@ pub enum Error {
     AlreadyMigrated = 14,
     /// Unsupported version jump.
     UnsupportedMigration = 15,
+    /// redeem_batch called with an empty items list.
+    EmptyBatch = 16,
+    /// redeem_batch called with more items than MAX_BATCH_SIZE.
+    BatchTooLarge = 17,
+    /// redeem_batch contains two items with the same voucher token_id.
+    DuplicateVoucherInBatch = 18,
+    /// set_approval_for_all called with an already-past `expires_at`.
+    ApprovalExpired = 19,
+    /// Royalty BPS exceeds 10 000 (100 %).
+    InvalidBps = 20,
+    /// Collection name is empty (Issue #476).
+    EmptyName = 21,
+    /// Collection name exceeds maximum length (Issue #476).
+    NameTooLong = 22,
+    /// Collection symbol is empty (Issue #476).
+    EmptySymbol = 23,
+    /// Collection symbol exceeds maximum length (Issue #476).
+    SymbolTooLong = 24,
+    /// max_supply is zero or exceeds the platform cap (Issue #476).
+    InvalidMaxSupply = 25,
+    /// accept_creator() called when no succession proposal is pending (#484).
+    NoPendingCreator = 26,
+    /// accept_creator() called by an address that is not the proposed successor (#484).
+    NotPendingCreator = 27,
+    /// accept_creator() called after the pending proposal's expiry ledger (#484).
+    ProposalExpired = 28,
+    /// redeem/check_voucher called with an empty URI.
+    EmptyUri = 29,
+    /// redeem/check_voucher called with a URI exceeding MAX_URI_LEN bytes.
+    UriTooLong = 30,
 }
 
 // ─── Data types ───────────────────────────────────────────────────────────────
@@ -131,6 +167,7 @@ pub enum DataKey {
     Approved(u64),
     BalanceOf(Address),
     ApprovedForAll(Address, Address),
+    ApprovedForAllExpiry(Address, Address), // (owner, operator) → u32 ledger sequence
     UsedVoucher(u64),    // nonce → bool  (redeemed)
     RevokedVoucher(u64), // nonce → bool  (creator-revoked, per-nonce)
     MerkleRoot,          // BytesN<32> — root of allowlist Merkle tree
@@ -138,6 +175,17 @@ pub enum DataKey {
     /// Network passphrase bound at initialization.
     /// Included in the signed digest to prevent cross-network replay (#273).
     NetworkPassphrase,   // String
+    /// On-chain version string written by migrate().
+    ContractVersion,
+    /// Migration completion marker (version string → bool).
+    MigrationDone(soroban_sdk::String),
+    /// Original creator address set at initialization — never changed by
+    /// succession (#484).
+    OriginalCreator,
+    /// Pending successor proposed via `propose_creator` (#484).
+    PendingCreator,
+    /// Ledger sequence at which the pending proposal expires (#484).
+    PendingCreatorExpiry,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -221,7 +269,17 @@ impl LazyMint721 {
         next_id: u64,
     ) -> Result<(), Error> {
         if voucher.valid_until != 0 && env.ledger().sequence() > voucher.valid_until as u32 {
+            env.events()
+                .publish((symbol_short!("expired"),), voucher.nonce);
             return Err(Error::VoucherExpired);
+        }
+        // URI boundary validation (#276)
+        let uri_len = voucher.uri.len();
+        if uri_len == 0 {
+            return Err(Error::EmptyUri);
+        }
+        if uri_len > MAX_URI_LEN {
+            return Err(Error::UriTooLong);
         }
         // Replay protection uses the voucher's nonce (not token_id) so the same
         // token can be covered by multiple vouchers with independent lifetimes.
@@ -349,8 +407,16 @@ impl LazyMint721 {
         if env.storage().instance().has(&DataKey::Initialized) {
             return Err(Error::AlreadyInitialized);
         }
+        // Issue #476: apply shared metadata validation rules before writing state.
+        metadata::validate_name(&name, Error::EmptyName, Error::NameTooLong)?;
+        metadata::validate_symbol(&symbol, Error::EmptySymbol, Error::SymbolTooLong)?;
+        metadata::validate_max_supply(max_supply, Error::InvalidMaxSupply)?;
+        metadata::validate_royalty_bps(royalty_bps, Error::InvalidBps)?;
         env.storage().instance().set(&DataKey::Initialized, &true);
         env.storage().instance().set(&DataKey::Creator, &creator);
+        // OriginalCreator is set once at initialization and never overwritten
+        // by succession — it preserves historical attribution (#484).
+        env.storage().instance().set(&DataKey::OriginalCreator, &creator);
         env.storage().instance().set(&DataKey::CurrentWasmHash, &BytesN::from_array(&env, &[0u8; 32]));
         env.storage()
             .instance()
@@ -392,7 +458,7 @@ impl LazyMint721 {
         env.storage()
             .instance()
             .set(&DataKey::CurrentWasmHash, &new_wasm_hash);
-        env.deployer().update_current_contract_wasm(&new_wasm_hash);
+        env.deployer().update_current_contract_wasm(new_wasm_hash.clone());
         env.events().publish(
             (symbol_short!("upgraded"),),
             (old_wasm_hash, new_wasm_hash),
@@ -678,6 +744,24 @@ impl LazyMint721 {
             .has(&DataKey::RevokedVoucher(nonce))
     }
 
+    /// Returns the composite status of a voucher nonce (#480):
+    ///   "Revoked"  — creator has explicitly revoked this nonce
+    ///   "Redeemed" — nonce has been consumed by a successful redeem call
+    ///   "Issued"   — nonce is still valid (not revoked, not redeemed)
+    ///
+    /// Revocation takes priority in the display string so a race where the
+    /// contract sets both flags is surfaced as "Revoked" (the creator-visible
+    /// terminal state), consistent with the on-chain check order in check_voucher.
+    pub fn voucher_status(env: Env, nonce: u64) -> String {
+        if env.storage().persistent().has(&DataKey::RevokedVoucher(nonce)) {
+            String::from_str(&env, "Revoked")
+        } else if env.storage().persistent().has(&DataKey::UsedVoucher(nonce)) {
+            String::from_str(&env, "Redeemed")
+        } else {
+            String::from_str(&env, "Issued")
+        }
+    }
+
     // ── Transfers ─────────────────────────────────────────────────────────
 
     pub fn transfer(env: Env, from: Address, to: Address, token_id: u64) -> Result<(), Error> {
@@ -731,12 +815,42 @@ impl LazyMint721 {
         Ok(())
     }
 
-    pub fn set_approval_for_all(env: Env, owner: Address, operator: Address, approved: bool) {
+    pub fn set_approval_for_all(
+        env: Env,
+        owner: Address,
+        operator: Address,
+        approved: bool,
+        expires_at: Option<u32>,
+    ) -> Result<(), Error> {
         Self::extend_instance_ttl(&env);
         owner.require_auth();
+
+        if approved {
+            if let Some(exp) = expires_at {
+                if env.ledger().sequence() >= exp {
+                    return Err(Error::ApprovalExpired);
+                }
+            }
+        }
+
         let key = DataKey::ApprovedForAll(owner.clone(), operator.clone());
+        let expiry_key = DataKey::ApprovedForAllExpiry(owner.clone(), operator.clone());
+
         env.storage().persistent().set(&key, &approved);
         env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_BUMP);
+
+        match (approved, expires_at) {
+            (true, Some(exp)) => {
+                env.storage().persistent().set(&expiry_key, &exp);
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&expiry_key, TTL_THRESHOLD, TTL_BUMP);
+            }
+            _ => {
+                env.storage().persistent().remove(&expiry_key);
+            }
+        }
+        Ok(())
     }
 
     // ── View functions ────────────────────────────────────────────────────
@@ -786,6 +900,21 @@ impl LazyMint721 {
             .has(&DataKey::UsedVoucher(nonce))
     }
 
+    /// Returns the current ledger sequence at query time, which callers can
+    /// compare against `MintVoucher.valid_until` to determine how many ledgers
+    /// remain before a voucher expires.  A voucher with `valid_until == 0` never
+    /// expires.  If `current_ledger > valid_until` the voucher is already expired
+    /// and `redeem` will return `VoucherExpired` (#481).
+    ///
+    /// This is intentionally a lightweight view that does NOT check revocation
+    /// or redemption state — callers should combine it with `is_voucher_redeemed`
+    /// and `is_voucher_revoked` to get the full voucher status picture.
+    pub fn voucher_expiry_info(env: Env, valid_until: u64) -> (u64, bool) {
+        let current = env.ledger().sequence() as u64;
+        let expired = valid_until != 0 && current > valid_until;
+        (current, expired)
+    }
+
     pub fn name(env: Env) -> String {
         env.storage().instance().get(&DataKey::Name).unwrap()
     }
@@ -829,10 +958,24 @@ impl LazyMint721 {
     }
 
     pub fn is_approved_for_all(env: Env, owner: Address, operator: Address) -> bool {
-        env.storage()
+        let approved: bool = env
+            .storage()
             .persistent()
-            .get(&DataKey::ApprovedForAll(owner, operator))
-            .unwrap_or(false)
+            .get(&DataKey::ApprovedForAll(owner.clone(), operator.clone()))
+            .unwrap_or(false);
+        if !approved {
+            return false;
+        }
+        if let Some(exp) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, u32>(&DataKey::ApprovedForAllExpiry(owner, operator))
+        {
+            if env.ledger().sequence() >= exp {
+                return false;
+            }
+        }
+        true
     }
 
     // ── Admin ─────────────────────────────────────────────────────────────
@@ -844,6 +987,116 @@ impl LazyMint721 {
             .instance()
             .set(&DataKey::Creator, &new_creator);
         Ok(())
+    }
+
+    /// Step 1 of the two-step creator succession (#484).
+    /// Proposes `new_creator` as the next collection administrator.
+    /// The proposal expires at `expires_at` (ledger sequence).
+    pub fn propose_creator(
+        env: Env,
+        new_creator: Address,
+        expires_at: u32,
+    ) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
+        let current = Self::only_creator(&env)?;
+        if env.ledger().sequence() >= expires_at {
+            return Err(Error::ApprovalExpired);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingCreator, &new_creator);
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingCreatorExpiry, &expires_at);
+        env.events().publish(
+            (symbol_short!("cr_prop"), current),
+            (new_creator, expires_at),
+        );
+        Ok(())
+    }
+
+    /// Step 2 of the two-step creator succession (#484).
+    /// The proposed successor accepts the role.  `OriginalCreator` is unchanged.
+    pub fn accept_creator(env: Env, new_creator: Address) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
+        new_creator.require_auth();
+        let pending: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingCreator)
+            .ok_or(Error::NoPendingCreator)?;
+        if new_creator != pending {
+            return Err(Error::NotPendingCreator);
+        }
+        let expiry: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingCreatorExpiry)
+            .unwrap_or(0);
+        if env.ledger().sequence() >= expiry {
+            return Err(Error::ProposalExpired);
+        }
+        let old_creator: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Creator)
+            .ok_or(Error::NotInitialized)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::Creator, &new_creator);
+        env.storage().instance().remove(&DataKey::PendingCreator);
+        env.storage()
+            .instance()
+            .remove(&DataKey::PendingCreatorExpiry);
+        env.events().publish(
+            (symbol_short!("cr_acc"), old_creator),
+            new_creator,
+        );
+        Ok(())
+    }
+
+    /// Cancel a pending creator succession proposal (#484). Creator-only.
+    pub fn cancel_creator_proposal(env: Env) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
+        let current = Self::only_creator(&env)?;
+        let pending: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingCreator)
+            .ok_or(Error::NoPendingCreator)?;
+        env.storage().instance().remove(&DataKey::PendingCreator);
+        env.storage()
+            .instance()
+            .remove(&DataKey::PendingCreatorExpiry);
+        env.events().publish(
+            (symbol_short!("cr_canc"), current),
+            pending,
+        );
+        Ok(())
+    }
+
+    /// Returns the original creator address set at initialization (#484).
+    pub fn original_creator(env: Env) -> Address {
+        env.storage()
+            .instance()
+            .get(&DataKey::OriginalCreator)
+            .unwrap_or_else(|| {
+                env.storage().instance().get(&DataKey::Creator).unwrap()
+            })
+    }
+
+    /// Returns the pending creator and expiry, or None (#484).
+    pub fn pending_creator(env: Env) -> Option<(Address, u32)> {
+        let pending = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::PendingCreator)?;
+        let expiry = env
+            .storage()
+            .instance()
+            .get::<DataKey, u32>(&DataKey::PendingCreatorExpiry)
+            .unwrap_or(0);
+        Some((pending, expiry))
     }
 
     pub fn update_creator_pubkey(env: Env, new_pubkey: BytesN<32>) -> Result<(), Error> {
@@ -858,6 +1111,9 @@ impl LazyMint721 {
     pub fn update_royalty(env: Env, receiver: Address, bps: u32) -> Result<(), Error> {
         Self::extend_instance_ttl(&env);
         Self::only_creator(&env)?;
+        if bps > MAX_BPS {
+            return Err(Error::InvalidBps);
+        }
         env.storage()
             .instance()
             .set(&DataKey::RoyaltyReceiver, &receiver);
@@ -901,8 +1157,8 @@ impl LazyMint721 {
 
     // ── Versioning & Migration ─────────────────────────────────────────────
 
-    pub fn version(_env: Env) -> &'static str {
-        "1.0.0"
+    pub fn version(env: Env) -> soroban_sdk::String {
+        soroban_sdk::String::from_str(&env, "1.0.0")
     }
 
     pub fn contract_version(env: Env) -> Option<String> {
@@ -1064,13 +1320,23 @@ impl LazyMint721 {
                 return Ok(());
             }
         }
-        if env
+        let all_approved: bool = env
             .storage()
             .persistent()
             .get::<DataKey, bool>(&DataKey::ApprovedForAll(from.clone(), spender.clone()))
-            .unwrap_or(false)
-        {
-            return Ok(());
+            .unwrap_or(false);
+        if all_approved {
+            let expiry: Option<u32> = env
+                .storage()
+                .persistent()
+                .get::<DataKey, u32>(&DataKey::ApprovedForAllExpiry(
+                    from.clone(),
+                    spender.clone(),
+                ));
+            let expired = expiry.map_or(false, |exp| env.ledger().sequence() >= exp);
+            if !expired {
+                return Ok(());
+            }
         }
         Err(Error::NotApproved)
     }

@@ -141,6 +141,28 @@ Soroban transaction disguised as a legitimate marketplace operation.
 
 **Residual risk:** Medium — dependent on user vigilance and browser extension security.
 
+### Threat: Transaction substitution (Issue #536)
+**Description:** A malicious browser extension, a compromised frontend build, or a stale
+network/contract configuration could present one transaction summary to the user while the
+transaction actually handed to the wallet for signing is different (different method,
+arguments, contract, or network).
+
+**Mitigations:**
+- A canonical, user-verifiable transaction intent (`src/lib/tx-intent.ts`) is derived from the
+  exact assembled transaction and re-derived from the literal XDR string handed to the wallet
+  adapter immediately before signing (`src/lib/contract.ts`, `invokeContract`).
+- Any mismatch between what was assembled, what is about to be signed, and (for the checkout
+  flow) what the confirmation UI displayed aborts signing and emits a `tx_intent_mismatch`
+  diagnostic event (`src/lib/wallet-telemetry.ts`) containing only field names, never values.
+- `CheckoutModal`'s "Transaction Details" panel renders the same canonical intent object used
+  for the pre-sign check, rather than a separately hand-rolled summary.
+
+**Residual risk:** Medium — this closes the gap between "what this app computed" and "what this
+app sent to the wallet," but cannot verify that the wallet extension's/app's own confirmation
+screen renders that transaction correctly to the user. See
+`docs/THREAT_MODEL_TX_SUBSTITUTION.md` for the full analysis, including this residual
+wallet-provider-UI risk.
+
 ### Threat: Secret leakage via client bundle
 **Description:** Server-side secrets (e.g., `PINATA_JWT`) bundled into the client-side JavaScript
 would be exposed to any visitor.
@@ -166,6 +188,7 @@ would be exposed to any visitor.
 | Malicious RPC | Low | High | Medium |
 | XSS | Low | High | Low |
 | Wallet phishing | Medium | High | Medium |
+| Transaction substitution | Low | High | Medium |
 | Secret leakage | Low | High | Low |
 | DDoS | Medium | Medium | Medium |
 

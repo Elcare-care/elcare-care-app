@@ -157,6 +157,30 @@ The JSON block below defines the exact topics and data schemas for all events. I
     "topic": "contract_unpaused",
     "data_schema": {}
   },
+  "COLLECTION_PAUSED": {
+    "topic": "collection_paused",
+    "data_schema": {
+      "collection": "Address"
+    }
+  },
+  "COLLECTION_UNPAUSED": {
+    "topic": "collection_unpaused",
+    "data_schema": {
+      "collection": "Address"
+    }
+  },
+  "FUNCTION_PAUSED": {
+    "topic": "function_paused",
+    "data_schema": {
+      "function_name": "Symbol"
+    }
+  },
+  "FUNCTION_UNPAUSED": {
+    "topic": "function_unpaused",
+    "data_schema": {
+      "function_name": "Symbol"
+    }
+  },
   "LISTING_PRICE_UPDATED": {
     "topic": "listing_price_updated",
     "data_schema": {
@@ -204,6 +228,38 @@ The JSON block below defines the exact topics and data schemas for all events. I
       "listing_id": "u64",
       "offerer": "Address",
       "amount": "i128"
+    }
+  },
+  "ROLE_TRANSFER_PROPOSED": {
+    "topic": "role_transfer_proposed",
+    "data_schema": {
+      "role": "RoleType",
+      "current_authority": "Address",
+      "proposed_authority": "Address",
+      "expires_at": "u64"
+    }
+  },
+  "ROLE_TRANSFERRED": {
+    "topic": "role_transferred",
+    "data_schema": {
+      "role": "RoleType",
+      "old_authority": "Address",
+      "new_authority": "Address"
+    }
+  },
+  "ROLE_PROPOSAL_CANCELLED": {
+    "topic": "role_proposal_cancelled",
+    "data_schema": {
+      "role": "RoleType",
+      "current_authority": "Address",
+      "cancelled_candidate": "Address"
+    }
+  },
+  "ROLE_MIGRATED": {
+    "topic": "role_migrated",
+    "data_schema": {
+      "role": "RoleType",
+      "authority": "Address"
     }
   }
 }

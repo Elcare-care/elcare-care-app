@@ -10,6 +10,7 @@ pub mod escrow;
 pub mod math;
 pub mod storage;
 mod types;
+mod lifecycle;
 
 #[cfg(test)]
 mod test;
@@ -17,9 +18,47 @@ mod test;
 #[cfg(test)]
 mod invariant_tests;
 
+#[cfg(test)]
+mod migration_tests;
+
+#[cfg(test)]
+mod governance_tests;
+
+#[cfg(test)]
+mod ownership_tests;
+
+#[cfg(test)]
+mod royalty_recovery_tests;
+
+#[cfg(test)]
+mod reservation_tests;
+
+#[cfg(test)]
+mod asset_equivalence_tests;
+
+#[cfg(test)]
+mod settlement_pause_tests;
+
+#[cfg(test)]
+mod auction_cancel_audit_tests;
+
+#[cfg(test)]
+mod offer_sweep_tests;
+
+#[cfg(test)]
+mod counter_offer_tests;
+
+#[cfg(test)]
+mod governance_quorum_tests;
+
+#[cfg(test)]
+mod erc1155_quantity_tests;
+
 pub use contract::MarketplaceContract;
 pub use types::{
-    BidRecord, CancelReason, Listing, ListingStatus, MarketplaceError, Offer, OfferStatus,
+    Auction, AuctionCancelReason, AuctionStatus, BatchItemError, BidRecord, CancelReason,
+    CollectionStandard, GovernanceProposal, GovernanceProposalType, Listing, ListingStatus,
+    MarketplaceError, Offer, OfferStatus, PauseMatrix, Recipient, RoleType,
 };
 
 #[cfg(any(test, feature = "testutils"))]

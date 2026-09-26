@@ -72,6 +72,15 @@ cd indexer
 docker compose up --build -d
 ```
 
+### Docker Deployment (Production - Hardened)
+For production deployments, always use the hardened configuration:
+```bash
+cd indexer
+docker compose -f docker-compose.yml -f docker-compose.prod.yml up --build -d
+```
+
+> **Important:** Production deployments must use the hardened configuration with non-root users, read-only filesystems, and dropped capabilities. See [Docker Hardening Guide](./docker-hardening.md) for detailed security measures and documented exceptions.
+
 ### Kubernetes Deployment (Production)
 To apply new indexer updates in production:
 ```bash
@@ -85,6 +94,31 @@ kubectl rollout restart deployment/indexer
 kubectl rollout status deployment/indexer
 ```
 
+**Kubernetes Security Context:**
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: indexer
+spec:
+  template:
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+        capabilities:
+          drop:
+            - ALL
+      containers:
+      - name: indexer
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+```
+
 ### Health & Readiness Checks
 The indexer exposes HTTP probes:
 - Liveness Probe: `GET http://localhost:4000/livez` (Returns HTTP 200)
@@ -93,6 +127,21 @@ The indexer exposes HTTP probes:
 ---
 
 ## 4. Frontend Deployment Workflow (Next.js / Vercel)
+
+### Docker Deployment (Local / Staging)
+```bash
+cd frontend/elcarehub-app
+docker compose up --build -d
+```
+
+### Docker Deployment (Production - Hardened)
+For production deployments, always use the hardened configuration:
+```bash
+cd frontend/elcarehub-app
+docker compose -f docker-compose.yml -f docker-compose.prod.yml up --build -d
+```
+
+> **Important:** Production deployments must use the hardened configuration with non-root users, read-only filesystems, and dropped capabilities. See [Docker Hardening Guide](./docker-hardening.md) for detailed security measures and documented exceptions.
 
 ### Production Build Check
 Always run a local production build before pushing to production:

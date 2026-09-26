@@ -32,11 +32,44 @@ enum OfferStatus {
   Reclaimed
 }
 
+/// Tracks per-bid refund eligibility for `refund_losing_bid` (Issue #466).
+enum BidRefundStatus {
+  /// Default: refund eligibility not yet determined (auction still Active).
+  None
+  /// The auction has settled; this losing bid is eligible for `refund_losing_bid`.
+  Refundable
+  /// The bidder has successfully claimed their refund via `refund_losing_bid`.
+  Claimed
+}
+
 model SyncState {
   id               Int      @id @default(1)
   lastLedger       Int      @default(0)
   lastLedgerHash   String?
   updatedAt        DateTime @updatedAt
+}
+
+// ── Distributed worker lease (coordination/lease.ts + fenced-lease.ts) ────────
+//
+// Each row represents one active lease for a worker role.
+// token: monotonically increasing fencing token — incremented on every renewal.
+//        Write operations guarded by the lease must include the current token
+//        as a precondition; a stale writer presenting an old token is rejected.
+// role_ownerId unique index: one row per (role, ownerId) — prevents the same
+//        worker from acquiring the same role twice.
+
+model WorkerLease {
+  id        Int      @id @default(autoincrement())
+  role      String   // 'poller' | 'reconciler' | 'backfill'
+  ownerId   String   // random per-process identifier
+  token     BigInt   @default(0)  // monotonically increasing fencing token
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([role, ownerId], name: "role_ownerId")
+  @@unique([role])            // only one active lease per role at a time
+  @@index([role, expiresAt])
 }
 
 // ── Dynamic contract registry ─────────────────────────────────────────────────
@@ -77,12 +110,34 @@ model Listing {
   createdAt       DateTime      @default(now())
   updatedAt       DateTime      @updatedAt
 
+  // ── ERC-1155 quantity fields (Issue #479) ──────────────────────────────────
+  /// Total quantity listed for ERC-1155 editions. Always 1 for ERC-721.
+  quantity          Int     @default(1)
+  /// Remaining unfilled quantity. Decremented on each partial purchase.
+  /// Reaches 0 when fully sold or cancelled. Always 1 for ERC-721.
+  remainingQuantity Int     @default(1)
+
+  // ── Royalty fields ─────────────────────────────────────────────────────────
+  /// Address of the original creator — used to attribute secondary royalties
+  /// after ownership has transferred.
+  originalCreator String?
+  /// Collection-level royalty in basis points (0–10 000).
+  royaltyBps      Int           @default(0)
+
+  /// Snapshot of the token's metadata version at last write.
+  /// NULL for rows ingested before token metadata versioning was introduced.
+  /// Used by cache-invalidation to target stale rows when decimals change.
+  tokenMetadataVersion Int?
+
   // ── Full-text search fields (populated from IPFS metadata after indexing) ──
   // Populated asynchronously after a LISTING_CREATED event is processed.
   // Null until IPFS metadata has been fetched and stored.
   title           String?
   description     String?
   artistName      String?
+  /// IPFS enrichment status: 'pending' | 'fetching' | 'done' | 'failed' | 'oversized' | 'unavailable' | 'deferred'
+  /// Null for rows ingested before IPFS backpressure was introduced.
+  ipfsStatus      String?
   // tsvector updated by the listing_search_vector_trigger in PostgreSQL.
   // Prisma cannot manage this column natively; it is marked Unsupported so
   // Prisma skips it in generated client writes — all updates go through the
@@ -96,6 +151,7 @@ model Listing {
   @@index([artist, updatedAtLedger])
   @@index([collection])
   @@index([collection, status])
+  @@index([originalCreator])
   // GIN index created via raw SQL in the migration (Prisma cannot express it).
   // CREATE INDEX "Listing_searchVector_idx" ON "Listing" USING gin("searchVector");
 }
@@ -116,6 +172,12 @@ model Auction {
   updatedAtLedger Int
   createdAt       DateTime      @default(now())
   updatedAt       DateTime      @updatedAt
+  /// Running count of extensions applied so far (from AuctionExtended events)
+  extensionCount  Int           @default(0)
+  /// Original end time set at auction creation, used to enforce total duration cap
+  originalEndTime BigInt
+  /// Snapshotted max-extensions cap from auction creation (0 = unlimited). Issue #468.
+  maxExtensions   Int           @default(0)
   @@index([updatedAtLedger])
   @@index([status, updatedAtLedger])
   @@index([creator, updatedAtLedger])
@@ -130,24 +192,68 @@ model Offer {
   status          OfferStatus @default(Pending)
   /// Optional expiry (ledger timestamp) after which the offer can be reclaimed. Null = never expires.
   expiresAt       BigInt?
+  /// Soroban tx hash of the escrow deposit (set from the OFFER_MADE event). Null until indexed.
+  escrowTxHash    String?
+  /// Soroban tx hash of the terminal payout/refund (accept, reject, withdraw, or reclaim). Null until indexed.
+  refundTxHash    String?
+  /// Issue #528 groundwork: offerId of the offer this one counters, when the
+  /// (not-yet-built) counter-offer flow creates one. Always null today.
+  parentOfferId   BigInt?
   createdAtLedger Int
   updatedAtLedger Int
   createdAt       DateTime    @default(now())
   updatedAt       DateTime    @updatedAt
+  /// Snapshot of the token's metadata version at last write (see tokenMetadataVersion on Listing)
+  tokenMetadataVersion Int?
   @@index([listingId])
   @@index([listingId, updatedAtLedger])
+  @@index([parentOfferId])
+}
+
+// ── Token whitelist registry (Issue #208) ─────────────────────────────────
+//
+// Tracks all tokens ever added to the whitelist with full audit trail.
+// Soft delete pattern: removed tokens have active=false but remain in the table.
+
+model WhitelistedToken {
+  address         String   @id
+  active          Boolean  @default(true)
+  addedAtLedger   Int
+  removedAtLedger  Int?
+  addedBy         String
+  removedBy       String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  /// Monotonically increasing version counter; incremented on each metadata change.
+  /// Starts at 1 on first insertion. Used by cache-invalidation to detect stale responses.
+  metadataVersion Int      @default(1)
+  /// Token decimal precision (e.g. 7 for XLM/SAC). NULL until set by a registry event.
+  decimals        Int?
+  /// Short token symbol from registry (e.g. "XLM", "USDC")
+  symbol          String?
+  /// Human-readable token name from registry
+  name            String?
+  /// The ledger sequence that caused the most recent metadata update.
+  sourceLedger    Int?
+
+  @@index([active])
+  @@index([addedAtLedger])
+  @@index([metadataVersion])
 }
 
 model Bid {
-  id              Int      @id @default(autoincrement())
+  id              Int             @id @default(autoincrement())
   auctionId       BigInt
   bidder          String
-  amount          Decimal  @db.Decimal(32, 7)
+  amount          Decimal         @db.Decimal(32, 7)
   ledgerSequence  Int
-  createdAt       DateTime @default(now())
+  createdAt       DateTime        @default(now())
+  /// Refund eligibility state populated from AUCTION_BID_REFUNDED events (Issue #466).
+  refundStatus    BidRefundStatus @default(None)
   @@index([auctionId])
   @@index([bidder])
   @@index([ledgerSequence])
+  @@index([auctionId, refundStatus])
   @@unique([auctionId, ledgerSequence, bidder])
 }
 
@@ -168,6 +274,10 @@ model MarketplaceEvent {
   /// behind the network tip.  On reorg, events past the safe ledger are
   /// hard-deleted (provisional by definition).
   confirmed       Boolean  @default(false)
+  /// Issue #532: position of this event within its ledger transaction, used
+  /// for deterministic same-ledger ordering in the provenance timeline.
+  /// NULL for legacy rows ingested before this field was introduced.
+  eventIndex      Int?
   @@index([actor])
   @@index([eventType])
   @@index([listingId])
@@ -176,6 +286,8 @@ model MarketplaceEvent {
   @@index([contractId])
   @@index([actor, ledgerSequence])
   @@index([contractId, ledgerSequence])
+  // Issue #532: composite index for provenance timeline ordering
+  @@index([ledgerSequence, eventIndex])
   @@unique([listingId, eventType, ledgerSequence])
 }
 
@@ -206,12 +318,92 @@ model Collection {
   /// Per-collection protocol fee override in basis points (0–10 000).
   /// Null means no override is set and the global protocol fee applies.
   feeBpsOverride  Int?
+  /// Whether the collection metadata has been permanently frozen.
+  metadataFrozen  Boolean  @default(false)
+  /// Metadata validation status (Issue #476).
+  /// "valid"   — deployed after #476 validation rules; all fields passed launchpad checks.
+  /// "unknown" — deployed before #476; no validation guarantee.
+  metadataStatus  String   @default("unknown")
+  /// Collection-level pause state (Issue #478).
+  /// When true, new listings and auctions for this collection are blocked.
+  paused          Boolean  @default(false)
+  /// Address that issued the most recent pause, for audit trail (Issue #478).
+  pausedBy        String?
   createdAt       DateTime @default(now())
   // GIN-indexed tsvector updated by collection_search_vector_trigger.
   searchVector    Unsupported("tsvector")?
   @@index([creator])
   @@index([creator, deployedAtLedger])
   @@index([kind, deployedAtLedger])
+}
+
+// ── Lazy-mint voucher registry ────────────────────────────────────────────────
+//
+// Tracks voucher issuance, redemption, and revocation for lazy-mint collections.
+// Indexed per collection so the API can serve filtered voucher lists with pagination.
+
+model Voucher {
+  id              Int      @id @default(autoincrement())
+  collection      String   // collection contract address
+  nonce           BigInt   // unique per-voucher nonce (replay-protection key)
+  tokenId         BigInt?  // target token id (may be null until redeemed)
+  status          String   @default("Issued") // Issued | Redeemed | Revoked | Expired
+  redeemer        String?  // address that redeemed (null if not yet redeemed)
+  /// Ledger sequence at which the voucher expires; 0 or null means no expiry (#481).
+  validUntil      BigInt?
+  /// Ledger sequence at which the indexer detected expiry (populated by the
+  /// expiry-sweep worker when validUntil < current ledger) (#481).
+  expiredAtLedger Int?
+  createdAtLedger Int
+  updatedAtLedger Int      @default(0)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@unique([collection, nonce])
+  @@index([collection])
+  @@index([collection, status])
+  @@index([createdAtLedger])
+  /// Composite index for the expiry-sweep query: find Issued vouchers whose
+  /// validUntil is non-zero and <= current ledger (#481).
+  @@index([status, validUntil])
+}
+
+// ── IPFS metadata cache ───────────────────────────────────────────────────────
+//
+// Content-addressed metadata cache keyed by IPFS CID.  Populated by the
+// background IpfsQueue worker once content is fetched from a gateway.
+// Prisma cannot express the raw JSON `raw` field as anything other than Json,
+// so callers must cast it to `Record<string, unknown>` when reading artist info.
+
+model IpfsMetadata {
+  cid         String   @id
+  title       String?
+  description String?
+  imageUrl    String?
+  attributes  Json?
+  fetchedAt   DateTime @default(now())
+  raw         Json
+  /// SHA-256 hex digest of the raw JSON body for content-integrity verification.
+  /// Null for rows fetched before content-hashing was introduced.
+  contentHash String?
+}
+
+// ── IPFS fetch queue ──────────────────────────────────────────────────────────
+//
+// Durable background job queue for fetching and caching IPFS content.
+// Workers poll for Pending/Failed entries with nextRetryAt <= now().
+
+model IpfsQueue {
+  id          Int       @id @default(autoincrement())
+  cid         String
+  attempts    Int       @default(0)
+  nextRetryAt DateTime?
+  status      String    @default("pending")
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([status, nextRetryAt])
+  @@index([cid])
 }
 
 // ── Backfill subsystem ───────────────────────────────────────────────────────
@@ -418,13 +610,54 @@ model DeadLetterEvent {
   parserVersion  String           @default("")
   status         DeadLetterStatus @default(Pending)
   attempts       Int              @default(0)
+  /// Optional human-readable reason supplied by the operator before replay.
+  /// Required before a Pending→Replayed transition via the admin API.
+  remediationReason String?
+  /// Operator identifier (wallet address or token-derived label) who triggered the last replay.
+  replayedBy     String?
+  /// ISO-8601 timestamp set when a replay attempt is in-flight; cleared on completion.
+  /// Prevents concurrent replays of the same record (optimistic lock).
+  lockedAt       DateTime?
+  /// Idempotency key supplied by the caller; duplicate requests with the same key
+  /// are detected and return the stored outcome without re-running replay logic.
+  idempotencyKey String?          @unique
   createdAt      DateTime         @default(now())
   updatedAt      DateTime         @updatedAt
+
+  /// All replay attempts for this dead-letter record (append-only audit trail).
+  replayAttempts DeadLetterReplayAttempt[]
 
   @@unique([contractId, ledgerSequence, txHash, eventIndex])
   @@index([status])
   @@index([contractId, ledgerSequence])
   @@index([createdAt])
+  @@index([lockedAt])
+}
+
+// ── Dead-letter replay attempt audit trail ────────────────────────────────────
+//
+// One append-only row per replay attempt.  Never modified after creation.
+// actor: operator wallet address or token-derived identifier.
+// outcome: "success" | "parse_null" | "parse_error" | "projection_error" | "duplicate"
+// projectionCommitted: true only when the event was re-projected into domain tables.
+
+model DeadLetterReplayAttempt {
+  id              Int             @id @default(autoincrement())
+  deadLetterId    Int
+  deadLetter      DeadLetterEvent @relation(fields: [deadLetterId], references: [id])
+  actor           String          // operator identifier
+  outcome         String          // "success" | "parse_null" | "parse_error" | "projection_error" | "duplicate"
+  errorMessage    String?         // set when outcome != success
+  parsedEventType String?         // event type returned by parser (null if parse returned null/threw)
+  projectionCommitted Boolean     @default(false)
+  dryRun          Boolean         @default(false)
+  idempotencyKey  String?         // echoed from the request
+  attemptedAt     DateTime        @default(now())
+  durationMs      Int?            // wall-clock duration of the attempt
+
+  @@index([deadLetterId])
+  @@index([actor])
+  @@index([attemptedAt])
 }
 
 // ── Reconciliation repairs (#288) ─────────────────────────────────────────────
@@ -467,6 +700,8 @@ model ReconciliationRun {
   completedAt         DateTime?
   sampledListings     Int           @default(0)
   sampledAuctions     Int           @default(0)
+  sampledOffers       Int           @default(0)
+  sampledCollections  Int           @default(0)
   discrepanciesFound  Int           @default(0)
   repairsApplied      Int           @default(0)
   skippedRecords      Int           @default(0)
@@ -494,4 +729,578 @@ model Discrepancy {
   @@index([kind, entityId])
   @@index([resolved])
   @@index([detectedAt])
+}
+
+// ── Archive tables (Issue #295) ────────────────────────────────────────────────
+//
+// These tables mirror the hot/warm tables and receive rows moved by the
+// archival job once they exceed the retention window.  The archive tables are
+// append-only; rows are never updated or deleted after insertion.
+// Each row carries `archivedAt` and `archiveChecksum` for provenance.
+
+model ArchivedMarketplaceEvent {
+  id             Int      @id @default(autoincrement())
+  listingId       BigInt?
+  eventType       String
+  actor           String
+  data            Json
+  ledgerSequence  Int
+  ledgerTimestamp DateTime @default(now())
+  eventHash       String?
+  contractId      String   @default("")
+  confirmed       Boolean  @default(false)
+  archivedAt      DateTime @default(now())
+  archiveChecksum String
+
+  @@index([ledgerSequence])
+  @@index([contractId, ledgerSequence])
+  @@index([archivedAt])
+}
+
+model ArchivedPriceHistory {
+  id              Int      @id @default(autoincrement())
+  listingId        BigInt
+  oldPrice         Decimal  @db.Decimal(32, 7)
+  newPrice         Decimal  @db.Decimal(32, 7)
+  changedBy        String   @default("")
+  changedAtLedger  Int
+  changedAt        DateTime @default(now())
+  archivedAt       DateTime @default(now())
+  archiveChecksum  String
+
+  @@index([listingId])
+  @@index([archivedAt])
+}
+
+model ArchivedLedgerCheckpoint {
+  id              Int      @id @default(autoincrement())
+  contractId      String
+  windowStart     Int
+  windowEnd       Int
+  ledgerHash      String?
+  eventCount      Int      @default(0)
+  status          String   @default("fetched")
+  error           String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @default(now())
+  archivedAt      DateTime @default(now())
+  archiveChecksum String
+
+  @@index([contractId, windowEnd])
+  @@index([archivedAt])
+}
+
+model ArchivedBackfillJob {
+  id               Int      @id @default(autoincrement())
+  startLedger      Int
+  endLedger        Int
+  checkpointLedger Int      @default(0)
+  status           String   @default("Pending")
+  rpcUrl           String
+  error            String?
+  totalInserted    Int      @default(0)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @default(now())
+  gapId            Int?
+  archivedAt       DateTime @default(now())
+  archiveChecksum  String
+
+  @@index([status])
+  @@index([archivedAt])
+}
+
+model ArchivedLedgerGap {
+  id          Int      @id @default(autoincrement())
+  fromLedger  Int
+  toLedger    Int
+  source      String
+  status      String   @default("Open")
+  error       String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @default(now())
+  archivedAt  DateTime @default(now())
+  archiveChecksum String
+
+  @@index([status])
+  @@index([archivedAt])
+}
+
+model ArchivedDeadLetterEvent {
+  id             Int      @id @default(autoincrement())
+  network        String   @default("")
+  contractId     String
+  ledgerSequence Int
+  txHash         String
+  eventIndex     Int
+  rawTopics      Json
+  rawValue       String   @default("")
+  errorCode      String
+  errorMessage   String
+  parserVersion  String   @default("")
+  status         String   @default("Pending")
+  attempts       Int      @default(0)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @default(now())
+  archivedAt     DateTime @default(now())
+  archiveChecksum String
+
+  @@index([status])
+  @@index([contractId, ledgerSequence])
+  @@index([archivedAt])
+}
+
+model ArchivedReconciliationRepair {
+  id           Int      @id @default(autoincrement())
+  modelType    String   // "listing" | "auction" | "offer" | "collection"
+  recordId     String
+  field        String
+  oldValue     String
+  newValue     String
+  reason       String
+  sourceLedger Int
+  status       String   @default("Applied")
+  createdAt    DateTime @default(now())
+  archivedAt   DateTime @default(now())
+  archiveChecksum String
+
+  @@index([modelType, recordId])
+  @@index([archivedAt])
+}
+
+model ArchivedReconciliationRun {
+  id                  Int      @id @default(autoincrement())
+  startedAt           DateTime @default(now())
+  completedAt         DateTime?
+  sampledListings     Int      @default(0)
+  sampledAuctions     Int      @default(0)
+  discrepanciesFound  Int      @default(0)
+  repairsApplied      Int      @default(0)
+  skippedRecords      Int      @default(0)
+  dryRun              Boolean  @default(false)
+  errorMessage        String?
+  archivedAt          DateTime @default(now())
+  archiveChecksum     String
+
+  @@index([startedAt])
+  @@index([archivedAt])
+}
+
+model ArchivedDiscrepancy {
+  id           Int      @id @default(autoincrement())
+  runId        Int
+  kind         String
+  entityId     String
+  field        String
+  dbValue      String
+  chainValue   String
+  resolved     Boolean @default(false)
+  detectedAt   DateTime @default(now())
+  resolvedAt   DateTime?
+  archivedAt   DateTime @default(now())
+  archiveChecksum String
+
+  @@index([runId])
+  @@index([kind, entityId])
+  @@index([archivedAt])
+}
+
+model ArchivedKeeperAction {
+  id          Int      @id @default(autoincrement())
+  targetType  String
+  targetId    BigInt
+  txHash      String?
+  status      String   @default("Pending")
+  attempts    Int      @default(0)
+  lastError   String?
+  feePaid     BigInt?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @default(now())
+  archivedAt  DateTime @default(now())
+  archiveChecksum String
+
+  @@index([targetType, status])
+  @@index([archivedAt])
+}
+
+// ── Operational Audit Trail ─────────────────────────────────────────────────────
+//
+// Append-only audit log for high-risk operational actions. Records cannot be
+// edited through the application. Sensitive context is redacted before storage.
+// Indexed by actor, action, and timestamp for efficient search and export.
+//
+// actionType: "admin_role_change" | "recovery_operation" | "cache_invalidation" |
+//            "replay_job" | "contract_upgrade" | "emergency_pause" | "data_correction"
+// outcome: "success" | "failure" | "partial"
+// redactedContext: JSON object with sensitive fields redacted (e.g., secrets, keys)
+
+enum AuditActionType {
+  AdminRoleChange
+  RecoveryOperation
+  CacheInvalidation
+  ReplayJob
+  ContractUpgrade
+  EmergencyPause
+  DataCorrection
+  BackfillJob
+  GapRepair
+  DeadLetterReplay
+  DeadLetterRemediate
+  SnapshotWrite
+  SnapshotVerify
+  ReorgRollback
+}
+
+enum AuditOutcome {
+  Success
+  Failure
+  Partial
+}
+
+model OperationalAudit {
+  id              Int           @id @default(autoincrement())
+  actor           String        // wallet address or operator identifier
+  actionType      AuditActionType
+  target          String?       // resource identifier (e.g., listing_id, contract_id)
+  requestId       String        // unique request ID for tracing
+  outcome         AuditOutcome
+  redactedContext Json          // action context with sensitive data redacted
+  ipAddress       String?       // client IP address
+  userAgent       String?       // client user agent
+  createdAt       DateTime      @default(now())
+
+  @@index([actor])
+  @@index([actionType])
+  @@index([createdAt])
+  @@index([actor, actionType])
+  @@index([actionType, createdAt])
+  @@index([requestId])
+}
+
+// ── Financial Reconciliation (Issue #XXX) ───────────────────────────────────────
+//
+// Tracks financial reconciliation for protocol fees, royalties, sales, and refunds.
+// Aggregates are computed per-ledger, per-token, per-collection, and protocol-wide.
+// Supports tolerance policies for provisional events and chain timing.
+
+enum FinancialReconcileStatus {
+  Pending
+  Matched
+  DriftDetected
+  AlertRaised
+  Resolved
+}
+
+enum FinancialDriftSeverity {
+  Low
+  Medium
+  High
+  Critical
+}
+
+model FinancialReconcileRun {
+  id                  Int                     @id @default(autoincrement())
+  startedAt           DateTime                @default(now())
+  completedAt         DateTime?
+  ledgerFrom          Int
+  ledgerTo            Int
+  confirmedDepth      Int                     // confirmation depth used for this run
+  toleranceBps        Int                     @default(100) // tolerance in basis points
+  includeProvisional  Boolean                 @default(false)
+  driftsDetected      Int                     @default(0)
+  alertsRaised        Int                     @default(0)
+  dryRun              Boolean                 @default(false)
+  errorMessage        String?
+  drifts              FinancialDrift[]
+  
+  @@index([startedAt])
+  @@index([ledgerFrom, ledgerTo])
+}
+
+model FinancialDrift {
+  id                  Int                       @id @default(autoincrement())
+  runId               Int
+  run                 FinancialReconcileRun     @relation(fields: [runId], references: [id])
+  
+  // Entity identification
+  entityType          String                    // "protocol_fee" | "royalty" | "sale" | "refund"
+  entityId            String                    // event hash or transaction ID
+  ledgerSequence      Int
+  
+  // Scope dimensions
+  token               String?
+  collection          String?
+  
+  // Expected vs actual values
+  expectedAmount      Decimal                   @db.Decimal(32, 7)
+  actualAmount        Decimal                   @db.Decimal(32, 7)
+  driftAmount         Decimal                   @db.Decimal(32, 7)
+  driftBps            Int                       // drift in basis points
+  
+  // Classification
+  severity            FinancialDriftSeverity
+  status              FinancialReconcileStatus  @default(DriftDetected)
+  reason              String                    // e.g., "missing_payout", "duplicate_payout", "wrong_token"
+  
+  // Provisional handling
+  isProvisional       Boolean                    @default(false)
+  confirmationDepth   Int?
+  
+  // Resolution tracking
+  resolvedAt          DateTime?
+  resolvedBy          String?
+  resolutionNotes     String?
+  
+  detectedAt          DateTime                  @default(now())
+  
+  @@index([runId])
+  @@index([entityType, ledgerSequence])
+  @@index([status, severity])
+  @@index([token])
+  @@index([collection])
+  @@index([isProvisional])
+  @@index([detectedAt])
+}
+
+// Materialized view refresh tracking (managed by application, not Prisma)
+model FinancialAggregateSnapshot {
+  id                  Int                       @id @default(autoincrement())
+  snapshotType        String                    // "per_ledger" | "per_token" | "per_collection" | "protocol"
+  scopeKey            String?                   // ledger sequence, token address, or collection address
+  ledgerFrom          Int
+  ledgerTo            Int
+  
+  // Aggregated values from events
+  protocolFeesTotal   Decimal                   @default(0) @db.Decimal(32, 7)
+  royaltiesTotal      Decimal                   @default(0) @db.Decimal(32, 7)
+  salesTotal          Decimal                   @default(0) @db.Decimal(32, 7)
+  refundsTotal        Decimal                   @default(0) @db.Decimal(32, 7)
+  
+  // Counts
+  protocolFeeCount    Int                       @default(0)
+  royaltyCount        Int                       @default(0)
+  saleCount           Int                       @default(0)
+  refundCount         Int                       @default(0)
+  
+  // Confirmation state
+  confirmedOnly       Boolean                   @default(true)
+  createdAt           DateTime                  @default(now())
+  
+  @@unique([snapshotType, scopeKey, ledgerFrom, ledgerTo, confirmedOnly])
+  @@index([snapshotType, ledgerFrom, ledgerTo])
+  @@index([scopeKey])
+}
+
+// ── Deployment fee accounting (Issue #483) ────────────────────────────────────
+//
+// One row per successful deploy_* call that charged a flat fee.  Sourced from
+// the "fee_coll" launchpad event.  Enables reconciliation between on-chain fee
+// transfers and indexed protocol revenue without reprocessing raw events.
+//
+// collectionAddress is nullable for legacy rows ingested before the fee event
+// carried the deployed collection address.
+
+model DeploymentFee {
+  id                Int      @id @default(autoincrement())
+  /// Launchpad contract address that emitted the event.
+  launchpadAddress  String
+  /// Creator who paid the fee.
+  creator           String
+  /// Treasury / fee receiver address.
+  treasury          String
+  /// Fee amount in the smallest token unit.
+  amount            Decimal  @db.Decimal(32, 7)
+  /// Token SAC address used for the fee transfer.
+  currency          String
+  /// Deployed collection contract address (null for pre-#483 rows).
+  collectionAddress String?
+  /// Kind of collection deployed (null for pre-#483 rows).
+  collectionKind    String?
+  /// Platform fee in basis points configured for this collection.
+  platformFeeBps    Int?
+  /// Ledger sequence this event was recorded at.
+  ledgerSequence    Int
+  createdAt         DateTime @default(now())
+
+  @@index([creator])
+  @@index([treasury])
+  @@index([launchpadAddress, ledgerSequence])
+  @@index([collectionAddress])
+  @@index([ledgerSequence])
+}
+
+
+//
+// Tracks a single resumable projection-rebuild operation initiated by the
+// rebuild-projections CLI or admin API.
+//
+// A rebuild replays canonical MarketplaceEvent rows through the same
+// processEvent() projection functions used during live ingestion, updating
+// Listing / Auction / Offer / Collection rows from the event log without
+// touching the live sync cursor.
+//
+// Lifecycle:
+//   Pending → Running → Completed
+//                     → Failed     (retryable via --resume=<id>)
+//                     → Cancelled  (operator-cancelled)
+//
+// Dry-run jobs reach DryRunComplete without modifying domain tables.
+
+enum ProjectionRebuildStatus {
+  Pending
+  Running
+  Completed
+  Failed
+  Cancelled
+  DryRunComplete
+}
+
+model ProjectionRebuildJob {
+  id                 Int                      @id @default(autoincrement())
+  /// Projection types included in this rebuild, e.g. ["listing","auction","offer","collection"]
+  projections        String[]
+  /// Ledger range lower bound (inclusive). 0 = "from genesis".
+  ledgerFrom         Int                      @default(0)
+  /// Ledger range upper bound (inclusive). 0 = "to current tip at start time".
+  ledgerTo           Int                      @default(0)
+  /// Optional filter: rebuild only entities matching this id (BigInt as string).
+  entityId           String?
+  /// Last fully-processed ledger sequence; 0 before first batch.
+  checkpointLedger   Int                      @default(0)
+  /// Number of event rows processed so far.
+  processedEvents    Int                      @default(0)
+  /// Total event rows in scope (estimated at job start; 0 until counted).
+  totalEvents        Int                      @default(0)
+  /// Number of domain table rows touched (upserted / updated).
+  affectedRows       Int                      @default(0)
+  /// Number of conflicts detected (rows that would change) in dry-run or execute mode.
+  conflictsDetected  Int                      @default(0)
+  /// SHA-256 of canonical event hashes before rebuild (hex string, null until computed).
+  checksumBefore     String?
+  /// SHA-256 of canonical event hashes after rebuild (null until rebuild completes).
+  checksumAfter      String?
+  status             ProjectionRebuildStatus  @default(Pending)
+  dryRun             Boolean                  @default(false)
+  /// Whether SSE broadcasts were suppressed during this rebuild.
+  sseSuppressed      Boolean                  @default(true)
+  error              String?
+  startedAt          DateTime?
+  completedAt        DateTime?
+  createdAt          DateTime                 @default(now())
+  updatedAt          DateTime                 @updatedAt
+
+  @@index([status])
+  @@index([createdAt])
+  @@index([ledgerFrom, ledgerTo])
+}
+
+// ── PendingOffer staging table (Issue: offer orphan FK strategy) ─────────────
+//
+// Holds OFFER_MADE events whose parent listing has not yet been ingested.
+// The promote_pending_offers() PostgreSQL trigger automatically moves these rows
+// into the live Offer table when the parent LISTING_CREATED arrives.
+// On reorg rollback, rows staged from > safeAtLedger are deleted via
+// revert_pending_offers(safe_ledger) raw SQL.
+
+model PendingOffer {
+  offerId         BigInt       @id
+  listingId       BigInt
+  offerer         String       @default("")
+  amount          Decimal      @db.Decimal(32, 7) @default(0)
+  token           String       @default("")
+  expiresAt       BigInt?
+  escrowTxHash    String?
+  createdAtLedger Int
+  updatedAtLedger Int
+  /// Full OFFER_MADE event payload preserved for replay after listing arrives.
+  rawEventData    Json?
+  stagedAt        DateTime     @default(now())
+
+  @@index([listingId])
+  @@index([createdAtLedger])
+}
+
+// ── TokenMetadataHistory (Issue: token metadata versioning) ──────────────────
+//
+// Audit trail of every metadata version change for a whitelisted token.
+// One row per (address, version). The current version matches WhitelistedToken.metadataVersion.
+// Used by cache-invalidation to target listings/auctions/offers that were written
+// with an older decimal precision.
+
+model TokenMetadataHistory {
+  id           Int      @id @default(autoincrement())
+  /// Token contract address (matches WhitelistedToken.address)
+  address      String
+  /// Monotonically increasing version number for this token (starts at 1)
+  version      Int
+  /// Decimal precision at this version (NULL = unknown / not yet set)
+  decimals     Int?
+  /// Short token symbol at this version
+  symbol       String?
+  /// Human-readable token name at this version
+  name         String?
+  /// Ledger sequence that triggered this version change
+  sourceLedger Int
+  /// Whether this token was active at this version
+  active       Boolean  @default(true)
+  changedAt    DateTime @default(now())
+
+  @@unique([address, version])
+  @@index([address])
+  @@index([sourceLedger])
+}
+
+// ── Indexer snapshots (recovery + audit checkpoints) ─────────────────────────
+//
+// Immutable, append-only snapshots written after every N committed batches.
+// Each snapshot captures the full sync state at a given ledger so that
+// recovery tooling can identify the last trustworthy point without scanning
+// arbitrary rows.
+//
+// contractCursors: JSON map of { contractId → lastLedger } for every active
+//   contract at the time the snapshot was written.
+// schemaVersion:   Value of SCHEMA_VERSION constant from config.ts at write time.
+//                  A mismatch between the persisted version and the running
+//                  binary signals a schema-incompatible snapshot — do not use
+//                  for automated recovery without operator approval.
+// rpcVerified:     true when the snapshotted ledgerHash was cross-checked against
+//                  the Stellar RPC before the snapshot was written.
+// hashMismatch:    true when the RPC returned a different hash than what the
+//                  indexer persisted — triggers an operator-visible alert and
+//                  prevents automated rollback to this snapshot.
+
+enum SnapshotStatus {
+  Pending   // written but not yet RPC-verified
+  Verified  // ledgerHash confirmed against RPC
+  Mismatch  // RPC hash differs from stored hash — do not use for automated recovery
+  Invalid   // structural validation failed (e.g. missing cursors)
+}
+
+model IndexerSnapshot {
+  id               Int            @id @default(autoincrement())
+  /// Ledger sequence this snapshot represents (immutable after creation).
+  ledgerSequence   Int
+  /// Stellar ledger hash at ledgerSequence (hex or base64, as returned by RPC).
+  ledgerHash       String
+  /// Per-contract sync cursors at snapshot time: { [contractId]: lastLedger }.
+  contractCursors  Json
+  /// Total MarketplaceEvent rows in the DB at snapshot time.
+  eventCount       BigInt         @default(0)
+  /// Schema version string from the running binary (e.g. "v2.3.0").
+  schemaVersion    String
+  /// Whether the ledgerHash was cross-checked against the Stellar RPC.
+  rpcVerified      Boolean        @default(false)
+  /// Set to true and status→Mismatch when RPC returns a different hash.
+  hashMismatch     Boolean        @default(false)
+  /// The hash returned by the RPC when hashMismatch is true (null otherwise).
+  rpcHash          String?
+  status           SnapshotStatus @default(Pending)
+  /// Free-text note written by the operator or recovery tooling.
+  notes            String?
+  createdAt        DateTime       @default(now())
+
+  @@index([ledgerSequence])
+  @@index([status])
+  @@index([createdAt])
+  // Composite: recovery query pattern is "latest Verified snapshot at or before X"
+  @@index([status, ledgerSequence])
 }

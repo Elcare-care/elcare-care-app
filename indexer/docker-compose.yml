@@ -73,6 +73,9 @@ services:
       - POLL_INTERVAL_MS=5000
       - CORS_ORIGIN=${CORS_ORIGIN:-}
       - HEALTH_DETAILS_TOKEN=${HEALTH_DETAILS_TOKEN:-}
+      # Structured logging (see README.md "Logging" section).
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      - LOG_FORMAT=${LOG_FORMAT:-json}
     ports:
       - "4000:4000"
     healthcheck:
@@ -82,6 +85,35 @@ services:
       timeout: 10s
       retries: 3
       start_period: 30s
+    # ── Log shipping (documentation only — disabled by default) ────────────────
+    #
+    # The indexer emits one JSON object per line on stdout, which is exactly
+    # what the docker log drivers below expect. Uncomment ONE of the examples
+    # to ship logs off-box instead of relying on `docker logs` / the default
+    # `json-file` driver. See README.md → "Logging" → "Log Shipping" for the
+    # full walkthrough (env vars, IAM permissions, Datadog Agent setup, etc).
+    #
+    # Example: AWS CloudWatch Logs via the built-in `awslogs` driver.
+    # Requires the CloudWatch Logs group to already exist and AWS credentials
+    # to be available to the Docker daemon (e.g. an EC2 instance role).
+    # logging:
+    #   driver: awslogs
+    #   options:
+    #     awslogs-region: us-east-1
+    #     awslogs-group: /elcarehub/indexer
+    #     awslogs-stream: indexer-${HOSTNAME:-local}
+    #     awslogs-create-group: "true"
+    #
+    # Example: Datadog, via the local `json-file` driver plus the Datadog
+    # Agent's Docker log collection (the Agent tails container log files
+    # directly — no per-service driver config needed beyond labels).
+    # logging:
+    #   driver: json-file
+    #   options:
+    #     max-size: "10m"
+    #     max-file: "3"
+    # labels:
+    #   com.datadoghq.ad.logs: '[{"source":"nodejs","service":"elcarehub-indexer"}]'
 
 volumes:
   postgres_data:

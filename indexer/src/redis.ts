@@ -1,4 +1,5 @@
 import { createClient } from 'redis';
+import { logger } from './logger.js';
 
 const REDIS_URL = process.env.REDIS_URL || 'redis://localhost:6379';
 const REDIS_RECONNECT_BASE_DELAY_MS = 50;
@@ -6,7 +7,8 @@ const REDIS_RECONNECT_MAX_DELAY_MS = 3000;
 const REDIS_RECONNECT_JITTER_MS = 100;
 
 export function calculateRedisReconnectDelay(retries: number, jitterMs = 0) {
-    const exponentialBackoff = REDIS_RECONNECT_BASE_DELAY_MS * (2 ** retries);
+    // Cap the exponent so the intermediate value never overflows to Infinity.
+    const exponentialBackoff = REDIS_RECONNECT_BASE_DELAY_MS * (2 ** Math.min(retries, 20));
     return Math.min(exponentialBackoff + jitterMs, REDIS_RECONNECT_MAX_DELAY_MS);
 }
 
@@ -24,11 +26,11 @@ const redis = createClient({
 });
 
 redis.on('error', (err) => {
-    console.warn('[Redis] Connection error (caching disabled):', err.message);
+    logger.warn({ err, component: 'redis' }, 'Redis connection error — caching disabled');
 });
 
 redis.connect().catch((err) => {
-    console.warn('[Redis] Could not connect (caching disabled):', err.message);
+    logger.warn({ err, component: 'redis' }, 'Redis initial connect failed — caching disabled');
 });
 
 // ── Cache invalidation helpers ────────────────────────────────────────────────
@@ -48,7 +50,7 @@ export async function invalidateKey(key: string): Promise<void> {
     try {
         await (redis as any).del(key);
     } catch (err) {
-        console.warn('[Redis] invalidateKey failed', key, err instanceof Error ? err.message : err);
+        logger.warn({ err, key, component: 'redis' }, 'Redis invalidateKey failed');
     }
 }
 
@@ -61,13 +63,16 @@ export async function invalidatePattern(pattern: string): Promise<void> {
     const client = redis as any;
     if (!isClientReady(client)) return;
     try {
-        // Use keys() for simplicity; for very large datasets consider SCAN cursor.
-        const keys: string[] = await client.keys(pattern);
-        if (keys.length > 0) {
-            await client.del(keys);
-        }
+        let cursor = 0;
+        do {
+            const reply = await client.scan(cursor, { MATCH: pattern, COUNT: 100 });
+            cursor = reply.cursor;
+            if (reply.keys.length > 0) {
+                await client.del(reply.keys);
+            }
+        } while (cursor !== 0);
     } catch (err) {
-        console.warn('[Redis] invalidatePattern failed', pattern, err instanceof Error ? err.message : err);
+        logger.warn({ err, pattern, component: 'redis' }, 'Redis invalidatePattern failed');
     }
 }
 

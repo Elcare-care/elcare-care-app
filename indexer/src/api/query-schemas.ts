@@ -22,37 +22,78 @@ const optionalIsoDate = z
 
 // ── Cursor pagination fields (shared across list endpoints) ───────────────────
 //
-// cursor_ledger    : ledgerSequence value to paginate from (exclusive boundary).
-// cursor_direction : "desc" (default, newest-first) | "asc" (oldest-first).
+// Two cursor styles are supported — clients should prefer the opaque cursor:
 //
-// When cursor_ledger is provided the endpoint uses:
-//   DESC → WHERE updatedAtLedger < cursor_ledger  (next older page)
-//   ASC  → WHERE updatedAtLedger > cursor_ledger  (next newer page)
+// Preferred (opaque composite cursor):
+//   cursor           : opaque base64url token returned in X-Next-Cursor.
+//                      Encodes ledger + row-id tiebreaker + HMAC signature.
+//                      Rejected with 400 if tampered or used on the wrong endpoint.
+//   cursor_direction : "desc" (default, newest-first) | "asc" (oldest-first).
+//
+// Legacy (plain ledger integer — kept for backwards compatibility):
+//   cursor_ledger    : ledgerSequence value to paginate from (exclusive boundary).
+//   cursor_direction : same as above.
 //
 // Responses include:
-//   X-Next-Cursor  : ledgerSequence of the last item returned, or "" when exhausted.
+//   X-Next-Cursor  : opaque cursor token for the next page, or "" when exhausted.
 //   X-Total-Count  : total matching rows (independent COUNT query).
+//
+// NOTE: `cursor` and `cursor_ledger` are mutually exclusive. When `cursor` is
+// present it takes precedence and `cursor_ledger` is ignored.
 
 const cursorFields = {
+  // Preferred opaque cursor (base64url, HMAC-signed composite token).
+  cursor: z.string().max(512).optional(),
+  // Legacy plain-integer cursor (backwards compatibility).
   cursor_ledger:    z.coerce.number().int().min(0).optional(),
   cursor_direction: z.enum(['asc', 'desc']).optional().default('desc'),
 };
 
 // ── Per-endpoint schemas ──────────────────────────────────────────────────────
 
+// Sort options — literal values must stay in sync with `SortOption` in
+// frontend/elcarehub-app/src/components/FilterSidebar.tsx. "newest" is the
+// default (no ORDER BY override needed since it matches the base query).
+const listingSortEnum = z.enum(['newest', 'oldest', 'price-low', 'price-high', 'recently-sold']);
+
+// `collection` may be sent as a single value or repeated (?collection=a&collection=b),
+// matching how useFilterUrlSync.ts appends one `collection` param per selected
+// collection. Normalise to an array of non-empty strings.
+const collectionField = z
+  .union([z.string(), z.array(z.string())])
+  .optional()
+  .transform((v) => {
+    if (v === undefined) return undefined;
+    const arr = Array.isArray(v) ? v : [v];
+    const cleaned = arr.map((s) => s.trim()).filter(Boolean);
+    return cleaned.length > 0 ? cleaned : undefined;
+  });
+
 export const listingsQuerySchema = z.object({
-  artist:   optionalStellarAddress,
-  owner:    optionalStellarAddress,
-  status:   z.enum(['Active', 'Sold', 'Cancelled', 'Auction']).optional(),
-  search:   optionalString,
-  minPrice: z.coerce.number().nonnegative().optional(),
-  maxPrice: z.coerce.number().nonnegative().optional(),
-  limit:    positiveInt(100).optional(),
-  offset:   positiveInt(10_000).optional(),
+  artist:     optionalString,
+  owner:      optionalString,
+  status:     z.enum(['Active', 'Sold', 'Cancelled', 'Auction', 'expired']).optional(),
+  search:     optionalString,
+  minPrice:   z.coerce.number().nonnegative().optional(),
+  maxPrice:   z.coerce.number().nonnegative().optional(),
+  sort:       listingSortEnum.optional(),
+  collection: collectionField,
+  token:      optionalString,
+  limit:      positiveInt(100).optional(),
+  offset:     positiveInt(10_000).optional(),
   ...cursorFields,
 }).refine(
   (d) => d.minPrice === undefined || d.maxPrice === undefined || d.minPrice <= d.maxPrice,
   { message: 'minPrice must be ≤ maxPrice', path: ['minPrice'] }
+).refine(
+  // Ledger-cursor pagination (cursor_ledger) assumes the result set is
+  // ordered by updatedAtLedger. "price-low"/"price-high" order by price
+  // instead, so a ledger cursor computed for one ordering is meaningless
+  // (and silently wrong — skipped/duplicated rows) against the other.
+  // Reject the combination up front rather than returning an ambiguous
+  // page; callers paginating a price sort must use offset instead.
+  (d) => d.cursor_ledger === undefined || d.sort === undefined || (d.sort !== 'price-low' && d.sort !== 'price-high'),
+  { message: 'cursor_ledger pagination is not supported with sort=price-low or sort=price-high; use offset pagination for price-sorted results', path: ['cursor_ledger'] }
 );
 
 export const auctionsQuerySchema = z.object({
@@ -68,6 +109,10 @@ export const offersQuerySchema = z.object({
     .string()
     .regex(/^\d+$/, 'listing_id must be a non-negative integer')
     .optional(),
+  // Issue #528: wallet-centric offer lookups ("offers I authored") need a
+  // server-side filter so the frontend can paginate instead of resolving
+  // every offer id from the contract and filtering client-side.
+  offerer: optionalStellarAddress,
   limit:  positiveInt(100).optional(),
   offset: positiveInt(10_000).optional(),
   ...cursorFields,
@@ -81,7 +126,7 @@ export const walletActivityQuerySchema = z.object({
 
 export const collectionsQuerySchema = z.object({
   kind:    z.enum(['normal_721', 'normal_1155', 'lazy_721', 'lazy_1155']).optional(),
-  creator: optionalStellarAddress,
+  creator: optionalString,
   limit:   positiveInt(100).optional(),
   offset:  positiveInt(10_000).optional(),
   ...cursorFields,
@@ -93,17 +138,16 @@ export const creatorCollectionsQuerySchema = z.object({
   ...cursorFields,
 });
 
+export const collectionTokensQuerySchema = z.object({
+  limit:  positiveInt(100).optional(),
+  offset: positiveInt(10_000).optional(),
+});
+
 export const statsQuerySchema = z.object({
   range: z.enum(['day', 'week', 'month']).optional(),
-  from:  optionalIsoDate,
-  to:    optionalIsoDate,
-}).refine(
-  (d) => {
-    if (d.from && d.to) return new Date(d.from) <= new Date(d.to);
-    return true;
-  },
-  { message: 'from must be before or equal to to', path: ['from'] }
-);
+  from:  z.string().optional(),
+  to:    z.string().optional(),
+});
 
 export const eventsQuerySchema = z.object({
   types: z
@@ -151,18 +195,11 @@ export const searchQuerySchema = z.object({
    * Defaults to all: listings, auctions, collections.
    */
   types: z
-    .union([
-      z.string().transform((s) => s.split(',').map((t) => t.trim())),
-      z.array(z.string()),
-    ])
+    .string()
     .optional()
     .default('listings,auctions,collections')
-    .transform((v) =>
-      (typeof v === 'string' ? v.split(',').map((t) => t.trim()) : v).filter(Boolean)
-    )
-    .pipe(
-      z.array(z.enum(['listings', 'auctions', 'collections'])).min(1)
-    ),
+    .transform((v) => v.split(',').map((t) => t.trim()).filter(Boolean))
+    .pipe(z.array(z.enum(['listings', 'auctions', 'collections'])).min(1)),
   /** Max results per entity type (1–50). */
   limit: positiveInt(50).optional().default(10),
 });

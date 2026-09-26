@@ -1,0 +1,99 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: migration
+  labels:
+    app: indexer
+    tier: database
+  annotations:
+    description: "Database migration job — runs before indexer deployment"
+spec:
+  template:
+    metadata:
+      labels:
+        app: indexer
+        tier: database
+    spec:
+      restartPolicy: Never
+      serviceAccountName: indexer
+      containers:
+      - name: migration
+        image: elcarehub/indexer:latest
+        command: ["sh", "-c", "npx prisma migrate deploy"]
+        env:
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: indexer-secrets
+              key: database-url
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "256Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+      terminationGracePeriodSeconds: 300
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 3600
+
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: pre-migration-check
+  labels:
+    app: indexer
+    tier: database
+  annotations:
+    description: "Pre-migration configuration validation"
+spec:
+  template:
+    metadata:
+      labels:
+        app: indexer
+        tier: database
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: validation
+        image: elcarehub/indexer:latest
+        command: ["node", "scripts/validate-config.js"]
+        env:
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: indexer-secrets
+              key: database-url
+        - name: REDIS_URL
+          valueFrom:
+            secretKeyRef:
+              name: indexer-secrets
+              key: redis-url
+        - name: STELLAR_RPC_URL
+          valueFrom:
+            secretKeyRef:
+              name: indexer-secrets
+              key: stellar-rpc-url
+        - name: STELLAR_NETWORK
+          value: "testnet"
+        - name: MARKETPLACE_CONTRACT_ID
+          valueFrom:
+            secretKeyRef:
+              name: indexer-secrets
+              key: marketplace-contract-id
+        resources:
+          requests:
+            cpu: "50m"
+            memory: "128Mi"
+          limits:
+            cpu: "100m"
+            memory: "256Mi"
+      terminationGracePeriodSeconds: 60
+  backoffLimit: 1

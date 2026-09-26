@@ -17,10 +17,13 @@ jest.mock('@/context/WalletContext', () => ({
 // Mock next/navigation
 jest.mock('next/navigation', () => ({
   useParams: () => ({ id: '1' }),
+  usePathname: () => '/',
   useRouter: () => ({
     push: jest.fn(),
     prefetch: jest.fn(),
+    replace: jest.fn(),
   }),
+  useSearchParams: () => new URLSearchParams(),
 }))
 
 describe('Smoke Test: Navigation and Route Rendering', () => {

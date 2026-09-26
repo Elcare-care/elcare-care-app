@@ -12,11 +12,13 @@ import {
   createAuction,
   placeBid,
   finalizeAuction,
+  cancelAuction,
+  refundLosingBid,
   Auction,
 } from "@/lib/contract";
 import { fetchAuctions } from "@/lib/indexer";
-import { uploadImageToIPFS, uploadMetadataToIPFS, ArtworkMetadata } from "@/lib/ipfs";
 import { getReadableErrorMessage } from "@/lib/errors";
+import { config } from "@/lib/config";
 import { useTransientErrorToast } from "./useTransientErrorToast";
 import { useTxToast } from "./useTxToast";
 import { assertSupportedTokenAddress } from "@/lib/token-support";
@@ -111,18 +113,32 @@ export function useArtistAuctions(artistPublicKey: string | null) {
 }
 
 // ── useCreateAuction ─────────────────────────────────────────
+//
+// Auction creation escrows an NFT the creator already owns — mirrors
+// useCreateListing in useMarketplace.ts. Recipients, reserve price and
+// duration map 1:1 onto the contract's create_auction bounds (Issue #527).
 
 export interface CreateAuctionInput {
-  title: string;
-  description: string;
-  artistName: string;
-  year: string;
-  category: string;
-  imageFile: File;
+  /** Address of the NFT collection contract the token belongs to. */
+  collectionAddress: string;
+  /** Token ID within the collection. */
+  nftTokenId: number;
+  /** Reserve price in the selected token's display units (e.g. XLM). */
   reservePriceXlm: number;
-  durationHours: number;
-  royaltyBps?: number;
+  /** Auction duration in seconds — contract minimum is 1 hour. */
+  durationSeconds: number;
+  /** Royalty split recipients — defaults to 100% creator when omitted. */
+  recipients?: Array<{ address: string; percentage: number }>;
   tokenAddress?: string;
+  /**
+   * Issue #530 — when the caller has already run the image + metadata
+   * through the validated/verified upload pipeline (see useIpfsUpload),
+   * pass the resulting CIDs here to skip re-uploading. This guarantees the
+   * on-chain auction is only ever created with a metadata CID that has
+   * already been confirmed to resolve to the intended content — a failed
+   * or unverified upload never reaches this point.
+   */
+  verifiedMetadataCid?: string;
 }
 
 export function useCreateAuction(creatorPublicKey: string | null) {
@@ -143,23 +159,32 @@ export function useCreateAuction(creatorPublicKey: string | null) {
       setError(null);
 
       try {
-        // Step 1: Upload image to IPFS.
-        setProgress("Uploading image to IPFS…");
-        const imageResult = await uploadImageToIPFS(input.imageFile, input.title);
+        // Issue #530: when the caller (AuctionForm) has already run the
+        // upload through the validated/verified pipeline (useIpfsUpload),
+        // reuse that CID instead of re-uploading. Otherwise fall back to
+        // uploading here directly (legacy/simple callers).
+        let metadataCid = input.verifiedMetadataCid;
 
-        // Step 2: Build metadata JSON.
-        const metadata: ArtworkMetadata = {
-          title: input.title,
-          description: input.description,
-          artist: input.artistName,
-          image: `ipfs://${imageResult.cid}`,
-          year: input.year,
-          category: input.category,
-        };
+        if (!metadataCid) {
+          // Step 1: Upload image to IPFS.
+          setProgress("Uploading image to IPFS…");
+          const imageResult = await uploadImageToIPFS(input.imageFile, input.title);
 
-        // Step 3: Upload metadata to IPFS.
-        setProgress("Uploading metadata to IPFS…");
-        const metadataResult = await uploadMetadataToIPFS(metadata, input.title);
+          // Step 2: Build metadata JSON.
+          const metadata: ArtworkMetadata = {
+            title: input.title,
+            description: input.description,
+            artist: input.artistName,
+            image: `ipfs://${imageResult.cid}`,
+            year: input.year,
+            category: input.category,
+          };
+
+          // Step 3: Upload metadata to IPFS.
+          setProgress("Uploading metadata to IPFS…");
+          const metadataResult = await uploadMetadataToIPFS(metadata, input.title);
+          metadataCid = metadataResult.cid;
+        }
 
         // Step 4: Validate token and call the Soroban contract via useTxToast.
         setProgress("Creating on-chain auction…");
@@ -167,16 +192,16 @@ export function useCreateAuction(creatorPublicKey: string | null) {
           input.tokenAddress ?? DEFAULT_TOKEN.address,
           "auction"
         );
-        const durationSeconds = input.durationHours * 3600;
+
+        setProgress("Creating on-chain auction…");
         const auctionId = await run(
           () =>
             createAuction(
               creatorPublicKey,
-              metadataResult.cid,
+              metadataCid as string,
               input.reservePriceXlm,
-              durationSeconds,
-              input.royaltyBps,
-              [],
+              input.durationSeconds,
+              input.recipients ?? [],
               token.address
             ),
           { action: "Auction" }
@@ -199,6 +224,89 @@ export function useCreateAuction(creatorPublicKey: string | null) {
   return { create, isCreating, progress, error };
 }
 
+// ── useEditAuctionBeforeFirstBid ─────────────────────────────
+//
+// The marketplace contract has no `update_auction` entry point — reserve
+// price, duration, asset, and recipients are immutable for the lifetime of
+// an auction once created. The only way to change them is to cancel (which
+// the contract only permits while `highest_bid == 0`, i.e. before any bid
+// has landed) and recreate with the new values. This hook wraps that
+// two-step flow as a single "edit" action so the UI can present it as one
+// operation; callers MUST also gate the edit affordance on
+// `auction.highest_bid === 0n` so users never attempt this once a bid has
+// escrowed real funds (the contract would reject the cancel with
+// `AuctionHasBids` and leave the original auction untouched).
+
+export function useEditAuctionBeforeFirstBid(creatorPublicKey: string | null) {
+  const [isSaving, setIsSaving] = useState(false);
+  const [progress, setProgress] = useState<string>("");
+  const [error, setError] = useState<string | null>(null);
+  useTransientErrorToast(error);
+  const { run } = useTxToast();
+
+  const save = useCallback(
+    async (
+      auction: Auction,
+      input: CreateAuctionInput
+    ): Promise<number | null> => {
+      if (!creatorPublicKey) {
+        setError("Wallet not connected");
+        return null;
+      }
+      if (auction.highest_bid > 0n) {
+        setError(
+          "This auction already has a bid — reserve price, duration, asset, and recipients are now immutable."
+        );
+        return null;
+      }
+
+      setIsSaving(true);
+      setError(null);
+      try {
+        setProgress("Cancelling previous configuration…");
+        const cancelled = await run(
+          () => cancelAuction(creatorPublicKey, auction.auction_id),
+          { action: "Cancel auction" }
+        );
+        if (cancelled === null) return null;
+
+        setProgress("Validating payment token…");
+        const token = await assertSupportedTokenAddress(
+          input.tokenAddress ?? DEFAULT_TOKEN.address,
+          "auction"
+        );
+
+        setProgress("Recreating auction with updated settings…");
+        const newAuctionId = await run(
+          () =>
+            createAuction(
+              creatorPublicKey,
+              input.collectionAddress,
+              input.nftTokenId,
+              input.reservePriceXlm,
+              input.durationSeconds,
+              input.recipients ?? [],
+              token.address
+            ),
+          { action: "Auction" }
+        );
+        if (newAuctionId === null) return null;
+
+        setProgress("Auction updated successfully!");
+        return newAuctionId;
+      } catch (err: unknown) {
+        setError(getReadableErrorMessage(err, "Failed to update auction"));
+        return null;
+      } finally {
+        setIsSaving(false);
+      }
+    },
+    [creatorPublicKey, run]
+  );
+
+  return { save, isSaving, progress, error };
+}
+
 // ── useFinalizeAuction ───────────────────────────────────────
 
 export function useFinalizeAuction(callerPublicKey: string | null) {
@@ -219,6 +327,55 @@ export function useFinalizeAuction(callerPublicKey: string | null) {
   return { finalize, isFinalizing, error: null };
 }
 
+// ── useCancelAuction ─────────────────────────────────────────
+//
+// Only valid while the auction is Active and has zero bids — the contract
+// rejects with AuctionHasBids otherwise. Callers should hide/disable the
+// triggering control once `auction.highest_bid > 0n`.
+
+export function useCancelAuction(creatorPublicKey: string | null) {
+  const { run, isRunning: isCancelling } = useTxToast();
+
+  const cancel = useCallback(
+    async (auctionId: number): Promise<boolean> => {
+      if (!creatorPublicKey) return false;
+      const result = await run(
+        () => cancelAuction(creatorPublicKey, auctionId),
+        { action: "Cancel auction" }
+      );
+      return result !== null;
+    },
+    [creatorPublicKey, run]
+  );
+
+  return { cancel, isCancelling, error: null };
+}
+
+// ── useRefundLosingBid ───────────────────────────────────────
+//
+// Refund-guidance action for a losing bidder on a terminal (Finalized or
+// Cancelled) auction. Most losing bids are refunded automatically the
+// moment they're outbid inside place_bid — this covers the edge case where
+// the frontend believes a refund is still outstanding after finalization.
+
+export function useRefundLosingBid(bidderPublicKey: string | null) {
+  const { run, isRunning: isRefunding } = useTxToast();
+
+  const refund = useCallback(
+    async (auctionId: number): Promise<boolean> => {
+      if (!bidderPublicKey) return false;
+      const result = await run(
+        () => refundLosingBid(bidderPublicKey, auctionId),
+        { action: "Claim refund" }
+      );
+      return result !== null;
+    },
+    [bidderPublicKey, run]
+  );
+
+  return { refund, isRefunding, error: null };
+}
+
 // ── useAuctionsWithReconciliation (Issue #302) ────────────────────────────────
 //
 // Wraps useAuctions with provisional state tracking for bid and finalize actions.
@@ -227,7 +384,17 @@ import { useRef } from "react";
 
 export function useAuctionsWithReconciliation() {
   const auctionsHook = useAuctions();
-  const recon = useReconciliation<Auction>({ mutationTtlMs: 60_000 });
+  const auctionsRefreshRef = useRef(auctionsHook.refresh);
+  auctionsRefreshRef.current = auctionsHook.refresh;
+
+  const recon = useReconciliation<Auction>({
+    mutationTtlMs: 60_000,
+    // Issue #520: a chain reorg invalidates any provisional bid/finalize
+    // state — reset and re-fetch confirmed truth instead of leaving stale
+    // local entities behind.
+    reorgIndexerUrl: config.indexerUrl || null,
+    onReorgReset: () => auctionsRefreshRef.current(),
+  });
 
   const prevRef = useRef<Auction[]>([]);
   useEffect(() => {

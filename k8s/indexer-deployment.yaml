@@ -1,0 +1,224 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: indexer
+  labels:
+    app: indexer
+  annotations:
+    description: "ELCARE-HUB Indexer — polls Stellar ledger and maintains marketplace state"
+spec:
+  replicas: 3
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: indexer
+  template:
+    metadata:
+      labels:
+        app: indexer
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "4000"
+        prometheus.io/path: "/metrics"
+    spec:
+      terminationGracePeriodSeconds: 60
+      serviceAccountName: indexer
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      containers:
+      - name: indexer
+        image: elcarehub/indexer:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 4000
+          name: http
+          protocol: TCP
+        env:
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: indexer-secrets
+              key: database-url
+        - name: REDIS_URL
+          valueFrom:
+            secretKeyRef:
+              name: indexer-secrets
+              key: redis-url
+        - name: STELLAR_RPC_URL
+          valueFrom:
+            secretKeyRef:
+              name: indexer-secrets
+              key: stellar-rpc-url
+        - name: STELLAR_NETWORK
+          value: "testnet"
+        - name: MARKETPLACE_CONTRACT_ID
+          valueFrom:
+            secretKeyRef:
+              name: indexer-secrets
+              key: marketplace-contract-id
+        - name: OPERATOR_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: indexer-secrets
+              key: operator-token
+        - name: PINATA_JWT
+          valueFrom:
+            secretKeyRef:
+              name: indexer-secrets
+              key: pinata-jwt
+        - name: KEEPER_ENABLED
+          value: "false"
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "256Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 4000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 4000
+          initialDelaySeconds: 60
+          periodSeconds: 15
+          timeoutSeconds: 5
+          failureThreshold: 3
+        startupProbe:
+          httpGet:
+            path: /health
+            port: 4000
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 30
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+        volumeMounts:
+        - name: scripts
+          mountPath: /scripts
+          readOnly: true
+        - name: tmp
+          mountPath: /tmp
+      volumes:
+      - name: scripts
+        configMap:
+          name: indexer-scripts
+      - name: tmp
+        emptyDir: {}
+      podManagementPolicy: Parallel
+      dnsPolicy: ClusterFirst
+      restartPolicy: Always
+      schedulerName: default-scheduler
+
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: indexer
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: indexer
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+  - type: Pods
+    pods:
+      metric:
+        name: indexer_sse_active_connections
+      target:
+        type: AverageValue
+        averageValue: "75"
+  - type: External
+    external:
+      metric:
+        name: indexer_ledger_lag
+        selector:
+          matchLabels:
+            deployment: indexer
+      target:
+        type: Value
+        value: 50
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: indexer
+  labels:
+    app: indexer
+spec:
+  type: ClusterIP
+  selector:
+    app: indexer
+  ports:
+  - name: http
+    port: 4000
+    targetPort: 4000
+    protocol: TCP
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: indexer
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: indexer
+rules:
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: indexer
+subjects:
+- kind: ServiceAccount
+  name: indexer
+  namespace: default
+roleRef:
+  kind: Role
+  name: indexer
+  apiGroup: rbac.authorization.k8s.io

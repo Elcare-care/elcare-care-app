@@ -6,6 +6,7 @@ members = [
     "contracts/collection_nft_erc1155",
     "contracts/lazy_mint_erc721",
     "contracts/lazy_mint_erc1155",
+    "contracts/e2e-conformance",
 ]
 resolver = "2"
 

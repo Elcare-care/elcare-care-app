@@ -387,6 +387,20 @@ describe('parseMarketplaceEvent — LISTING_CANCELLED fixture', () => {
     expect(r.actor).toBe('');
     expect(r.data.listing_id).toBe('3');
   });
+
+  it('preserves reason as object when CancelReason::Expired', () => {
+    setupMocks('lst_cncl', { listing_id: 7n, reason: { tag: 2 } });
+    const r = parseMarketplaceEvent(['t'], 'v', 400)!;
+    expect(r.eventType).toBe('LISTING_CANCELLED');
+    expect(r.data.reason).toEqual({ tag: 2 });
+  });
+
+  it('preserves reason as string for non-object values', () => {
+    setupMocks('lst_cncl', { listing_id: 8n, reason: 'owner' });
+    const r = parseMarketplaceEvent(['t'], 'v', 401)!;
+    expect(r.eventType).toBe('LISTING_CANCELLED');
+    expect(r.data.reason).toBe('owner');
+  });
 });
 
 describe('parseMarketplaceEvent — LISTING_UPDATED fixture', () => {

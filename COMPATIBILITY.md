@@ -67,3 +67,42 @@ When releasing a new version:
 3. Update **Minimum Required Versions** if compatibility requirements changed.
 4. Document any new **Breaking Change Policy** additions.
 5. Document **Rollback Compatibility** for the new version.
+
+---
+
+## Collection Contract Conformance Matrix
+
+*Updated by Issue #485 — Add collection contract compatibility conformance suite.*
+
+### Collection Variants
+
+| Kind | Deploy Topic | Deploy Event Type | Standard | Lazy-Mint |
+|------|-------------|-------------------|----------|-----------|
+| `normal_721` | `dep_n721` | `DEPLOY_NORMAL_721` | ✓ | — |
+| `normal_1155` | `dep_n1155` | `DEPLOY_NORMAL_1155` | ✓ | — |
+| `lazy_721` | `dep_l721` | `DEPLOY_LAZY_721` | ✓ | ✓ |
+| `lazy_1155` | `dep_l1155` | `DEPLOY_LAZY_1155` | ✓ | ✓ |
+
+### Capability Matrix
+
+| Capability | normal_721 | normal_1155 | lazy_721 | lazy_1155 | Required by |
+|-----------|-----------|------------|---------|----------|-------------|
+| Deploy via Launchpad | ✓ | ✓ | ✓ | ✓ | Launchpad, Indexer |
+| Collection-level pause (`c_psd` / `c_unpsd`) | ✓ | ✓ | ✓ | ✓ | Marketplace, Indexer |
+| Ownership transfer events | ✓ | ✓ | ✓ | ✓ | Marketplace, Frontend |
+| Lazy-mint voucher revocation (`revoke`) | — | — | ✓ | ✓ | Indexer, Frontend |
+| Deploy idempotency (`dep_idem`) | ✓ | ✓ | ✓ | ✓ | Launchpad, Indexer |
+| Marketplace listing / sale / offer events | ✓ | ✓ | ✓ | ✓ | Marketplace, Indexer, Frontend |
+
+**Legend:** ✓ = supported and conformance-tested; — = intentionally unsupported (documented).
+
+### Conformance Test Location
+
+`indexer/tests/collection-conformance.test.ts` — runs as part of the standard CI test suite. The suite verifies deploy event schema, pause capability, lazy-mint capability (lazy variants only), and marketplace integration events for every variant. Unsupported capabilities are documented with explicit `expect(variant.supportsLazyMint).toBe(false)` assertions that would fail if a standard variant started emitting lazy-mint events unexpectedly.
+
+### How to Update After a Contract Change
+
+1. Run `npm test -- collection-conformance` and check for failures.
+2. If a new capability is added to a variant, add it to the matrix above and write a new `it(...)` block in the test file.
+3. If a capability is removed, mark it `—` in the matrix and update the test to document the intentional removal.
+4. Update the **Supported Combinations** table above with a new release row.

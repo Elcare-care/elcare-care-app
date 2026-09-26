@@ -87,6 +87,13 @@ export default function RootLayout({
                       >
                         Help
                       </a>
+                      {" "}·{" "}
+                      <a
+                        href="/privacy"
+                        className="text-brand-400/70 hover:text-brand-400 hover:underline transition-colors"
+                      >
+                        Privacy
+                      </a>
                     </p>
                     <p className="mt-3 text-xs text-white/15">
                       Celebrating African art and heritage through blockchain technology.

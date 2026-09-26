@@ -8,17 +8,32 @@
 //       ↘ (at any stage) → error
 //
 // Key features:
+//   - Real RPC polling during the confirming phase via lookupTxOnRpc
 //   - Persists pending tx hash in sessionStorage so a page reload can recover
 //   - Typed error categories (wallet_rejection, simulation_failure, rpc_failure,
 //     indexer_delay, unknown)
-//   - Retry guard: a retry after submission requires explicit confirmation that
-//     the previous outcome was terminal (failed or timed-out)
+//   - Duplicate-submission guard: a run() call while one is already active
+//     returns null immediately without starting a second submission
+//   - Issue #524: optional cross-remount/reload/tab intent deduplication —
+//     pass `dedupe` to fingerprint the call (action + account + network +
+//     contract + args) and short-circuit an identical in-flight submission
+//     instead of resubmitting it, even across a page reload or another tab
 //   - Cancellation: an in-progress run can be aborted via the returned abort()
 // ─────────────────────────────────────────────────────────────────────────────
 
 "use client";
 
 import { useCallback, useRef, useState, useEffect } from "react";
+import { lookupTxOnRpc } from "@/lib/txLookup";
+import {
+  beginIntent,
+  updateIntentStatus,
+  clearIntent,
+  getIntent,
+  subscribeToIntentChanges,
+  intentScopeKey,
+  DEFAULT_INTENT_WINDOW_MS,
+} from "@/lib/txIntentDedup";
 
 // ── State model ───────────────────────────────────────────────────────────────
 
@@ -33,13 +48,13 @@ import { useCallback, useRef, useState, useEffect } from "react";
  */
 export type TxState =
   | "idle"
-  | "simulating"   // building + simulating the transaction
-  | "signing"      // waiting for wallet signature
-  | "broadcasting" // submitted to the network, awaiting inclusion
-  | "confirming"   // in ledger, awaiting final RPC confirmation
+  | "simulating"      // building + simulating the transaction
+  | "signing"         // waiting for wallet signature
+  | "broadcasting"    // submitted to the network, awaiting inclusion
+  | "confirming"      // polling RPC until ledger inclusion is confirmed
   | "indexer_pending" // confirmed on-chain, not yet visible in indexer
-  | "success"      // confirmed on-chain AND visible in indexer (or timeout elapsed)
-  | "error";       // terminal failure
+  | "success"         // confirmed on-chain AND visible in indexer (or timeout elapsed)
+  | "error";          // terminal failure
 
 /** Low-cardinality categories that let the UI distinguish failure causes. */
 export type TxErrorCategory =
@@ -47,6 +62,7 @@ export type TxErrorCategory =
   | "simulation_failure"  // contract simulation failed (pre-flight check)
   | "rpc_failure"         // network / RPC submission error
   | "indexer_delay"       // on-chain success but indexer confirmation timed out
+  | "intent_mismatch"     // Issue #536: assembled tx didn't match the displayed intent — aborted before signing
   | "unknown";            // catch-all
 
 export interface TxError {
@@ -65,6 +81,33 @@ export interface TxLifecycleState {
 
 // ── Options ───────────────────────────────────────────────────────────────────
 
+/**
+ * Issue #524 — client-side transaction intent deduplication.
+ *
+ * When supplied, `run()` fingerprints the call from `action` + `account` +
+ * `network` + `contract` + `args` before invoking `fn`. If an identical
+ * intent is already pending — in this component instance, in another
+ * mounted instance, recovered after a page reload, or in another browser
+ * tab — `fn` is never invoked a second time; the hook instead recovers the
+ * in-flight intent's known state (including its tx hash once broadcast).
+ *
+ * Different prices/accounts/assets/contracts hash differently and are never
+ * deduplicated together. A terminal outcome (success or error) clears the
+ * intent immediately so an intentional retry is never blocked.
+ */
+export interface TxIntentDedupeOptions {
+  /** Signing account (public key). Dedup is skipped when null/empty. */
+  account: string | null | undefined;
+  /** Network identifier (e.g. passphrase) that scopes the dedup registry. */
+  network: string;
+  /** Target contract id, when the action invokes one specific contract. */
+  contract?: string | null;
+  /** Distinguishing arguments — price, token id, amount, listing id, etc. */
+  args?: unknown;
+  /** Validity window in ms. Defaults to DEFAULT_INTENT_WINDOW_MS (20s). */
+  windowMs?: number;
+}
+
 export interface TxLifecycleOptions {
   /**
    * Human-readable action label used in error messages.
@@ -80,11 +123,24 @@ export interface TxLifecycleOptions {
   indexerConfirmTimeoutMs?: number;
 
   /**
+   * How long (ms) to poll the Soroban RPC for on-chain confirmation before
+   * giving up and treating the transaction as failed.
+   * Defaults to 60 000 ms (60 s).
+   */
+  rpcConfirmTimeoutMs?: number;
+
+  /**
    * Storage key prefix for sessionStorage persistence.
    * Defaults to "txLifecycle".
    * Set to null to disable persistence.
    */
   persistKey?: string | null;
+
+  /**
+   * Issue #524 — intent deduplication. See {@link TxIntentDedupeOptions}.
+   * Omit or pass null to disable (default).
+   */
+  dedupe?: TxIntentDedupeOptions | null;
 }
 
 // ── Return type ───────────────────────────────────────────────────────────────
@@ -98,6 +154,9 @@ export interface UseTxLifecycleResult {
 
   /**
    * Execute a write action through the full lifecycle.
+   *
+   * The duplicate-submission guard ensures that calling run() while a run is
+   * already active returns null immediately without submitting again.
    *
    * @param fn        The async action (must resolve with a result containing
    *                  a `hash` or `txHash` string field, or return null).
@@ -152,6 +211,14 @@ function loadPersistedTx(key: string): string | null {
 /** Classify an error into a TxErrorCategory. */
 export function classifyTxError(err: unknown): TxErrorCategory {
   if (!err) return "unknown";
+
+  // Issue #536: transaction-substitution guard tripped — checked by name
+  // rather than message content so it's never mis-bucketed as some other
+  // category regardless of the wording of the message.
+  if (err instanceof Error && err.name === "TxIntentMismatchError") {
+    return "intent_mismatch";
+  }
+
   const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
 
   // Wallet rejection signals from Freighter / Lobstr / Magic
@@ -160,18 +227,26 @@ export function classifyTxError(err: unknown): TxErrorCategory {
     msg.includes("user rejected") ||
     msg.includes("rejected by user") ||
     msg.includes("cancelled") ||
-    msg.includes("canceled")
+    msg.includes("canceled") ||
+    msg.includes("user denied") ||
+    msg.includes("sign request was rejected") ||
+    msg.includes("request rejected") ||
+    msg.includes("declined")
   ) {
     return "wallet_rejection";
   }
 
-  // Soroban simulation failures
+  // Soroban simulation / preflight failures
   if (
     msg.includes("simulation") ||
     msg.includes("simulate") ||
     msg.includes("preflight") ||
     msg.includes("contract error") ||
-    msg.includes("invoke_host_function")
+    msg.includes("invoke_host_function") ||
+    msg.includes("insufficient funds") ||
+    msg.includes("insufficient balance") ||
+    msg.includes("below minimum") ||
+    msg.includes("error(contract")
   ) {
     return "simulation_failure";
   }
@@ -185,12 +260,63 @@ export function classifyTxError(err: unknown): TxErrorCategory {
     msg.includes("submit") ||
     msg.includes("503") ||
     msg.includes("502") ||
-    msg.includes("429")
+    msg.includes("429") ||
+    msg.includes("econnreset") ||
+    msg.includes("econnrefused") ||
+    msg.includes("etimedout") ||
+    msg.includes("fetch failed") ||
+    msg.includes("failed to fetch")
   ) {
     return "rpc_failure";
   }
 
   return "unknown";
+}
+
+/**
+ * Build a user-facing error message from a raw error, enriching the raw
+ * message with context about the transaction action where helpful.
+ *
+ * Returns a plain string suitable for display in TxErrorPanel.
+ */
+export function buildTxErrorMessage(
+  err: unknown,
+  action: string,
+  category: TxErrorCategory
+): string {
+  const raw = err instanceof Error ? err.message : typeof err === "string" ? err : "";
+
+  switch (category) {
+    case "wallet_rejection":
+      return `You declined the ${action} request in your wallet. Nothing was submitted.`;
+
+    case "simulation_failure": {
+      // Surface contract error codes when present
+      const codeMatch = raw.match(/error\(contract,\s*#(\d+)\)/i);
+      const code = codeMatch ? ` (contract error #${codeMatch[1]})` : "";
+      if (raw.toLowerCase().includes("insufficient")) {
+        return `Insufficient funds to complete this ${action}. Check your balance and try again.${code}`;
+      }
+      return `${action} could not be simulated${code}. Refresh the page and try again — the listing state may have changed.`;
+    }
+
+    case "rpc_failure":
+      if (raw.includes("429"))
+        return `The Stellar network is busy. Wait a moment and retry your ${action}.`;
+      if (raw.toLowerCase().includes("timeout"))
+        return `The network request timed out while processing your ${action}. Try again.`;
+      return `A network error occurred during ${action}. Check your connection and try again.`;
+
+    case "indexer_delay":
+      return `Your ${action} was confirmed on-chain but the indexer hasn't caught up yet. This usually resolves within 30 seconds.`;
+
+    case "intent_mismatch":
+      return `We stopped your ${action} before asking your wallet to sign it because the transaction details changed unexpectedly. Nothing was sent to your wallet. Please refresh and try again.`;
+
+    case "unknown":
+    default:
+      return raw || `${action} failed. Please try again.`;
+  }
 }
 
 /** Attempt to extract a transaction hash from a raw SDK result. */
@@ -201,6 +327,45 @@ export function extractTxHash(result: unknown): string | null {
   if (typeof r["txHash"] === "string" && r["txHash"].length > 0) return r["txHash"];
   if (typeof r["id"] === "string" && r["id"].length === 64) return r["id"];
   return null;
+}
+
+// ── RPC confirmation poll ─────────────────────────────────────────────────────
+
+/**
+ * Polls the Soroban RPC until the transaction is confirmed (success or failed)
+ * or the timeout elapses.
+ *
+ * Returns:
+ *   "success"   – transaction included and all ops succeeded
+ *   "failed"    – transaction included but at least one op failed
+ *   "timeout"   – RPC confirmation did not arrive within rpcConfirmTimeoutMs
+ *   "aborted"   – abort signal fired
+ */
+async function pollRpcForConfirmation(
+  hash: string,
+  rpcConfirmTimeoutMs: number,
+  signal: AbortSignal
+): Promise<"success" | "failed" | "timeout" | "aborted"> {
+  const deadline = Date.now() + rpcConfirmTimeoutMs;
+  // Max 20 poll attempts with a 3-second interval gives 60 s coverage.
+  const maxAttempts = Math.ceil(rpcConfirmTimeoutMs / 3_000);
+
+  const result = await lookupTxOnRpc(hash, {
+    maxPollAttempts: maxAttempts,
+    pollIntervalMs: 3_000,
+    signal,
+  });
+
+  if (signal.aborted) return "aborted";
+
+  switch (result.chainStatus) {
+    case "success":   return "success";
+    case "failed":    return "failed";
+    case "rpc_error": return "timeout";  // treat RPC errors like timeouts
+    default:
+      // not_found after exhausted retries
+      return Date.now() >= deadline ? "timeout" : "timeout";
+  }
 }
 
 // ── Hook ──────────────────────────────────────────────────────────────────────
@@ -219,10 +384,23 @@ export function useTxLifecycle(
 
   // Abort flag: set to true when abort() is called mid-run
   const abortedRef = useRef(false);
-  // Whether a run is currently executing
+  // Whether a run is currently executing (duplicate-submission guard)
   const runningRef = useRef(false);
+  // AbortController for the in-progress RPC poll
+  const abortControllerRef = useRef<AbortController | null>(null);
   // Resolved persist key
   const persistKeyRef = useRef<string | null>(null);
+
+  // Issue #524 — intent dedup: the scope of the intent registered by the
+  // *current* run() call (if any), so status updates and reset() know which
+  // registry entry to mirror/clear.
+  const dedupeScopeRef = useRef<{
+    network: string;
+    account: string;
+    fingerprint: string;
+  } | null>(null);
+  // Unsubscribe for the cross-tab watcher started when a duplicate is detected.
+  const dedupeWatchUnsubRef = useRef<(() => void) | null>(null);
 
   // On mount: check sessionStorage for a persisted pending hash.
   // If found and we are currently idle, restore indexer_pending state so
@@ -248,6 +426,50 @@ export function useTxLifecycle(
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []); // intentionally run only on mount
 
+  // Unsubscribe any active cross-tab dedup watcher on unmount.
+  useEffect(() => {
+    return () => {
+      dedupeWatchUnsubRef.current?.();
+      dedupeWatchUnsubRef.current = null;
+    };
+  }, []);
+
+  const clearDedupeWatch = useCallback(() => {
+    dedupeWatchUnsubRef.current?.();
+    dedupeWatchUnsubRef.current = null;
+  }, []);
+
+  // Issue #524 — while short-circuited on a duplicate intent, watch the
+  // registry (cross-tab, via BroadcastChannel/storage events) so this
+  // instance updates automatically once the in-flight intent resolves
+  // elsewhere: it recovers a newly-known tx hash, or returns to idle the
+  // moment the other submission reaches a terminal state and clears its
+  // entry, so the user can retry without needing to reload.
+  const watchDuplicateIntent = useCallback(
+    (network: string, account: string, fingerprint: string) => {
+      clearDedupeWatch();
+      const targetScope = intentScopeKey(network, account);
+      const unsub = subscribeToIntentChanges((changedScopeKey) => {
+        if (changedScopeKey !== targetScope) return;
+        const record = getIntent(network, account, fingerprint);
+        if (!record) {
+          // Resolved (or expired) elsewhere — unblock this instance.
+          clearDedupeWatch();
+          setTxState(INITIAL_STATE);
+          return;
+        }
+        setTxState((prev) => ({
+          ...prev,
+          txHash: record.txHash ?? prev.txHash,
+          state: record.txHash ? "confirming" : prev.state,
+          stateEnteredAt: Date.now(),
+        }));
+      });
+      dedupeWatchUnsubRef.current = unsub;
+    },
+    [clearDedupeWatch]
+  );
+
   const transition = useCallback(
     (next: Partial<TxLifecycleState>) => {
       setTxState((prev) => ({
@@ -262,16 +484,29 @@ export function useTxLifecycle(
   const abort = useCallback(() => {
     if (!runningRef.current) return;
     abortedRef.current = true;
-    // Will be picked up in the run() loop and transition to error
+    abortControllerRef.current?.abort();
   }, []);
 
   const reset = useCallback(() => {
     abortedRef.current = false;
     runningRef.current = false;
+    abortControllerRef.current?.abort();
+    abortControllerRef.current = null;
     const key = persistKeyRef.current;
     if (key !== null) clearPersistedTx(storageKey(key));
+
+    // Issue #524 — a manual reset always frees the dedup slot immediately,
+    // so the user can deliberately retry even from a non-terminal state
+    // (e.g. after abort()) instead of waiting out the validity window.
+    clearDedupeWatch();
+    if (dedupeScopeRef.current) {
+      const { network, account, fingerprint } = dedupeScopeRef.current;
+      clearIntent(network, account, fingerprint);
+      dedupeScopeRef.current = null;
+    }
+
     setTxState(INITIAL_STATE);
-  }, []);
+  }, [clearDedupeWatch]);
 
   const run = useCallback(
     async <T>(
@@ -281,17 +516,71 @@ export function useTxLifecycle(
       const {
         action = defaultOpts.action ?? "Transaction",
         indexerConfirmTimeoutMs = defaultOpts.indexerConfirmTimeoutMs ?? 30_000,
+        rpcConfirmTimeoutMs = defaultOpts.rpcConfirmTimeoutMs ?? 60_000,
         persistKey = defaultOpts.persistKey !== undefined
           ? defaultOpts.persistKey
           : STORAGE_KEY_PREFIX,
+        dedupe = opts.dedupe !== undefined ? opts.dedupe : defaultOpts.dedupe,
       } = opts;
 
-      // Guard: do not start a new run while one is already active
+      // ── Duplicate-submission guard (same hook instance) ────────────────────
+      // If a run is already active, return null immediately. This prevents
+      // the user from clicking "Buy" twice and sending duplicate transactions.
       if (runningRef.current) return null;
+
+      // ── Issue #524: intent dedup guard (remount / reload / another tab) ────
+      // Distinct from the guard above: this catches the case where *this*
+      // hook instance is idle (e.g. after a remount, or in a second tab) but
+      // an identical intent — same action/account/network/contract/args — is
+      // already in flight elsewhere within its validity window.
+      if (dedupe && dedupe.account) {
+        const windowMs = dedupe.windowMs ?? DEFAULT_INTENT_WINDOW_MS;
+        const { duplicate, fingerprint, record } = beginIntent({
+          action,
+          account: dedupe.account,
+          network: dedupe.network,
+          contract: dedupe.contract ?? null,
+          args: dedupe.args,
+          windowMs,
+        });
+
+        if (duplicate) {
+          // fn() is intentionally never invoked here — that is the entire
+          // point of the guard. Recover the in-flight intent's known state
+          // instead (its tx hash, once broadcast) and watch for it to
+          // resolve so this instance updates automatically.
+          setTxState({
+            state: record.txHash ? "confirming" : "signing",
+            txHash: record.txHash,
+            error: null,
+            stateEnteredAt: Date.now(),
+          });
+          watchDuplicateIntent(dedupe.network, dedupe.account, fingerprint);
+          return null;
+        }
+
+        clearDedupeWatch();
+        dedupeScopeRef.current = { network: dedupe.network, account: dedupe.account, fingerprint };
+      } else {
+        dedupeScopeRef.current = null;
+      }
 
       runningRef.current = true;
       abortedRef.current = false;
+
+      // Create a fresh AbortController for this run's RPC poll
+      const ac = new AbortController();
+      abortControllerRef.current = ac;
+
       const resolvedPersistKey = persistKey !== null ? storageKey(persistKey) : null;
+
+      /** Issue #524 — mirrors a terminal outcome into the intent registry and
+       * frees the dedup slot so a retry is never blocked past this point. */
+      const finalizeDedupe = (status: "success" | "error", finalTxHash: string | null) => {
+        if (!dedupeScopeRef.current) return;
+        updateIntentStatus({ ...dedupeScopeRef.current, status, txHash: finalTxHash });
+        dedupeScopeRef.current = null;
+      };
 
       // ── Phase: simulating ──────────────────────────────────────────────────
       transition({ state: "simulating", txHash: null, error: null });
@@ -301,6 +590,7 @@ export function useTxLifecycle(
 
       if (abortedRef.current) {
         runningRef.current = false;
+        finalizeDedupe("error", null);
         transition({
           state: "error",
           error: { category: "unknown", message: `${action} cancelled by user.` },
@@ -309,6 +599,8 @@ export function useTxLifecycle(
       }
 
       // ── Phase: signing ─────────────────────────────────────────────────────
+      // fn() encompasses simulation + signing + submission in invokeContract.
+      // We label this "signing" because that is the user-facing blocking step.
       transition({ state: "signing" });
 
       let result: T;
@@ -316,8 +608,10 @@ export function useTxLifecycle(
         result = await fn();
       } catch (err: unknown) {
         runningRef.current = false;
+        abortControllerRef.current = null;
 
         if (abortedRef.current) {
+          finalizeDedupe("error", null);
           transition({
             state: "error",
             error: { category: "unknown", message: `${action} cancelled by user.` },
@@ -326,10 +620,8 @@ export function useTxLifecycle(
         }
 
         const category = classifyTxError(err);
-        const message =
-          err instanceof Error
-            ? err.message
-            : `${action} failed. Please try again.`;
+        const message  = buildTxErrorMessage(err, action, category);
+        finalizeDedupe("error", null);
         transition({
           state: "error",
           error: { category, message, originalError: err },
@@ -339,6 +631,8 @@ export function useTxLifecycle(
 
       if (abortedRef.current) {
         runningRef.current = false;
+        abortControllerRef.current = null;
+        finalizeDedupe("error", null);
         transition({
           state: "error",
           error: { category: "unknown", message: `${action} cancelled by user.` },
@@ -347,31 +641,99 @@ export function useTxLifecycle(
       }
 
       // ── Phase: broadcasting ────────────────────────────────────────────────
+      // fn() returned — invokeContract has submitted the transaction.
+      // Extract the hash from the result so we can poll RPC and persist.
       const txHash = extractTxHash(result);
       transition({ state: "broadcasting", txHash });
 
-      // Persist hash so page reload can recover
+      // Persist hash so a page reload can recover the pending state
       if (resolvedPersistKey && txHash) {
         persistTx(resolvedPersistKey, txHash);
       }
 
+      // Mirror the hash into the intent registry too, so a duplicate
+      // short-circuited in another tab (or after a remount) can recover it.
+      if (dedupeScopeRef.current && txHash) {
+        updateIntentStatus({ ...dedupeScopeRef.current, status: "pending", txHash });
+      }
+
       // ── Phase: confirming ──────────────────────────────────────────────────
+      // Poll the Soroban RPC until the transaction is included in a ledger.
       transition({ state: "confirming", txHash });
 
+      if (txHash) {
+        const rpcOutcome = await pollRpcForConfirmation(
+          txHash,
+          rpcConfirmTimeoutMs,
+          ac.signal
+        );
+
+        if (rpcOutcome === "aborted") {
+          runningRef.current = false;
+          abortControllerRef.current = null;
+          // Transaction may still be on-chain — do not clear the persisted hash,
+          // and leave the dedup entry pending for the same reason (it still
+          // carries the tx hash for cross-tab/reload recovery).
+          return result;
+        }
+
+        if (rpcOutcome === "failed") {
+          if (resolvedPersistKey) clearPersistedTx(resolvedPersistKey);
+          runningRef.current = false;
+          abortControllerRef.current = null;
+          finalizeDedupe("error", txHash);
+          transition({
+            state: "error",
+            txHash,
+            error: {
+              category: "rpc_failure",
+              message: buildTxErrorMessage(
+                new Error("Transaction failed on-chain"),
+                action,
+                "rpc_failure"
+              ),
+            },
+          });
+          return null;
+        }
+
+        if (rpcOutcome === "timeout") {
+          // We couldn't confirm in time — surface as rpc_failure so the user
+          // can check /tx/[hash] for the actual outcome.
+          if (resolvedPersistKey) clearPersistedTx(resolvedPersistKey);
+          finalizeDedupe("error", txHash);
+          runningRef.current = false;
+          abortControllerRef.current = null;
+          transition({
+            state: "error",
+            txHash,
+            error: {
+              category: "rpc_failure",
+              message: `${action} confirmation timed out. Check your transaction status at /tx/${txHash}.`,
+            },
+          });
+          return null;
+        }
+        // rpcOutcome === "success" → fall through to indexer_pending
+      }
+
       // ── Phase: indexer_pending ─────────────────────────────────────────────
-      // The transaction is on-chain; wait for the indexer to pick it up.
+      // The transaction is confirmed on-chain; wait for the indexer to pick it up.
       transition({ state: "indexer_pending", txHash });
 
       // Set a timeout: if indexer confirmation doesn't arrive within the
-      // configured window we transition to success with an indexer_delay flag.
+      // configured window we transition to success anyway with an indexer_delay
+      // note so the user is not stuck.
       await new Promise<void>((resolve) =>
         setTimeout(resolve, indexerConfirmTimeoutMs)
       );
 
       if (abortedRef.current) {
         runningRef.current = false;
-        // Don't overwrite — we're already on-chain
+        abortControllerRef.current = null;
+        // Transaction is already on-chain — transition to success
         if (resolvedPersistKey) clearPersistedTx(resolvedPersistKey);
+        finalizeDedupe("success", txHash);
         transition({ state: "success", txHash });
         return result;
       }
@@ -379,11 +741,13 @@ export function useTxLifecycle(
       // ── Phase: success ─────────────────────────────────────────────────────
       if (resolvedPersistKey) clearPersistedTx(resolvedPersistKey);
       runningRef.current = false;
+      abortControllerRef.current = null;
+      finalizeDedupe("success", txHash);
       transition({ state: "success", txHash });
 
       return result;
     },
-    [defaultOpts, transition]
+    [defaultOpts, transition, watchDuplicateIntent, clearDedupeWatch]
   );
 
   const isActive =

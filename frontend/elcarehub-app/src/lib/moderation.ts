@@ -137,16 +137,22 @@ export function nextStateAfterReport(
   return "REPORTED";
 }
 
-// ── In-memory store (development / MVP) ──────────────────────
+// ── In-memory store (local fallback only) ─────────────────────
 //
-// In production, replace with calls to the indexer's /moderation endpoints.
-// The indexer will persist records in PostgreSQL via Prisma.
+// The indexer's /moderation endpoints (indexer/src/api/moderation-routes.ts)
+// are now the source of truth — records persist in PostgreSQL via Prisma
+// (see indexer/prisma/schema.prisma: ModerationCase / ModerationReport /
+// ModerationDecision / ModerationAppeal). This in-memory store only exists
+// as a fallback for local development when the indexer is unreachable, so
+// the report flow never hard-fails.
 
 const _store = new Map<string, ModerationRecord>();
 const _auditLog: ModerationAuditEntry[] = [];
 
 /**
- * Creates a PENDING moderation record for a freshly uploaded CID.
+ * Creates a PENDING moderation record for a freshly uploaded CID (local
+ * fallback store only — the indexer creates its own ModerationCase lazily
+ * on first report).
  * Idempotent — calling again for the same CID is a no-op.
  */
 export function registerUpload(
@@ -168,18 +174,7 @@ export function registerUpload(
   return record;
 }
 
-/**
- * Returns the moderation record for a CID, or null if unknown.
- */
-export function getModerationRecord(cid: string): ModerationRecord | null {
-  return _store.get(cid) ?? null;
-}
-
-/**
- * Applies a report to a CID, advancing state if threshold is crossed.
- * Returns the updated record.
- */
-export function applyReport(req: ReportRequest): ModerationRecord {
+function _localApplyReport(req: ReportRequest): ModerationRecord {
   let record = _store.get(req.cid);
   if (!record) {
     record = registerUpload(req.cid, req.kind);
@@ -210,8 +205,8 @@ export function applyReport(req: ReportRequest): ModerationRecord {
 }
 
 /**
- * Sets a moderation state manually (admin action).
- * Creates a full audit trail entry.
+ * Sets a moderation state manually (admin action) in the local fallback
+ * store. Creates a full audit trail entry.
  */
 export function setModerationState(
   cid: string,
@@ -242,7 +237,7 @@ export function setModerationState(
 }
 
 /**
- * Returns all audit log entries for a given CID.
+ * Returns all audit log entries for a given CID (local fallback store only).
  */
 export function getAuditLog(cid?: string): ModerationAuditEntry[] {
   if (!cid) return [..._auditLog];
@@ -251,4 +246,184 @@ export function getAuditLog(cid?: string): ModerationAuditEntry[] {
 
 function _appendAudit(entry: ModerationAuditEntry): void {
   _auditLog.push(entry);
+}
+
+// ── Indexer-backed API (Issue #542) ───────────────────────────
+//
+// These functions call the indexer's /moderation endpoints and fall back to
+// the in-memory store above when the indexer is unreachable (e.g. local dev
+// without the indexer running). Public-facing fields only — reporter
+// identity and report evidence never round-trip through these calls.
+
+function indexerBaseUrl(): string {
+  return (process.env.NEXT_PUBLIC_INDEXER_URL ?? "http://localhost:4000").replace(/\/$/, "");
+}
+
+/** Link to the human-readable moderation policy, surfaced next to report/decision UI. */
+export const MODERATION_POLICY_URL =
+  "https://github.com/Elcare-care/elcare-care-app/blob/main/docs/MODERATION_POLICY.md";
+
+/**
+ * Submits a report to the indexer. Falls back to the local in-memory store
+ * if the indexer request fails, so the report flow never hard-fails.
+ * Never receives or echoes back the reporter's address.
+ */
+export async function applyReport(req: ReportRequest): Promise<ModerationRecord> {
+  try {
+    const res = await fetch(`${indexerBaseUrl()}/moderation/reports`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(req),
+    });
+    if (!res.ok) throw new Error(`indexer responded ${res.status}`);
+    const data = await res.json();
+    return {
+      cid: data.cid,
+      kind: data.kind,
+      state: data.state,
+      updatedAt: data.updatedAt,
+      reportCount: data.reportCount,
+    };
+  } catch {
+    return _localApplyReport(req);
+  }
+}
+
+/**
+ * Fetches the public-safe moderation case for a CID from the indexer,
+ * falling back to the local in-memory store on failure.
+ */
+export async function getModerationRecord(cid: string): Promise<ModerationRecord | null> {
+  try {
+    const res = await fetch(`${indexerBaseUrl()}/moderation/cases/${encodeURIComponent(cid)}`, {
+      cache: "no-store",
+    });
+    if (res.status === 404) return null;
+    if (!res.ok) throw new Error(`indexer responded ${res.status}`);
+    const data = await res.json();
+    return {
+      cid: data.cid,
+      kind: data.kind,
+      state: data.state,
+      updatedAt: data.updatedAt,
+      reportCount: data.reportCount,
+    };
+  } catch {
+    return _store.get(cid) ?? null;
+  }
+}
+
+export interface ModerationCaseFull {
+  id: number;
+  cid: string;
+  kind: ModerationAssetKind;
+  state: ModerationState;
+  reportCount: number;
+  uploaderAddress: string | null;
+  listingId: string | null;
+  reason: string | null;
+  reviewedBy: string | null;
+  createdAt: string;
+  updatedAt: string;
+  reports: Array<{
+    id: number;
+    category: ReportCategory;
+    description: string | null;
+    reporterAddress: string | null;
+    createdAt: string;
+  }>;
+  decisions: Array<{
+    id: number;
+    previousState: ModerationState;
+    newState: ModerationState;
+    actor: string;
+    reason: string | null;
+    createdAt: string;
+  }>;
+  appeals: ModerationAppeal[];
+}
+
+export type AppealStatus = "PENDING" | "UNDER_REVIEW" | "UPHELD" | "OVERTURNED";
+
+export interface ModerationAppeal {
+  id: number;
+  caseId: number;
+  appellantAddress: string;
+  statement: string;
+  status: AppealStatus;
+  decidedBy: string | null;
+  decisionReason: string | null;
+  createdAt: string;
+  decidedAt: string | null;
+}
+
+// ── Operator (admin) calls ─────────────────────────────────────
+//
+// These route through the Next.js server-side proxy under
+// app/api/moderation/admin/* rather than calling the indexer directly, so
+// the indexer's OPERATOR_TOKEN never ships to the browser bundle. The admin
+// page itself is gated behind the on-chain admin wallet check and
+// useAdminSession (see app/admin/page.tsx) before any of these are called.
+
+/** Operator-only: paginated triage list, optionally filtered by state. */
+export async function listModerationCases(
+  opts: { state?: ModerationState; limit?: number; offset?: number } = {}
+): Promise<{ cases: ModerationCaseFull[]; total: number }> {
+  const params = new URLSearchParams();
+  if (opts.state) params.set("state", opts.state);
+  if (opts.limit) params.set("limit", String(opts.limit));
+  if (opts.offset) params.set("offset", String(opts.offset));
+
+  const res = await fetch(`/api/moderation/admin/cases?${params.toString()}`, { cache: "no-store" });
+  if (!res.ok) throw new Error(`Failed to fetch moderation cases (${res.status})`);
+  return res.json();
+}
+
+/** Operator-only: full case detail including reports, decisions, and appeals. */
+export async function getModerationCaseFull(cid: string): Promise<ModerationCaseFull> {
+  const res = await fetch(`/api/moderation/admin/cases/${encodeURIComponent(cid)}`, { cache: "no-store" });
+  if (!res.ok) throw new Error(`Failed to fetch moderation case (${res.status})`);
+  return res.json();
+}
+
+/** Operator-only: record a moderation decision (APPROVED / QUARANTINED / REJECTED). */
+export async function decideModerationCase(
+  cid: string,
+  input: { state: "APPROVED" | "QUARANTINED" | "REJECTED"; actor: string; reason?: string }
+): Promise<ModerationRecord> {
+  const res = await fetch(`/api/moderation/admin/cases/${encodeURIComponent(cid)}/decision`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+  if (!res.ok) throw new Error(`Failed to record decision (${res.status})`);
+  return res.json();
+}
+
+/** Authenticated: uploader/creator files an appeal against a QUARANTINED/REJECTED case. */
+export async function submitAppeal(
+  cid: string,
+  input: { appellantAddress: string; statement: string }
+): Promise<ModerationAppeal> {
+  const res = await fetch(`${indexerBaseUrl()}/moderation/cases/${encodeURIComponent(cid)}/appeals`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-wallet-address": input.appellantAddress },
+    body: JSON.stringify(input),
+  });
+  if (!res.ok) throw new Error(`Failed to submit appeal (${res.status})`);
+  return res.json();
+}
+
+/** Operator-only: resolve an appeal (UPHELD keeps the rejection; OVERTURNED reinstates the case). */
+export async function decideAppeal(
+  appealId: number,
+  input: { status: "UPHELD" | "OVERTURNED"; decidedBy: string; decisionReason?: string; reinstateState?: "APPROVED" | "REPORTED" }
+): Promise<ModerationAppeal> {
+  const res = await fetch(`/api/moderation/admin/appeals/${appealId}/decision`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+  if (!res.ok) throw new Error(`Failed to record appeal decision (${res.status})`);
+  return res.json();
 }

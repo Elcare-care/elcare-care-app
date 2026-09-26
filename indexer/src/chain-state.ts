@@ -390,6 +390,50 @@ async function simulateView(
   }
 }
 
+// ── Auction configuration reads ─────────────────────────────────────────────────
+
+export interface AuctionConfig {
+  minBidIncrement: string; // i128 formatted as "${value}.0000000"
+  extensionWindow: string;  // u64 as decimal string
+  extensionTrigger: string; // u64 as decimal string
+}
+
+/**
+ * Reads global auction configuration from the contract via simulateTransaction.
+ * Calls get_min_bid_increment, get_auction_extension_window, and get_auction_extension_trigger.
+ */
+export async function fetchAuctionConfig(
+  server: rpc.Server,
+  contractId: string
+): Promise<AuctionConfig | null> {
+  try {
+    const [minIncrement, extensionWindow, extensionTrigger] = await Promise.all([
+      simulateView(server, contractId, 'get_min_bid_increment', []),
+      simulateView(server, contractId, 'get_auction_extension_window', []),
+      simulateView(server, contractId, 'get_auction_extension_trigger', []),
+    ]);
+
+    if (minIncrement === null || extensionWindow === null || extensionTrigger === null) {
+      return null;
+    }
+
+    const windowStr = (extensionWindow as unknown as bigint | number | string).toString();
+    const triggerStr = (extensionTrigger as unknown as bigint | number | string).toString();
+
+    return {
+      minBidIncrement: formatDecimal7(minIncrement),
+      extensionWindow: windowStr,
+      extensionTrigger: triggerStr,
+    };
+  } catch (err) {
+    logger.error('[chain-state] Failed to fetch auction config', {
+      contractId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return null;
+  }
+}
+
 /**
  * Reads Listing state via simulateTransaction of get_listing().
  * Use when CHAIN_STATE_MODE=simulate or as a fallback.
@@ -400,42 +444,25 @@ export async function fetchListingOnChainSimulate(
   contractId: string,
   listingId: bigint
 ): Promise<ChainListingState | null> {
-  const native = await simulateView(
-    server, contractId, 'get_listing',
-    [nativeToScVal(listingId, { type: 'u64' })]
-  );
+  const args = [nativeToScVal(listingId, { type: 'u64' })];
+  const native = await simulateView(server, contractId, 'get_listing', args);
   if (!native) return null;
-  try {
-    return decodeListingEntry(native);
-  } catch (err) {
-    logger.warn('[chain-state] Simulate: failed to decode listing', {
-      listingId: listingId.toString(),
-      error: err instanceof Error ? err.message : String(err),
-    });
-    return null;
-  }
+  return decodeListingEntry(native);
 }
 
-/** Reads Auction state via simulateTransaction of get_auction(). */
+/**
+ * Reads Auction state via simulateTransaction of get_auction().
+ * Use when CHAIN_STATE_MODE=simulate or as a fallback.
+ */
 export async function fetchAuctionOnChainSimulate(
   server: rpc.Server,
   contractId: string,
   auctionId: bigint
 ): Promise<ChainAuctionState | null> {
-  const native = await simulateView(
-    server, contractId, 'get_auction',
-    [nativeToScVal(auctionId, { type: 'u64' })]
-  );
+  const args = [nativeToScVal(auctionId, { type: 'u64' })];
+  const native = await simulateView(server, contractId, 'get_auction', args);
   if (!native) return null;
-  try {
-    return decodeAuctionEntry(native);
-  } catch (err) {
-    logger.warn('[chain-state] Simulate: failed to decode auction', {
-      auctionId: auctionId.toString(),
-      error: err instanceof Error ? err.message : String(err),
-    });
-    return null;
-  }
+  return decodeAuctionEntry(native);
 }
 
 // ── Raw-struct readers (for poller event enrichment) ─────────────────────────
@@ -501,4 +528,195 @@ export function getAuctionReader(): (
   return process.env.CHAIN_STATE_MODE === 'simulate'
     ? fetchAuctionOnChainSimulate
     : fetchAuctionOnChain;
+}
+
+// ── Offer types + key construction ────────────────────────────────────────────
+
+export interface ChainOfferState {
+  /** "Pending" | "Accepted" | "Rejected" | "Withdrawn" */
+  status: string;
+  /** i128 formatted as "${value}.0000000" */
+  amount: string;
+  /** Stellar address of the offerer. */
+  offerer: string | null;
+  /** Ledger timestamp, or null when Option<u64> is None. */
+  expiresAt: bigint | null;
+}
+
+const OFFER_STATUSES = new Set(['Pending', 'Accepted', 'Rejected', 'Withdrawn']);
+
+/** Encodes DataKey::Offer(id) — same contracttype ScMap pattern as Listing/Auction. */
+export function buildOfferKey(offerId: bigint): xdr.ScVal {
+  return xdr.ScVal.scvMap([
+    new xdr.ScMapEntry({
+      key: xdr.ScVal.scvSymbol('Offer'),
+      val: nativeToScVal(offerId, { type: 'u64' }),
+    }),
+  ]);
+}
+
+/**
+ * Decodes a scValToNative()-produced object into ChainOfferState.
+ * Matches the on-chain Offer struct fields: status, amount, offerer, expires_at.
+ */
+export function decodeOfferEntry(native: Record<string, unknown>): ChainOfferState {
+  return {
+    status:    requireStatus(native['status'], OFFER_STATUSES, 'offer'),
+    amount:    formatDecimal7(native['amount']),
+    offerer:   parseOptionalAddress(native['offerer']),
+    expiresAt: parseOptionalU64(native['expires_at']),
+  };
+}
+
+/** Reads Offer state from chain via getLedgerEntries. */
+export async function fetchOfferOnChain(
+  server: rpc.Server,
+  contractId: string,
+  offerId: bigint
+): Promise<ChainOfferState | null> {
+  const ledgerKey = buildLedgerKey(contractId, buildOfferKey(offerId));
+  const scVal = await fetchScValByLedgerKey(
+    server, ledgerKey, `getLedgerEntries-offer-${offerId}`
+  );
+  if (!scVal) return null;
+  const native = scValToNative(scVal) as Record<string, unknown>;
+  return decodeOfferEntry(native);
+}
+
+/** Fetches many offers in a single getLedgerEntries RPC call. */
+export async function fetchOffersBatch(
+  server: rpc.Server,
+  contractId: string,
+  offerIds: bigint[]
+): Promise<Map<string, ChainOfferState | null>> {
+  const result = new Map<string, ChainOfferState | null>();
+  if (offerIds.length === 0) return result;
+
+  const keys = offerIds.map(id => buildLedgerKey(contractId, buildOfferKey(id)));
+  const keyIndex = new Map<string, bigint>();
+  keys.forEach((k, i) => keyIndex.set(k.toXDR('base64'), offerIds[i]));
+
+  try {
+    const response = await withRpcRetry(
+      () => server.getLedgerEntries(...keys),
+      { operation: 'getLedgerEntries-offers-batch' }
+    );
+
+    for (const entry of response.entries) {
+      const offerId = keyIndex.get(entry.key.toXDR('base64'));
+      if (offerId === undefined) continue;
+      try {
+        const native = scValToNative(entry.val.contractData().val()) as Record<string, unknown>;
+        result.set(offerId.toString(), decodeOfferEntry(native));
+      } catch (err) {
+        logger.warn('[chain-state] Malformed offer entry', {
+          offerId: offerId.toString(),
+          error: err instanceof Error ? err.message : String(err),
+        });
+        result.set(offerId.toString(), null);
+      }
+    }
+  } catch (err) {
+    logger.error('[chain-state] Batch getLedgerEntries (offers) failed', {
+      count: offerIds.length,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+
+  for (const id of offerIds) {
+    if (!result.has(id.toString())) result.set(id.toString(), null);
+  }
+  return result;
+}
+
+/** Returns the offer reader (always getLedgerEntries; no simulate fallback). */
+export function getOfferReader(): (
+  server: rpc.Server,
+  contractId: string,
+  offerId: bigint
+) => Promise<ChainOfferState | null> {
+  return fetchOfferOnChain;
+}
+
+// ── Collection state (launchpad contract) ─────────────────────────────────────
+
+export interface ChainCollectionState {
+  /**
+   * platform_fee_bps from the launchpad contract's CollectionRecord.
+   * Matches DB feeBpsOverride (null means no override / global fee applies).
+   */
+  feeBpsOverride: number | null;
+  /** "Normal721" | "Normal1155" | "LazyMint721" | "LazyMint1155" */
+  kind: string | null;
+  /** Creator address string, or null when unavailable. */
+  creator: string | null;
+}
+
+/**
+ * Decodes a scValToNative()-produced CollectionRecord into ChainCollectionState.
+ * Fields: address, kind, creator, name, symbol, ledger, platform_fee_bps.
+ */
+export function decodeCollectionEntry(native: Record<string, unknown>): ChainCollectionState {
+  const raw = native['platform_fee_bps'];
+  const feeBpsOverride: number | null =
+    typeof raw === 'number' ? raw :
+    typeof raw === 'bigint' ? Number(raw) :
+    null;
+
+  const kind = native['kind'];
+  const kindStr: string | null = typeof kind === 'string' ? kind : null;
+
+  const creator = native['creator'];
+  const creatorStr: string | null = typeof creator === 'string' ? creator : null;
+
+  return { feeBpsOverride, kind: kindStr, creator: creatorStr };
+}
+
+/**
+ * Reads Collection state via simulateTransaction of get_collection() on the
+ * launchpad contract.  Returns null when the collection is not registered or
+ * the launchpad contract ID is empty.
+ */
+export async function fetchCollectionOnChain(
+  server: rpc.Server,
+  launchpadContractId: string,
+  collectionAddress: string
+): Promise<ChainCollectionState | null> {
+  if (!launchpadContractId) return null;
+  const args = [nativeToScVal(collectionAddress, { type: 'address' })];
+  const native = await simulateView(server, launchpadContractId, 'get_collection', args);
+  if (native == null) return null;
+  return decodeCollectionEntry(native as Record<string, unknown>);
+}
+
+/**
+ * Reads the per-collection fee override from the marketplace contract via
+ * simulateTransaction of get_collection_fee_bps(collection: Address) -> Option<u32>.
+ *
+ * Returns null when no override is set (contract returns None) or on error.
+ */
+export async function fetchCollectionFeeBpsFromMarketplace(
+  server: rpc.Server,
+  marketplaceContractId: string,
+  collectionAddress: string
+): Promise<number | null> {
+  if (!marketplaceContractId) return null;
+  const args = [nativeToScVal(collectionAddress, { type: 'address' })];
+  try {
+    const raw = await simulateView(server, marketplaceContractId, 'get_collection_fee_bps', args);
+    if (raw == null) return null;
+    const n = Number(raw);
+    return isNaN(n) ? null : n;
+  } catch {
+    return null;
+  }
+}
+
+/** Returns the collection reader (launchpad get_collection via simulate). */
+export function getCollectionReader(): (
+  server: rpc.Server,
+  launchpadContractId: string,
+  address: string
+) => Promise<ChainCollectionState | null> {
+  return fetchCollectionOnChain;
 }

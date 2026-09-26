@@ -1,6 +1,51 @@
 // events.rs — Defines all contract event schemas for ELCARE-HUB Marketplace
+//
+// ── Event Schema Versioning Policy (Issue #278) ─────────────────────────────
+//
+// The indexer (`indexer/src/event-schemas.ts`) decodes these events from raw
+// Soroban XDR using a per-event-type schema registry. The indexer is deployed
+// and upgraded independently from these contracts, and must remain able to
+// decode historical ledger events forever (raw XDR is replayable via
+// `indexer/src/backfill.ts`). That cross-component dependency is why event
+// shape changes follow explicit rules rather than being made ad hoc:
+//
+// 1. Numbering: `EVENT_SCHEMA_VERSION` below applies to the settlement- and
+//    audit-critical event structs that carry an explicit `schema_version:
+//    u32` field (see the list in `docs/guides/event-parsing.md`). Bump it
+//    whenever any of those structs gains a new field. Historical events
+//    emitted before the field existed have no `schema_version` in their XDR
+//    at all — the indexer treats that absence as implicit version 0.
+// 2. Additive-only: existing fields are never renamed, retyped, removed, or
+//    given a different meaning. A shape change is always a NEW field
+//    appended to the struct. Soroban encodes `#[contracttype]` structs as an
+//    ordered map keyed by field name, so appending a field never changes how
+//    existing fields decode.
+// 3. Numeric encoding is fixed per field once chosen: prices/amounts are
+//    `i128`, ledger sequences are `u32`, ids/timestamps are `u64`. Never
+//    narrow or widen an existing field's numeric type — add a new field
+//    instead of changing one in place.
+// 4. Topic naming: topic constants (e.g. `ARTWORK_SOLD`) are permanent once
+//    shipped. A new event kind gets a new topic constant; an existing topic
+//    is never reused for a differently-shaped payload.
+// 5. Deprecation: old struct fields are never mutated or deleted while any
+//    historical ledger data referencing them may still need to be replayed.
+//    Mark superseded fields as deprecated in a doc comment only.
+// 6. Migration for historical records: because the indexer persists decoded
+//    JSON and can always fall back to raw XDR, a shape change never requires
+//    rewriting historical rows. Instead, the indexer's schema field for the
+//    new struct field MUST be marked `optional: true` in `SCHEMA_REGISTRY`
+//    (see `indexer/src/event-schemas.ts`) so both pre- and post-bump events
+//    decode through the same code path. Full migration guidance and the
+//    per-event version catalog live in `docs/guides/event-parsing.md`.
 
 use soroban_sdk::{contracttype, Address, Env, Symbol};
+
+/// Schema version for the explicitly-versioned event structs in this module
+/// (those with a `schema_version: u32` field). See the versioning policy
+/// above. Bump this — and only this — when one of those structs gains a new
+/// field; unversioned event structs are covered by their topic name alone
+/// because they have never required a shape change.
+pub const EVENT_SCHEMA_VERSION: u32 = 1;
 
 // Versioned event topics as string constants
 pub const LISTING_CREATED: &str = "listing_created";
@@ -26,6 +71,16 @@ pub const LISTING_PRICE_UPDATED: &str = "listing_price_updated";
 pub const LISTING_EXPIRED: &str = "listing_expired";
 pub const AUCTION_EXTENDED: &str = "auction_extended";
 pub const AUCTION_CANCELLED: &str = "auction_cancelled";
+// Offer auto-expiry sweep (Issue #470)
+pub const OFFER_EXPIRED_SWEEP: &str = "offer_expired_sweep";
+// Counter-offer (Issue #471)
+pub const COUNTER_OFFER_MADE: &str = "counter_offer_made";
+pub const COUNTER_OFFER_SUPERSEDED: &str = "counter_offer_superseded";
+// Governance quorum (Issue #472)
+pub const GOVERNANCE_PROPOSED: &str = "gov_proposed";
+pub const GOVERNANCE_APPROVED: &str = "gov_approved";
+pub const GOVERNANCE_EXECUTED: &str = "gov_executed";
+pub const GOVERNANCE_CANCELLED: &str = "gov_cancelled";
 pub const PROTOCOL_FEE_COLLECTED: &str = "protocol_fee_collected";
 pub const OFFER_RECLAIMED: &str = "offer_reclaimed";
 pub const NFT_ESCROWED: &str = "nft_escrowed";
@@ -35,6 +90,15 @@ pub const COLLECTION_PAUSED: &str = "collection_paused";
 pub const COLLECTION_UNPAUSED: &str = "collection_unpaused";
 pub const FUNCTION_PAUSED: &str = "function_paused";
 pub const FUNCTION_UNPAUSED: &str = "function_unpaused";
+// Role-based authorization events (Issue #267)
+pub const ROLE_TRANSFER_PROPOSED: &str = "role_transfer_proposed";
+pub const ROLE_TRANSFERRED: &str = "role_transferred";
+pub const ROLE_PROPOSAL_CANCELLED: &str = "role_proposal_cancelled";
+pub const ROLE_MIGRATED: &str = "role_migrated";
+/// Emitted when a `propose_role_transfer` call overwrites a still-pending
+/// proposal for the same role.  Lets indexers reconcile the superseded
+/// candidate without ambiguity.
+pub const ROLE_PROPOSAL_OVERWRITTEN: &str = "role_proposal_overwritten";
 // Royalty settlement snapshot event (Issue #270)
 pub const ROYALTY_SETTLEMENT: &str = "royalty_settlement";
 // Auction escrow recovery events (Issue #271)
@@ -42,6 +106,19 @@ pub const AUCTION_BID_REFUNDED: &str = "auction_bid_refunded";
 pub const AUCTION_ADMIN_CANCELLED: &str = "auction_admin_cancelled";
 // Revocation cascade incomplete signal (Issue #214)
 pub const REVOCATION_INCOMPLETE: &str = "revocation_incomplete";
+// Auction configuration update events
+pub const AUCTION_CONFIG_UPDATED: &str = "auction_config_updated";
+// Auction blocked-bidder registry events (Issue #199)
+pub const AUCTION_BIDDER_BLOCKED: &str = "bidder_blocked";
+pub const AUCTION_BIDDER_UNBLOCKED: &str = "bidder_unblocked";
+// Token whitelist events (Issue #208)
+pub const TOKEN_WHITELISTED: &str = "token_whitelisted";
+pub const TOKEN_REMOVED: &str = "token_removed";
+// Bounded maintenance observability (Issue #280)
+pub const TTL_ANOMALY: &str = "ttl_anomaly";
+pub const CLEANUP_SUMMARY: &str = "cleanup_summary";
+// Migration phase observability
+pub const MIGRATION_PHASE_COMPLETE: &str = "migration_phase_complete";
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -53,6 +130,9 @@ pub struct ListingCreatedEvent {
     pub collection: Address,
     pub token_id: u64,
     pub ledger_sequence: u32,
+    /// Event schema version (Issue #278). Added additively; absent on
+    /// historical pre-upgrade events, which the indexer treats as version 0.
+    pub schema_version: u32,
 }
 
 #[contracttype]
@@ -64,6 +144,9 @@ pub struct ArtworkSoldEvent {
     pub price: i128,
     pub currency: Symbol,
     pub ledger_sequence: u32,
+    /// Event schema version (Issue #278). Added additively; absent on
+    /// historical pre-upgrade events, which the indexer treats as version 0.
+    pub schema_version: u32,
 }
 
 #[contracttype]
@@ -96,6 +179,9 @@ pub struct AuctionCreatedEvent {
     pub collection: Address,
     pub token_id: u64,
     pub end_time: u64,
+    /// Event schema version (Issue #278). Added additively; absent on
+    /// historical pre-upgrade events, which the indexer treats as version 0.
+    pub schema_version: u32,
 }
 
 #[contracttype]
@@ -104,6 +190,9 @@ pub struct BidPlacedEvent {
     pub auction_id: u64,
     pub bidder: Address,
     pub bid_amount: i128,
+    /// The auction's end time after applying any anti-sniping extension.
+    /// Equals `auction.end_time` when no extension occurred (Issue #468).
+    pub effective_end_time: u64,
 }
 
 #[contracttype]
@@ -112,6 +201,9 @@ pub struct AuctionFinalizedEvent {
     pub auction_id: u64,
     pub winner: Option<Address>,
     pub amount: i128,
+    /// Event schema version (Issue #278). Added additively; absent on
+    /// historical pre-upgrade events, which the indexer treats as version 0.
+    pub schema_version: u32,
 }
 
 impl ListingCreatedEvent {
@@ -168,13 +260,22 @@ impl AuctionExtendedEvent {
     }
 }
 
+/// Emitted on every auction cancellation — creator, admin, or emergency path.
+/// Carries a stable typed `reason` enum instead of an opaque Symbol so API
+/// consumers receive a stable discriminant they can pattern-match. (Issue #469)
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AuctionCancelledEvent {
     pub auction_id: u64,
     pub cancelled_by: Address,
-    /// Reason code: "owner" | "admin" | "no_bids"
-    pub reason: soroban_sdk::Symbol,
+    /// Typed reason: Owner | Admin | Emergency (Issue #469).
+    pub reason: crate::types::AuctionCancelReason,
+    /// Escrowed bid amount that was refunded (0 when no bids existed).
+    pub escrow_amount: i128,
+    /// Payment token in which the refund was denominated.
+    pub token: Address,
+    pub ledger_sequence: u32,
+    pub schema_version: u32,
 }
 impl AuctionCancelledEvent {
     #[allow(deprecated)]
@@ -195,6 +296,9 @@ pub struct AuctionBidRefundedEvent {
     /// Reason code: "outbid" | "cancelled" | "admin_cancel"
     pub reason: soroban_sdk::Symbol,
     pub ledger_sequence: u32,
+    /// Event schema version (Issue #278). Added additively; absent on
+    /// historical pre-upgrade events, which the indexer treats as version 0.
+    pub schema_version: u32,
 }
 impl AuctionBidRefundedEvent {
     #[allow(deprecated)]
@@ -212,6 +316,9 @@ pub struct AuctionAdminCancelledEvent {
     pub refunded_amount: i128,
     pub token: Address,
     pub ledger_sequence: u32,
+    /// Event schema version (Issue #278). Added additively; absent on
+    /// historical pre-upgrade events, which the indexer treats as version 0.
+    pub schema_version: u32,
 }
 impl AuctionAdminCancelledEvent {
     #[allow(deprecated)]
@@ -231,6 +338,9 @@ pub struct RoyaltySettlementEvent {
     pub total_amount: i128,
     pub token: Address,
     pub ledger_sequence: u32,
+    /// Event schema version (Issue #278). Added additively; absent on
+    /// historical pre-upgrade events, which the indexer treats as version 0.
+    pub schema_version: u32,
 }
 impl RoyaltySettlementEvent {
     #[allow(deprecated)]
@@ -350,6 +460,9 @@ pub struct OfferMadeEvent {
     /// reclaimed; `None` when the offer never expires.  Emitted so the indexer
     /// can surface countdown timers without a separate contract read.
     pub expires_at: Option<u64>,
+    /// Event schema version (Issue #278). Added additively; absent on
+    /// historical pre-upgrade events, which the indexer treats as version 0.
+    pub schema_version: u32,
 }
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -358,6 +471,9 @@ pub struct OfferAcceptedEvent {
     pub listing_id: u64,
     pub offerer: Address,
     pub amount: i128,
+    /// Event schema version (Issue #278). Added additively; absent on
+    /// historical pre-upgrade events, which the indexer treats as version 0.
+    pub schema_version: u32,
 }
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -565,6 +681,9 @@ pub struct ProtocolFeeCollectedEvent {
     pub amount: i128,
     pub token: Address,
     pub treasury: Address,
+    /// Event schema version (Issue #278). Added additively; absent on
+    /// historical pre-upgrade events, which the indexer treats as version 0.
+    pub schema_version: u32,
 }
 impl ProtocolFeeCollectedEvent {
     #[allow(deprecated)]
@@ -761,4 +880,977 @@ pub fn emit_function_paused(env: &Env, function_name: soroban_sdk::Symbol) {
 /// Emit function_unpaused event.
 pub fn emit_function_unpaused(env: &Env, function_name: soroban_sdk::Symbol) {
     FunctionUnpausedEvent { function_name }.publish(env);
+}
+
+// ── Role-based authorization events (Issue #267) ─────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoleTransferProposedEvent {
+    pub role: crate::types::RoleType,
+    pub current_authority: Address,
+    pub proposed_authority: Address,
+    pub expires_at: u64,
+}
+impl RoleTransferProposedEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, ROLE_TRANSFER_PROPOSED),), self);
+    }
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoleTransferredEvent {
+    pub role: crate::types::RoleType,
+    pub old_authority: Address,
+    pub new_authority: Address,
+    /// Ledger sequence at which the transfer was accepted.
+    pub ledger_sequence: u32,
+}
+impl RoleTransferredEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, ROLE_TRANSFERRED),), self);
+    }
+}
+
+/// Emitted when the current holder of a role cancels a still-pending
+/// transfer proposal before it was accepted or expired.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoleProposalCancelledEvent {
+    pub role: crate::types::RoleType,
+    pub current_authority: Address,
+    pub cancelled_candidate: Address,
+    /// Ledger sequence at which the cancellation occurred.
+    pub ledger_sequence: u32,
+}
+impl RoleProposalCancelledEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, ROLE_PROPOSAL_CANCELLED),), self);
+    }
+}
+
+/// Emitted when a second `propose_role_transfer` call for the same role
+/// overwrites a still-pending proposal. Carries both the superseded candidate
+/// and the new candidate so indexers can close the old proposal unambiguously.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoleProposalOverwrittenEvent {
+    pub role: crate::types::RoleType,
+    pub current_authority: Address,
+    /// The candidate whose proposal is being replaced.
+    pub old_candidate: Address,
+    pub old_expires_at: u64,
+    /// The new candidate being proposed.
+    pub new_candidate: Address,
+    pub new_expires_at: u64,
+    pub ledger_sequence: u32,
+}
+impl RoleProposalOverwrittenEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, ROLE_PROPOSAL_OVERWRITTEN),), self);
+    }
+}
+
+/// Emitted by `migrate_roles` when a previously-unassigned role is given an
+/// explicit holder for the first time (single-admin → role-separated
+/// migration path, Issue #267).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoleMigratedEvent {
+    pub role: crate::types::RoleType,
+    pub authority: Address,
+}
+impl RoleMigratedEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, ROLE_MIGRATED),), self);
+    }
+}
+
+// ── Auction configuration update events ───────────────────────────────────────
+
+/// Emitted when an admin updates a global auction configuration parameter.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuctionConfigUpdatedEvent {
+    /// The configuration field that was updated (e.g., "min_bid_increment", "extension_window").
+    pub field: soroban_sdk::Symbol,
+    /// The previous value (None if the field was previously unset).
+    pub old_value: Option<i128>,
+    /// The new value.
+    pub new_value: Option<i128>,
+}
+
+impl AuctionConfigUpdatedEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, AUCTION_CONFIG_UPDATED),), self);
+    }
+}
+
+/// Emit `auction_config_updated` for a configuration change.
+pub fn emit_auction_config_updated(
+    env: &Env,
+    field: soroban_sdk::Symbol,
+    old_value: Option<i128>,
+    new_value: Option<i128>,
+) {
+    AuctionConfigUpdatedEvent {
+        field,
+        old_value,
+        new_value,
+    }
+    .publish(env);
+}
+
+/// Emit `role_transfer_proposed` for a newly-created role rotation proposal.
+pub fn emit_role_proposed(
+    env: &Env,
+    role: crate::types::RoleType,
+    current_authority: Address,
+    proposed_authority: Address,
+    expires_at: u64,
+) {
+    RoleTransferProposedEvent {
+        role,
+        current_authority,
+        proposed_authority,
+        expires_at,
+    }
+    .publish(env);
+}
+
+/// Emit `role_transferred` once a role proposal is accepted and authority moves.
+pub fn emit_role_accepted(
+    env: &Env,
+    role: crate::types::RoleType,
+    old_authority: Address,
+    new_authority: Address,
+    ledger_sequence: u32,
+) {
+    RoleTransferredEvent {
+        role,
+        old_authority,
+        new_authority,
+        ledger_sequence,
+    }
+    .publish(env);
+}
+
+/// Emit `role_proposal_cancelled` when the current holder clears a pending
+/// role proposal before acceptance/expiry.
+pub fn emit_role_proposal_cancelled(
+    env: &Env,
+    role: crate::types::RoleType,
+    current_authority: Address,
+    cancelled_candidate: Address,
+    ledger_sequence: u32,
+) {
+    RoleProposalCancelledEvent {
+        role,
+        current_authority,
+        cancelled_candidate,
+        ledger_sequence,
+    }
+    .publish(env);
+}
+
+/// Emit `role_proposal_overwritten` when a new proposal replaces a pending one.
+pub fn emit_role_proposal_overwritten(
+    env: &Env,
+    role: crate::types::RoleType,
+    current_authority: Address,
+    old_candidate: Address,
+    old_expires_at: u64,
+    new_candidate: Address,
+    new_expires_at: u64,
+) {
+    RoleProposalOverwrittenEvent {
+        role,
+        current_authority,
+        old_candidate,
+        old_expires_at,
+        new_candidate,
+        new_expires_at,
+        ledger_sequence: env.ledger().sequence(),
+    }
+    .publish(env);
+}
+
+/// Emit `token_whitelisted` when a token is added to the whitelist (Issue #208).
+pub fn emit_token_whitelisted(env: &Env, token: &Address, added_by: &Address) {
+    TokenWhitelistedEvent {
+        token: token.clone(),
+        added_by: added_by.clone(),
+    }
+    .publish(env);
+}
+
+/// Emit `token_removed` when a token is removed from the whitelist (Issue #208).
+pub fn emit_token_removed(env: &Env, token: &Address, removed_by: &Address) {
+    TokenRemovedEvent {
+        token: token.clone(),
+        removed_by: removed_by.clone(),
+    }
+    .publish(env);
+}
+
+/// Emit `role_migrated` when `migrate_roles` assigns an explicit holder to a
+/// role that was previously falling back to `Admin`.
+pub fn emit_role_migrated(env: &Env, role: crate::types::RoleType, authority: Address) {
+    RoleMigratedEvent { role, authority }.publish(env);
+}
+
+// ── Token whitelist events (Issue #208) ──────────────────────────────────────
+
+/// Emitted when a new token is added to the protocol whitelist.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TokenWhitelistedEvent {
+    pub token: Address,
+    pub added_by: Address,
+}
+
+impl TokenWhitelistedEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, TOKEN_WHITELISTED),), self);
+    }
+}
+
+/// Emitted when a token is (soft-)removed from the protocol whitelist.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TokenRemovedEvent {
+    pub token: Address,
+    pub removed_by: Address,
+}
+
+impl TokenRemovedEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, TOKEN_REMOVED),), self);
+    }
+}
+
+// ── TTL-maintenance observability (Issue #280) ────────────────────────────────
+
+/// Emitted by `extend_active_ttls` when a record found in the `ActiveListings`
+/// index or the sequential auction id space is not in the expected Active state
+/// (or is missing entirely). Surfaces index/state drift to off-chain operators.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TtlAnomalyEvent {
+    /// "listing" or "auction"
+    pub subject: soroban_sdk::Symbol,
+    pub id: u64,
+    pub ledger_sequence: u32,
+}
+
+impl TtlAnomalyEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, TTL_ANOMALY),), self);
+    }
+}
+
+/// Emitted at the end of each `extend_active_ttls` / `cleanup_expired_locks` /
+/// `renew_storage` call so off-chain keepers can observe how much work was done.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CleanupSummaryEvent {
+    /// Identifies which maintenance operation produced this event:
+    /// "ttl_extend" | "lock_cleanup" | "storage_renewal"
+    pub kind: soroban_sdk::Symbol,
+    pub items_processed: u32,
+    pub ledger_sequence: u32,
+}
+
+impl CleanupSummaryEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, CLEANUP_SUMMARY),), self);
+    }
+}
+
+// ── Token whitelist event emitters (Issue #435) ──────────────────────────────
+//
+// The event structs (`TokenWhitelistedEvent`, `TokenRemovedEvent`) were defined
+// above (Issue #208). The corresponding thin emitter helpers are also defined
+// above (Issue #208 section) as `emit_token_whitelisted` / `emit_token_removed`.
+
+// ── Listing ownership reconciliation (Issue #456) ────────────────────────────
+
+pub const LISTING_OWNERSHIP_RECONCILED: &str = "own_reconciled";
+
+/// Emitted when an authorized collection administrator reconciles the
+/// effective owner of a listing.  The event is idempotent — if the stored
+/// owner already matches `new_owner` no state change occurs and no event
+/// is emitted, so downstream consumers can safely replay this without
+/// concern about phantom updates.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ListingOwnershipReconciledEvent {
+    pub listing_id: u64,
+    /// The owner stored before the reconciliation (None for an Active listing
+    /// whose stored `owner` field is still unset, meaning the artist is the
+    /// effective owner).
+    pub previous_owner: Option<Address>,
+    /// The owner written by the reconciliation call.
+    pub new_owner: Address,
+    /// The operator who authorized this reconciliation (must hold the
+    /// `CollectionAdmin` role).
+    pub reconciled_by: Address,
+    pub ledger_sequence: u32,
+}
+
+impl ListingOwnershipReconciledEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, LISTING_OWNERSHIP_RECONCILED),), self);
+    }
+}
+
+/// Emit `own_reconciled` for a completed ownership reconciliation.
+pub fn emit_listing_ownership_reconciled(
+    env: &Env,
+    listing_id: u64,
+    previous_owner: Option<Address>,
+    new_owner: Address,
+    reconciled_by: Address,
+) {
+    ListingOwnershipReconciledEvent {
+        listing_id,
+        previous_owner,
+        new_owner,
+        reconciled_by,
+        ledger_sequence: env.ledger().sequence(),
+    }
+    .publish(env);
+}
+
+// ── Migration phase observability ─────────────────────────────────────────────
+
+/// Emitted when a migration phase transitions to the next, carrying postcondition
+/// counts so operators can verify no records were lost or duplicated.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MigrationPhaseCompletedEvent {
+    pub version: soroban_sdk::String,
+    /// Phase that just completed (0-based).
+    pub phase: u32,
+    /// Number of records processed in this phase.
+    pub records_processed: u64,
+    pub ledger_sequence: u32,
+}
+
+impl MigrationPhaseCompletedEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, MIGRATION_PHASE_COMPLETE),), self);
+    }
+}
+
+// ── Treasury rotation events (Issue #459) ────────────────────────────────────
+
+pub const TREASURY_PROPOSED: &str = "treasury_proposed";
+pub const TREASURY_ACCEPTED: &str = "treasury_accepted";
+pub const TREASURY_PROPOSAL_CANCELLED: &str = "treasury_proposal_cancelled";
+
+/// Emitted when the ProtocolConfig role holder proposes a new treasury address.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TreasuryProposedEvent {
+    /// The current active treasury (may be `None` if no treasury was set yet).
+    pub current_treasury: Option<Address>,
+    /// The address being proposed as the new treasury destination.
+    pub proposed_treasury: Address,
+    /// Ledger timestamp when the proposal was created.
+    pub proposed_at: u64,
+    /// Absolute ledger timestamp after which the proposal expires and cannot
+    /// be accepted.
+    pub expires_at: u64,
+}
+
+impl TreasuryProposedEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, TREASURY_PROPOSED),), self);
+    }
+}
+
+/// Emitted when the proposed treasury address accepts and the rotation becomes
+/// active. All subsequent settlements use `new_treasury` as the fee destination.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TreasuryAcceptedEvent {
+    /// The treasury address that was active before the rotation.
+    pub old_treasury: Option<Address>,
+    /// The treasury address that is now active.
+    pub new_treasury: Address,
+    /// Ledger sequence at which acceptance occurred (for audit ordering).
+    pub ledger_sequence: u32,
+}
+
+impl TreasuryAcceptedEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, TREASURY_ACCEPTED),), self);
+    }
+}
+
+/// Emitted when a pending treasury proposal is cancelled before it was accepted.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TreasuryProposalCancelledEvent {
+    /// The address that cancelled the proposal (ProtocolConfig role holder).
+    pub cancelled_by: Address,
+    /// The candidate whose proposal was cancelled.
+    pub cancelled_candidate: Address,
+}
+
+impl TreasuryProposalCancelledEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, TREASURY_PROPOSAL_CANCELLED),), self);
+    }
+}
+
+pub fn emit_treasury_proposed(
+    env: &Env,
+    current_treasury: Option<Address>,
+    proposed_treasury: Address,
+    proposed_at: u64,
+    expires_at: u64,
+) {
+    TreasuryProposedEvent {
+        current_treasury,
+        proposed_treasury,
+        proposed_at,
+        expires_at,
+    }
+    .publish(env);
+}
+
+pub fn emit_treasury_accepted(
+    env: &Env,
+    old_treasury: Option<Address>,
+    new_treasury: Address,
+    ledger_sequence: u32,
+) {
+    TreasuryAcceptedEvent {
+        old_treasury,
+        new_treasury,
+        ledger_sequence,
+    }
+    .publish(env);
+}
+
+pub fn emit_treasury_proposal_cancelled(
+    env: &Env,
+    cancelled_by: Address,
+    cancelled_candidate: Address,
+) {
+    TreasuryProposalCancelledEvent {
+        cancelled_by,
+        cancelled_candidate,
+    }
+    .publish(env);
+}
+
+// ── Auction reserve price update event (Issue #467) ──────────────────────────
+
+pub const AUCTION_RESERVE_UPDATED: &str = "auc_res_upd";
+
+/// Emitted when the creator updates the reserve price of a no-bid active auction.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuctionReservePriceUpdatedEvent {
+    pub auction_id: u64,
+    pub updated_by: Address,
+    pub old_reserve_price: i128,
+    pub new_reserve_price: i128,
+    pub ledger_sequence: u32,
+}
+
+impl AuctionReservePriceUpdatedEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, AUCTION_RESERVE_UPDATED),), self);
+    }
+}
+
+pub fn emit_auction_reserve_updated(
+    env: &Env,
+    auction_id: u64,
+    updated_by: Address,
+    old_reserve_price: i128,
+    new_reserve_price: i128,
+) {
+    AuctionReservePriceUpdatedEvent {
+        auction_id,
+        updated_by,
+        old_reserve_price,
+        new_reserve_price,
+        ledger_sequence: env.ledger().sequence(),
+    }
+    .publish(env);
+}
+
+// ── Listing duration config events (Issue #460) ───────────────────────────────
+
+pub const LISTING_DURATION_CONFIG_UPDATED: &str = "listing_duration_config_updated";
+
+/// Emitted when the ProtocolConfig role updates the min/max listing duration.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ListingDurationConfigUpdatedEvent {
+    /// "min_listing_duration" or "max_listing_duration"
+    pub field: soroban_sdk::Symbol,
+    /// Previous value (`None` if it was not previously configured).
+    pub old_value: Option<u64>,
+    /// New value (`None` means the bound was cleared/removed).
+    pub new_value: Option<u64>,
+}
+
+impl ListingDurationConfigUpdatedEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, LISTING_DURATION_CONFIG_UPDATED),), self);
+    }
+}
+
+pub fn emit_listing_duration_config_updated(
+    env: &Env,
+    field: soroban_sdk::Symbol,
+    old_value: Option<u64>,
+    new_value: Option<u64>,
+) {
+    ListingDurationConfigUpdatedEvent {
+        field,
+        old_value,
+        new_value,
+    }
+    .publish(env);
+}
+
+// ── Royalty payout observability events (Issue #461) ─────────────────────────
+
+pub const ROYALTY_CLAIM_QUEUED: &str = "royalty_claim_queued";
+pub const ROYALTY_CLAIMED: &str = "royalty_claimed";
+
+/// Emitted once per recipient at settlement time when the direct transfer
+/// succeeds and the claim record is auto-marked as claimed.  Carrying both
+/// `settlement_id` and `is_listing` lets the indexer correlate this with the
+/// `RoyaltySettlementEvent` and the sale record without extra lookups.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoyaltyClaimQueuedEvent {
+    pub settlement_id: u64,
+    pub is_listing: bool,
+    pub recipient: Address,
+    pub token: Address,
+    pub amount: i128,
+    pub ledger_sequence: u32,
+}
+
+impl RoyaltyClaimQueuedEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, ROYALTY_CLAIM_QUEUED),), self);
+    }
+}
+
+/// Emitted when a recipient successfully pulls an unclaimed royalty via
+/// `claim_royalty`.  In the normal (direct-transfer) path this fires
+/// immediately at settlement; in the recovery path it fires when the
+/// recipient manually triggers the claim.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoyaltyClaimedEvent {
+    pub settlement_id: u64,
+    pub is_listing: bool,
+    pub recipient: Address,
+    pub token: Address,
+    pub amount: i128,
+    pub ledger_sequence: u32,
+}
+
+impl RoyaltyClaimedEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, ROYALTY_CLAIMED),), self);
+    }
+}
+
+pub fn emit_royalty_claim_queued(
+    env: &Env,
+    settlement_id: u64,
+    is_listing: bool,
+    recipient: Address,
+    token: Address,
+    amount: i128,
+) {
+    RoyaltyClaimQueuedEvent {
+        settlement_id,
+        is_listing,
+        recipient,
+        token,
+        amount,
+        ledger_sequence: env.ledger().sequence(),
+    }
+    .publish(env);
+}
+
+pub fn emit_royalty_claimed(
+    env: &Env,
+    settlement_id: u64,
+    is_listing: bool,
+    recipient: Address,
+    token: Address,
+    amount: i128,
+) {
+    RoyaltyClaimedEvent {
+        settlement_id,
+        is_listing,
+        recipient,
+        token,
+        amount,
+        ledger_sequence: env.ledger().sequence(),
+    }
+    .publish(env);
+}
+
+// ── Issue #462: Listing Reservation Window Events ─────────────────────────────
+
+pub const LISTING_RESERVATION_SET: &str = "listing_reservation_set";
+
+/// Emitted whenever `set_listing_reservation` is called (including clears).
+///
+/// The indexer uses this to maintain a current-reservation projection without
+/// re-fetching the full listing record. When `reserved_for` is `None` the
+/// reservation has been cleared.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ListingReservationSetEvent {
+    pub listing_id: u64,
+    pub artist: Address,
+    /// `None` when the reservation is being cleared.
+    pub reserved_for: Option<Address>,
+    pub reservation_start: Option<u64>,
+    pub reservation_end: Option<u64>,
+    pub ledger_sequence: u32,
+}
+
+impl ListingReservationSetEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, LISTING_RESERVATION_SET),), self);
+    }
+}
+
+pub fn emit_listing_reservation_set(
+    env: &Env,
+    listing_id: u64,
+    artist: Address,
+    reserved_for: Option<Address>,
+    reservation_start: Option<u64>,
+    reservation_end: Option<u64>,
+) {
+    ListingReservationSetEvent {
+        listing_id,
+        artist,
+        reserved_for,
+        reservation_start,
+        reservation_end,
+        ledger_sequence: env.ledger().sequence(),
+    }
+    .publish(env);
+}
+
+// ── Offer auto-expiry sweep events (Issue #470) ───────────────────────────────
+
+/// Emitted once per offer that the permissionless `sweep_expired_offers` batch
+/// transitions to `Expired` status. Carries the full refund audit trail so
+/// indexers can reconcile escrow without replaying the transaction.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OfferExpiredSweepEvent {
+    pub offer_id: u64,
+    pub listing_id: u64,
+    pub offerer: Address,
+    pub amount: i128,
+    pub token: Address,
+    pub ledger_sequence: u32,
+}
+
+impl OfferExpiredSweepEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, OFFER_EXPIRED_SWEEP),), self);
+    }
+}
+
+pub fn emit_offer_expired_sweep(
+    env: &Env,
+    offer_id: u64,
+    listing_id: u64,
+    offerer: Address,
+    amount: i128,
+    token: Address,
+) {
+    OfferExpiredSweepEvent {
+        offer_id,
+        listing_id,
+        offerer,
+        amount,
+        token,
+        ledger_sequence: env.ledger().sequence(),
+    }
+    .publish(env);
+}
+
+// ── Counter-offer events (Issue #471) ────────────────────────────────────────
+
+/// Emitted when the listing artist creates a counter-offer referencing a
+/// buyer's pending offer. The `parent_offer_id` is the buyer's original offer
+/// that was atomically closed; `counter_offer_id` is the new pending proposal.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CounterOfferMadeEvent {
+    pub counter_offer_id: u64,
+    pub parent_offer_id: u64,
+    pub listing_id: u64,
+    pub counterparty: Address,
+    pub amount: i128,
+    pub token: Address,
+    pub expires_at: Option<u64>,
+    pub ledger_sequence: u32,
+}
+
+impl CounterOfferMadeEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, COUNTER_OFFER_MADE),), self);
+    }
+}
+
+pub fn emit_counter_offer_made(
+    env: &Env,
+    counter_offer_id: u64,
+    parent_offer_id: u64,
+    listing_id: u64,
+    counterparty: Address,
+    amount: i128,
+    token: Address,
+    expires_at: Option<u64>,
+) {
+    CounterOfferMadeEvent {
+        counter_offer_id,
+        parent_offer_id,
+        listing_id,
+        counterparty,
+        amount,
+        token,
+        expires_at,
+        ledger_sequence: env.ledger().sequence(),
+    }
+    .publish(env);
+}
+
+// ── Governance quorum events (Issue #472) ─────────────────────────────────────
+
+/// Emitted when a new multi-approval governance proposal is created.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GovernanceProposedEvent {
+    pub proposal_id: u64,
+    pub proposal_type: crate::types::GovernanceProposalType,
+    pub proposed_by: Address,
+    pub threshold: u32,
+    pub expires_at: u64,
+    pub ledger_sequence: u32,
+}
+
+impl GovernanceProposedEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, GOVERNANCE_PROPOSED),), self);
+    }
+}
+
+/// Emitted each time a signer approves a pending governance proposal.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GovernanceApprovedEvent {
+    pub proposal_id: u64,
+    pub approved_by: Address,
+    /// Running count of approvals after this one.
+    pub approval_count: u32,
+    pub threshold: u32,
+    pub ledger_sequence: u32,
+}
+
+impl GovernanceApprovedEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, GOVERNANCE_APPROVED),), self);
+    }
+}
+
+/// Emitted when a fully-approved proposal is executed and the underlying
+/// operation takes effect.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GovernanceExecutedEvent {
+    pub proposal_id: u64,
+    pub proposal_type: crate::types::GovernanceProposalType,
+    pub executed_by: Address,
+    pub ledger_sequence: u32,
+}
+
+impl GovernanceExecutedEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, GOVERNANCE_EXECUTED),), self);
+    }
+}
+
+/// Emitted when a governance proposal is cancelled before execution.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GovernanceCancelledEvent {
+    pub proposal_id: u64,
+    pub cancelled_by: Address,
+    pub ledger_sequence: u32,
+}
+
+impl GovernanceCancelledEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, GOVERNANCE_CANCELLED),), self);
+    }
+}
+
+pub fn emit_governance_proposed(
+    env: &Env,
+    proposal_id: u64,
+    proposal_type: crate::types::GovernanceProposalType,
+    proposed_by: Address,
+    threshold: u32,
+    expires_at: u64,
+) {
+    GovernanceProposedEvent {
+        proposal_id,
+        proposal_type,
+        proposed_by,
+        threshold,
+        expires_at,
+        ledger_sequence: env.ledger().sequence(),
+    }
+    .publish(env);
+}
+
+pub fn emit_governance_approved(
+    env: &Env,
+    proposal_id: u64,
+    approved_by: Address,
+    approval_count: u32,
+    threshold: u32,
+) {
+    GovernanceApprovedEvent {
+        proposal_id,
+        approved_by,
+        approval_count,
+        threshold,
+        ledger_sequence: env.ledger().sequence(),
+    }
+    .publish(env);
+}
+
+pub fn emit_governance_executed(
+    env: &Env,
+    proposal_id: u64,
+    proposal_type: crate::types::GovernanceProposalType,
+    executed_by: Address,
+) {
+    GovernanceExecutedEvent {
+        proposal_id,
+        proposal_type,
+        executed_by,
+        ledger_sequence: env.ledger().sequence(),
+    }
+    .publish(env);
+}
+
+pub fn emit_governance_cancelled(env: &Env, proposal_id: u64, cancelled_by: Address) {
+    GovernanceCancelledEvent {
+        proposal_id,
+        cancelled_by,
+        ledger_sequence: env.ledger().sequence(),
+    }
+    .publish(env);
+}
+
+// ── Terminal-record cleanup event (Issue #474) ───────────────────────────────
+
+pub const TERMINAL_CLEANED: &str = "terminal_cleaned";
+
+/// Emitted once per terminal record processed by `cleanup_terminal_records`
+/// before the contract stops renewing that record's TTL.
+///
+/// The indexer should treat this event as a signal that the on-chain copy of
+/// the record may eventually become unavailable ("hot" storage lapses), while
+/// the indexer's own database copy remains the durable historical record.
+///
+/// Fields:
+///   `kind`   — "listing" | "offer"
+///   `id`     — the listing_id or offer_id processed
+///   `status` — numeric status discriminant as a string (for readability)
+///   `ledger_sequence` — ledger the cleanup was processed on
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TerminalCleanedEvent {
+    pub kind: soroban_sdk::Symbol,
+    pub id: u64,
+    pub ledger_sequence: u32,
+}
+
+impl TerminalCleanedEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, TERMINAL_CLEANED),), self);
+    }
 }

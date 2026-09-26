@@ -6,14 +6,15 @@
 
 import { useState, useEffect } from "react";
 import { useWalletContext } from "@/context/WalletContext";
-import { 
-  Settings, 
-  Wallet, 
-  Network, 
-  Shield, 
-  Globe, 
-  Bell, 
-  Eye, 
+import { getLocalePreferences, setLocalePreferences } from "@/lib/format";
+import {
+  Settings,
+  Wallet,
+  Network,
+  Shield,
+  Globe,
+  Bell,
+  Eye,
   EyeOff,
   Save,
   RefreshCw,
@@ -21,8 +22,36 @@ import {
   X,
   AlertTriangle,
   Info,
-  ExternalLink
+  ExternalLink,
+  Download,
+  Trash2,
+  Loader2,
+  FileJson
 } from "lucide-react";
+
+// ── Privacy requests (Issue #543) ───────────────────────────────
+//
+// Mirrors the record shape returned by indexer/src/api/privacy-routes.ts
+// via the frontend proxy at /api/privacy/requests.
+
+type PrivacyRequestType = "EXPORT" | "DELETION";
+type PrivacyRequestStatus =
+  | "PENDING"
+  | "VERIFIED"
+  | "PROCESSING"
+  | "COMPLETED"
+  | "REJECTED"
+  | "FAILED";
+
+interface PrivacyRequestRecord {
+  id: string;
+  type: PrivacyRequestType;
+  status: PrivacyRequestStatus;
+  requestedAt: string;
+  completedAt: string | null;
+  exportPayload: unknown;
+  retainedRecordsNote: string | null;
+}
 
 export default function SettingsPage() {
   const { 
@@ -43,38 +72,136 @@ export default function SettingsPage() {
         ? 'futurenet'
         : 'public';
 
+  const localePrefs = getLocalePreferences();
+
   const [settings, setSettings] = useState({
     // Network Settings
     preferredNetwork: network || 'public',
     autoSwitchNetwork: true,
-    
+
     // Wallet Settings
     showBalance: true,
     showTransactionHistory: true,
     confirmTransactions: true,
-    
+
     // Notification Settings
     priceAlerts: true,
     offerUpdates: true,
     auctionEndings: true,
-    
+
     // Privacy Settings
+    rememberWallet: true, // Will be loaded from preferences
     showProfilePublicly: true,
     shareActivityData: false,
-    
-    // Display Settings
+
+    // Display Settings — wired to localePrefs for Issue #67
     theme: 'dark',
-    language: 'en',
+    language: localePrefs.locale,
+    timeZone: localePrefs.timeZone,
     currency: 'XLM'
   });
+
+  // Load wallet preferences on mount
+  useEffect(() => {
+    const { getWalletPreferences } = require('@/lib/wallet-preferences');
+    const prefs = getWalletPreferences();
+    setSettings(prev => ({ ...prev, rememberWallet: prefs.rememberWallet }));
+  }, []);
 
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
 
+  // ── Privacy requests (Issue #543) ─────────────────────────────
+  const [privacyRequests, setPrivacyRequests] = useState<PrivacyRequestRecord[]>([]);
+  const [privacyLoading, setPrivacyLoading] = useState(false);
+  const [privacyActionPending, setPrivacyActionPending] = useState<PrivacyRequestType | null>(null);
+  const [privacyError, setPrivacyError] = useState<string | null>(null);
+
+  const loadPrivacyRequests = async () => {
+    if (!publicKey) return;
+    setPrivacyLoading(true);
+    setPrivacyError(null);
+    try {
+      const res = await fetch("/api/privacy/requests", {
+        headers: { "x-wallet-address": publicKey },
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data?.error ?? "Failed to load privacy requests.");
+      setPrivacyRequests(Array.isArray(data) ? data : []);
+    } catch (err) {
+      setPrivacyError(err instanceof Error ? err.message : "Failed to load privacy requests.");
+    } finally {
+      setPrivacyLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (isConnected && publicKey) {
+      loadPrivacyRequests();
+    } else {
+      setPrivacyRequests([]);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isConnected, publicKey]);
+
+  const submitPrivacyRequest = async (type: PrivacyRequestType) => {
+    if (!publicKey) return;
+    if (
+      type === "DELETION" &&
+      !window.confirm(
+        "This will delete eligible off-chain data linked to your wallet. " +
+          "Canonical blockchain records (listings, auctions, offers, bids, royalties) " +
+          "cannot be deleted and will be reported as retained. Continue?"
+      )
+    ) {
+      return;
+    }
+    setPrivacyActionPending(type);
+    setPrivacyError(null);
+    try {
+      const res = await fetch("/api/privacy/requests", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-wallet-address": publicKey,
+        },
+        body: JSON.stringify({ type }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data?.error ?? `Failed to submit ${type.toLowerCase()} request.`);
+      await loadPrivacyRequests();
+    } catch (err) {
+      setPrivacyError(err instanceof Error ? err.message : "Request failed.");
+    } finally {
+      setPrivacyActionPending(null);
+    }
+  };
+
+  const downloadExport = (request: PrivacyRequestRecord) => {
+    if (typeof window === "undefined" || !request.exportPayload) return;
+    const blob = new Blob([JSON.stringify(request.exportPayload, null, 2)], {
+      type: "application/json",
+    });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `elcarehub-privacy-export-${request.id}.json`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  };
+
   const handleSave = async () => {
     setSaving(true);
-    // Simulate saving settings
-    await new Promise(resolve => setTimeout(resolve, 1000));
+    // Persist locale and time zone preferences via format utilities (Issue #67)
+    setLocalePreferences({ locale: settings.language, timeZone: settings.timeZone });
+    
+    // Persist wallet preferences
+    const { setWalletPreferences } = require('@/lib/wallet-preferences');
+    setWalletPreferences({ rememberWallet: settings.rememberWallet });
+    
+    await new Promise(resolve => setTimeout(resolve, 500));
     setSaving(false);
     setSaved(true);
     setTimeout(() => setSaved(false), 2000);
@@ -101,11 +228,36 @@ export default function SettingsPage() {
   ];
 
   const languages = [
-    { code: 'en', name: 'English' },
+    { code: 'en-US', name: 'English (US)' },
+    { code: 'en-NG', name: 'English (Nigeria)' },
+    { code: 'en-GH', name: 'English (Ghana)' },
+    { code: 'en-KE', name: 'English (Kenya)' },
     { code: 'es', name: 'Español' },
-    { code: 'fr', name: 'Français' },
+    { code: 'fr-FR', name: 'Français' },
     { code: 'pt', name: 'Português' },
-    { code: 'sw', name: 'Kiswahili' }
+    { code: 'sw-KE', name: 'Kiswahili' },
+    { code: 'am', name: 'አማርኛ (Amharic)' },
+    { code: 'ha', name: 'Hausa' },
+    { code: 'yo', name: 'Yorùbá' },
+    { code: 'ig', name: 'Igbo' },
+    { code: 'ar', name: 'العربية (Arabic)' },
+  ];
+
+  const timeZones = [
+    { value: 'UTC', label: 'UTC' },
+    { value: 'Africa/Lagos', label: 'Africa/Lagos (WAT, UTC+1)' },
+    { value: 'Africa/Nairobi', label: 'Africa/Nairobi (EAT, UTC+3)' },
+    { value: 'Africa/Johannesburg', label: 'Africa/Johannesburg (SAST, UTC+2)' },
+    { value: 'Africa/Accra', label: 'Africa/Accra (GMT, UTC+0)' },
+    { value: 'Africa/Cairo', label: 'Africa/Cairo (EET, UTC+2)' },
+    { value: 'Africa/Abidjan', label: 'Africa/Abidjan (GMT, UTC+0)' },
+    { value: 'Africa/Addis_Ababa', label: 'Africa/Addis Ababa (EAT, UTC+3)' },
+    { value: 'Africa/Casablanca', label: 'Africa/Casablanca (WET, UTC+0/+1)' },
+    { value: 'Africa/Dakar', label: 'Africa/Dakar (GMT, UTC+0)' },
+    { value: 'America/New_York', label: 'America/New_York (ET)' },
+    { value: 'Europe/London', label: 'Europe/London (GMT/BST)' },
+    { value: 'Europe/Paris', label: 'Europe/Paris (CET)' },
+    { value: 'Asia/Dubai', label: 'Asia/Dubai (GST, UTC+4)' },
   ];
 
   if (!isConnected) {
@@ -343,7 +495,7 @@ export default function SettingsPage() {
           
           <div className="space-y-4">
             <div>
-              <label className="block text-sm font-medium text-gray-300 mb-2">Language</label>
+              <label className="block text-sm font-medium text-gray-300 mb-2">Language / Locale</label>
               <select
                 value={settings.language}
                 onChange={(e) => setSettings(prev => ({ ...prev, language: e.target.value }))}
@@ -355,6 +507,27 @@ export default function SettingsPage() {
                   </option>
                 ))}
               </select>
+              <p className="text-xs text-gray-500 mt-1">
+                Locale affects date and number formatting only. Financial base units and asset amounts are not affected.
+              </p>
+            </div>
+
+            <div>
+              <label className="block text-sm font-medium text-gray-300 mb-2">Time Zone</label>
+              <select
+                value={settings.timeZone}
+                onChange={(e) => setSettings(prev => ({ ...prev, timeZone: e.target.value }))}
+                className="w-full px-3 py-2 bg-white/5 border border-white/10 rounded-lg text-white focus:outline-none focus:ring-2 focus:ring-brand-500"
+              >
+                {timeZones.map((tz) => (
+                  <option key={tz.value} value={tz.value}>
+                    {tz.label}
+                  </option>
+                ))}
+              </select>
+              <p className="text-xs text-gray-500 mt-1">
+                Dates and times are shown in your selected zone. Ledger times always display their UTC offset so you can trace them back to on-chain data.
+              </p>
             </div>
 
             <div>
@@ -382,6 +555,27 @@ export default function SettingsPage() {
           </div>
           
           <div className="space-y-4">
+            <div className="flex items-center justify-between p-3 rounded-lg bg-white/5 border border-white/10">
+              <div>
+                <div className="font-medium text-white">Remember Wallet</div>
+                <div className="text-xs text-gray-400">
+                  Keep your wallet connection when you close the browser. Disable this to log out on browser close.
+                </div>
+              </div>
+              <button
+                onClick={() => setSettings(prev => ({ ...prev, rememberWallet: !prev.rememberWallet }))}
+                className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
+                  settings.rememberWallet ? 'bg-brand-500' : 'bg-gray-600'
+                }`}
+              >
+                <span
+                  className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                    settings.rememberWallet ? 'translate-x-6' : 'translate-x-1'
+                  }`}
+                />
+              </button>
+            </div>
+
             <div className="flex items-center justify-between p-3 rounded-lg bg-white/5 border border-white/10">
               <div>
                 <div className="font-medium text-white">Public Profile</div>
@@ -419,6 +613,125 @@ export default function SettingsPage() {
                 />
               </button>
             </div>
+
+            <div className="p-3 rounded-lg bg-brand-500/5 border border-brand-500/20">
+              <div className="flex gap-2">
+                <Info className="h-4 w-4 text-brand-400 flex-shrink-0 mt-0.5" />
+                <div className="text-xs text-gray-400 leading-relaxed">
+                  <strong className="text-white">Wallet Privacy:</strong> Your wallet address is pseudonymous and public on the blockchain. 
+                  When "Remember Wallet" is enabled, your wallet connector type is stored locally. 
+                  When disabled, your session clears when you close your browser. 
+                  Your private keys are never stored by ElcareHub — they stay in your wallet extension.
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* Data & Privacy Controls (Issue #543) */}
+        <div className="bg-midnight-900 rounded-xl border border-white/5 p-6 mb-6">
+          <div className="flex items-center gap-3 mb-4">
+            <FileJson className="h-5 w-5 text-brand-400" />
+            <h2 className="text-lg font-semibold text-white">Data &amp; Privacy Controls</h2>
+          </div>
+
+          <p className="text-xs text-gray-400 mb-4 leading-relaxed">
+            Request an export of the off-chain application data linked to your wallet, or
+            request deletion of the parts we can remove. Blockchain transactions and
+            IPFS-pinned metadata are public and permanent and cannot be deleted by us or
+            anyone else — see the{" "}
+            <a href="/privacy" className="text-brand-400 hover:underline">
+              Privacy Policy
+            </a>{" "}
+            for the full data inventory and retention rules.
+          </p>
+
+          <div className="flex flex-col sm:flex-row gap-3 mb-4">
+            <button
+              onClick={() => submitPrivacyRequest("EXPORT")}
+              disabled={privacyActionPending !== null}
+              className="flex items-center justify-center gap-2 flex-1 rounded-lg bg-white/5 border border-white/10 px-4 py-2.5 text-sm font-medium text-white hover:bg-white/10 disabled:opacity-50 disabled:cursor-not-allowed transition-all"
+            >
+              {privacyActionPending === "EXPORT" ? (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              ) : (
+                <Download className="h-4 w-4" />
+              )}
+              Request data export
+            </button>
+            <button
+              onClick={() => submitPrivacyRequest("DELETION")}
+              disabled={privacyActionPending !== null}
+              className="flex items-center justify-center gap-2 flex-1 rounded-lg border border-terracotta-500/30 bg-terracotta-500/10 px-4 py-2.5 text-sm font-medium text-terracotta-400 hover:bg-terracotta-500/20 disabled:opacity-50 disabled:cursor-not-allowed transition-all"
+            >
+              {privacyActionPending === "DELETION" ? (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              ) : (
+                <Trash2 className="h-4 w-4" />
+              )}
+              Request account deletion
+            </button>
+          </div>
+
+          {privacyError && (
+            <div className="mb-4 p-3 rounded-lg bg-terracotta-500/10 border border-terracotta-500/30 text-xs text-terracotta-300">
+              {privacyError}
+            </div>
+          )}
+
+          <div className="space-y-2">
+            <div className="flex items-center justify-between">
+              <span className="text-sm font-medium text-gray-300">Request history</span>
+              <button
+                onClick={loadPrivacyRequests}
+                disabled={privacyLoading}
+                className="text-xs text-gray-400 hover:text-white flex items-center gap-1"
+              >
+                <RefreshCw className={`h-3 w-3 ${privacyLoading ? "animate-spin" : ""}`} />
+                Refresh
+              </button>
+            </div>
+
+            {privacyRequests.length === 0 ? (
+              <p className="text-xs text-gray-500 py-2">No privacy requests yet.</p>
+            ) : (
+              privacyRequests.map((r) => (
+                <div
+                  key={r.id}
+                  className="p-3 rounded-lg bg-white/5 border border-white/10 text-xs"
+                >
+                  <div className="flex items-center justify-between mb-1">
+                    <span className="font-mono text-white">{r.id}</span>
+                    <span
+                      className={`px-2 py-0.5 rounded-full font-semibold ${
+                        r.status === "COMPLETED"
+                          ? "bg-mint-500/20 text-mint-400"
+                          : r.status === "FAILED" || r.status === "REJECTED"
+                            ? "bg-terracotta-500/20 text-terracotta-400"
+                            : "bg-brand-500/20 text-brand-400"
+                      }`}
+                    >
+                      {r.status}
+                    </span>
+                  </div>
+                  <div className="text-gray-400">
+                    {r.type} — requested {new Date(r.requestedAt).toLocaleString()}
+                  </div>
+                  {r.retainedRecordsNote && (
+                    <div className="mt-2 text-gray-500 leading-relaxed">{r.retainedRecordsNote}</div>
+                  )}
+                  {r.status === "COMPLETED" && r.type === "EXPORT" && r.exportPayload ? (
+                    <button
+                      onClick={() => downloadExport(r)}
+                      className="mt-2 flex items-center gap-1 text-brand-400 hover:underline"
+                    >
+                      <Download className="h-3 w-3" />
+                      Download export JSON
+                    </button>
+                  ) : null}
+                </div>
+              ))
+            )}
           </div>
         </div>
 
