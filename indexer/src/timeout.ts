@@ -117,7 +117,8 @@ try {
     help: 'Total provider errors by dependency and error type',
     labelNames: ['dependency', 'error_type'],
   });
-} catch {
+} catch (err) {
+  console.warn('[timeout] prom-client metric already registered — timeout metrics may be no-ops in this environment');
   // Already registered — retrieve existing metrics
   const reg = client.register as any;
   timeoutCounter = (typeof reg.getSingleMetric === 'function'
