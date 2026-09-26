@@ -35,8 +35,8 @@ import type { KeeperCandidate } from './types.js';
 
 // How many Active listings / offers to check per discovery sweep.
 // Keeps each cycle bounded regardless of dataset size.
-const MAX_LISTINGS_TO_CHECK = parseInt(process.env.KEEPER_DISCOVERY_LIMIT || '200');
-const MAX_OFFERS_TO_CHECK   = parseInt(process.env.KEEPER_DISCOVERY_LIMIT || '200');
+const MAX_LISTINGS_TO_CHECK = parseInt(process.env.KEEPER_DISCOVERY_LIMIT || '200', 10);
+const MAX_OFFERS_TO_CHECK   = parseInt(process.env.KEEPER_DISCOVERY_LIMIT || '200', 10);
 
 // ── Low-level: single view call via simulateTransaction ──────────────────────
 

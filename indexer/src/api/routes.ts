@@ -75,8 +75,8 @@ import { logger } from '../logger.js';
 // ID scheme: monotonic integer counter (local/degraded mode). The RealtimeHub
 // (realtime/index.ts) takes over when Redis is available, using Redis Stream ids.
 
-const SSE_BUFFER_SIZE = parseInt(process.env.SSE_LOCAL_BUFFER_SIZE || '200');
-const MAX_SSE_CONNECTIONS = parseInt(process.env.MAX_SSE_CONNECTIONS || '500');
+const SSE_BUFFER_SIZE = parseInt(process.env.SSE_LOCAL_BUFFER_SIZE || '200', 10);
+const MAX_SSE_CONNECTIONS = parseInt(process.env.MAX_SSE_CONNECTIONS || '500', 10);
 
 interface SSEEvent {
   id: string;
@@ -182,7 +182,7 @@ router.use(versioningMiddleware);
 router.use(etagMiddleware);
 router.use(apiDurationMiddleware);
 
-const CACHE_TTL_SECONDS = parseInt(process.env.REDIS_CACHE_TTL_SECONDS || '30');
+const CACHE_TTL_SECONDS = parseInt(process.env.REDIS_CACHE_TTL_SECONDS || '30', 10);
 
 /**
  * getCached — thin wrapper over the cache-service that adds thundering-herd
@@ -1331,8 +1331,8 @@ router.get('/collections/:address/vouchers', async (req: Request, res: Response,
     if (status && ['Issued', 'Redeemed', 'Revoked', 'Expired'].includes(status as string)) {
       where.status = status;
     }
-    const take = Math.min(limit ? parseInt(limit) : 50, 200);
-    const skip = offset ? parseInt(offset) : 0;
+    const take = Math.min(limit ? parseInt(limit, 10) : 50, 200);
+    const skip = offset ? parseInt(offset, 10) : 0;
 
     const [vouchers, total] = await Promise.all([
       (prisma as any).voucher.findMany({
