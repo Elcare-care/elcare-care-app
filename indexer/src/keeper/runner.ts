@@ -265,6 +265,13 @@ export async function runKeeperCycle(
   const cycleTimer = keeperCycleDurationSeconds.startTimer();
 
   try {
+    // Guard: warn operators if the daily fee budget is misconfigured as 0.
+    if (BigInt(cfg.KEEPER_DAILY_FEE_BUDGET_STROOPS) === 0n) {
+      logger.error(
+        { component: 'keeper' },
+        'Keeper daily fee budget is 0 — no transactions will be submitted. Check KEEPER_DAILY_BUDGET_STROOPS.',
+      );
+    }
     logger.info('keeper: sweep cycle starting', { dryRun });
 
     // Resume any in-flight actions from a prior crashed run first.

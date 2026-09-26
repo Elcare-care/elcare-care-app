@@ -13,7 +13,7 @@ const userIndex = new Map<string, Set<string>>();
 export function insertReminder(input: ScheduleReminderRequest): CareReminder {
   const now = new Date().toISOString();
   const reminder: CareReminder = {
-    id: `rem_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+    id: crypto.randomUUID(),
     userId: input.userId,
     kind: input.kind,
     title: input.title,
@@ -41,9 +41,18 @@ export function getReminder(id: string): CareReminder | undefined {
 export function getRemindersForUser(userId: string): CareReminder[] {
   const ids = userIndex.get(userId);
   if (!ids) return [];
-  return Array.from(ids)
-    .map((id) => reminders.get(id))
-    .filter((r): r is CareReminder => Boolean(r));
+  const result: CareReminder[] = [];
+  for (const id of Array.from(ids)) {
+    const reminder = reminders.get(id);
+    if (reminder) {
+      result.push(reminder);
+    } else {
+      // Stale index entry — reminder was deleted without updating the index.
+      // Self-heal by removing it now.
+      ids.delete(id);
+    }
+  }
+  return result;
 }
 
 export function updateReminderReceipt(id: string, update: ReceiptUpdateRequest): CareReminder | undefined {

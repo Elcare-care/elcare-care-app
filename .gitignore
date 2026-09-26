@@ -113,3 +113,21 @@ dist/
 /sbom-*.cdx.json
 /sbom-*.meta.json
 /cargo-metadata.json
+
+# Editor / AI tool artifacts
+*.swp
+*.swo
+*~
+.codex
+
+# Playwright cache
+/playwright/.cache/
+
+# Local markdown notes / one-off PR descriptions
+IMPLEMENTATION_COMPLETE.md
+LOAD_TEST_RESULTS.md
+DEPLOYMENT.md
+MUTATION_TESTING.md
+COMPATIBILITY.md
+OPERATIONAL_QUICK_REFERENCE.md
+CONTRIBUTING-SCHEMA-CHANGES.md
