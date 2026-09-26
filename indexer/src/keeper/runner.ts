@@ -43,11 +43,13 @@ import type { KeeperCandidate, KeeperCycleStats } from './types.js';
 // For production you'd persist this in Redis or the DB; for the scope of this
 // implementation an in-process counter is reset each calendar day.
 
-let dailyBudgetDate = new Date().toDateString();
+let dailyBudgetDate = new Date().toISOString().slice(0, 10);
+// NOTE: This counter resets on process restart. A restart mid-day allows spending up to
+// 2× the daily budget. Persistent tracking is tracked in issue #809.
 let dailyFeesSpentStroops = 0n;
 
 function checkAndAccumulateFee(feeStroops: bigint, maxDaily: number): boolean {
-  const today = new Date().toDateString();
+  const today = new Date().toISOString().slice(0, 10);
   if (today !== dailyBudgetDate) {
     dailyBudgetDate = today;
     dailyFeesSpentStroops = 0n;
@@ -73,7 +75,10 @@ async function resumeSubmittedActions(
   logger.info('keeper: resuming submitted actions from prior run', { count: submitted.length });
 
   for (const action of submitted) {
-    if (!action.txHash) continue;
+    if (!action.txHash) {
+      logger.warn({ actionId: action.id, component: 'keeper' }, 'Submitted action has no txHash — skipping (orphaned state)');
+      continue;
+    }
 
     const entryLabel = ENTRY_POINT_LABEL[action.targetType as keyof typeof ENTRY_POINT_LABEL];
 
