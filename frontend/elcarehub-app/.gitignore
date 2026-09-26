@@ -4,3 +4,14 @@
 
 # Jest coverage
 /coverage/
+
+# Test snapshots
+__snapshots__/
+*.snap
+
+# Coverage
+coverage/
+
+# Playwright
+test-results/
+playwright-report/
