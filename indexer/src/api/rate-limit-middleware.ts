@@ -45,17 +45,24 @@ function getRateLimitKey(req: Request): string {
 
 function baseOptions(cost: ResourceCost, message?: string) {
   const limits = RESOURCE_LIMITS[cost];
+  const windowSeconds = Math.ceil(limits.windowMs / 1000);
   return {
     windowMs: limits.windowMs,
     max: limits.max,
     keyGenerator: getRateLimitKey,
     standardHeaders: 'draft-6' as const,
     legacyHeaders: false,
-    message: {
-      error: message || 'Rate limit exceeded',
-      retryAfter: '1 minute',
-      limit: limits.max,
-      windowMs: limits.windowMs,
+    // Custom handler so we can set the RFC 6585 Retry-After header explicitly.
+    // express-rate-limit's standardHeaders option sets RateLimit-Reset but does
+    // not set Retry-After; well-behaved clients (and fetchWithRetry) rely on it.
+    handler: (req: Request, res: Response) => {
+      res.set('Retry-After', String(windowSeconds));
+      res.status(429).json({
+        error: message || 'Rate limit exceeded',
+        retryAfter: '1 minute',
+        limit: limits.max,
+        windowMs: limits.windowMs,
+      });
     },
     skip: (req: Request) => req.path === '/health' || req.path === '/readyz',
   };
@@ -76,11 +83,14 @@ export const globalRateLimiter = rateLimit({
   keyGenerator: getRateLimitKey,
   standardHeaders: 'draft-6' as const,
   legacyHeaders: false,
-  message: {
-    error: 'Too many requests, please try again later.',
-    retryAfter: '1 minute',
-    limit: GLOBAL_LIMIT,
-    windowMs: 60_000,
+  handler: (_req: Request, res: Response) => {
+    res.set('Retry-After', '60');
+    res.status(429).json({
+      error: 'Too many requests, please try again later.',
+      retryAfter: '1 minute',
+      limit: GLOBAL_LIMIT,
+      windowMs: 60_000,
+    });
   },
   skip: (req) => req.path === '/health' || req.path === '/readyz',
 });
@@ -121,6 +131,7 @@ export function sseConcurrencyGuard(req: Request, res: Response, next: NextFunct
 
   sseConnectionCounts.set(key, current + 1);
   sseConnectionsTotal.inc();
+  sseActiveConnectionsGauge.inc();
 
   res.on('close', () => {
     const updated = (sseConnectionCounts.get(key) ?? 0) - 1;
@@ -129,6 +140,7 @@ export function sseConcurrencyGuard(req: Request, res: Response, next: NextFunct
     } else {
       sseConnectionCounts.set(key, updated);
     }
+    sseActiveConnectionsGauge.dec();
   });
 
   next();
