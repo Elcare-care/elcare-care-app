@@ -77,7 +77,7 @@ export const reentrancyGuardTriggeredTotal = new client.Counter({
   help: 'Total number of times a ReentrancyGuard rejection (error #22) was observed in contract invocation results',
 });
 
-export const httpRequestDurationMicroseconds = new client.Histogram({
+export const httpRequestDurationSeconds = new client.Histogram({
   name: 'http_request_duration_seconds',
   help: 'Duration of HTTP requests in seconds',
   labelNames: ['method', 'route', 'status'],
@@ -209,13 +209,15 @@ export function metricsMiddleware(req: express.Request, res: express.Response, n
     const duration = process.hrtime(start);
     const durationInSeconds = duration[0] + duration[1] / 1e9;
     
-    // Normalize route to avoid high-cardinality issues
-    let route = req.baseUrl + (req.route ? req.route.path : req.path);
+    // Normalize route to avoid high-cardinality issues.
+    // When req.route is absent (404s, pre-routing middleware) we use the fixed
+    // placeholder 'unmatched' so raw resource IDs never become label values.
+    let route = req.baseUrl + (req.route ? req.route.path : 'unmatched');
     if (!route || route === '') {
-      route = req.path;
+      route = 'unmatched';
     }
-    
-    httpRequestDurationMicroseconds.labels(
+
+    httpRequestDurationSeconds.labels(
       req.method,
       route,
       res.statusCode.toString()
@@ -613,8 +615,8 @@ export const financialCollectionAggregateGauge = new client.Gauge({
 /** Per-ledger aggregate totals for reconciliation verification. */
 export const financialLedgerAggregateGauge = new client.Gauge({
   name: 'financial_ledger_aggregate',
-  help: 'Per-ledger aggregate totals for financial reconciliation verification',
-  labelNames: ['ledger_sequence', 'metric'],
+  help: 'Current aggregate totals for financial reconciliation verification (ledger_sequence logged, not labeled)',
+  labelNames: ['metric'],
 });
 
 /** Duration of financial reconciliation runs in seconds. */

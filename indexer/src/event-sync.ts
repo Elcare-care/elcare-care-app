@@ -252,6 +252,20 @@ export async function collectMarketplaceEvents(
       }
 
       for (const [idx, event] of (response.events ?? []).entries()) {
+        // Guard against anomalous zero-topic events (Issue #755).
+        // An on-chain event with no topics indicates either a contract bug or
+        // RPC data-integrity issue. Log a warning with full context so the
+        // anomaly is visible in the log aggregator, then skip safely.
+        const contractId = (event as RpcEvent).contractId ?? '';
+        const txHash = (event as RpcEvent).txHash ?? '';
+        const ledger = (event as RpcEvent).ledger;
+        if (!event.topic || event.topic.length === 0) {
+          logger.warn(
+            { ledger, contractId, txHash, eventIndex: idx },
+            'event has no topics — skipping',
+          );
+          continue;
+        }
         try {
           const decoded = decodeRpcEvent(event, idx);
           if (decoded) decodedEvents.push(decoded);
