@@ -16,6 +16,7 @@ import prismaWrite from './prisma-write.js';
 // Stellar Soroban RPC limits event queries to ~17,280 ledgers (≈ 24 hours at 5s/ledger).
 // Exceeding this window causes the RPC to return an error. Do not raise without verifying.
 export const MAX_LEDGER_WINDOW = 17_000;
+// Stellar RPC allows up to 200 events per page; 100 is conservative to limit response size.
 export const EVENT_PAGE_LIMIT = 100;
 const MIN_PAGE_SIZE = 10;
 // Soroban RPC rate-limit window is not publicly documented; 5 s is a safe empirical default.
