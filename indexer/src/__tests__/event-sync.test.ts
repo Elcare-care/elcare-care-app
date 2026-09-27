@@ -270,13 +270,13 @@ describe('extractEventOrdering', () => {
     expect(ordering).toEqual({ txIndex: 7, eventIndex: 3 });
   });
 
-  it('falls back to (0, array position) when the id is missing', () => {
-    expect(extractEventOrdering({} as any, 5)).toEqual({ txIndex: 0, eventIndex: 5 });
+  it('falls back to (-1, array position) when the id is missing', () => {
+    expect(extractEventOrdering({} as any, 5)).toEqual({ txIndex: -1, eventIndex: 5 });
   });
 
-  it('falls back to (0, array position) when the id is unparseable', () => {
-    expect(extractEventOrdering({ id: 'garbage' } as any, 2)).toEqual({ txIndex: 0, eventIndex: 2 });
-    expect(extractEventOrdering({ id: 'not-numeric-id' } as any, 4)).toEqual({ txIndex: 0, eventIndex: 4 });
+  it('falls back to (-1, array position) when the id is unparseable', () => {
+    expect(extractEventOrdering({ id: 'garbage' } as any, 2)).toEqual({ txIndex: -1, eventIndex: 2 });
+    expect(extractEventOrdering({ id: 'not-numeric-id' } as any, 4)).toEqual({ txIndex: -1, eventIndex: 4 });
   });
 });
 

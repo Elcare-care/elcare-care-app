@@ -47,7 +47,7 @@ describe('Rate Limiting Middleware', () => {
     it('[ISSUE-066] should apply global baseline rate limiter to all endpoints', async () => {
         const response = await request(app).get('/test');
         expect(response.headers['ratelimit-limit']).toBeDefined();
-        expect(parseInt(response.headers['ratelimit-limit'])).toBeGreaterThan(0);
+        expect(parseInt(response.headers['ratelimit-limit'], 10)).toBeGreaterThan(0);
     });
 
     it('[ISSUE-066] should skip rate limit for /health endpoint', async () => {
@@ -64,7 +64,7 @@ describe('Rate Limiting Middleware', () => {
         // Strict limiter has max of 20 per minute, so just verify headers
         const response = await request(app).get('/test-strict');
         expect(response.headers['ratelimit-limit']).toBeDefined();
-        const limit = parseInt(response.headers['ratelimit-limit']);
+        const limit = parseInt(response.headers['ratelimit-limit'], 10);
         expect(limit).toBeLessThanOrEqual(100); // strict is more restrictive than standard
     });
 
@@ -85,6 +85,6 @@ describe('Rate Limiting Middleware', () => {
         const response = await request(app).get('/test-standard');
         expect(response.status).toBe(200);
         expect(response.headers['ratelimit-limit']).toBe('100');
-        expect(parseInt(response.headers['ratelimit-remaining'])).toBeGreaterThan(-1);
+        expect(parseInt(response.headers['ratelimit-remaining'], 10)).toBeGreaterThan(-1);
     });
 });

@@ -321,4 +321,4 @@ export function resetStallStateForTest(): void {
 // STALL_THRESHOLD_MS is retained so existing callers that read it from this
 // module keep working.  The watchdog supersedes the old setTimeout approach.
 
-export const STALL_THRESHOLD_MS = parseInt(process.env.STALL_THRESHOLD_MS || '60000');
+export const STALL_THRESHOLD_MS = parseInt(process.env.STALL_THRESHOLD_MS || '60000', 10);

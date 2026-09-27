@@ -114,7 +114,8 @@ function stableStringify(value: unknown): string {
     const keys = Object.keys(obj).sort();
     return `{${keys.map((k) => `${JSON.stringify(k)}:${stableStringify(obj[k])}`).join(",")}}`;
   }
-  // functions, symbols, bigint, etc. — fall back to a stable-ish string form
+  if (t === 'bigint') return String(value as bigint);
+  // functions, symbols, etc. — fall back to a stable-ish string form
   return JSON.stringify(String(value));
 }
 

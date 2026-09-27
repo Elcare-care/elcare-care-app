@@ -51,14 +51,17 @@ dotenv.config();
 
 const GAP_REPAIR_INTERVAL_MS = parseInt(
   process.env.GAP_REPAIR_INTERVAL_MS || '120000', // 2 min
+  10,
 );
 
 const GAP_REPAIR_MAX_RETRIES = parseInt(
   process.env.GAP_REPAIR_MAX_RETRIES || '3',
+  10,
 );
 
 const GAP_REPAIR_BATCH_SIZE = parseInt(
   process.env.GAP_REPAIR_BATCH_SIZE || process.env.BACKFILL_BATCH_SIZE || '5000',
+  10,
 );
 
 // ── Types ─────────────────────────────────────────────────────────────────────

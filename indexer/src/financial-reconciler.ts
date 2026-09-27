@@ -24,10 +24,10 @@ import {
 
 // ── Configuration ───────────────────────────────────────────────────────────────
 
-const CONFIRMATION_DEPTH = parseInt(process.env.FINANCIAL_RECONCILE_CONFIRMATION_DEPTH || '32');
-const DEFAULT_TOLERANCE_BPS = parseInt(process.env.FINANCIAL_RECONCILE_TOLERANCE_BPS || '100'); // 1%
-const PROVISIONAL_TOLERANCE_BPS = parseInt(process.env.FINANCIAL_RECONCILE_PROVISIONAL_TOLERANCE_BPS || '500'); // 5%
-const ALERT_THRESHOLD_BPS = parseInt(process.env.FINANCIAL_RECONCILE_ALERT_THRESHOLD_BPS || '200'); // 2%
+const CONFIRMATION_DEPTH = parseInt(process.env.FINANCIAL_RECONCILE_CONFIRMATION_DEPTH || '32', 10);
+const DEFAULT_TOLERANCE_BPS = parseInt(process.env.FINANCIAL_RECONCILE_TOLERANCE_BPS || '100', 10); // 1%
+const PROVISIONAL_TOLERANCE_BPS = parseInt(process.env.FINANCIAL_RECONCILE_PROVISIONAL_TOLERANCE_BPS || '500', 10); // 5%
+const ALERT_THRESHOLD_BPS = parseInt(process.env.FINANCIAL_RECONCILE_ALERT_THRESHOLD_BPS || '200', 10); // 2%
 
 // ── Public Types ───────────────────────────────────────────────────────────────
 
@@ -650,10 +650,17 @@ export async function runFinancialReconciliation(
     }
 
     for (const [ledgerSeq, totals] of aggregates.perLedger) {
-      financialLedgerAggregateGauge.set({ ledger_sequence: ledgerSeq.toString(), metric: 'protocol_fees' }, Number(totals.protocolFeesTotal));
-      financialLedgerAggregateGauge.set({ ledger_sequence: ledgerSeq.toString(), metric: 'royalties' }, Number(totals.royaltiesTotal));
-      financialLedgerAggregateGauge.set({ ledger_sequence: ledgerSeq.toString(), metric: 'sales' }, Number(totals.salesTotal));
-      financialLedgerAggregateGauge.set({ ledger_sequence: ledgerSeq.toString(), metric: 'refunds' }, Number(totals.refundsTotal));
+      // ledger_sequence is logged here for debugging — it must NOT be a metric
+      // label because it is an ever-increasing integer that would create one new
+      // Prometheus time series per ledger, causing unbounded cardinality (Issue #758).
+      logger.debug(
+        { ledger_sequence: ledgerSeq },
+        'financialLedgerAggregateGauge updating current aggregate totals',
+      );
+      financialLedgerAggregateGauge.set({ metric: 'protocol_fees' }, Number(totals.protocolFeesTotal));
+      financialLedgerAggregateGauge.set({ metric: 'royalties' }, Number(totals.royaltiesTotal));
+      financialLedgerAggregateGauge.set({ metric: 'sales' }, Number(totals.salesTotal));
+      financialLedgerAggregateGauge.set({ metric: 'refunds' }, Number(totals.refundsTotal));
     }
 
     // Detect drift

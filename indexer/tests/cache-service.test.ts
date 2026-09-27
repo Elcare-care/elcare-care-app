@@ -368,6 +368,9 @@ describe('getCached — distributed locking', () => {
 
     // Loser: lock is held by another instance (SET NX returns null)
     mockRedis.set.mockResolvedValue(null);
+    // Lock is still held while waiting (exists=1), so the poll loop does not
+    // break early before the winner has had time to write the value.
+    mockRedis.exists.mockResolvedValue(1);
 
     // After 2 poll cycles the winner has written the value
     let pollCount = 0;

@@ -662,7 +662,7 @@ describe('GET /wallets/:address/royalty-stats — extended', () => {
     const response = await request(app).get('/wallets/GTEST/royalty-stats');
     // If headers contain ratelimit info, strict limiter is applied
     expect(response.headers['ratelimit-limit']).toBeDefined();
-    expect(parseInt(response.headers['ratelimit-limit'])).toBeLessThanOrEqual(100);
+    expect(parseInt(response.headers['ratelimit-limit'], 10)).toBeLessThanOrEqual(100);
   });
 });
 // ── GET /auctions/:id/blocked-bidders (Issue #199) ────────────────────────────

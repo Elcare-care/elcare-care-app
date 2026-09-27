@@ -224,7 +224,7 @@ export function loadConfig() {
      *
      * Configurable via CONFIRMATION_DEPTH environment variable.
      */
-    confirmationDepth: parseInt(process.env.CONFIRMATION_DEPTH || '10', 10),
+    confirmationDepth: parsePositiveInt('CONFIRMATION_DEPTH', process.env.CONFIRMATION_DEPTH, 10),
   };
 }
 
@@ -271,8 +271,8 @@ const keeperEnvSchema = z.object({
   KEEPER_SECRET: z
     .string()
     .optional()
-    .refine((v) => v === undefined || v.startsWith('S'), {
-      message: 'KEEPER_SECRET must be a Stellar secret key starting with "S"',
+    .refine((v) => v === undefined || (v.startsWith('S') && v.length === 56), {
+      message: 'KEEPER_SECRET must be a valid 56-character Stellar secret key starting with "S"',
     }),
 
   // Whether to simulate only and never broadcast (default: true — safe default).

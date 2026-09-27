@@ -14,10 +14,10 @@ import {
 export type ResourceCost = 'light' | 'medium' | 'heavy' | 'operational';
 
 export const RESOURCE_LIMITS: Record<ResourceCost, { windowMs: number; max: number }> = {
-  light:      { windowMs: 60_000, max: parseInt(process.env.RATE_LIMIT_LIGHT      || '200') },
-  medium:     { windowMs: 60_000, max: parseInt(process.env.RATE_LIMIT_MEDIUM     || '100') },
-  heavy:      { windowMs: 60_000, max: parseInt(process.env.RATE_LIMIT_HEAVY      || '20')  },
-  operational:{ windowMs: 60_000, max: parseInt(process.env.RATE_LIMIT_OPERATIONAL || '10')  },
+  light:      { windowMs: 60_000, max: parseInt(process.env.RATE_LIMIT_LIGHT      || '200', 10) },
+  medium:     { windowMs: 60_000, max: parseInt(process.env.RATE_LIMIT_MEDIUM     || '100', 10) },
+  heavy:      { windowMs: 60_000, max: parseInt(process.env.RATE_LIMIT_HEAVY      || '20',  10) },
+  operational:{ windowMs: 60_000, max: parseInt(process.env.RATE_LIMIT_OPERATIONAL || '10',  10) },
 };
 
 // ── Key extractors ─────────────────────────────────────────────────────────────
@@ -45,17 +45,24 @@ function getRateLimitKey(req: Request): string {
 
 function baseOptions(cost: ResourceCost, message?: string) {
   const limits = RESOURCE_LIMITS[cost];
+  const windowSeconds = Math.ceil(limits.windowMs / 1000);
   return {
     windowMs: limits.windowMs,
     max: limits.max,
     keyGenerator: getRateLimitKey,
     standardHeaders: 'draft-6' as const,
     legacyHeaders: false,
-    message: {
-      error: message || 'Rate limit exceeded',
-      retryAfter: '1 minute',
-      limit: limits.max,
-      windowMs: limits.windowMs,
+    // Custom handler so we can set the RFC 6585 Retry-After header explicitly.
+    // express-rate-limit's standardHeaders option sets RateLimit-Reset but does
+    // not set Retry-After; well-behaved clients (and fetchWithRetry) rely on it.
+    handler: (req: Request, res: Response) => {
+      res.set('Retry-After', String(windowSeconds));
+      res.status(429).json({
+        error: message || 'Rate limit exceeded',
+        retryAfter: '1 minute',
+        limit: limits.max,
+        windowMs: limits.windowMs,
+      });
     },
     skip: (req: Request) => req.path === '/health' || req.path === '/readyz',
   };
@@ -69,18 +76,21 @@ export const heavyRateLimiter = rateLimit(baseOptions('heavy',     'Heavy endpoi
 export const operationalRateLimiter = rateLimit(baseOptions('operational', 'Operator endpoint rate limit exceeded.'));
 
 // Global baseline limiter — applies to all public endpoints
-const GLOBAL_LIMIT = parseInt(process.env.RATE_LIMIT_GLOBAL || '500');
+const GLOBAL_LIMIT = parseInt(process.env.RATE_LIMIT_GLOBAL || '500', 10);
 export const globalRateLimiter = rateLimit({
   windowMs: 60_000,
   max: GLOBAL_LIMIT,
   keyGenerator: getRateLimitKey,
   standardHeaders: 'draft-6' as const,
   legacyHeaders: false,
-  message: {
-    error: 'Too many requests, please try again later.',
-    retryAfter: '1 minute',
-    limit: GLOBAL_LIMIT,
-    windowMs: 60_000,
+  handler: (_req: Request, res: Response) => {
+    res.set('Retry-After', '60');
+    res.status(429).json({
+      error: 'Too many requests, please try again later.',
+      retryAfter: '1 minute',
+      limit: GLOBAL_LIMIT,
+      windowMs: 60_000,
+    });
   },
   skip: (req) => req.path === '/health' || req.path === '/readyz',
 });
@@ -99,7 +109,7 @@ export const strictRateLimiter = heavyRateLimiter;
 // The guard emits SSE connection metrics so Grafana dashboards track
 // per-key usage alongside the global active connection count.
 
-const SSE_CONCURRENT_PER_KEY = parseInt(process.env.SSE_CONCURRENT_PER_KEY || '5');
+const SSE_CONCURRENT_PER_KEY = parseInt(process.env.SSE_CONCURRENT_PER_KEY || '5', 10);
 const sseConnectionCounts = new Map<string, number>();
 
 export function sseConcurrencyGuard(req: Request, res: Response, next: NextFunction): void {
@@ -121,14 +131,16 @@ export function sseConcurrencyGuard(req: Request, res: Response, next: NextFunct
 
   sseConnectionCounts.set(key, current + 1);
   sseConnectionsTotal.inc();
+  sseActiveConnectionsGauge.inc();
 
   res.on('close', () => {
-    const updated = (sseConnectionCounts.get(key) ?? 1) - 1;
+    const updated = (sseConnectionCounts.get(key) ?? 0) - 1;
     if (updated <= 0) {
       sseConnectionCounts.delete(key);
     } else {
       sseConnectionCounts.set(key, updated);
     }
+    sseActiveConnectionsGauge.dec();
   });
 
   next();

@@ -8,7 +8,7 @@ import {
   metricsMiddleware,
   handleMetrics,
   requestLogger,
-  httpRequestDurationMicroseconds,
+  httpRequestDurationSeconds,
   // Issue #299 — new correctness & business metrics
   reconciliationMismatchesTotal,
   unresolvedEscrowGauge,

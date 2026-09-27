@@ -13,10 +13,14 @@ import { withRpcRetry } from './retry.js';
 import { logger } from './logger.js';
 import prismaWrite from './prisma-write.js';
 
+// Stellar Soroban RPC limits event queries to ~17,280 ledgers (≈ 24 hours at 5s/ledger).
+// Exceeding this window causes the RPC to return an error. Do not raise without verifying.
 export const MAX_LEDGER_WINDOW = 17_000;
 // Stellar RPC allows up to 200 events per page; 100 is conservative to limit response size.
 export const EVENT_PAGE_LIMIT = 100;
 const MIN_PAGE_SIZE = 10;
+// Soroban RPC rate-limit window is not publicly documented; 5 s is a safe empirical default.
+// If the provider returns a Retry-After header, that value takes precedence.
 const DEFAULT_RATE_LIMIT_BACKOFF_MS = 5_000;
 const PAGE_SIZE_RECOVERY_THRESHOLD = 3;
 
@@ -55,8 +59,9 @@ export interface EventOrdering {
  * txApplicationOrder gives the transaction's position within the ledger; the
  * suffix gives the event's position within the transaction.
  *
- * Falls back to (0, array position) when the id is absent or unparseable —
- * the RPC returns events in application order, so array position preserves
+ * Falls back to (-1, array position) when the id is absent or unparseable —
+ * -1 is a sentinel meaning "transaction index unknown from RPC response".
+ * The RPC returns events in application order, so array position preserves
  * the correct relative order within a page.
  */
 export function extractEventOrdering(event: RpcEvent, fallback: number): EventOrdering {
@@ -73,7 +78,8 @@ export function extractEventOrdering(event: RpcEvent, fallback: number): EventOr
       }
     }
   }
-  return { txIndex: 0, eventIndex: fallback };
+  // -1 = txIndex absent from RPC response; sorts before all real transactions.
+  return { txIndex: -1, eventIndex: fallback };
 }
 
 function decodeRpcEvent(event: RpcEvent, arrayIndex: number): DecodedEvent | null {
@@ -251,6 +257,20 @@ export async function collectMarketplaceEvents(
       }
 
       for (const [idx, event] of (response.events ?? []).entries()) {
+        // Guard against anomalous zero-topic events (Issue #755).
+        // An on-chain event with no topics indicates either a contract bug or
+        // RPC data-integrity issue. Log a warning with full context so the
+        // anomaly is visible in the log aggregator, then skip safely.
+        const contractId = (event as RpcEvent).contractId ?? '';
+        const txHash = (event as RpcEvent).txHash ?? '';
+        const ledger = (event as RpcEvent).ledger;
+        if (!event.topic || event.topic.length === 0) {
+          logger.warn(
+            { ledger, contractId, txHash, eventIndex: idx },
+            'event has no topics — skipping',
+          );
+          continue;
+        }
         try {
           const decoded = decodeRpcEvent(event, idx);
           if (decoded) decodedEvents.push(decoded);
@@ -289,14 +309,15 @@ export async function collectMarketplaceEvents(
           eventDecodeErrorsCounter.inc({ event_type: eventType });
 
           // Log at warn level with the raw event for post-mortem; never crash the batch.
-          console.warn({
-            msg: '[EventSync] Failed to decode event — skipping',
-            ledger: (event as RpcEvent).ledger,
-            eventIndex: idx,
-            eventType,
-            error: err instanceof Error ? err.message : String(err),
-            rawTopic: (event as RpcEvent).topic,
-          });
+          logger.warn(
+            {
+              eventType,
+              reason: err instanceof SchemaDecodeError ? err.reason : (err instanceof Error ? err.message : String(err)),
+              ledger: (event as RpcEvent).ledger,
+              txHash: (event as RpcEvent).txHash,
+            },
+            'schema decode error — skipping event',
+          );
 
           // Persist durable diagnostic record (fire-and-forget — must not block the batch).
           persistDeadLetter(event as RpcEvent, idx, err).catch((dlErr) => {
@@ -319,6 +340,10 @@ export async function collectMarketplaceEvents(
 
       paginationToken = nextToken;
     } while (paginationToken);
+
+    // Cursors are monotonically increasing across windows; clear the set so it
+    // does not accumulate entries from every window in a long-running process.
+    seenCursors.clear();
   }
 
   // Deliver the batch in deterministic application order.
