@@ -1075,3 +1075,134 @@ fn update_royalty_exceeds_max_bps_lazy721() {
     let result = client.try_update_royalty(&receiver, &10_001u32);
     assert_eq!(result, Err(Ok(Error::InvalidBps)));
 }
+
+// ── Creator succession: two-step, expiring, cancellable (#845) ───────────────
+
+fn jump_ledger(env: &Env, delta: u32) {
+    env.ledger().with_mut(|li| {
+        li.sequence_number += delta;
+    });
+}
+
+/// True when an event carrying `name` as a topic symbol was emitted.
+#[allow(irrefutable_let_patterns)] // ContractEventBody has a single variant in this SDK version
+fn has_symbol_event(env: &Env, name: &str) -> bool {
+    use soroban_sdk::xdr::{ContractEventBody, ScVal};
+
+    env.events().all().events().iter().any(|event| {
+        if let ContractEventBody::V0(body) = &event.body {
+            body.topics.iter().any(|topic| match topic {
+                ScVal::Symbol(symbol) => {
+                    core::str::from_utf8(symbol.0.as_slice()).unwrap_or("") == name
+                }
+                _ => false,
+            })
+        } else {
+            false
+        }
+    })
+}
+
+#[test]
+fn test_creator_succession_happy_path() {
+    let (env, client, creator, _fee_receiver) = setup(500);
+    let successor = Address::generate(&env);
+    let expires_at = env.ledger().sequence() + 1_000;
+
+    client.propose_creator(&successor, &expires_at);
+    assert!(
+        has_symbol_event(&env, "cr_prop"),
+        "proposal must be announced"
+    );
+    // Authority does not move on the proposal itself.
+    assert_eq!(client.creator(), creator);
+
+    jump_ledger(&env, 10);
+    client.accept_creator(&successor);
+    // The event buffer holds the last invocation's events, so assert before any
+    // other contract call.
+    assert!(
+        has_symbol_event(&env, "cr_acc"),
+        "acceptance must be announced"
+    );
+
+    assert_eq!(client.creator(), successor);
+    assert_eq!(client.original_creator(), creator);
+}
+
+#[test]
+fn test_creator_succession_not_pending_creator() {
+    let (env, client, creator, _fee_receiver) = setup(500);
+    let successor = Address::generate(&env);
+    let impostor = Address::generate(&env);
+
+    client.propose_creator(&successor, &(env.ledger().sequence() + 1_000));
+    jump_ledger(&env, 10);
+
+    let result = client.try_accept_creator(&impostor);
+    assert_eq!(result, Err(Ok(Error::NotPendingCreator)));
+    // A rejected acceptance leaves the creator untouched.
+    assert_eq!(client.creator(), creator);
+}
+
+#[test]
+fn test_creator_succession_proposal_expired() {
+    let (env, client, creator, _fee_receiver) = setup(500);
+    let successor = Address::generate(&env);
+    let expires_at = env.ledger().sequence() + 20;
+
+    client.propose_creator(&successor, &expires_at);
+    jump_ledger(&env, 20);
+
+    let result = client.try_accept_creator(&successor);
+    assert_eq!(result, Err(Ok(Error::ProposalExpired)));
+    assert_eq!(client.creator(), creator);
+}
+
+#[test]
+fn test_creator_succession_no_pending() {
+    let (env, client, _creator, _fee_receiver) = setup(500);
+    let successor = Address::generate(&env);
+
+    let result = client.try_accept_creator(&successor);
+    assert_eq!(result, Err(Ok(Error::NoPendingCreator)));
+}
+
+#[test]
+fn test_original_creator_immutable() {
+    let (env, client, creator, _fee_receiver) = setup(500);
+    let first = Address::generate(&env);
+    let second = Address::generate(&env);
+
+    client.propose_creator(&first, &(env.ledger().sequence() + 1_000));
+    client.accept_creator(&first);
+    client.propose_creator(&second, &(env.ledger().sequence() + 1_000));
+    client.accept_creator(&second);
+
+    assert_eq!(client.creator(), second);
+    // Two successions later the original creator is still the one set at init.
+    assert_eq!(client.original_creator(), creator);
+}
+
+#[test]
+fn test_creator_succession_cancelled_proposal_cannot_be_accepted() {
+    let (env, client, creator, _fee_receiver) = setup(500);
+    let successor = Address::generate(&env);
+    let expires_at = env.ledger().sequence() + 1_000;
+
+    client.propose_creator(&successor, &expires_at);
+    client.cancel_creator_proposal();
+    assert!(
+        has_symbol_event(&env, "cr_canc"),
+        "cancellation must be announced"
+    );
+
+    let result = client.try_accept_creator(&successor);
+    assert_eq!(result, Err(Ok(Error::NoPendingCreator)));
+    assert_eq!(client.creator(), creator);
+
+    // A fresh proposal is accepted normally afterwards.
+    client.propose_creator(&successor, &expires_at);
+    client.accept_creator(&successor);
+    assert_eq!(client.creator(), successor);
+}
