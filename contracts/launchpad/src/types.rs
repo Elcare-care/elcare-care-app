@@ -38,6 +38,12 @@ pub enum Error {
     SymbolTooLong = 19,
     /// max_supply exceeds the platform cap of 1,000,000,000 (Issue #476).
     MaxSupplyTooLarge = 20,
+    /// `set_collection_protocol_fee` was called before an admin configured the
+    /// marketplace address (Issue #849).
+    MarketplaceNotConfigured = 21,
+    /// `set_collection_protocol_fee` was called for an address this launchpad
+    /// did not deploy (Issue #849).
+    CollectionNotOurs = 22,
 }
 
 // `#[contracterror]` in soroban-sdk 25.3.x does not emit `SorobanArbitrary`.
@@ -173,4 +179,8 @@ pub enum DataKey {
     /// Per-collection pause flag — set by either the collection creator or a
     /// launchpad admin via the emergency pause path (#478).
     CollectionPaused(Address),
+    /// Marketplace contract this launchpad configures per-collection fee
+    /// overrides on (Issue #849). Absent until an admin sets it, in which case
+    /// `set_collection_protocol_fee` fails with `MarketplaceNotConfigured`.
+    Marketplace,
 }

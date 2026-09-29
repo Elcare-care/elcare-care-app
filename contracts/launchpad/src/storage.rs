@@ -286,6 +286,23 @@ pub fn get_emergency_pauser(env: &Env) -> Option<Address> {
     env.storage().instance().get(&DataKey::EmergencyPauser)
 }
 
+// ── Marketplace address (Issue #849) ────────────────────────────────────────
+//
+// The launchpad configures per-collection fee overrides on the marketplace it
+// deploys collections for. Kept as explicit, admin-set configuration rather
+// than an `initialize` argument so existing deployments do not need a
+// re-initialisation.
+
+pub fn set_marketplace(env: &Env, marketplace: &Address) {
+    env.storage()
+        .instance()
+        .set(&DataKey::Marketplace, marketplace);
+}
+
+pub fn get_marketplace(env: &Env) -> Option<Address> {
+    env.storage().instance().get(&DataKey::Marketplace)
+}
+
 /// Authorize a `pause`/`unpause` call: the explicit `EmergencyPauser` if one
 /// has been configured, otherwise the `Admin` fallback. Returns the
 /// authorizing address for event emission.
