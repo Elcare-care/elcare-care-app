@@ -34,6 +34,20 @@ jobs:
       - name: Validate error catalog coverage
         run: node scripts/contract-errors/validate-error-coverage.mjs
 
+  # ── Event schema registry parity gate (Issue #846) ──────────────────────────
+  # Blocks merge when a struct in contracts/soroban-marketplace/src/events.rs
+  # carries a `schema_version: u32` field but the indexer's schema registry has
+  # no entry for its event type, or the entry does not mark `schema_version`
+  # optional — either way one decoder could not handle both the historical
+  # (implicit version 0) and the post-upgrade shapes of that event.
+  event-schema-lint:
+    name: Event Schema Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check every versioned contract event has an optional schema_version entry
+        run: node scripts/check-event-schemas.mjs
+
   # ── Migration safety gate ────────────────────────────────────────────────────
   # Runs on every push/PR that touches migration files.
   # Blocks merge when destructive SQL patterns are detected (DROP TABLE,

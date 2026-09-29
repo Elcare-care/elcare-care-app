@@ -548,7 +548,8 @@ export const AUCTION_BID_REFUNDED_SCHEMA: ContractEventSchema = {
     { name: 'amount', type: 'bigint' },
     { name: 'token', type: 'string' },
     { name: 'reason', type: 'string', optional: true },
-    { name: 'ledger_sequence', type: 'bigint', optional: true },
+    // u32 on the contract side, so scValToNative yields a JS number.
+    { name: 'ledger_sequence', type: 'number', optional: true },
     // Issue #278: additive, absent on pre-upgrade historical events.
     { name: 'schema_version', type: 'number', optional: true },
   ],
@@ -562,7 +563,8 @@ export const AUCTION_ADMIN_CANCELLED_SCHEMA: ContractEventSchema = {
     { name: 'cancelled_by', type: 'string', optional: true },
     { name: 'refunded_amount', type: 'bigint' },
     { name: 'token', type: 'string' },
-    { name: 'ledger_sequence', type: 'bigint', optional: true },
+    // u32 on the contract side, so scValToNative yields a JS number.
+    { name: 'ledger_sequence', type: 'number', optional: true },
     // Issue #278: additive, absent on pre-upgrade historical events.
     { name: 'schema_version', type: 'number', optional: true },
   ],
@@ -573,6 +575,11 @@ export const AUCTION_CANCELLED_SCHEMA: ContractEventSchema = {
   data: [
     { name: 'auction_id', type: 'bigint' },
     { name: 'cancelled_by', type: 'string', optional: true },
+    // Issue #278: additive, absent on pre-upgrade historical events. Without
+    // this entry a versioned event has no schema_version field to validate,
+    // so the version gate in parser.ts never sees it (see the audit in
+    // Issue #846 and scripts/check-event-schemas.mjs, which now enforces it).
+    { name: 'schema_version', type: 'number', optional: true },
   ],
 };
 
@@ -892,6 +899,11 @@ export const SCHEMA_REGISTRY: Map<string, ContractEventSchema> = new Map([
   ['AUCTION_RESOLVED', AUCTION_RESOLVED_SCHEMA],
   ['AUCTION_CANCELLED', AUCTION_CANCELLED_SCHEMA],
   ['AUCTION_EXTENDED', AUCTION_EXTENDED_SCHEMA],
+  // Issue #271 events that were defined but never registered, so the indexer
+  // had no schema to validate them against (found by the Issue #846 audit,
+  // enforced by scripts/check-event-schemas.mjs from now on).
+  ['AUCTION_BID_REFUNDED', AUCTION_BID_REFUNDED_SCHEMA],
+  ['AUCTION_ADMIN_CANCELLED', AUCTION_ADMIN_CANCELLED_SCHEMA],
   ['OFFER_MADE', OFFER_MADE_SCHEMA],
   ['OFFER_ACCEPTED', OFFER_ACCEPTED_SCHEMA],
   ['OFFER_REJECTED', OFFER_REJECTED_SCHEMA],
