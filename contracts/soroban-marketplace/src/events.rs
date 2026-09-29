@@ -119,6 +119,8 @@ pub const TTL_ANOMALY: &str = "ttl_anomaly";
 pub const CLEANUP_SUMMARY: &str = "cleanup_summary";
 // Migration phase observability
 pub const MIGRATION_PHASE_COMPLETE: &str = "migration_phase_complete";
+// Batch listing validation failure (Issue #457)
+pub const BATCH_ITEM_INVALID: &str = "batch_item_invalid";
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1852,5 +1854,32 @@ impl TerminalCleanedEvent {
     pub fn publish(self, env: &Env) {
         env.events()
             .publish((soroban_sdk::Symbol::new(env, TERMINAL_CLEANED),), self);
+    }
+}
+
+// ── Batch listing validation failure event (Issue #457) ──────────────────────
+
+/// Emitted immediately before a `create_listings` or `update_listings` call
+/// panics with `BatchItemInvalid = 61`.  Because `panic_with_error!` only
+/// surfaces the integer error code to the caller, this event carries the
+/// structured context — zero-based `item_index` and the underlying
+/// `error_code` — so clients can identify exactly which item caused the
+/// rejection and why without replaying the whole transaction.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchItemInvalidEvent {
+    /// Zero-based index of the failing item in the batch.
+    pub item_index: u32,
+    /// The `MarketplaceError` discriminant that caused this item to fail.
+    pub error_code: u32,
+    /// Ledger sequence at the time of failure (for indexer correlation).
+    pub ledger_sequence: u32,
+}
+
+impl BatchItemInvalidEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, BATCH_ITEM_INVALID),), self);
     }
 }
