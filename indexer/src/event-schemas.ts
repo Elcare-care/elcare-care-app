@@ -10,6 +10,7 @@
  *
  * JS types after scValToNative:
  *   Soroban u64 / i128  → BigInt
+ *   Soroban u32 / i32   → number (verified against @stellar/stellar-sdk)
  *   Soroban Address     → string
  *   Soroban Symbol      → string
  *   Soroban bool        → boolean
@@ -437,7 +438,7 @@ export const LISTING_CREATED_SCHEMA: ContractEventSchema = {
     { name: 'currency', type: 'string' },
     { name: 'collection', type: 'string' },
     { name: 'token_id', type: 'bigint' },
-    { name: 'ledger_sequence', type: 'bigint', optional: true },
+    { name: 'ledger_sequence', type: 'number', optional: true },
     { name: 'token', type: 'string', optional: true },
     { name: 'recipients', type: 'array', optional: true },
     // Issue #278: additive, absent on pre-upgrade historical events.
@@ -453,7 +454,7 @@ export const ARTWORK_SOLD_SCHEMA: ContractEventSchema = {
     { name: 'price', type: 'bigint' },
     { name: 'artist', type: 'string', optional: true },
     { name: 'currency', type: 'string', optional: true },
-    { name: 'ledger_sequence', type: 'bigint', optional: true },
+    { name: 'ledger_sequence', type: 'number', optional: true },
     // Issue #278: additive, absent on pre-upgrade historical events.
     { name: 'schema_version', type: 'number', optional: true },
   ],
@@ -466,7 +467,7 @@ export const LISTING_CANCELLED_SCHEMA: ContractEventSchema = {
     { name: 'cancelled_by', type: 'string', optional: true },
     // reason can be an enum object { tag: N } OR a plain string in legacy builds
     { name: 'reason', type: 'any', optional: true },
-    { name: 'ledger_sequence', type: 'bigint', optional: true },
+    { name: 'ledger_sequence', type: 'number', optional: true },
   ],
 };
 
@@ -478,7 +479,7 @@ export const LISTING_UPDATED_SCHEMA: ContractEventSchema = {
     { name: 'artist', type: 'string', optional: true },
     { name: 'collection', type: 'string', optional: true },
     { name: 'token_id', type: 'bigint', optional: true },
-    { name: 'ledger_sequence', type: 'bigint', optional: true },
+    { name: 'ledger_sequence', type: 'number', optional: true },
   ],
 };
 
@@ -497,7 +498,7 @@ export const LISTING_EXPIRED_SCHEMA: ContractEventSchema = {
   data: [
     { name: 'listing_id', type: 'bigint' },
     { name: 'expired_at', type: 'bigint' },
-    { name: 'ledger_sequence', type: 'bigint', optional: true },
+    { name: 'ledger_sequence', type: 'number', optional: true },
   ],
 };
 
@@ -674,7 +675,7 @@ export const ROYALTY_PAID_SCHEMA: ContractEventSchema = {
     { name: 'protocol_fee_amount', type: 'bigint' },
     { name: 'token', type: 'string' },
     { name: 'recipients', type: 'array' },
-    { name: 'ledger_sequence', type: 'bigint', optional: true },
+    { name: 'ledger_sequence', type: 'number', optional: true },
   ],
 };
 
@@ -698,7 +699,7 @@ export const ROYALTY_SETTLEMENT_SCHEMA: ContractEventSchema = {
     { name: 'recipients', type: 'array' },
     { name: 'total_amount', type: 'bigint' },
     { name: 'token', type: 'string' },
-    { name: 'ledger_sequence', type: 'bigint', optional: true },
+    { name: 'ledger_sequence', type: 'number', optional: true },
     // Issue #278: additive, absent on pre-upgrade historical events.
     { name: 'schema_version', type: 'number', optional: true },
   ],
@@ -860,7 +861,7 @@ export const LISTING_OWNERSHIP_RECONCILED_SCHEMA: ContractEventSchema = {
     { name: 'reconciled_by', type: 'string' },
     // previous_owner is Option<Address> — absent on first-ever reconciliation
     { name: 'previous_owner',  type: 'string',  optional: true },
-    { name: 'ledger_sequence', type: 'bigint',  optional: true },
+    { name: 'ledger_sequence', type: 'number', optional: true },
   ],
 };
 
