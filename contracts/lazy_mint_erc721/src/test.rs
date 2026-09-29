@@ -1075,3 +1075,145 @@ fn update_royalty_exceeds_max_bps_lazy721() {
     let result = client.try_update_royalty(&receiver, &10_001u32);
     assert_eq!(result, Err(Ok(Error::InvalidBps)));
 }
+
+// ── Creator succession (#484) ─────────────────────────────────────────────────
+
+fn jump_ledger_721(env: &Env, delta: u32) {
+    env.ledger().with_mut(|li| li.sequence_number += delta);
+}
+
+/// Happy path: propose → advance ledger → accept from proposed address.
+/// Verifies Creator is updated and OriginalCreator is unchanged.
+#[test]
+fn test_creator_succession_happy_path() {
+    let (env, client, creator, _fee) = setup(0);
+    let new_creator = Address::generate(&env);
+
+    // OriginalCreator must equal creator at init.
+    assert_eq!(client.original_creator(), creator);
+
+    // Propose: current ledger = 1, expiry = 100.
+    client.propose_creator(&new_creator, &100u32);
+
+    // Confirm pending proposal is recorded.
+    let (pending_addr, pending_exp) = client.pending_creator().unwrap();
+    assert_eq!(pending_addr, new_creator);
+    assert_eq!(pending_exp, 100u32);
+
+    // Advance ledger to sequence 50 — still before expiry 100.
+    jump_ledger_721(&env, 49); // 1 + 49 = 50
+
+    // Accept from the proposed address.
+    client.accept_creator(&new_creator);
+
+    // Creator must now be new_creator.
+    assert_eq!(client.creator(), new_creator);
+
+    // OriginalCreator must be unchanged.
+    assert_eq!(client.original_creator(), creator);
+
+    // Pending proposal must be cleared.
+    assert_eq!(client.pending_creator(), None);
+}
+
+/// Calling accept_creator from an address that is not the pending candidate
+/// must return NotPendingCreator (= 27 in LazyMint721).
+#[test]
+fn test_creator_succession_not_pending_creator() {
+    let (env, client, _creator, _fee) = setup(0);
+    let new_creator = Address::generate(&env);
+    let intruder = Address::generate(&env);
+
+    client.propose_creator(&new_creator, &100u32);
+
+    let result = client.try_accept_creator(&intruder);
+    assert_eq!(result, Err(Ok(Error::NotPendingCreator)));
+}
+
+/// Calling accept_creator after the expiry ledger has passed must return
+/// ProposalExpired (= 28 in LazyMint721).
+#[test]
+fn test_creator_succession_proposal_expired() {
+    let (env, client, _creator, _fee) = setup(0);
+    let new_creator = Address::generate(&env);
+
+    // Expiry = 50. Current sequence = 1.
+    client.propose_creator(&new_creator, &50u32);
+
+    // Jump to sequence 50 — at boundary (>= expiry → expired).
+    jump_ledger_721(&env, 49); // 1 + 49 = 50 >= 50
+
+    let result = client.try_accept_creator(&new_creator);
+    assert_eq!(result, Err(Ok(Error::ProposalExpired)));
+}
+
+/// Calling accept_creator when no proposal is pending must return
+/// NoPendingCreator (= 26 in LazyMint721).
+#[test]
+fn test_creator_succession_no_pending() {
+    let (env, client, _creator, _fee) = setup(0);
+    let someone = Address::generate(&env);
+
+    let result = client.try_accept_creator(&someone);
+    assert_eq!(result, Err(Ok(Error::NoPendingCreator)));
+}
+
+/// OriginalCreator must be immutable through any number of succession cycles.
+#[test]
+fn test_original_creator_immutable() {
+    let (env, client, original, _fee) = setup(0);
+    let second = Address::generate(&env);
+    let third = Address::generate(&env);
+
+    assert_eq!(client.original_creator(), original);
+
+    // First succession: original → second.
+    client.propose_creator(&second, &100u32);
+    jump_ledger_721(&env, 10); // seq = 11
+    client.accept_creator(&second);
+    assert_eq!(client.creator(), second);
+    assert_eq!(client.original_creator(), original);
+
+    // Second succession: second → third.
+    client.propose_creator(&third, &200u32);
+    jump_ledger_721(&env, 10); // seq = 21
+    client.accept_creator(&third);
+    assert_eq!(client.creator(), third);
+    assert_eq!(client.original_creator(), original);
+}
+
+/// Cancelling a proposal prevents acceptance until a new one is proposed.
+#[test]
+fn test_creator_succession_cancel_prevents_accept() {
+    let (env, client, _creator, _fee) = setup(0);
+    let new_creator = Address::generate(&env);
+
+    client.propose_creator(&new_creator, &100u32);
+    assert!(client.pending_creator().is_some());
+
+    client.cancel_creator_proposal();
+    assert_eq!(client.pending_creator(), None);
+
+    let result = client.try_accept_creator(&new_creator);
+    assert_eq!(result, Err(Ok(Error::NoPendingCreator)));
+}
+
+/// cancel_creator_proposal when no proposal is active must return
+/// NoPendingCreator.
+#[test]
+fn test_cancel_creator_no_pending_fails() {
+    let (_env, client, _creator, _fee) = setup(0);
+    let result = client.try_cancel_creator_proposal();
+    assert_eq!(result, Err(Ok(Error::NoPendingCreator)));
+}
+
+/// propose_creator with an expiry equal to the current ledger must be
+/// rejected with ApprovalExpired (= 19 in LazyMint721).
+#[test]
+fn test_propose_creator_expired_expiry_rejected() {
+    let (env, client, _creator, _fee) = setup(0);
+    let new_creator = Address::generate(&env);
+    // Current ledger = 1; expiry = 1 → sequence >= expiry → ApprovalExpired.
+    let result = client.try_propose_creator(&new_creator, &1u32);
+    assert_eq!(result, Err(Ok(Error::ApprovalExpired)));
+}
