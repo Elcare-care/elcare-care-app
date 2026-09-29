@@ -65,6 +65,7 @@ export const SUPPORTED_SCHEMA_VERSIONS: Record<string, number> = {
   OFFER_MADE: 1,
   OFFER_ACCEPTED: 1,
   PROTOCOL_FEE_COLLECTED: 1,
+  FEE_ATTRIBUTION: 1,
   ROYALTY_SETTLEMENT: 1,
   AUCTION_BID_REFUNDED: 1,
   AUCTION_ADMIN_CANCELLED: 1,
@@ -679,6 +680,24 @@ export const ROYALTY_PAID_SCHEMA: ContractEventSchema = {
   ],
 };
 
+/**
+ * Fee attribution for a settlement (Issue #846): the fee rate the payout split
+ * actually applied and whether it came from the collection's fee override
+ * rather than the rate snapshotted on the listing/auction. Versioned from the
+ * start, so `schema_version` is only ever absent if a producer omits it.
+ */
+export const FEE_ATTRIBUTION_SCHEMA: ContractEventSchema = {
+  type: 'FEE_ATTRIBUTION',
+  data: [
+    { name: 'listing_id', type: 'bigint' },
+    { name: 'collection', type: 'string' },
+    // u32 on the contract side → JS number
+    { name: 'applied_fee_bps', type: 'number' },
+    { name: 'is_collection_override', type: 'boolean' },
+    { name: 'schema_version', type: 'number', optional: true },
+  ],
+};
+
 export const PROTOCOL_FEE_COLLECTED_SCHEMA: ContractEventSchema = {
   type: 'PROTOCOL_FEE_COLLECTED',
   data: [
@@ -912,6 +931,7 @@ export const SCHEMA_REGISTRY: Map<string, ContractEventSchema> = new Map([
   ['OFFER_RECLAIMED', OFFER_RECLAIMED_SCHEMA],
   ['ROYALTY_PAID', ROYALTY_PAID_SCHEMA],
   ['PROTOCOL_FEE_COLLECTED', PROTOCOL_FEE_COLLECTED_SCHEMA],
+  ['FEE_ATTRIBUTION', FEE_ATTRIBUTION_SCHEMA],
   ['ROYALTY_SETTLEMENT', ROYALTY_SETTLEMENT_SCHEMA],
   ['TOKEN_WHITELISTED', TOKEN_WHITELISTED_SCHEMA],
   ['TOKEN_REMOVED', TOKEN_REMOVED_SCHEMA],

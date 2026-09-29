@@ -80,6 +80,7 @@ The table below maps contract Rust event topics to human-readable indexer `event
 | `royalty_paid` | `ROYALTY_PAID` | `recipient`, `amount`, `listing_id` |
 | `royalty_settlement` | `ROYALTY_SETTLEMENT` | `id`, `recipients[]`, `total_amount`, `token`, `ledger_sequence` |
 | `protocol_fee_collected` | `PROTOCOL_FEE_COLLECTED` | `listing_id`, `amount`, `token`, `treasury` |
+| `fee_attribution` | `FEE_ATTRIBUTION` | `listing_id`, `collection`, `applied_fee_bps`, `is_collection_override` |
 | `artist_revoked` | `ARTIST_REVOKED` | `artist` |
 | `artist_reinstated` | `ARTIST_REINSTATED` | `artist` |
 | `admin_transfer_proposed` | `ADMIN_TRANSFER_PROPOSED` | `current_admin`, `proposed_admin`, `expires_at` |
@@ -92,6 +93,8 @@ The table below maps contract Rust event topics to human-readable indexer `event
 | `("deploy", "dep_n1155")` | `DEPLOY_NORMAL_1155` | `[creator, contract_address, schema_version]` |
 | `("deploy", "dep_l721")` | `DEPLOY_LAZY_721` | `[creator, contract_address, schema_version]` |
 | `("deploy", "dep_l1155")` | `DEPLOY_LAZY_1155` | `[creator, contract_address, schema_version]` |
+
+Every topic constant the marketplace contract publishes is now mapped — the table above lists the long-form symbols (`listing_created`, …), which is what `events.rs` emits via `Symbol::new(env, LISTING_CREATED)`. Until Issue #846 the map only carried the legacy short forms (`lst_crtd`, `art_sold`, …), so **every long-form topic was silently dropped** regardless of the schema registry; the short forms are kept as aliases for historical backfills. `scripts/check-event-schemas.mjs` (CI job `event-schema-lint`) now fails the build when a versioned contract event has no schema entry, and `indexer/tests/event-parsing.test.ts` pins both topic spellings per event type.
 
 `royalty_settlement`, `auction_bid_refunded`, and `auction_admin_cancelled` were added to the contract in Issues #270/#271 but were **not** previously wired into `TOPIC_MAP`/`SCHEMA_REGISTRY` — meaning every one of those events was silently dropped by the indexer. This was fixed as part of Issue #278; see §6 for why this class of gap is exactly what the versioning work is meant to catch going forward.
 
@@ -182,6 +185,7 @@ Contract events and the indexer are separate deployables with independent releas
 | `RoyaltySettlementEvent` | `ROYALTY_SETTLEMENT` | yes | 1 |
 | `AuctionBidRefundedEvent` | `AUCTION_BID_REFUNDED` | yes | 1 |
 | `AuctionAdminCancelledEvent` | `AUCTION_ADMIN_CANCELLED` | yes | 1 |
+| `FeeAttributionEvent` | `FEE_ATTRIBUTION` | yes (versioned from the start, Issue #846) | 1 |
 | Launchpad deploy events (`publish_deploy`) | `DEPLOY_NORMAL_721` / `DEPLOY_NORMAL_1155` / `DEPLOY_LAZY_721` / `DEPLOY_LAZY_1155` | yes (3rd tuple element) | 1 |
 | All other events in the tables above | (as listed) | no | not tracked — never required a shape change |
 
@@ -209,6 +213,14 @@ A schema/shape change **never requires rewriting historical rows**, because:
 
 If an event was **silently dropped** (unmapped topic, like `royalty_settlement` before this issue — see §3), the fix is: add the `TOPIC_MAP`/`SCHEMA_REGISTRY` entries, deploy, then backfill the ledger range where the gap occurred so those specific events get ingested retroactively. This is the same backfill mechanism used for RPC-window gaps (`docs/guides/indexer-ingestion.md`).
 
+### Re-indexing a range that spans a contract upgrade
+
+Version 0 is not a separate code path — it is the *absence* of the field:
+
+- **What version 0 means.** A version-0 event is one emitted *before* the struct gained its `schema_version` field: the decoded payload simply has no `schema_version` key. Absence is therefore read as `0` (implicit, pre-upgrade). `parseMarketplaceEvent()` only version-gates when the key is present, so a version-0 event can never be rejected as unsupported, at any point in the future.
+- **How it lands in the database.** There is no `schema_version` column on `MarketplaceEvent` — the decoded `data` JSON is stored as-is, so a version-0 row has no `schema_version` key and a version-1 row has `"schema_version": 1`. Consumers and dashboards must treat *missing* as `0` rather than branching on the key's presence; nothing rewrites historical rows to make the key appear.
+- **Re-indexing across the boundary.** Run the backfill as usual (`indexer/src/backfill.ts` over the ledger range); a range that straddles the upgrade decodes both shapes with the same schema, because every versioned field is declared `optional: true` in `event-schemas.ts`. Two practical rules: (1) deploy the indexer **before or with** the contract upgrade, never after — the newer decoder handles both shapes, the older one does not; (2) if a range was ingested by an older decoder that predates a topic alias (see §3), backfill it again after deploying, since those events were dropped rather than mis-decoded.
+
 If an event's `schema_version` is ever bumped in a way that turns out **not** to be safely additive (a mistake — this policy is designed to prevent that, but mistakes happen), the recovery path is: ship a hotfix contract that reverts to additive-only emission, treat the bad window as a data-quality incident, and use `backfill.ts` to re-ingest the affected range once the indexer schema is corrected. There is intentionally no automatic "migrate old rows to new shape" tooling — the additive-only policy is what makes that unnecessary in the common case.
 
 ---
@@ -217,10 +229,13 @@ If an event's `schema_version` is ever bumped in a way that turns out **not** to
 
 `indexer/src/__tests__/parser.test.ts` already has a per-event-type fixture table (see `LISTING_FIXTURE`, `ARTWORK_SOLD_FIXTURE`, etc.) that this versioning work was written to extend easily: each event type's schema-driven validation is table-driven, so adding coverage for a new event, or for the "no `schema_version`" vs. "`schema_version: 1`" vs. "unsupported future version" cases, is a matter of adding a fixture + a `[symbol, expectedType, fixture]` row, not new decoder logic. Tests were intentionally **not** added as part of Issue #278 (out of scope for that change); the acceptance-testing follow-up is:
 
-- Add fixtures + assertions for `ROYALTY_SETTLEMENT`, `AUCTION_BID_REFUNDED`, and `AUCTION_ADMIN_CANCELLED` (newly wired into `TOPIC_MAP`/`SCHEMA_REGISTRY` here).
-- Add a case per versioned event type that omits `schema_version` (legacy/implicit v0 — must still decode), a case with the current supported version, and a case with an out-of-range version (must throw `UnsupportedSchemaVersionError`, not `SchemaDecodeError`).
+Both follow-ups are now implemented (Issue #846):
 
-See also the **CI/fixture requirement** follow-up noted in `CONTRIBUTING.md`'s Documentation Review Policy: contract event changes and indexer event-schema changes should not be mergeable independently without updated fixtures covering both shapes, but wiring that up as an enforced CI gate is out of scope for this change and tracked as follow-up work.
+- `indexer/tests/event-parsing.test.ts` builds the real XDR for every versioned event type and asserts both shapes decode — no `schema_version` (implicit v0) and `schema_version: 1` — with every other field identical, plus a mixed pre/post scan standing in for a backfill across an upgrade boundary. Fixtures go through `scValToNative`, so a wrong field type or an unmapped topic fails the test instead of passing against a mock.
+- Out-of-range versions are covered by `indexer/tests/event-schema-versioning.test.ts` (`UnsupportedSchemaVersionError`, never a generic `SchemaDecodeError`).
+- The static half is enforced in CI: `scripts/check-event-schemas.mjs` (job `event-schema-lint`) fails when a struct in `events.rs` that carries `schema_version` has no schema entry, or has one that does not mark the field optional.
+
+The **CI/fixture requirement** from `CONTRIBUTING.md`'s Documentation Review Policy is now partially enforced: the schema-registry parity half runs as the `event-schema-lint` job. Requiring *fixtures* for both shapes on every contract-event change still relies on review, since the gate cannot tell whether a new field is additive-only from the sources alone.
 
 ---
 

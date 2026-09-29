@@ -7,7 +7,7 @@
  *     reachable through the topic the contract actually publishes, and has a
  *     registry entry whose `schema_version` field is optional (the CI gate in
  *     scripts/check-event-schemas.mjs enforces the static half of this).
- *   ✓ For all eleven versioned event types: the pre-upgrade shape (no
+ *   ✓ For every versioned event type: the pre-upgrade shape (no
  *     `schema_version` field at all) decodes and reports implicit version 0.
  *   ✓ The post-upgrade shape decodes and reports version 1.
  *   ✓ Every other field decodes identically in both shapes, so a mixed
@@ -38,6 +38,7 @@ const u64 = (n: number) => xdr.ScVal.scvU64(new xdr.Uint64(n));
 const i128 = (n: number) =>
   xdr.ScVal.scvI128(new xdr.Int128Parts({ hi: new xdr.Int64(0), lo: new xdr.Uint64(n) }));
 const addr = (a: string = ACCOUNT) => Address.fromString(a).toScVal();
+const bool = (b: boolean) => xdr.ScVal.scvBool(b);
 const none = () => xdr.ScVal.scvVoid();
 const vec = (vals: xdr.ScVal[]) => xdr.ScVal.scvVec(vals);
 
@@ -213,6 +214,17 @@ const CASES: VersionedCase[] = [
       ['treasury', addr()],
     ],
   },
+  {
+    constName: 'FEE_ATTRIBUTION',
+    struct: 'FeeAttributionEvent',
+    topic: 'fee_attribution',
+    fields: [
+      ['listing_id', u64(1)],
+      ['collection', addr(CONTRACT)],
+      ['applied_fee_bps', u32(700)],
+      ['is_collection_override', bool(true)],
+    ],
+  },
 ];
 
 const LEDGER = 4_242;
@@ -233,8 +245,10 @@ const decodeV1 = (c: VersionedCase) =>
 // ── Static parity: topic and registry reachability ───────────────────────────
 
 describe('versioned event registry parity (#846)', () => {
-  it('covers the eleven structs that carry schema_version', () => {
-    expect(CASES).toHaveLength(11);
+  it('covers every struct that carries schema_version', () => {
+    // Eleven pre-existing versioned events plus FeeAttributionEvent, which is
+    // versioned from the start (Issue #846).
+    expect(CASES).toHaveLength(12);
   });
 
   for (const c of CASES) {

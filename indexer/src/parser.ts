@@ -71,6 +71,7 @@ const TOPIC_MAP: Record<string, string> = {
   // ── Settlement / fee events ──────────────────────────────────────────────
   'roy_paid':  'ROYALTY_PAID',
   'fee_cltd':  'PROTOCOL_FEE_COLLECTED',
+  'fee_attribution': 'FEE_ATTRIBUTION',
   // ── Governance / admin events ────────────────────────────────────────────
   'adm_prop':  'ADMIN_TRANSFER_PROPOSED',
   'adm_xfrd':  'ADMIN_TRANSFERRED',
