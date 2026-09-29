@@ -1883,3 +1883,74 @@ impl BatchItemInvalidEvent {
             .publish((soroban_sdk::Symbol::new(env, BATCH_ITEM_INVALID),), self);
     }
 }
+
+// ── Fee attribution event (Issue #488) ───────────────────────────────────────
+
+/// Topic constant for `FeeAttributionEvent`.
+pub const FEE_ATTRIBUTION: &str = "fee_attribution";
+
+/// Emitted at settlement whenever the protocol fee applied to a sale can be
+/// attributed to a specific collection.  Operators use this event to
+/// distinguish income driven by per-collection fee overrides
+/// (`set_collection_fee_bps`) from income collected at the global rate.
+///
+/// - `is_collection_override = true`  — a per-collection override was active
+///   and was used instead of the global protocol fee.
+/// - `is_collection_override = false` — the global protocol fee applied; no
+///   override was configured for this collection at settlement time.
+///
+/// Fields follow the standard numeric encoding policy: amounts/prices are
+/// `i128` (not relevant here), ids are `u64`, BPS values are `u32`,
+/// `bool` fields stay `bool`.  `schema_version` is set to
+/// `EVENT_SCHEMA_VERSION` from the first emission so the indexer can version-
+/// gate future shape changes without a separate migration.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeAttributionEvent {
+    /// The listing_id (or auction_id) of the settlement that triggered this
+    /// attribution.
+    pub listing_id: u64,
+    /// The NFT collection contract address the settled listing belonged to.
+    pub collection: Address,
+    /// The fee rate in basis points that was actually applied at settlement.
+    /// Equals the collection override when `is_collection_override = true`,
+    /// or the global protocol fee otherwise.
+    pub applied_fee_bps: u32,
+    /// `true` when a per-collection fee override (`CollectionFeeBps`) was
+    /// active for `collection` and was used instead of the global rate.
+    pub is_collection_override: bool,
+    /// Event schema version — set to `EVENT_SCHEMA_VERSION` so the indexer
+    /// can version-gate future shape changes.
+    pub schema_version: u32,
+}
+
+impl FeeAttributionEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, FEE_ATTRIBUTION),), self);
+    }
+}
+
+/// Emit a `fee_attribution` event for a settlement.
+///
+/// `listing_id`  — the listing or auction id that was settled.
+/// `collection`  — the NFT collection the settled token belongs to.
+/// `applied_fee_bps` — the fee rate (bps) that was actually used.
+/// `is_collection_override` — whether a per-collection override drove the rate.
+pub fn emit_fee_attribution(
+    env: &Env,
+    listing_id: u64,
+    collection: &Address,
+    applied_fee_bps: u32,
+    is_collection_override: bool,
+) {
+    FeeAttributionEvent {
+        listing_id,
+        collection: collection.clone(),
+        applied_fee_bps,
+        is_collection_override,
+        schema_version: EVENT_SCHEMA_VERSION,
+    }
+    .publish(env);
+}

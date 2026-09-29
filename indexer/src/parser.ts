@@ -92,6 +92,8 @@ const TOPIC_MAP: Record<string, string> = {
   'c_unpsd': 'COLLECTION_UNPAUSED',
   // ── Deployment idempotency (Issue #477) ───────────────────────────────
   'dep_idem': 'DEPLOY_IDEMPOTENT',
+  // ── Fee attribution (Issue #488) ──────────────────────────────────────
+  'fee_attribution': 'FEE_ATTRIBUTION',
 };
 
 /** All event type names this parser can produce (exported for tests/UI). */

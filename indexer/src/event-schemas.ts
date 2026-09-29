@@ -71,6 +71,8 @@ export const SUPPORTED_SCHEMA_VERSIONS: Record<string, number> = {
   DEPLOY_NORMAL_1155: 1,
   DEPLOY_LAZY_721: 1,
   DEPLOY_LAZY_1155: 1,
+  // Issue #488: fee attribution event — versioned from its first emission.
+  FEE_ATTRIBUTION: 1,
 };
 
 /**
@@ -878,6 +880,44 @@ export const AUCTION_RESERVE_UPDATED_SCHEMA: ContractEventSchema = {
   ],
 };
 
+// ── Fee attribution event (Issue #488) ───────────────────────────────────────
+
+/**
+ * Emitted at settlement when a per-collection fee override (CollectionFeeBps)
+ * is active, or when the global rate applies.  Lets operators distinguish
+ * override-driven fee income from global-rate income in the indexer.
+ *
+ * `is_collection_override = true`  — a per-collection override was used.
+ * `is_collection_override = false` — the global protocol fee applied.
+ */
+export interface FeeAttributionData {
+  /** Listing or auction id of the settlement that triggered this attribution. */
+  listing_id: bigint;
+  /** NFT collection contract address. */
+  collection: string;
+  /** Fee rate in basis points actually applied at settlement. */
+  applied_fee_bps: number;
+  /** True when a per-collection CollectionFeeBps override was active. */
+  is_collection_override: boolean;
+  /** Schema version — absent on implicit-v0 events (none exist yet for this
+   *  new event, but the field is optional per the versioning policy so future
+   *  indexer builds that back-fill historical data decode consistently). */
+  schema_version?: number;
+}
+
+export const FEE_ATTRIBUTION_SCHEMA: ContractEventSchema = {
+  type: 'FEE_ATTRIBUTION',
+  data: [
+    { name: 'listing_id',           type: 'bigint'  },
+    { name: 'collection',           type: 'string'  },
+    { name: 'applied_fee_bps',      type: 'number'  },
+    { name: 'is_collection_override', type: 'boolean' },
+    // Issue #488: versioned from first emission — optional so any
+    // hypothetical pre-upgrade replay still decodes without error.
+    { name: 'schema_version',       type: 'number',  optional: true },
+  ],
+};
+
 // ── Schema registry ───────────────────────────────────────────────────────────
 
 export const SCHEMA_REGISTRY: Map<string, ContractEventSchema> = new Map([
@@ -929,6 +969,8 @@ export const SCHEMA_REGISTRY: Map<string, ContractEventSchema> = new Map([
   ['COLLECTION_UNPAUSED', COLLECTION_UNPAUSED_SCHEMA],
   // Issue #477: deployment idempotency
   ['DEPLOY_IDEMPOTENT', DEPLOY_IDEMPOTENT_SCHEMA],
+  // Issue #488: fee attribution — per-collection override vs global rate
+  ['FEE_ATTRIBUTION', FEE_ATTRIBUTION_SCHEMA],
 ]);
 
 // ── Schema-driven decoder ─────────────────────────────────────────────────────

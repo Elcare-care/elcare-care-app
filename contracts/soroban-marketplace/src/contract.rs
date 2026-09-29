@@ -2808,6 +2808,18 @@ impl MarketplaceContract {
                 }.publish(&env);
             }
         }
+        // Issue #488 — fee attribution: emit once per settlement so operators
+        // can distinguish collection-override-driven income from global-rate income.
+        {
+            let (col_fee_bps, is_override) =
+                match crate::storage::get_collection_fee_bps_storage(&env, &listing.collection) {
+                    Some(bps) => (bps, true),
+                    None      => (listing.protocol_fee_bps, false),
+                };
+            crate::events::emit_fee_attribution(
+                &env, listing_id, &listing.collection, col_fee_bps, is_override,
+            );
+        }
         // On-chain accounting counters (Issue #279)
         crate::storage::add_royalty_total(&env, &listing.token, listing.price);
         crate::storage::increment_settlement_count(&env, &listing.token);
@@ -3242,6 +3254,17 @@ impl MarketplaceContract {
                         schema_version: EVENT_SCHEMA_VERSION,
                     }.publish(&env);
                 }
+            }
+            // Issue #488 — fee attribution for auction settlement.
+            {
+                let (col_fee_bps, is_override) =
+                    match crate::storage::get_collection_fee_bps_storage(&env, &auction.collection) {
+                        Some(bps) => (bps, true),
+                        None      => (auction.protocol_fee_bps, false),
+                    };
+                crate::events::emit_fee_attribution(
+                    &env, auction_id, &auction.collection, col_fee_bps, is_override,
+                );
             }
             // On-chain accounting counters (Issue #279) — see buy_artwork.
             crate::storage::add_royalty_total(&env, &auction.token, winning_bid);
@@ -3758,6 +3781,17 @@ impl MarketplaceContract {
                     schema_version: EVENT_SCHEMA_VERSION,
                 }.publish(&env);
             }
+        }
+        // Issue #488 — fee attribution for offer-acceptance settlement.
+        {
+            let (col_fee_bps, is_override) =
+                match crate::storage::get_collection_fee_bps_storage(&env, &listing.collection) {
+                    Some(bps) => (bps, true),
+                    None      => (listing.protocol_fee_bps, false),
+                };
+            crate::events::emit_fee_attribution(
+                &env, listing_id, &listing.collection, col_fee_bps, is_override,
+            );
         }
         // On-chain accounting counters (Issue #279) — see buy_artwork.
         crate::storage::add_royalty_total(&env, &offer.token, offer.amount);
