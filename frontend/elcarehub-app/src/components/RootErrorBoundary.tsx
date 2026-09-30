@@ -3,6 +3,7 @@
 import React from "react";
 import { AlertTriangle, RefreshCw } from "lucide-react";
 import * as Sentry from "@sentry/nextjs";
+import { onErrorBoundary } from "../lib/errors";
 
 interface RootErrorBoundaryState {
   hasError: boolean;
@@ -30,8 +31,8 @@ export class RootErrorBoundary extends React.Component<
   }
 
   public componentDidCatch(error: Error, errorInfo: React.ErrorInfo) {
-    // Log to console for debugging
-    console.error("RootErrorBoundary caught an error:", error, errorInfo);
+    // Structured log via the centralised error boundary helper
+    onErrorBoundary(error, { componentStack: errorInfo.componentStack ?? "" });
 
     // Send to Sentry with additional context
     Sentry.withScope((scope) => {

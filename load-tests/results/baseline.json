@@ -1,0 +1,19 @@
+{
+  "_comment": "Initial empty baseline. Run 'npm run update-baseline' inside load-tests/ after the first passing load test to populate this file.",
+  "timestamp": null,
+  "apiP95Ms": null,
+  "apiP99Ms": null,
+  "apiErrorRatePct": null,
+  "apiTotalRequests": null,
+  "cacheHitRatePct": null,
+  "sseP95Ms": null,
+  "sseDiscoRatePct": null,
+  "sseEventsReceived": null,
+  "ingestLagP95Ms": null,
+  "ingestLagP99Ms": null,
+  "ingestTputEvtPerSec": null,
+  "ingestTotalErrors": null,
+  "dbActiveConns": null,
+  "redisMemMb": null,
+  "redisHitPct": null
+}

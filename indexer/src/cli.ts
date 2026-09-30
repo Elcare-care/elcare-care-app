@@ -24,6 +24,10 @@ import {
   runRepairCycle,
   repairGap,
 } from './gap-repair.js';
+import {
+  runEventVerifier,
+  serializeVerifierResult,
+} from './event-verifier.js';
 
 dotenv.config();
 
@@ -185,6 +189,70 @@ async function handleGaps(args: string[]): Promise<void> {
   }
 }
 
+// ── Verifier command ──────────────────────────────────────────────────────────
+
+async function handleVerify(args: string[]): Promise<void> {
+  // Parse flags: --from=N --to=N [--contract=C,C2] [--cursor=N] [--window=N]
+  function getFlag(name: string): string | undefined {
+    return args.find((a) => a.startsWith(`--${name}=`))?.split('=').slice(1).join('=');
+  }
+
+  const fromStr = getFlag('from');
+  const toStr   = getFlag('to');
+
+  if (!fromStr || !toStr) {
+    console.error('Usage: verify --from=<ledger> --to=<ledger> [--contract=C1,C2] [--cursor=N] [--window=N]');
+    process.exit(1);
+  }
+
+  const fromLedger = parseInt(fromStr, 10);
+  const toLedger   = parseInt(toStr, 10);
+
+  if (isNaN(fromLedger) || isNaN(toLedger) || fromLedger > toLedger) {
+    console.error('--from and --to must be valid integers with from <= to');
+    process.exit(1);
+  }
+
+  const contractFlag = getFlag('contract');
+  const contractIds  = contractFlag ? contractFlag.split(',').filter(Boolean) : undefined;
+
+  const windowStr  = getFlag('window');
+  const cursorStr  = getFlag('cursor');
+  const windowSize = windowStr ? parseInt(windowStr, 10) : undefined;
+  const cursorLedger = cursorStr ? parseInt(cursorStr, 10) : undefined;
+
+  console.log(`Running event verifier: ledgers ${fromLedger}–${toLedger}...`);
+
+  const result = await runEventVerifier({
+    fromLedger,
+    toLedger,
+    contractIds,
+    windowSize,
+    cursorLedger,
+  });
+
+  const json = serializeVerifierResult(result);
+  console.log(JSON.stringify(json, null, 2));
+
+  const hasIssues =
+    result.duplicates.length > 0 ||
+    result.omissions.length > 0 ||
+    result.orphans.length > 0 ||
+    result.discontinuities.length > 0;
+
+  console.log('');
+  console.log(`Verification ${result.complete ? 'complete' : 'partial (use --cursor=' + result.cursor + ' to resume)'}`);
+  console.log(`  Scanned ledgers : ${result.scannedLedgers}`);
+  console.log(`  RPC events      : ${result.rpcEventCount}`);
+  console.log(`  DB events       : ${result.dbEventCount}`);
+  console.log(`  Duplicates      : ${result.duplicates.length}`);
+  console.log(`  Omissions       : ${result.omissions.length}`);
+  console.log(`  Orphans         : ${result.orphans.length}`);
+  console.log(`  Discontinuities : ${result.discontinuities.length}`);
+
+  process.exit(hasIssues ? 1 : 0);
+}
+
 // ── Entrypoint ────────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
@@ -197,9 +265,12 @@ async function main(): Promise<void> {
     case 'gaps':
       await handleGaps(rest);
       break;
+    case 'verify':
+      await handleVerify(rest);
+      break;
     default:
       console.error(`Unknown command domain: "${domain}"`);
-      console.error('Usage: cli <backfill|gaps> <subcommand> [args]');
+      console.error('Usage: cli <backfill|gaps|verify> <subcommand> [args]');
       process.exit(1);
   }
 }

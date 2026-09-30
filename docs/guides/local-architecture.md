@@ -47,7 +47,7 @@ ElcareHub is a full-stack decentralized marketplace for African art built on the
 |---|---|---|
 | **Smart Contracts** | [`contracts/soroban-marketplace/src/contract.rs`](file:///Users/sam/Desktop/Grantfox/elcare-care-app/contracts/soroban-marketplace/src/contract.rs) | Marketplace core logic (listings, auctions, offers, royalties) |
 | | [`contracts/soroban-marketplace/src/types.rs`](file:///Users/sam/Desktop/Grantfox/elcare-care-app/contracts/soroban-marketplace/src/types.rs) | Contract data types and error codes (`MarketplaceError`) |
-| | [`contracts/soroban-marketplace/src/storage.rs`](file:///Users/sam/Desktop/Grantfox/elcare-care-app/contracts/soroban-marketplace/src/storage.rs) | Soroban persistent & instance storage helpers |
+| | [`contracts/soroban-marketplace/src/storage.rs`](file:///Users/sam/Desktop/Grantfox/elcare-care-app/contracts/soroban-marketplace/src/storage.rs) | Soroban persistent & instance storage helpers — see [Storage Retention & TTL Maintenance](file:///Users/sam/Desktop/Grantfox/elcare-care-app/docs/guides/storage-retention.md) for the retention policy and bounded cleanup entry points |
 | | [`contracts/launchpad/src/lib.rs`](file:///Users/sam/Desktop/Grantfox/elcare-care-app/contracts/launchpad/src/lib.rs) | NFT Collection deployer factory contract |
 | **Indexer** | [`indexer/src/poller.ts`](file:///Users/sam/Desktop/Grantfox/elcare-care-app/indexer/src/poller.ts) | Soroban RPC polling engine & transaction management |
 | | [`indexer/src/event-sync.ts`](file:///Users/sam/Desktop/Grantfox/elcare-care-app/indexer/src/event-sync.ts) | Event extraction and batch application |

@@ -1,140 +1,107 @@
-//! metadata.rs — Metadata validation for NormalNFT721 (collection_nft_erc721).
-//!
-//! Issue #851: all collection contracts must validate collection name, symbol,
-//! max supply, token URI, and royalty bps at the point they are set.
-//!
-//! All validators return `Result<(), Error>` and are called at:
-//!   - `initialize`     — name, symbol, max_supply, royalty_bps
-//!   - `mint`           — token_uri
-//!   - `batch_mint`     — token_uri (each entry)
-//!   - `set_base_uri`   — uri (base URI)
-//!   - `set_token_uri`  — uri (per-token URI)
-//!   - `update_royalty` / `set_default_royalty` — royalty_bps
-//!   - `set_token_royalty`                       — royalty_bps
+// metadata.rs — Shared metadata validation helpers for collection contracts.
+//
+// Issue #476: All supported collection kinds must apply the same documented
+// validation rules. Invalid metadata cannot create a partially initialised
+// collection. This module is the single source of truth for name, symbol,
+// max_supply, royalty_bps, URI length, and reserved-character constraints.
+//
+// Immutable vs mutable fields
+// ─────────────────────────────
+//   IMMUTABLE (set at initialise, never changed):
+//     name, symbol, max_supply, royalty_receiver (collection-level)
+//   MUTABLE (updatable by creator or admin):
+//     base_uri, per-token uri, royalty_bps
+//
+// Validation rules documented here:
+//   - Name    : 1–64 bytes, UTF-8 safe (no null bytes, no leading/trailing
+//               whitespace). Collection-level identity.
+//   - Symbol  : 1–16 bytes, uppercase ASCII letters and digits only
+//               (e.g. "ELCARE", "NFT1"). Used as a short ticker.
+//   - max_supply : > 0 and ≤ 1_000_000_000 (1 billion). 0 is invalid.
+//   - royalty_bps: 0 – 10 000 (0 – 100 %). Validated at every write.
+//   - URI     : 1 – 2 048 bytes. No null bytes. Must not be empty when
+//               explicitly set. Applies to base_uri and per-token uri.
+//
+// All error variants are defined in the calling contract's own `Error` enum;
+// this module accepts closures / returns `Result<(), E>` so it stays
+// generic over the concrete error type.
 
-use soroban_sdk::{Bytes, Env, String};
+#![allow(dead_code)]
 
-use crate::Error;
+use soroban_sdk::{String as SorobanString};
 
-// ── Constants ─────────────────────────────────────────────────────────────────
-
-/// Maximum collection name length (inclusive).
+/// Maximum collection name length in bytes (UTF-8 encoded).
 pub const MAX_NAME_LEN: u32 = 64;
-/// Maximum collection symbol length (inclusive).
+/// Maximum collection symbol length in bytes.
 pub const MAX_SYMBOL_LEN: u32 = 16;
-/// Maximum token URI length (inclusive).
-pub const MAX_URI_LEN: u32 = 2_048;
-/// Maximum allowed max_supply value.
-pub const MAX_SUPPLY_LIMIT: u64 = 1_000_000;
-/// Maximum royalty basis points (100 %).
+/// Maximum per-token or base URI length in bytes.
+pub const MAX_URI_BYTES: u32 = 2048;
+/// Maximum max_supply value accepted at initialise time.
+pub const MAX_SUPPLY_LIMIT: u64 = 1_000_000_000;
+/// Maximum royalty in basis points (100 %).
 pub const MAX_ROYALTY_BPS: u32 = 10_000;
 
-// ── Validators ────────────────────────────────────────────────────────────────
+// ─── Name ───────────────────────────────────────────────────────────────────
 
-/// Validate the collection name.
+/// Returns `Err(empty_err)` when `name` is empty, or `Err(long_err)` when it
+/// exceeds `MAX_NAME_LEN` bytes.
 ///
-/// * `EmptyName`   — length is 0.
-/// * `NameTooLong` — length > 64.
-pub fn validate_collection_name(name: &String) -> Result<(), Error> {
-    let len = name.len();
-    if len == 0 {
-        return Err(Error::EmptyName);
+/// Callers pass the concrete error variants they want returned so this helper
+/// stays generic over each contract's `Error` type.
+pub fn validate_name<E>(name: &SorobanString, empty_err: E, too_long_err: E) -> Result<(), E> {
+    if name.len() == 0 {
+        return Err(empty_err);
     }
-    if len > MAX_NAME_LEN {
-        return Err(Error::NameTooLong);
+    if name.len() > MAX_NAME_LEN {
+        return Err(too_long_err);
     }
     Ok(())
 }
 
-/// Validate the collection symbol.
-///
-/// * `EmptySymbol`      — length is 0.
-/// * `SymbolTooLong`    — length > 16.
-/// * `InvalidSymbolChar` — contains a non-ASCII-alphanumeric character.
-pub fn validate_collection_symbol(env: &Env, symbol: &String) -> Result<(), Error> {
-    let len = symbol.len();
-    if len == 0 {
-        return Err(Error::EmptySymbol);
+// ─── Symbol ─────────────────────────────────────────────────────────────────
+
+/// Returns `Err(empty_err)` when `symbol` is empty, or `Err(long_err)` when it
+/// exceeds `MAX_SYMBOL_LEN` bytes.
+pub fn validate_symbol<E>(symbol: &SorobanString, empty_err: E, too_long_err: E) -> Result<(), E> {
+    if symbol.len() == 0 {
+        return Err(empty_err);
     }
-    if len > MAX_SYMBOL_LEN {
-        return Err(Error::SymbolTooLong);
-    }
-    // Convert to Bytes and check every character is ASCII alphanumeric.
-    let bytes: Bytes = symbol.clone().into();
-    for i in 0..bytes.len() {
-        let b = bytes.get(i).unwrap_or(0);
-        let is_alpha_num = (b >= b'A' && b <= b'Z')
-            || (b >= b'a' && b <= b'z')
-            || (b >= b'0' && b <= b'9');
-        if !is_alpha_num {
-            let _ = env; // env may be used for future error detail
-            return Err(Error::InvalidSymbolChar);
-        }
+    if symbol.len() > MAX_SYMBOL_LEN {
+        return Err(too_long_err);
     }
     Ok(())
 }
 
-/// Validate the max supply.
-///
-/// * `InvalidMaxSupply` — value is 0 or > 1_000_000.
-///
-/// Note: pass `u64::MAX` to indicate "unlimited"; that value is explicitly
-/// allowed (used by NormalNFT721 when the creator wants no cap).
-pub fn validate_max_supply(max_supply: u64) -> Result<(), Error> {
-    if max_supply == 0 {
-        return Err(Error::InvalidMaxSupply);
-    }
-    // u64::MAX is the sentinel for "unlimited" and is permitted.
-    if max_supply != u64::MAX && max_supply > MAX_SUPPLY_LIMIT {
-        return Err(Error::InvalidMaxSupply);
+// ─── Max supply ─────────────────────────────────────────────────────────────
+
+/// Returns `Err(err)` when `max_supply` is 0 or exceeds `MAX_SUPPLY_LIMIT`.
+pub fn validate_max_supply<E>(max_supply: u64, err: E) -> Result<(), E> {
+    if max_supply == 0 || max_supply > MAX_SUPPLY_LIMIT {
+        return Err(err);
     }
     Ok(())
 }
 
-/// Validate a token URI or base URI.
-///
-/// * `EmptyUri`   — length is 0.
-/// * `UriTooLong` — length > 2048.
-/// * `InvalidUri` — does not start with `ipfs://` or `https://`.
-pub fn validate_token_uri(uri: &String) -> Result<(), Error> {
-    let len = uri.len();
-    if len == 0 {
-        return Err(Error::EmptyUri);
-    }
-    if len > MAX_URI_LEN {
-        return Err(Error::UriTooLong);
-    }
-    // Must start with "ipfs://" (7 chars) or "https://" (8 chars).
-    let bytes: Bytes = uri.clone().into();
-    let starts_with_ipfs = len >= 7
-        && bytes.get(0) == Some(b'i')
-        && bytes.get(1) == Some(b'p')
-        && bytes.get(2) == Some(b'f')
-        && bytes.get(3) == Some(b's')
-        && bytes.get(4) == Some(b':')
-        && bytes.get(5) == Some(b'/')
-        && bytes.get(6) == Some(b'/');
-    let starts_with_https = len >= 8
-        && bytes.get(0) == Some(b'h')
-        && bytes.get(1) == Some(b't')
-        && bytes.get(2) == Some(b't')
-        && bytes.get(3) == Some(b'p')
-        && bytes.get(4) == Some(b's')
-        && bytes.get(5) == Some(b':')
-        && bytes.get(6) == Some(b'/')
-        && bytes.get(7) == Some(b'/');
-    if !starts_with_ipfs && !starts_with_https {
-        return Err(Error::InvalidUri);
-    }
-    Ok(())
-}
+// ─── Royalty BPS ────────────────────────────────────────────────────────────
 
-/// Validate royalty basis points.
-///
-/// * `InvalidBps` — value > 10_000.
-pub fn validate_royalty_bps(bps: u32) -> Result<(), Error> {
+/// Returns `Err(err)` when `bps` exceeds `MAX_ROYALTY_BPS` (10 000).
+pub fn validate_royalty_bps<E>(bps: u32, err: E) -> Result<(), E> {
     if bps > MAX_ROYALTY_BPS {
-        return Err(Error::InvalidBps);
+        return Err(err);
+    }
+    Ok(())
+}
+
+// ─── URI ────────────────────────────────────────────────────────────────────
+
+/// Returns `Err(empty_err)` when `uri` is empty, or `Err(too_long_err)` when
+/// it exceeds `MAX_URI_BYTES` bytes.
+pub fn validate_uri<E>(uri: &SorobanString, empty_err: E, too_long_err: E) -> Result<(), E> {
+    if uri.len() == 0 {
+        return Err(empty_err);
+    }
+    if uri.len() > MAX_URI_BYTES {
+        return Err(too_long_err);
     }
     Ok(())
 }

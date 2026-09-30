@@ -316,3 +316,196 @@ describe('IncomingOffersPage', () => {
     expect(screen.getByText('Failed to load incoming offers')).toBeInTheDocument();
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Additional tests — expired offers, escrow/refund visibility, disabled actions
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Re-mock lucide-react to include new icons
+jest.mock('lucide-react', () => {
+  const icon = (name: string) =>
+    function MockIcon(props: Record<string, unknown>) {
+      return <span data-testid={`icon-${name}`} />;
+    };
+  return {
+    Inbox: icon('Inbox'),
+    Clock: icon('Clock'),
+    CheckCircle: icon('CheckCircle'),
+    XCircle: icon('XCircle'),
+    MoreVertical: icon('MoreVertical'),
+    ArrowUpRight: icon('ArrowUpRight'),
+    History: icon('History'),
+    Activity: icon('Activity'),
+    TrendingUp: icon('TrendingUp'),
+    Loader2: icon('Loader2'),
+    User: icon('User'),
+    Tag: icon('Tag'),
+    CalendarClock: icon('CalendarClock'),
+    ExternalLink: icon('ExternalLink'),
+    AlertOctagon: icon('AlertOctagon'),
+  };
+});
+
+// Override contract mock to include deriveOfferUIStatus
+jest.mock('@/lib/contract', () => ({
+  stroopsToXlm: (s: bigint) => String(Number(s) / 10_000_000),
+  deriveOfferUIStatus: jest.fn((offer: any) => {
+    if (offer.__testUIStatus) return offer.__testUIStatus;
+    return offer.status;
+  }),
+  isOfferActionable: (s: string) => s === 'Pending' || s === 'Stale',
+}));
+
+describe('IncomingOffersPage — extended offer state tests', () => {
+  const { deriveOfferUIStatus } = require('@/lib/contract');
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockUseAcceptOffer.mockReturnValue({ accept: mockAccept, isAccepting: false, error: null });
+    mockUseRejectOffer.mockReturnValue({ reject: mockReject, isRejecting: false, error: null });
+    (deriveOfferUIStatus as jest.Mock).mockImplementation((offer: any) => {
+      if (offer.__testUIStatus) return offer.__testUIStatus;
+      return offer.status;
+    });
+  });
+
+  it('shows "Expired" badge for an expired offer', () => {
+    mockUseIncomingOffers.mockReturnValue({
+      offersByListing: [
+        { listing: makeListing(1), offers: [makeOffer(200, { status: 'Pending', expires_at: 1, __testUIStatus: 'Expired' })] },
+      ],
+      isLoading: false, error: null, refresh: mockRefresh,
+    });
+
+    render(<IncomingOffersPage />);
+    const badge = screen.getByTestId('offer-status-badge-200');
+    expect(badge.textContent).toBe('Expired');
+  });
+
+  it('hides accept/reject buttons for an expired offer', () => {
+    mockUseIncomingOffers.mockReturnValue({
+      offersByListing: [
+        { listing: makeListing(1), offers: [makeOffer(201, { status: 'Pending', expires_at: 1, __testUIStatus: 'Expired' })] },
+      ],
+      isLoading: false, error: null, refresh: mockRefresh,
+    });
+
+    render(<IncomingOffersPage />);
+    expect(screen.queryByTestId('accept-btn-201')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('reject-btn-201')).not.toBeInTheDocument();
+  });
+
+  it('shows expired notice banner for an expired offer', () => {
+    mockUseIncomingOffers.mockReturnValue({
+      offersByListing: [
+        { listing: makeListing(1), offers: [makeOffer(202, { status: 'Pending', expires_at: 1, __testUIStatus: 'Expired' })] },
+      ],
+      isLoading: false, error: null, refresh: mockRefresh,
+    });
+
+    render(<IncomingOffersPage />);
+    expect(screen.getByTestId('offer-expired-notice-202')).toBeInTheDocument();
+  });
+
+  it('shows accept/reject buttons for a Stale (still actionable) offer', () => {
+    mockUseIncomingOffers.mockReturnValue({
+      offersByListing: [
+        { listing: makeListing(1), offers: [makeOffer(203, { status: 'Pending', __testUIStatus: 'Stale' })] },
+      ],
+      isLoading: false, error: null, refresh: mockRefresh,
+    });
+
+    render(<IncomingOffersPage />);
+    expect(screen.getByTestId('accept-btn-203')).toBeInTheDocument();
+    expect(screen.getByTestId('reject-btn-203')).toBeInTheDocument();
+  });
+
+  it('hides accept/reject buttons for an Accepted offer', () => {
+    mockUseIncomingOffers.mockReturnValue({
+      offersByListing: [
+        { listing: makeListing(1), offers: [makeOffer(204, { status: 'Accepted', __testUIStatus: 'Accepted' })] },
+      ],
+      isLoading: false, error: null, refresh: mockRefresh,
+    });
+
+    render(<IncomingOffersPage />);
+    expect(screen.queryByTestId('accept-btn-204')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('reject-btn-204')).not.toBeInTheDocument();
+  });
+
+  it('hides accept/reject buttons for a Rejected offer', () => {
+    mockUseIncomingOffers.mockReturnValue({
+      offersByListing: [
+        { listing: makeListing(1), offers: [makeOffer(205, { status: 'Rejected', __testUIStatus: 'Rejected' })] },
+      ],
+      isLoading: false, error: null, refresh: mockRefresh,
+    });
+
+    render(<IncomingOffersPage />);
+    expect(screen.queryByTestId('accept-btn-205')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('reject-btn-205')).not.toBeInTheDocument();
+  });
+
+  it('hides accept/reject buttons for a Withdrawn offer', () => {
+    mockUseIncomingOffers.mockReturnValue({
+      offersByListing: [
+        { listing: makeListing(1), offers: [makeOffer(206, { status: 'Withdrawn', __testUIStatus: 'Withdrawn' })] },
+      ],
+      isLoading: false, error: null, refresh: mockRefresh,
+    });
+
+    render(<IncomingOffersPage />);
+    expect(screen.queryByTestId('accept-btn-206')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('reject-btn-206')).not.toBeInTheDocument();
+  });
+
+  it('shows escrow tx link when escrow_tx_hash is present', () => {
+    mockUseIncomingOffers.mockReturnValue({
+      offersByListing: [
+        { listing: makeListing(1), offers: [makeOffer(210, { escrow_tx_hash: 'ESCROWHASH12345' })] },
+      ],
+      isLoading: false, error: null, refresh: mockRefresh,
+    });
+
+    render(<IncomingOffersPage />);
+    expect(screen.getByTestId('escrow-tx-210')).toBeInTheDocument();
+  });
+
+  it('shows refund tx link when refund_tx_hash is present on Rejected offer', () => {
+    mockUseIncomingOffers.mockReturnValue({
+      offersByListing: [
+        { listing: makeListing(1), offers: [makeOffer(211, { status: 'Rejected', __testUIStatus: 'Rejected', refund_tx_hash: 'REFUNDHASH67890' })] },
+      ],
+      isLoading: false, error: null, refresh: mockRefresh,
+    });
+
+    render(<IncomingOffersPage />);
+    expect(screen.getByTestId('refund-tx-211')).toBeInTheDocument();
+  });
+
+  it('shows "Payment:" label for Accepted offer with refund_tx_hash', () => {
+    mockUseIncomingOffers.mockReturnValue({
+      offersByListing: [
+        { listing: makeListing(1), offers: [makeOffer(212, { status: 'Accepted', __testUIStatus: 'Accepted', refund_tx_hash: 'PAYMENTHASH' })] },
+      ],
+      isLoading: false, error: null, refresh: mockRefresh,
+    });
+
+    render(<IncomingOffersPage />);
+    const refundEl = screen.getByTestId('refund-tx-212');
+    expect(refundEl.textContent).toContain('Payment:');
+  });
+
+  it('does not show escrow/refund elements when hashes are absent', () => {
+    mockUseIncomingOffers.mockReturnValue({
+      offersByListing: [
+        { listing: makeListing(1), offers: [makeOffer(213)] },
+      ],
+      isLoading: false, error: null, refresh: mockRefresh,
+    });
+
+    render(<IncomingOffersPage />);
+    expect(screen.queryByTestId('escrow-tx-213')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('refund-tx-213')).not.toBeInTheDocument();
+  });
+});

@@ -4,31 +4,101 @@
 
 "use client";
 
+import React from "react";
 import { useWalletContext } from "@/context/WalletContext";
-import { useIncomingOffers, useAcceptOffer, useRejectOffer } from "@/hooks/useOffers";
-import { stroopsToXlm, Offer, Listing } from "@/lib/contract";
-import { Inbox, Clock, CheckCircle, XCircle, MoreVertical, ArrowUpRight, History, Activity, TrendingUp, Loader2, User, Tag, CalendarClock } from "lucide-react";
+import { useIncomingOffersWithReconciliation, useAcceptOffer, useRejectOffer } from "@/hooks/useOffers";
+import { stroopsToXlm, Offer, Listing, deriveOfferUIStatus } from "@/lib/contract";
+import { Inbox, Clock, CheckCircle, XCircle, MoreVertical, ArrowUpRight, History, Activity, TrendingUp, Loader2, User, Tag, CalendarClock, ExternalLink, AlertOctagon } from "lucide-react";
 import { WalletGuard } from "@/components/WalletGuard";
 import { SUPPORTED_TOKENS } from "@/config/tokens";
+import { OfferStatusBadge } from "@/components/OfferStatusBadge";
 import { clsx } from "clsx";
 import Link from "next/link";
 
+type StatusFilter = "all" | "Pending" | "Accepted" | "Rejected" | "Expired" | "Withdrawn";
+
 export default function IncomingOffersPage() {
   const { publicKey } = useWalletContext();
-  const { offersByListing, isLoading, error, refresh } = useIncomingOffers(publicKey);
+  const {
+    offersByListing,
+    isLoading,
+    error,
+    refresh,
+    addOfferMutation,
+    getOfferState,
+    resolveMutation,
+    rejectMutation: rollbackMutation,
+  } = useIncomingOffersWithReconciliation(publicKey);
   const { accept, isAccepting, error: acceptError } = useAcceptOffer(publicKey);
   const { reject, isRejecting, error: rejectError } = useRejectOffer(publicKey);
+  const [statusFilter, setStatusFilter] = React.useState<StatusFilter>("all");
+
+  // Tick every second for live expiry countdowns
+  const [now, setNow] = React.useState(() => Date.now());
+  React.useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, []);
+
+  // Optimistic transition with rollback: flip the offer's status immediately
+  // on submit; a failed tx rolls back to the last confirmed snapshot.
+  const handleAccept = async (o: Offer) => {
+    const pendingId = addOfferMutation("accept", { ...o, status: "Accepted" });
+    const ok = await accept(o.offer_id);
+    if (ok) {
+      resolveMutation(pendingId);
+      refresh();
+    } else {
+      rollbackMutation(pendingId);
+    }
+  };
+
+  const handleReject = async (o: Offer) => {
+    const pendingId = addOfferMutation("reject", { ...o, status: "Rejected" });
+    const ok = await reject(o.offer_id);
+    if (ok) {
+      resolveMutation(pendingId);
+      refresh();
+    } else {
+      rollbackMutation(pendingId);
+    }
+  };
 
   // Flatten all offers for stats
   const allOffers = offersByListing.flatMap(
     (group: { listing: Listing; offers: Offer[] }) => group.offers
   );
-  const pendingCnt = allOffers.filter((o: Offer) => o.status === "Pending").length;
+  const pendingCnt = allOffers.filter((o: Offer) => {
+    const s = deriveOfferUIStatus(o, now);
+    return s === "Pending" || s === "Stale";
+  }).length;
   const acceptedCnt = allOffers.filter((o: Offer) => o.status === "Accepted").length;
+
+  const statusFilters: { key: StatusFilter; label: string }[] = [
+    { key: "all", label: "All" },
+    { key: "Pending", label: "Pending" },
+    { key: "Accepted", label: "Accepted" },
+    { key: "Rejected", label: "Rejected" },
+    { key: "Expired", label: "Expired" },
+    { key: "Withdrawn", label: "Withdrawn" },
+  ];
+
+  const matchesFilter = (o: Offer): boolean => {
+    if (statusFilter === "all") return true;
+    const uiStatus = deriveOfferUIStatus(o, now);
+    if (statusFilter === "Pending") return uiStatus === "Pending" || uiStatus === "Stale";
+    return uiStatus === statusFilter;
+  };
 
   const getTokenSymbol = (address: string) => {
     return SUPPORTED_TOKENS.find(t => t.address === address)?.symbol || "Tokens";
   };
+
+  // Apply the status filter within each listing group; groups left with no
+  // matching offers are hidden entirely rather than shown empty.
+  const visibleGroups = offersByListing
+    .map((group) => ({ ...group, offers: group.offers.filter(matchesFilter) }))
+    .filter((group) => group.offers.length > 0);
 
   return (
     <div className="min-h-screen bg-midnight-950 pb-20 pt-24 selection:bg-brand-500 selection:text-white">
@@ -128,6 +198,35 @@ export default function IncomingOffersPage() {
             ))}
           </div>
 
+          {/* Status filter — accessible tablist */}
+          <div
+            role="tablist"
+            aria-label="Filter incoming offers by status"
+            className="mb-8 flex flex-wrap gap-2 border-b border-white/5 pb-px overflow-x-auto no-scrollbar"
+          >
+            {statusFilters.map(({ key, label }) => (
+              <button
+                key={key}
+                role="tab"
+                id={`incoming-tab-${key}`}
+                aria-selected={statusFilter === key}
+                aria-controls="incoming-tabpanel"
+                tabIndex={statusFilter === key ? 0 : -1}
+                onClick={() => setStatusFilter(key)}
+                data-testid={`incoming-filter-${key}`}
+                className={clsx(
+                  "relative px-5 py-3 text-xs font-bold uppercase tracking-widest transition-all whitespace-nowrap",
+                  statusFilter === key ? "text-brand-400" : "text-white/40 hover:text-white"
+                )}
+              >
+                {label}
+                {statusFilter === key && (
+                  <div className="absolute inset-x-3 bottom-0 h-1 rounded-t-full bg-brand-500" />
+                )}
+              </button>
+            ))}
+          </div>
+
           {/* Error banners */}
           {(error || acceptError || rejectError) && (
             <div className="mb-8 rounded-3xl border border-terracotta-500/20 bg-terracotta-500/5 px-6 py-4 text-sm font-bold text-terracotta-400 backdrop-blur-md flex items-center gap-3 animate-fade-in shadow-xl">
@@ -137,7 +236,12 @@ export default function IncomingOffersPage() {
           )}
 
           {/* Content area */}
-          <div className="animate-fade-in duration-700">
+          <div
+            className="animate-fade-in duration-700"
+            role="tabpanel"
+            id="incoming-tabpanel"
+            aria-labelledby={`incoming-tab-${statusFilter}`}
+          >
             {isLoading ? (
               <div className="space-y-12">
                 {[1, 2].map((i) => (
@@ -160,16 +264,31 @@ export default function IncomingOffersPage() {
                   When buyers make offers on your artworks, they will appear here grouped by listing.
                 </p>
               </div>
+            ) : visibleGroups.length === 0 ? (
+              <div className="flex flex-col items-center justify-center rounded-[3.5rem] bg-midnight-900/50 border-2 border-dashed border-white/5 py-32 px-10 text-center backdrop-blur-sm relative overflow-hidden group">
+                <div className="relative mb-10 flex h-28 w-28 items-center justify-center rounded-[2.5rem] bg-midnight-950 text-white/10 shadow-inner">
+                  <Inbox size={48} />
+                </div>
+                <h3 className="font-display text-3xl font-bold text-white tracking-tight relative z-10">
+                  No {statusFilter.toLowerCase()} offers.
+                </h3>
+              </div>
             ) : (
               <div className="space-y-16">
-                {offersByListing.map((group) => (
+                {visibleGroups.map((group) => (
                   <div key={group.listing.listing_id} className="relative group/listing">
                     {/* Listing Group Header */}
                     <div className="flex flex-col sm:flex-row sm:items-end justify-between gap-4 mb-8 pb-4 border-b border-white/5">
                       <div className="flex items-center gap-6">
                         <div className="flex flex-col">
                           <h2 className="font-display text-2xl font-bold text-white tracking-tight">
-                            Listing <span className="text-mint-400">#{group.listing.listing_id}</span>
+                            <Link
+                              href={`/listings/${group.listing.listing_id}`}
+                              className="hover:underline decoration-mint-400/50 inline-flex items-center gap-1.5"
+                            >
+                              Listing <span className="text-mint-400">#{group.listing.listing_id}</span>
+                              <ArrowUpRight size={16} className="text-mint-400/60" />
+                            </Link>
                           </h2>
                           <p className="text-[10px] font-mono text-white/20 break-all">{group.listing.metadata_cid}</p>
                         </div>
@@ -195,7 +314,14 @@ export default function IncomingOffersPage() {
 
                     {/* Offers Grid for this Listing */}
                     <div className="grid gap-6 sm:grid-cols-2 lg:grid-cols-3" data-testid={`offers-grid-${group.listing.listing_id}`}>
-                      {group.offers.map((o) => (
+                      {group.offers.map((raw) => {
+                        // Show the optimistic value while accept/reject is in
+                        // flight; falls back to the confirmed/raw offer.
+                        const o = (getOfferState(raw.offer_id).data as Offer) ?? raw;
+                        const uiStatus = deriveOfferUIStatus(o, now);
+                        const isActionable = uiStatus === "Pending" || uiStatus === "Stale";
+                        const isExpired = uiStatus === "Expired";
+                        return (
                         <div key={o.offer_id} data-testid={`offer-card-${o.offer_id}`} className="group relative flex flex-col rounded-[2.5rem] bg-white/[0.03] hover:bg-white/[0.07] hover:border-white/10 transition-all duration-500 border border-white/5 p-6 shadow-2xl overflow-hidden min-h-[320px]">
                           {/* BG Tribal Accent */}
                           <div className="absolute -top-10 -right-10 tribal-pattern opacity-[0.02] scale-50 group-hover:scale-75 transition-transform duration-1000" />
@@ -208,16 +334,21 @@ export default function IncomingOffersPage() {
                               <div className="flex flex-col">
                                 <span className="text-[9px] uppercase font-bold text-white/20 tracking-widest">Offerer</span>
                                 <span className="text-xs font-mono text-white/60">{o.offerer.slice(0, 6)}...{o.offerer.slice(-4)}</span>
+                                {o.parent_offer_id != null && (
+                                  <span
+                                    className="mt-0.5 text-[9px] font-bold text-white/30 uppercase tracking-widest"
+                                    data-testid={`counter-offer-indicator-${o.offer_id}`}
+                                  >
+                                    Counter-offer to #{o.parent_offer_id}
+                                  </span>
+                                )}
                               </div>
                             </div>
-                            <div className={clsx(
-                              "px-3 py-1 rounded-full text-[9px] font-bold uppercase tracking-widest border",
-                              o.status === "Pending" ? "bg-brand-500/10 text-brand-400 border-brand-500/20" :
-                                o.status === "Accepted" ? "bg-mint-500/10 text-mint-400 border-mint-500/20" :
-                                  "bg-white/5 text-white/30 border-white/10"
-                            )}>
-                              {o.status}
-                            </div>
+                            <OfferStatusBadge
+                              uiStatus={uiStatus}
+                              size="sm"
+                              data-testid={`offer-status-badge-${o.offer_id}`}
+                            />
                           </div>
 
                           <div className="flex flex-col gap-1 mb-10">
@@ -234,45 +365,104 @@ export default function IncomingOffersPage() {
                               <span className="text-white/40">{new Date(o.created_at * 1000).toLocaleDateString()}</span>
                             </div>
 
-                            {o.status === "Pending" && (
-                              <div className="grid grid-cols-2 gap-3">
-                                <button
-                                  data-testid={`accept-btn-${o.offer_id}`}
-                                  onClick={async () => {
-                                    const ok = await accept(o.offer_id);
-                                    if (ok) refresh();
-                                  }}
-                                  disabled={isAccepting || isRejecting}
-                                  className="flex items-center justify-center gap-2 rounded-2xl bg-mint-500/20 hover:bg-mint-500/30 py-3.5 text-xs font-bold text-mint-400 border border-mint-500/30 transition-all hover:scale-[1.02] disabled:opacity-50 group/btn"
-                                >
-                                  {isAccepting ? <Loader2 size={16} className="animate-spin" /> : (
-                                    <>
-                                      <CheckCircle size={16} className="group-hover/btn:scale-110 transition-transform" />
-                                      Accept
-                                    </>
-                                  )}
-                                </button>
-                                <button
-                                  data-testid={`reject-btn-${o.offer_id}`}
-                                  onClick={async () => {
-                                    const ok = await reject(o.offer_id);
-                                    if (ok) refresh();
-                                  }}
-                                  disabled={isAccepting || isRejecting}
-                                  className="flex items-center justify-center gap-2 rounded-2xl bg-white/5 hover:bg-terracotta-500/20 py-3.5 text-xs font-bold text-white/60 hover:text-terracotta-400 border border-white/10 hover:border-terracotta-500/30 transition-all disabled:opacity-50 group/rej"
-                                >
-                                  {isRejecting ? <Loader2 size={16} className="animate-spin" /> : (
-                                    <>
-                                      <XCircle size={16} className="group-hover/rej:scale-110 transition-transform" />
-                                      Reject
-                                    </>
-                                  )}
-                                </button>
+                            {/* Expired notice */}
+                            {isExpired && (
+                              <div
+                                className="flex items-center gap-2 rounded-xl bg-amber-500/10 border border-amber-500/20 px-3 py-2 text-[10px] text-amber-400"
+                                data-testid={`offer-expired-notice-${o.offer_id}`}
+                              >
+                                <AlertOctagon size={12} />
+                                Offer expired — awaiting reclaim by offerer
+                              </div>
+                            )}
+
+                            {/* Escrow / refund transaction links */}
+                            {(o.escrow_tx_hash || o.refund_tx_hash) && (
+                              <div className="flex flex-col gap-1">
+                                {o.escrow_tx_hash && (
+                                  <div
+                                    className="flex items-center gap-2 text-[10px] text-white/30"
+                                    data-testid={`escrow-tx-${o.offer_id}`}
+                                  >
+                                    <span className="uppercase font-bold tracking-widest text-white/20">Escrow:</span>
+                                    <span className="font-mono">{o.escrow_tx_hash.slice(0, 8)}…</span>
+                                    <a
+                                      href={`https://stellar.expert/explorer/testnet/tx/${o.escrow_tx_hash}`}
+                                      target="_blank"
+                                      rel="noopener noreferrer"
+                                      aria-label="View escrow transaction"
+                                      className="hover:text-brand-400 transition-colors"
+                                    >
+                                      <ExternalLink size={10} />
+                                    </a>
+                                  </div>
+                                )}
+                                {o.refund_tx_hash && (
+                                  <div
+                                    className="flex items-center gap-2 text-[10px] text-white/30"
+                                    data-testid={`refund-tx-${o.offer_id}`}
+                                  >
+                                    <span className="uppercase font-bold tracking-widest text-white/20">
+                                      {o.status === "Accepted" ? "Payment:" : "Refund:"}
+                                    </span>
+                                    <span className="font-mono">{o.refund_tx_hash.slice(0, 8)}…</span>
+                                    <a
+                                      href={`https://stellar.expert/explorer/testnet/tx/${o.refund_tx_hash}`}
+                                      target="_blank"
+                                      rel="noopener noreferrer"
+                                      aria-label="View refund transaction"
+                                      className="hover:text-mint-400 transition-colors"
+                                    >
+                                      <ExternalLink size={10} />
+                                    </a>
+                                  </div>
+                                )}
+                              </div>
+                            )}
+
+                            {/* Accept / Reject — only for actionable offers */}
+                            {isActionable && (
+                              <div className="space-y-2">
+                                <p className="text-[9px] leading-relaxed text-white/30">
+                                  Accepting sells this listing to this offerer for the amount above and
+                                  automatically rejects every other pending offer on it.
+                                </p>
+                                <div className="grid grid-cols-2 gap-3">
+                                  <button
+                                    data-testid={`accept-btn-${o.offer_id}`}
+                                    onClick={() => handleAccept(o)}
+                                    disabled={isAccepting || isRejecting}
+                                    aria-label={`Accept offer ${o.offer_id} and sell this listing`}
+                                    className="flex items-center justify-center gap-2 rounded-2xl bg-mint-500/20 hover:bg-mint-500/30 py-3.5 text-xs font-bold text-mint-400 border border-mint-500/30 transition-all hover:scale-[1.02] disabled:opacity-50 group/btn"
+                                  >
+                                    {isAccepting ? <Loader2 size={16} className="animate-spin" /> : (
+                                      <>
+                                        <CheckCircle size={16} className="group-hover/btn:scale-110 transition-transform" />
+                                        Accept &amp; Sell
+                                      </>
+                                    )}
+                                  </button>
+                                  <button
+                                    data-testid={`reject-btn-${o.offer_id}`}
+                                    onClick={() => handleReject(o)}
+                                    disabled={isAccepting || isRejecting}
+                                    aria-label={`Reject offer ${o.offer_id}`}
+                                    className="flex items-center justify-center gap-2 rounded-2xl bg-white/5 hover:bg-terracotta-500/20 py-3.5 text-xs font-bold text-white/60 hover:text-terracotta-400 border border-white/10 hover:border-terracotta-500/30 transition-all disabled:opacity-50 group/rej"
+                                  >
+                                    {isRejecting ? <Loader2 size={16} className="animate-spin" /> : (
+                                      <>
+                                        <XCircle size={16} className="group-hover/rej:scale-110 transition-transform" />
+                                        Reject
+                                      </>
+                                    )}
+                                  </button>
+                                </div>
                               </div>
                             )}
                           </div>
                         </div>
-                      ))}
+                        );
+                      })}
                     </div>
                   </div>
                 ))}

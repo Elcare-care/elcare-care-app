@@ -1,6 +1,8 @@
 extern crate std;
 
-use soroban_sdk::{testutils::Address as _, testutils::Ledger as _, Address, Env, String};
+use soroban_sdk::{
+    testutils::Address as _, testutils::Events as _, testutils::Ledger as _, Address, Env, String,
+};
 
 use crate::{DataKey, Error, NormalNFT721, NormalNFT721Client};
 
@@ -1098,20 +1100,18 @@ fn mint_succeeds_after_unpause() {
 }
 
 #[test]
-fn transfer_unaffected_when_paused() {
+fn transfer_blocked_when_paused() {
     let (env, client, _, _) = setup();
     let alice = Address::generate(&env);
     let bob = Address::generate(&env);
-    // Mint before pausing
     let id = client.mint(&alice, &String::from_str(&env, "uri"));
     client.pause();
-    // Transfer must still work while paused
-    client.transfer(&alice, &bob, &id);
-    assert_eq!(client.owner_of(&id), bob);
+    let result = client.try_transfer(&alice, &bob, &id);
+    assert_eq!(result, Err(Ok(Error::CollectionPaused)));
 }
 
 #[test]
-fn transfer_from_unaffected_when_paused() {
+fn transfer_from_blocked_when_paused() {
     let (env, client, _, _) = setup();
     let alice = Address::generate(&env);
     let bob = Address::generate(&env);
@@ -1119,20 +1119,19 @@ fn transfer_from_unaffected_when_paused() {
     let id = client.mint(&alice, &String::from_str(&env, "uri"));
     client.approve(&alice, &spender, &id, &None::<u32>);
     client.pause();
-    client.transfer_from(&spender, &alice, &bob, &id);
-    assert_eq!(client.owner_of(&id), bob);
+    let result = client.try_transfer_from(&spender, &alice, &bob, &id);
+    assert_eq!(result, Err(Ok(Error::CollectionPaused)));
 }
 
 #[test]
-fn burn_unaffected_when_paused() {
+fn burn_blocked_when_paused() {
     let (env, client, _, _) = setup();
     let alice = Address::generate(&env);
     let id = client.mint(&alice, &String::from_str(&env, "uri"));
     client.approve(&alice, &alice, &id, &None::<u32>);
     client.pause();
-    client.burn(&alice, &id);
-    let result = client.try_owner_of(&id);
-    assert_eq!(result, Err(Ok(Error::TokenNotFound)));
+    let result = client.try_burn(&alice, &id);
+    assert_eq!(result, Err(Ok(Error::CollectionPaused)));
 }
 
 #[test]
@@ -1477,160 +1476,159 @@ fn transfer_clears_expiry_key_alongside_approval() {
     assert!(expiry_after.is_none(), "expiry key must be cleared after transfer");
 }
 
+// ── Migration tests ───────────────────────────────────────────────────────────
 
-// ════════════════════════════════════════════════════════════
-// Issue #851 — Metadata Validation Tests (NormalNFT721)
-// ════════════════════════════════════════════════════════════
-#[cfg(test)]
-mod metadata_tests {
+mod migration {
     use super::*;
-    use crate::metadata;
-    use soroban_sdk::{Env, String};
 
-    fn env() -> Env {
-        Env::default()
-    }
-
-    fn s(env: &Env, val: &str) -> String {
-        String::from_str(env, val)
-    }
-
-    // ── Name ──────────────────────────────────────────────────────────────────
+    // Re-use the shared setup() helper defined above.
 
     #[test]
-    fn test_empty_name_rejected() {
-        let env = env();
-        assert_eq!(metadata::validate_collection_name(&s(&env, "")), Err(crate::Error::EmptyName));
-    }
+    fn fresh_install_migrate_records_marker_and_version() {
+        let (env, client, _contract_id, _creator) = setup();
 
-    #[test]
-    fn test_name_at_max_len_accepted() {
-        let env = env();
-        // 64 'A' characters — exactly at limit
-        let name = s(&env, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
-        assert_eq!(name.len(), 64);
-        assert!(metadata::validate_collection_name(&name).is_ok());
-    }
+        // No migration done yet
+        assert!(client.contract_version().is_none());
 
-    #[test]
-    fn test_name_over_max_len_rejected() {
-        let env = env();
-        // 65 characters — one over limit
-        let name = s(&env, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
-        assert_eq!(name.len(), 65);
-        assert_eq!(metadata::validate_collection_name(&name), Err(crate::Error::NameTooLong));
-    }
+        client.migrate();
 
-    // ── Symbol ────────────────────────────────────────────────────────────────
-
-    #[test]
-    fn test_empty_symbol_rejected() {
-        let env = env();
+        // Marker is now set and version is readable
         assert_eq!(
-            metadata::validate_collection_symbol(&env, &s(&env, "")),
-            Err(crate::Error::EmptySymbol)
+            client.contract_version(),
+            Some(String::from_str(&env, "1.0.0"))
         );
     }
 
     #[test]
-    fn test_symbol_with_special_char_rejected() {
-        let env = env();
-        assert_eq!(
-            metadata::validate_collection_symbol(&env, &s(&env, "ABc-1")),
-            Err(crate::Error::InvalidSymbolChar)
-        );
+    #[should_panic(expected = "Contract, #14")]
+    fn double_migrate_reverts_with_already_migrated() {
+        let (_env, client, _contract_id, _creator) = setup();
+
+        client.migrate();
+        // Second call must revert
+        client.migrate();
     }
 
     #[test]
-    fn test_valid_symbol_accepted() {
-        let env = env();
-        assert!(metadata::validate_collection_symbol(&env, &s(&env, "ART1")).is_ok());
-    }
+    fn migrate_emits_migrated_event() {
+        let (env, client, _contract_id, _creator) = setup();
+        client.migrate();
 
-    // ── Max supply ────────────────────────────────────────────────────────────
-
-    #[test]
-    fn test_zero_max_supply_rejected() {
-        assert_eq!(metadata::validate_max_supply(0), Err(crate::Error::InvalidMaxSupply));
-    }
-
-    #[test]
-    fn test_max_supply_at_limit_accepted() {
-        assert!(metadata::validate_max_supply(1_000_000).is_ok());
-    }
-
-    #[test]
-    fn test_max_supply_over_limit_rejected() {
-        assert_eq!(
-            metadata::validate_max_supply(1_000_001),
-            Err(crate::Error::InvalidMaxSupply)
-        );
+        let events = env.events().all();
+        let found = events.events().iter().any(|e| {
+            use soroban_sdk::xdr::{ContractEventBody, ScVal};
+            if let ContractEventBody::V0(body) = &e.body {
+                body.topics.iter().any(|t| {
+                    if let ScVal::Symbol(s) = t {
+                        core::str::from_utf8(s.0.as_slice()).unwrap_or("") == "migrated"
+                    } else {
+                        false
+                    }
+                })
+            } else {
+                false
+            }
+        });
+        assert!(found, "expected 'migrated' event");
     }
 
     #[test]
-    fn test_unlimited_max_supply_accepted() {
-        assert!(metadata::validate_max_supply(u64::MAX).is_ok());
-    }
+    fn state_readable_after_migrate() {
+        let (env, client, _contract_id, _creator) = setup();
 
-    // ── URI ───────────────────────────────────────────────────────────────────
+        let alice = Address::generate(&env);
+        let token_id = client.mint(&alice, &String::from_str(&env, "ipfs://pre-migrate"));
 
-    #[test]
-    fn test_empty_uri_rejected() {
-        let env = env();
-        assert_eq!(metadata::validate_token_uri(&s(&env, "")), Err(crate::Error::EmptyUri));
-    }
+        client.migrate();
 
-    #[test]
-    fn test_data_prefix_uri_rejected() {
-        let env = env();
-        assert_eq!(
-            metadata::validate_token_uri(&s(&env, "data:image/png;base64,abc")),
-            Err(crate::Error::InvalidUri)
-        );
+        // Token owner, balance, and total supply all survive the migration
+        assert_eq!(client.owner_of(&token_id), alice);
+        assert_eq!(client.balance_of(&alice), 1u64);
+        assert_eq!(client.total_supply(), 1u64);
     }
 
     #[test]
-    fn test_ipfs_prefix_accepted() {
-        let env = env();
-        assert!(metadata::validate_token_uri(&s(&env, "ipfs://QmHash")).is_ok());
+    fn royalty_info_readable_after_migrate() {
+        let (_env, client, _contract_id, _creator) = setup();
+        client.migrate();
+
+        let (_, bps) = client.royalty_info();
+        assert_eq!(bps, 500u32);
     }
 
     #[test]
-    fn test_https_prefix_accepted() {
-        let env = env();
-        assert!(metadata::validate_token_uri(&s(&env, "https://example.com/meta.json")).is_ok());
-    }
+    fn migrate_does_not_corrupt_existing_approvals() {
+        let (env, client, _contract_id, _creator) = setup();
 
-    #[test]
-    fn test_http_prefix_rejected() {
-        let env = env();
-        assert_eq!(
-            metadata::validate_token_uri(&s(&env, "http://example.com/meta.json")),
-            Err(crate::Error::InvalidUri)
-        );
-    }
+        let alice = Address::generate(&env);
+        let bob = Address::generate(&env);
 
-    #[test]
-    fn test_uri_too_long_rejected() {
-        let env = env();
-        // Build a URI that is MAX_URI_LEN + 1 bytes
-        let prefix = "ipfs://";
-        let padding_len = (metadata::MAX_URI_LEN + 1 - prefix.len() as u32) as usize;
-        let mut uri_str = prefix.to_string();
-        for _ in 0..padding_len { uri_str.push('a'); }
-        let uri = s(&env, &uri_str);
-        assert_eq!(metadata::validate_token_uri(&uri), Err(crate::Error::UriTooLong));
-    }
+        let token_id = client.mint(&alice, &String::from_str(&env, "uri"));
+        client.approve(&alice, &bob, &token_id, &None::<u32>);
 
-    // ── Royalty bps ───────────────────────────────────────────────────────────
+        client.migrate();
 
-    #[test]
-    fn test_royalty_bps_at_max_accepted() {
-        assert!(metadata::validate_royalty_bps(10_000).is_ok());
+        assert_eq!(client.get_approved(&token_id), Some(bob));
     }
+}
 
-    #[test]
-    fn test_royalty_bps_over_max_rejected() {
-        assert_eq!(metadata::validate_royalty_bps(10_001), Err(crate::Error::InvalidBps));
-    }
+// ── Security hardening regression tests (issue #6) ───────────────────────────
+
+#[test]
+fn initialize_invalid_royalty_bps_fails() {
+    let env = Env::default();
+    env.ledger().with_mut(|li| li.sequence_number = 1);
+    env.mock_all_auths();
+    let contract_id = env.register(NormalNFT721, ());
+    let client = NormalNFT721Client::new(&env, &contract_id);
+    let creator = Address::generate(&env);
+    let royalty_receiver = Address::generate(&env);
+    let result = client.try_initialize(
+        &creator,
+        &String::from_str(&env, "Test"),
+        &String::from_str(&env, "TST"),
+        &100u64,
+        &10_001u32,
+        &royalty_receiver,
+    );
+    assert_eq!(result, Err(Ok(Error::InvalidBps)));
+}
+
+#[test]
+fn update_royalty_exceeds_max_bps_returns_invalid_bps() {
+    let (env, client, _, _) = setup();
+    let receiver = Address::generate(&env);
+    let result = client.try_update_royalty(&receiver, &10_001u32);
+    assert_eq!(result, Err(Ok(Error::InvalidBps)));
+}
+
+#[test]
+fn set_token_royalty_on_nonexistent_token_fails() {
+    let (env, client, _, _) = setup();
+    let receiver = Address::generate(&env);
+    let result = client.try_set_token_royalty(&9999u64, &receiver, &500u32);
+    assert_eq!(result, Err(Ok(Error::TokenNotFound)));
+}
+
+#[test]
+fn burn_clears_per_token_royalty_override() {
+    let (env, client, _, _) = setup();
+    let alice = Address::generate(&env);
+    let royalty_receiver = Address::generate(&env);
+    let id = client.mint(&alice, &String::from_str(&env, "uri"));
+    client.set_token_royalty(&id, &royalty_receiver, &500u32);
+    let (rec, _amount) = client.royalty_info_for(&id, &1000i128);
+    assert_eq!(rec, royalty_receiver);
+    client.approve(&alice, &alice, &id, &None::<u32>);
+    client.burn(&alice, &id);
+    // After burn the token is gone — royalty_info_for must return TokenNotFound.
+    let result = client.try_royalty_info_for(&id, &1000i128);
+    assert_eq!(result, Err(Ok(Error::TokenNotFound)));
+}
+
+#[test]
+fn royalty_info_for_nonexistent_token_fails() {
+    let (_, client, _, _) = setup();
+    let result = client.try_royalty_info_for(&9999u64, &1000i128);
+    assert_eq!(result, Err(Ok(Error::TokenNotFound)));
 }

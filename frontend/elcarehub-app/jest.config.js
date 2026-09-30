@@ -51,10 +51,19 @@ module.exports = {
   coverageDirectory: 'coverage',
   coverageReporters: ['text', 'text-summary', 'lcov', 'json-summary'],
   coverageThreshold: {
-    global:                               { statements: 60, branches: 50, functions: 55, lines: 60 },
+    // ── Global thresholds (ratchet — do not lower without explicit review) ────
+    // Raised from 60/50/55/60 → 65/55/60/65 as new tests land (Issue #10).
+    // See docs/COVERAGE_POLICY.md for the ratchet process.
+    global:                               { statements: 65, branches: 55, functions: 60, lines: 65 },
+    // ── Per-file thresholds for high-risk financial paths ─────────────────────
     './src/components/CheckoutModal.tsx': { statements: 90, branches: 75, functions: 85, lines: 90 },
     './src/components/ListingCard.tsx':   { statements: 90, branches: 75, functions: 85, lines: 90 },
     './src/hooks/useMarketplace.ts':      { statements: 55, branches: 45, functions: 50, lines: 55 },
     './src/lib/contract.ts':              { statements: 15, branches: 10, functions: 10, lines: 15 },
+    // Issue #7: IPFS utilities are now comprehensively tested
+    './src/lib/ipfs.ts':                  { statements: 80, branches: 65, functions: 80, lines: 80 },
+    // Work item C additions
+    './src/lib/disclosures.ts':           { statements: 80, branches: 70, functions: 75, lines: 80 },
+    './src/lib/support.ts':               { statements: 80, branches: 70, functions: 75, lines: 80 },
   },
 }

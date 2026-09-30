@@ -1,0 +1,50 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# versions.toml — Single source of truth for the ElcareHub release train.
+#
+# Every release MUST bump `release_id` and update the component versions and
+# compatibility entries below.  CI reads this file to validate consistency
+# against package.json, Cargo.toml, and runtime metadata.
+# ─────────────────────────────────────────────────────────────────────────────
+
+[release]
+# Monotonically increasing release number (not semver — release train ID).
+release_id = 1
+
+[components.contracts.marketplace]
+# Matches contracts/soroban-marketplace/Cargo.toml → package.version
+version = "0.1.0"
+# Semantic version embedded in contract storage (CONTRACT_VERSION in contract.rs)
+contract_version = "1.1.0"
+# Event schema version — bump when EVENTS.md or event fields change
+event_schema_version = "1"
+min_indexer = "1.0.0"
+
+[components.contracts.launchpad]
+version = "0.1.0"
+event_schema_version = "1"
+min_indexer = "1.0.0"
+
+[components.indexer]
+# Matches indexer/package.json → version
+version = "1.0.0"
+# OpenAPI spec version — matches indexer/openapi.json → info.version
+api_version = "1.0.0"
+# Latest Prisma migration directory prefix (YYYYMMDDNNNNNN)
+db_migration_version = "20260724000000"
+min_frontend = "0.1.0"
+min_event_schema = "1"
+
+[components.frontend]
+# Matches frontend/elcarehub-app/package.json → version
+version = "0.1.0"
+min_indexer_api = "1.0.0"
+
+[components.event_schema]
+version = "1"
+
+[compatibility]
+# Each entry documents a tested and validated combination of component versions.
+# `release_id` links to the release number above.
+valid_combinations = [
+  { release_id = 1, contracts_marketplace = "0.1.0", contracts_launchpad = "0.1.0", indexer = "1.0.0", frontend = "0.1.0", event_schema = "1", db_migration = "20260724000000", contract_version = "1.1.0" },
+]

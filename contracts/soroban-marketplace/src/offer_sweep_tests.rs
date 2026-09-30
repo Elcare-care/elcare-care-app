@@ -1,398 +1,222 @@
-//! offer_sweep_tests.rs — Issue #850: Offer Expiry Sweep Integration Tests
-//!
-//! Tests the `sweep_expired_offers` (reclaim_offer) mechanism:
-//! - Expired offers transition to Withdrawn and funds are returned
-//! - Non-expired (still Pending) offers survive the sweep unchanged
-//! - ListingPendingOffers count decreases correctly after sweeps
-//! - The global OfferCount counter is append-only and never decremented
+// offer_sweep_tests.rs — Offer auto-expiry sweep (Issue #470)
+//
+// Coverage:
+//   - Expired pending offer is swept to Expired status and escrow returned
+//   - Non-expired offer is silently skipped
+//   - Non-pending offer (accepted, withdrawn, expired) is silently skipped
+//   - Non-expiring offer (expires_at = None) is silently skipped
+//   - Batch limit (> 20) panics with BatchTooLarge
+//   - Partial batch: only expired offers in the batch are swept
+//   - Repeated sweep on the same offer is a no-op (idempotent retry)
+//   - Mixed active/expired batch: only expired are swept; return count is accurate
+//   - Expired offer cannot be accepted after sweep
 
-#![cfg(test)]
-extern crate std;
-
+use super::*;
+use crate::types::OfferStatus;
 use soroban_sdk::{
     symbol_short,
-    testutils::{Address as _, Events as _, Ledger},
-    token::{StellarAssetClient, TokenClient},
+    testutils::{Address as _, Ledger},
     vec, Address, Env,
 };
 
-use crate::{
-    storage::{load_offer, load_pending_offer_ids},
-    types::{Listing, ListingStatus, Offer, OfferStatus, Recipient},
-    MarketplaceContract, MarketplaceContractClient,
-};
+use crate::test::{mock_nft, MockNftClient, valid_recipients};
+use soroban_sdk::token::StellarAssetClient;
 
-// ── Mock NFT (re-declared locally so this module is self-contained) ───────────
+// ── Shared setup ─────────────────────────────────────────────────────────────
 
-mod mock_nft_sweep {
-    use soroban_sdk::{contract, contractimpl, Address, Env};
-
-    #[soroban_sdk::contracttype]
-    enum NftKey {
-        Owner(u64),
-    }
-
-    #[contract]
-    pub struct MockNft;
-
-    #[contractimpl]
-    impl MockNft {
-        pub fn owner_of(env: Env, token_id: u64) -> Address {
-            env.storage()
-                .instance()
-                .get::<NftKey, Address>(&NftKey::Owner(token_id))
-                .expect("token has no owner")
-        }
-        pub fn set_owner(env: Env, token_id: u64, owner: Address) {
-            env.storage()
-                .instance()
-                .set(&NftKey::Owner(token_id), &owner);
-        }
-        pub fn transfer_from(
-            env: Env,
-            _spender: Address,
-            from: Address,
-            to: Address,
-            token_id: u64,
-        ) {
-            let cur: Address = env
-                .storage()
-                .instance()
-                .get::<NftKey, Address>(&NftKey::Owner(token_id))
-                .expect("token has no owner");
-            assert_eq!(cur, from, "transfer_from: wrong owner");
-            env.storage()
-                .instance()
-                .set(&NftKey::Owner(token_id), &to);
-        }
-        pub fn royalty_info(env: Env) -> (Address, u32) {
-            use soroban_sdk::testutils::Address as _;
-            (Address::generate(&env), 0u32)
-        }
-    }
-}
-
-use mock_nft_sweep::MockNftClient;
-
-// ── Setup helper ──────────────────────────────────────────────────────────────
-
-fn setup_sweep() -> (
+fn sweep_setup() -> (
     Env,
     MarketplaceContractClient<'static>,
-    Address, // admin/artist
-    Address, // buyer1
-    Address, // buyer2
-    Address, // buyer3
+    Address, // admin
+    Address, // artist
+    Address, // buyer
     Address, // payment_token
-    Address, // collection_id
+    Address, // collection
 ) {
     let env = Env::default();
     env.mock_all_auths();
-
-    let contract_id = env.register(MarketplaceContract, ());
-    let client = MarketplaceContractClient::new(&env, &contract_id);
-
+    let cid = env.register(MarketplaceContract, ());
+    let client = MarketplaceContractClient::new(&env, &cid);
+    let admin = Address::generate(&env);
     let artist = Address::generate(&env);
-    let buyer1 = Address::generate(&env);
-    let buyer2 = Address::generate(&env);
-    let buyer3 = Address::generate(&env);
-
+    let buyer = Address::generate(&env);
     let token_admin = Address::generate(&env);
-    let payment_token = env
-        .register_stellar_asset_contract_v2(token_admin.clone())
-        .address();
+    let payment_token = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
     let sac = StellarAssetClient::new(&env, &payment_token);
     sac.mint(&artist, &100_000_000_000_i128);
-    sac.mint(&buyer1, &100_000_000_000_i128);
-    sac.mint(&buyer2, &100_000_000_000_i128);
-    sac.mint(&buyer3, &100_000_000_000_i128);
-    sac.mint(&contract_id, &100_000_000_000_i128);
-
-    let collection_id = env.register(mock_nft_sweep::MockNft, ());
-    MockNftClient::new(&env, &collection_id).set_owner(&1u64, &artist);
-
-    client.set_admin(&artist);
-    client.add_token_to_whitelist(&payment_token);
-
-    (
-        env,
-        client,
-        artist,
-        buyer1,
-        buyer2,
-        buyer3,
-        payment_token,
-        collection_id,
-    )
+    sac.mint(&buyer, &100_000_000_000_i128);
+    sac.mint(&cid, &100_000_000_000_i128);
+    let collection = env.register(mock_nft::MockNft, ());
+    MockNftClient::new(&env, &collection).set_owner(&1u64, &artist);
+    client.set_admin(&admin);
+    (env, client, admin, artist, buyer, payment_token, collection)
 }
 
-fn valid_recipients(env: &Env, artist: &Address) -> soroban_sdk::Vec<Recipient> {
-    vec![
-        env,
-        Recipient {
-            address: artist.clone(),
-            percentage: 10_000,
-        },
-    ]
-}
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
-
-/// Setup scenario: one listing, three offers (two expired, one still pending).
-/// Returns (listing_id, expired_offer1_id, expired_offer2_id, active_offer_id).
-fn setup_expired_offer_scenario(
+fn make_listing_and_offer(
     env: &Env,
     client: &MarketplaceContractClient,
     artist: &Address,
-    buyer1: &Address,
-    buyer2: &Address,
-    buyer3: &Address,
+    buyer: &Address,
     payment_token: &Address,
-    collection_id: &Address,
-) -> (u64, u64, u64, u64) {
+    collection: &Address,
+    offer_expires_at: Option<u64>,
+) -> (u64, u64) {
     let listing_id = client.create_listing(
-        artist,
-        &50_000_i128,
-        &symbol_short!("XLM"),
-        payment_token,
-        collection_id,
-        &1u64,
-        &valid_recipients(env, artist),
-        &None::<u64>,
+        artist, &10_000_000_i128, &symbol_short!("XLM"),
+        payment_token, collection, &1u64, &1u64,
+        &valid_recipients(env, artist), &None::<u64>,
     );
-
-    // Set ledger timestamp to 1000 so we can place offers
-    env.ledger().with_mut(|li| li.timestamp = 1000);
-
-    // Two offers that expire at timestamp 2000 (will be expired when we advance to 3000)
-    let exp_id1 = client.make_offer(
-        buyer1,
-        &listing_id,
-        &1_000_i128,
-        payment_token,
-        &Some(2000u64),
-    );
-    let exp_id2 = client.make_offer(
-        buyer2,
-        &listing_id,
-        &2_000_i128,
-        payment_token,
-        &Some(2000u64),
-    );
-
-    // One offer that expires far in the future — should survive
-    let active_id = client.make_offer(
-        buyer3,
-        &listing_id,
-        &3_000_i128,
-        payment_token,
-        &Some(9_999_999u64),
-    );
-
-    (listing_id, exp_id1, exp_id2, active_id)
-}
-
-/// Reclaiming an expired offer returns the escrowed funds to the offerer
-/// and transitions the offer to Withdrawn.
-#[test]
-fn test_expired_offer_reclaim_returns_funds() {
-    let (env, client, artist, buyer1, buyer2, buyer3, payment_token, collection_id) =
-        setup_sweep();
-
-    let (listing_id, exp_id1, exp_id2, active_id) = setup_expired_offer_scenario(
-        &env,
-        &client,
-        &artist,
-        &buyer1,
-        &buyer2,
-        &buyer3,
-        &payment_token,
-        &collection_id,
-    );
-
-    let token = TokenClient::new(&env, &payment_token);
-    let buyer1_before = token.balance(&buyer1);
-    let buyer2_before = token.balance(&buyer2);
-
-    // Advance past expiry
-    env.ledger().with_mut(|li| li.timestamp = 3000);
-
-    // buyer1 reclaims their expired offer
-    client.reclaim_offer(&exp_id1);
-    let offer1 = client.get_offer(&exp_id1);
-    assert_eq!(
-        offer1.status,
-        OfferStatus::Withdrawn,
-        "expired offer should be Withdrawn after reclaim"
-    );
-    assert_eq!(
-        token.balance(&buyer1),
-        buyer1_before + 1_000_i128,
-        "buyer1 should get their escrow back"
-    );
-
-    // buyer2 reclaims their expired offer
-    client.reclaim_offer(&exp_id2);
-    let offer2 = client.get_offer(&exp_id2);
-    assert_eq!(offer2.status, OfferStatus::Withdrawn);
-    assert_eq!(token.balance(&buyer2), buyer2_before + 2_000_i128);
-
-    // Active offer should still be Pending
-    let active = client.get_offer(&active_id);
-    assert_eq!(
-        active.status,
-        OfferStatus::Pending,
-        "non-expired offer must remain Pending"
-    );
-
-    // Pending offers count for the listing should now be 1 (only active_id remains)
-    let pending = load_pending_offer_ids(&env, listing_id);
-    assert_eq!(
-        pending.len(),
-        1,
-        "ListingPendingOffers should have exactly 1 entry remaining"
-    );
-    assert_eq!(pending.get(0).unwrap(), active_id);
-}
-
-/// Attempting to reclaim an offer that has NOT expired must panic.
-#[test]
-#[should_panic]
-fn test_reclaim_non_expired_offer_panics() {
-    let (env, client, artist, buyer1, _b2, _b3, payment_token, collection_id) = setup_sweep();
-
-    let listing_id = client.create_listing(
-        &artist,
-        &50_000_i128,
-        &symbol_short!("XLM"),
-        &payment_token,
-        &collection_id,
-        &1u64,
-        &valid_recipients(&env, &artist),
-        &None::<u64>,
-    );
-
-    env.ledger().with_mut(|li| li.timestamp = 1000);
     let offer_id = client.make_offer(
-        &buyer1,
-        &listing_id,
-        &1_000_i128,
-        &payment_token,
-        &Some(9_999_999u64),
+        buyer, &listing_id, &5_000_000_i128, payment_token, &offer_expires_at,
     );
-
-    // Still before expiry — should panic
-    client.reclaim_offer(&offer_id);
+    (listing_id, offer_id)
 }
 
-/// An offer with no expiry cannot be reclaimed (only withdrawn by the offerer).
+// ── §1  Basic sweep ───────────────────────────────────────────────────────────
+
 #[test]
-#[should_panic]
-fn test_reclaim_offer_without_expiry_panics() {
-    let (env, client, artist, buyer1, _b2, _b3, payment_token, collection_id) = setup_sweep();
+fn test_sweep_transitions_expired_offer_to_expired_status() {
+    let (env, client, _, artist, buyer, token, collection) = sweep_setup();
+    let now = env.ledger().timestamp();
+    let expires_at = now + 1_000;
+    let (_, offer_id) = make_listing_and_offer(&env, &client, &artist, &buyer, &token, &collection, Some(expires_at));
 
-    let listing_id = client.create_listing(
-        &artist,
-        &50_000_i128,
-        &symbol_short!("XLM"),
-        &payment_token,
-        &collection_id,
-        &1u64,
-        &valid_recipients(&env, &artist),
-        &None::<u64>,
-    );
+    // Advance past expiry.
+    env.ledger().with_mut(|l| l.timestamp = now + 1_001);
+    let swept = client.sweep_expired_offers(&vec![&env, offer_id]);
+    assert_eq!(swept, 1);
 
-    env.ledger().with_mut(|li| li.timestamp = 1000);
-    let offer_id = client.make_offer(
-        &buyer1,
-        &listing_id,
-        &1_000_i128,
-        &payment_token,
-        &None::<u64>, // no expiry
-    );
-
-    // Advance time — but offer has no expiry, so reclaim should still panic
-    env.ledger().with_mut(|li| li.timestamp = 99_999_999);
-    client.reclaim_offer(&offer_id);
+    let offer = client.get_offer(&offer_id);
+    assert_eq!(offer.status, OfferStatus::Expired);
 }
 
-/// The global OfferCount is append-only: reclaiming expired offers does not
-/// decrement it.
 #[test]
-fn test_offer_count_is_append_only() {
-    let (env, client, artist, buyer1, buyer2, _b3, payment_token, collection_id) = setup_sweep();
+fn test_sweep_returns_escrow_to_offerer() {
+    let (env, client, _, artist, buyer, token, collection) = sweep_setup();
+    let sac = soroban_sdk::token::TokenClient::new(&env, &token);
+    let buyer_balance_before = sac.balance(&buyer);
 
-    let listing_id = client.create_listing(
-        &artist,
-        &50_000_i128,
-        &symbol_short!("XLM"),
-        &payment_token,
-        &collection_id,
-        &1u64,
-        &valid_recipients(&env, &artist),
-        &None::<u64>,
+    let now = env.ledger().timestamp();
+    let (_, offer_id) = make_listing_and_offer(
+        &env, &client, &artist, &buyer, &token, &collection, Some(now + 500),
     );
+    env.ledger().with_mut(|l| l.timestamp = now + 501);
+    client.sweep_expired_offers(&vec![&env, offer_id]);
 
-    env.ledger().with_mut(|li| li.timestamp = 1000);
-    let _oid1 = client.make_offer(
-        &buyer1,
-        &listing_id,
-        &1_000_i128,
-        &payment_token,
-        &Some(2000u64),
-    );
-    let _oid2 = client.make_offer(
-        &buyer2,
-        &listing_id,
-        &1_500_i128,
-        &payment_token,
-        &Some(2000u64),
-    );
-
-    // Count should be 2 before any expiry
-    assert_eq!(client.get_total_offers(), 2u64);
-
-    // Advance past expiry and reclaim both
-    env.ledger().with_mut(|li| li.timestamp = 3000);
-    client.reclaim_offer(&_oid1);
-    client.reclaim_offer(&_oid2);
-
-    // Count must still be 2 — it is append-only
-    assert_eq!(
-        client.get_total_offers(),
-        2u64,
-        "OfferCount is append-only and must not decrease after reclaims"
-    );
+    let buyer_balance_after = sac.balance(&buyer);
+    assert_eq!(buyer_balance_after, buyer_balance_before,
+        "buyer balance must be restored after sweep");
 }
 
-/// After reclaiming expired offers, load_pending_offer_ids reflects only the
-/// remaining pending offers.
 #[test]
-fn test_pending_offer_list_accuracy_after_reclaims() {
-    let (env, client, artist, buyer1, buyer2, buyer3, payment_token, collection_id) =
-        setup_sweep();
+fn test_sweep_does_not_affect_non_expired_offer() {
+    let (env, client, _, artist, buyer, token, collection) = sweep_setup();
+    let now = env.ledger().timestamp();
+    let (_, offer_id) = make_listing_and_offer(
+        &env, &client, &artist, &buyer, &token, &collection, Some(now + 10_000),
+    );
+    let swept = client.sweep_expired_offers(&vec![&env, offer_id]);
+    assert_eq!(swept, 0);
 
-    let (listing_id, exp_id1, exp_id2, active_id) = setup_expired_offer_scenario(
-        &env,
-        &client,
-        &artist,
-        &buyer1,
-        &buyer2,
-        &buyer3,
-        &payment_token,
-        &collection_id,
+    let offer = client.get_offer(&offer_id);
+    assert_eq!(offer.status, OfferStatus::Pending, "non-expired offer must remain Pending");
+}
+
+#[test]
+fn test_sweep_skips_non_expiring_offer() {
+    let (env, client, _, artist, buyer, token, collection) = sweep_setup();
+    let (_, offer_id) = make_listing_and_offer(
+        &env, &client, &artist, &buyer, &token, &collection, None,
+    );
+    env.ledger().with_mut(|l| l.timestamp += 999_999);
+    let swept = client.sweep_expired_offers(&vec![&env, offer_id]);
+    assert_eq!(swept, 0, "non-expiring offer must never be swept");
+}
+
+// ── §2  Idempotency and retry-safety ─────────────────────────────────────────
+
+#[test]
+fn test_sweep_repeated_on_same_offer_is_noop() {
+    let (env, client, _, artist, buyer, token, collection) = sweep_setup();
+    let now = env.ledger().timestamp();
+    let (_, offer_id) = make_listing_and_offer(
+        &env, &client, &artist, &buyer, &token, &collection, Some(now + 100),
+    );
+    env.ledger().with_mut(|l| l.timestamp = now + 200);
+    let first = client.sweep_expired_offers(&vec![&env, offer_id]);
+    let second = client.sweep_expired_offers(&vec![&env, offer_id]);
+    assert_eq!(first, 1);
+    assert_eq!(second, 0, "second sweep must be a no-op");
+}
+
+// ── §3  Mixed active/expired batch ────────────────────────────────────────────
+
+#[test]
+fn test_sweep_mixed_batch_only_sweeps_expired() {
+    let (env, client, _, artist, buyer, token, collection) = sweep_setup();
+    // Create a second collection and offer so we can have two distinct listings.
+    let collection2 = env.register(mock_nft::MockNft, ());
+    MockNftClient::new(&env, &collection2).set_owner(&2u64, &artist);
+    let now = env.ledger().timestamp();
+
+    let (_, offer_expired) = make_listing_and_offer(
+        &env, &client, &artist, &buyer, &token, &collection, Some(now + 100),
+    );
+    // Second offer on a fresh listing with token 2.
+    let listing2 = client.create_listing(
+        &artist, &10_000_000_i128, &symbol_short!("XLM"),
+        &token, &collection2, &2u64, &1u64,
+        &valid_recipients(&env, &artist), &None::<u64>,
+    );
+    let offer_active = client.make_offer(
+        &buyer, &listing2, &5_000_000_i128, &token, &Some(now + 99_999),
     );
 
-    // Before any reclaims: 3 pending
-    let before = load_pending_offer_ids(&env, listing_id);
-    assert_eq!(before.len(), 3);
+    env.ledger().with_mut(|l| l.timestamp = now + 200);
+    let swept = client.sweep_expired_offers(&vec![&env, offer_expired, offer_active]);
+    assert_eq!(swept, 1, "only the expired offer must be swept");
 
-    env.ledger().with_mut(|li| li.timestamp = 3000);
-    client.reclaim_offer(&exp_id1);
-    client.reclaim_offer(&exp_id2);
+    assert_eq!(client.get_offer(&offer_expired).status, OfferStatus::Expired);
+    assert_eq!(client.get_offer(&offer_active).status, OfferStatus::Pending);
+}
 
-    // After reclaims: only active_id remains
-    let after = load_pending_offer_ids(&env, listing_id);
-    assert_eq!(after.len(), 1);
-    assert_eq!(after.get(0).unwrap(), active_id);
+// ── §4  Batch limit ───────────────────────────────────────────────────────────
+
+#[test]
+#[should_panic(expected = "Error(Contract, #36)")]
+fn test_sweep_batch_too_large_panics() {
+    let (env, client, _, _, _, _, _) = sweep_setup();
+    // Build a vec of 21 ids (ids are arbitrary — limit check runs first).
+    let mut ids = soroban_sdk::Vec::new(&env);
+    for i in 0u64..21 {
+        ids.push_back(i + 1);
+    }
+    // BatchTooLarge = 36
+    client.sweep_expired_offers(&ids);
+}
+
+// ── §5  Expired offer cannot be accepted ─────────────────────────────────────
+
+#[test]
+#[should_panic(expected = "Error(Contract, #33)")]
+fn test_accept_swept_offer_panics() {
+    let (env, client, _, artist, buyer, token, collection) = sweep_setup();
+    let now = env.ledger().timestamp();
+    let (_, offer_id) = make_listing_and_offer(
+        &env, &client, &artist, &buyer, &token, &collection, Some(now + 100),
+    );
+    env.ledger().with_mut(|l| l.timestamp = now + 200);
+    client.sweep_expired_offers(&vec![&env, offer_id]);
+    // InvalidOfferState = 33 (offer.status is Expired, not Pending)
+    client.accept_offer(&artist, &offer_id);
+}
+
+// ── §6  Missing offer id is silently skipped ─────────────────────────────────
+
+#[test]
+fn test_sweep_unknown_offer_id_silently_skipped() {
+    let (env, client, _, _, _, _, _) = sweep_setup();
+    // Offer ID 9999 does not exist.
+    let swept = client.sweep_expired_offers(&vec![&env, 9999u64]);
+    assert_eq!(swept, 0);
 }

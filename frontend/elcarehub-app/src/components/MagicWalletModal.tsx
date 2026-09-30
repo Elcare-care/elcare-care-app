@@ -4,7 +4,7 @@
 
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useId, useState } from "react";
 import { useMagicWallet } from "@/hooks/useMagicWallet";
 import {
     X,
@@ -16,6 +16,8 @@ import {
     Loader2,
     CheckCircle2,
 } from "lucide-react";
+import { useModalA11y } from "@/hooks/useModalA11y";
+import { StatusAnnouncer } from "@/components/a11y/StatusAnnouncer";
 
 interface MagicWalletModalProps {
     isOpen: boolean;
@@ -33,6 +35,9 @@ export function MagicWalletModal({ isOpen, onClose }: MagicWalletModalProps) {
         loginWithPasskey,
     } = useMagicWallet();
 
+    const { dialogRef, titleId, descriptionId } = useModalA11y(isOpen, onClose);
+    const emailErrorId = useId();
+
     const [emailInput, setEmailInput] = useState("");
     const [hasStartedConnect, setHasStartedConnect] = useState(false);
     const [showEmailForm, setShowEmailForm] = useState(false);
@@ -46,6 +51,16 @@ export function MagicWalletModal({ isOpen, onClose }: MagicWalletModalProps) {
     }, [status, hasStartedConnect, onClose]);
 
     if (!isOpen) return null;
+
+    const statusMessage =
+        status === "CONNECTED"
+            ? "Magic wallet connected successfully."
+            : error
+            ? `Error: ${error}`
+            : isConnecting
+            ? "Connecting to Magic wallet…"
+            : "";
+    const statusPoliteness = error && !isConnecting ? "assertive" : "polite";
 
     const handleEmailLogin = async (e: React.FormEvent) => {
         e.preventDefault();
@@ -74,27 +89,40 @@ export function MagicWalletModal({ isOpen, onClose }: MagicWalletModalProps) {
             <div
                 className="absolute inset-0 bg-midnight-950/80 backdrop-blur-md animate-fade-in"
                 onClick={onClose}
+                aria-hidden="true"
             />
 
             {/* Modal Card */}
-            <div className="relative w-full max-w-md overflow-hidden rounded-3xl bg-white shadow-2xl shadow-black/50 animate-scale-in">
-                <div className="tribal-strip h-2" />
+            <div
+                ref={dialogRef}
+                role="dialog"
+                aria-modal="true"
+                aria-labelledby={titleId}
+                aria-describedby={descriptionId}
+                data-testid="magic-wallet-modal"
+                tabIndex={-1}
+                className="relative w-full max-w-md overflow-hidden rounded-3xl bg-white shadow-2xl shadow-black/50 animate-scale-in outline-none"
+            >
+                <StatusAnnouncer message={statusMessage} politeness={statusPoliteness} />
+                <div className="tribal-strip h-2" aria-hidden="true" />
 
                 {/* Header */}
                 <div className="flex items-center justify-between p-6 pb-0">
-                    <h2 className="font-display text-2xl font-bold text-midnight-900">
+                    <h2 id={titleId} className="font-display text-2xl font-bold text-midnight-900">
                         Magic <span className="text-brand-500">Wallet</span>
                     </h2>
                     <button
+                        type="button"
                         onClick={onClose}
+                        aria-label="Close Magic wallet dialog"
                         className="rounded-full p-2 text-gray-400 hover:bg-gray-100 hover:text-midnight-900 transition-colors"
                     >
-                        <X size={20} />
+                        <X size={20} aria-hidden="true" />
                     </button>
                 </div>
 
                 <div className="p-6 pt-4">
-                    <p className="text-sm text-gray-500 mb-6 font-medium">
+                    <p id={descriptionId} className="text-sm text-gray-500 mb-6 font-medium">
                         Create a wallet with just your email or passkey. No crypto knowledge needed.
                     </p>
 
@@ -102,7 +130,7 @@ export function MagicWalletModal({ isOpen, onClose }: MagicWalletModalProps) {
                     <div className="space-y-4">
                         {status === "CONNECTED" ? (
                             <div className="rounded-2xl border-2 border-mint-100 bg-mint-50/30 p-8 text-center animate-fade-in">
-                                <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-mint-100 text-mint-600 scale-110">
+                                <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-mint-100 text-mint-600 scale-110" aria-hidden="true">
                                     <CheckCircle2 size={32} />
                                 </div>
                                 <h3 className="font-display font-bold text-midnight-900 text-xl">Success!</h3>
@@ -116,16 +144,19 @@ export function MagicWalletModal({ isOpen, onClose }: MagicWalletModalProps) {
                         ) : showEmailForm ? (
                             <form onSubmit={handleEmailLogin} className="space-y-4">
                                 <div>
-                                    <label className="block text-sm font-medium text-midnight-900 mb-2">
+                                    <label htmlFor="magic-email-input" className="block text-sm font-medium text-midnight-900 mb-2">
                                         Email Address
                                     </label>
                                     <input
+                                        id="magic-email-input"
                                         type="email"
                                         value={emailInput}
                                         onChange={(e) => setEmailInput(e.target.value)}
                                         placeholder="you@example.com"
                                         disabled={isConnecting}
-                                        className="w-full px-4 py-3 rounded-xl border-2 border-gray-100 focus:border-brand-500 focus:outline-none transition-colors disabled:bg-gray-50"
+                                        aria-invalid={!!error}
+                                        aria-describedby={error ? emailErrorId : undefined}
+                                        className="w-full px-4 py-3 rounded-xl border-2 border-gray-100 focus:border-brand-500 focus:outline-none transition-colors disabled:bg-gray-50 aria-[invalid=true]:border-terracotta-400"
                                     />
                                 </div>
                                 <button
@@ -135,12 +166,12 @@ export function MagicWalletModal({ isOpen, onClose }: MagicWalletModalProps) {
                                 >
                                     {isConnecting ? (
                                         <>
-                                            <Loader2 size={16} className="animate-spin" />
+                                            <Loader2 size={16} className="animate-spin" aria-hidden="true" />
                                             Sending Link...
                                         </>
                                     ) : (
                                         <>
-                                            <Mail size={16} />
+                                            <Mail size={16} aria-hidden="true" />
                                             Send Magic Link
                                         </>
                                     )}
@@ -156,26 +187,28 @@ export function MagicWalletModal({ isOpen, onClose }: MagicWalletModalProps) {
                         ) : (
                             <div className="space-y-3">
                                 <button
+                                    type="button"
                                     onClick={() => setShowEmailForm(true)}
                                     disabled={isConnecting}
                                     className="group relative flex w-full items-center gap-4 rounded-2xl border-2 border-gray-100 p-4 hover:border-brand-300 hover:bg-brand-50/30 transition-all duration-300 disabled:opacity-50"
                                 >
-                                    <div className="flex h-12 w-12 items-center justify-center rounded-xl bg-brand-100 text-brand-600 group-hover:bg-brand-500 group-hover:text-white transition-colors">
+                                    <div className="flex h-12 w-12 items-center justify-center rounded-xl bg-brand-100 text-brand-600 group-hover:bg-brand-500 group-hover:text-white transition-colors" aria-hidden="true">
                                         <Mail size={24} />
                                     </div>
                                     <div className="text-left">
                                         <p className="font-bold text-midnight-900">Email Magic Link</p>
                                         <p className="text-xs text-gray-500">Receive a link via email</p>
                                     </div>
-                                    <ArrowRight size={18} className="absolute right-4 text-gray-300 group-hover:text-brand-500 group-hover:translate-x-1 transition-all" />
+                                    <ArrowRight size={18} className="absolute right-4 text-gray-300 group-hover:text-brand-500 group-hover:translate-x-1 transition-all" aria-hidden="true" />
                                 </button>
 
                                 <button
+                                    type="button"
                                     onClick={handlePasskeyLogin}
                                     disabled={isConnecting}
                                     className="group relative flex w-full items-center gap-4 rounded-2xl border-2 border-gray-100 p-4 hover:border-brand-300 hover:bg-brand-50/30 transition-all duration-300 disabled:opacity-50"
                                 >
-                                    <div className="flex h-12 w-12 items-center justify-center rounded-xl bg-brand-100 text-brand-600 group-hover:bg-brand-500 group-hover:text-white transition-colors">
+                                    <div className="flex h-12 w-12 items-center justify-center rounded-xl bg-brand-100 text-brand-600 group-hover:bg-brand-500 group-hover:text-white transition-colors" aria-hidden="true">
                                         {isConnecting ? (
                                             <Loader2 size={24} className="animate-spin" />
                                         ) : (
@@ -186,7 +219,7 @@ export function MagicWalletModal({ isOpen, onClose }: MagicWalletModalProps) {
                                         <p className="font-bold text-midnight-900">Passkey Login</p>
                                         <p className="text-xs text-gray-500">Use FaceID or fingerprint</p>
                                     </div>
-                                    <ArrowRight size={18} className="absolute right-4 text-gray-300 group-hover:text-brand-500 group-hover:translate-x-1 transition-all" />
+                                    <ArrowRight size={18} className="absolute right-4 text-gray-300 group-hover:text-brand-500 group-hover:translate-x-1 transition-all" aria-hidden="true" />
                                 </button>
 
                                 <div className="relative py-2">
@@ -211,8 +244,12 @@ export function MagicWalletModal({ isOpen, onClose }: MagicWalletModalProps) {
                     </div>
 
                     {error && status !== "CONNECTED" && !isConnecting && (
-                        <div className="mt-6 rounded-xl bg-terracotta-50 p-3 flex items-start gap-2 text-xs text-terracotta-700 animate-slide-up">
-                            <AlertTriangle size={14} className="flex-shrink-0 mt-0.5" />
+                        <div
+                            id={emailErrorId}
+                            role="alert"
+                            className="mt-6 rounded-xl bg-terracotta-50 p-3 flex items-start gap-2 text-xs text-terracotta-700 animate-slide-up"
+                        >
+                            <AlertTriangle size={14} className="flex-shrink-0 mt-0.5" aria-hidden="true" />
                             <p>{error}</p>
                         </div>
                     )}

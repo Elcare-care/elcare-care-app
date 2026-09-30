@@ -1,0 +1,112 @@
+{
+  "title": "TTL Anomaly Detected — ActiveListings / Auction Index Drift",
+  "description": "Fires whenever a TtlAnomalyEvent is emitted by extend_active_ttls. This indicates an ActiveListings index entry (or auction id) whose stored record is missing or no longer Active — unexpected state that operators should investigate. Issue #847.",
+  "uid": "elcarehub-ttl-anomaly-detected",
+  "orgId": 1,
+  "condition": "C",
+  "data": [
+    {
+      "refId": "A",
+      "queryType": "",
+      "relativeTimeRange": {
+        "from": 300,
+        "to": 0
+      },
+      "datasourceUid": "${datasource}",
+      "model": {
+        "expr": "increase(elcarehub_ttl_anomaly_total[5m])",
+        "intervalMs": 1000,
+        "maxDataPoints": 43200,
+        "refId": "A"
+      }
+    },
+    {
+      "refId": "B",
+      "queryType": "",
+      "relativeTimeRange": {
+        "from": 300,
+        "to": 0
+      },
+      "datasourceUid": "__expr__",
+      "model": {
+        "conditions": [
+          {
+            "evaluator": {
+              "params": [],
+              "type": "gt"
+            },
+            "operator": {
+              "type": "and"
+            },
+            "query": {
+              "params": ["A"]
+            },
+            "reducer": {
+              "params": [],
+              "type": "last"
+            },
+            "type": "query"
+          }
+        ],
+        "datasource": {
+          "type": "__expr__",
+          "uid": "__expr__"
+        },
+        "expression": "A",
+        "reducer": "last",
+        "refId": "B",
+        "type": "reduce"
+      }
+    },
+    {
+      "refId": "C",
+      "queryType": "",
+      "relativeTimeRange": {
+        "from": 300,
+        "to": 0
+      },
+      "datasourceUid": "__expr__",
+      "model": {
+        "conditions": [
+          {
+            "evaluator": {
+              "params": [0],
+              "type": "gt"
+            },
+            "operator": {
+              "type": "and"
+            },
+            "query": {
+              "params": ["B"]
+            },
+            "reducer": {
+              "params": [],
+              "type": "last"
+            },
+            "type": "query"
+          }
+        ],
+        "datasource": {
+          "type": "__expr__",
+          "uid": "__expr__"
+        },
+        "expression": "B",
+        "refId": "C",
+        "type": "threshold"
+      }
+    }
+  ],
+  "noDataState": "OK",
+  "execErrState": "Error",
+  "for": "0s",
+  "labels": {
+    "severity": "warning",
+    "team": "elcarehub-platform"
+  },
+  "annotations": {
+    "summary": "TtlAnomalyEvent fired {{ $values.B.Value | printf \"%.0f\" }} time(s) in the last 5 minutes",
+    "description": "extend_active_ttls found an ActiveListings/auction id in an unexpected state. Inspect recent ttl_anomaly events (subject=listing|auction). Runbook: docs/guides/storage-retention.md",
+    "runbook_url": "https://github.com/Elcare-care/elcare-care-app/blob/main/docs/guides/storage-retention.md"
+  },
+  "isPaused": false
+}

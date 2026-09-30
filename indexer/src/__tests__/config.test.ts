@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { loadConfig, validateRequiredEnv } from '../config';
+import { loadConfig, validateRequiredEnv, loadRealtimeConfig } from '../config';
 
 // ── loadConfig ────────────────────────────────────────────────────────────────
 
@@ -69,6 +69,63 @@ describe('loadConfig', () => {
   it('throws a descriptive error for fractional MAX_LEDGERS_PER_CYCLE', () => {
     process.env.MAX_LEDGERS_PER_CYCLE = '2.5';
     expect(() => loadConfig()).toThrow('MAX_LEDGERS_PER_CYCLE');
+  });
+});
+
+// ── loadRealtimeConfig (#192) ─────────────────────────────────────────────────
+
+describe('loadRealtimeConfig', () => {
+  const ORIGINAL = { ...process.env };
+  const KEYS = [
+    'SSE_MAX_CONNECTIONS', 'SSE_HEARTBEAT_MS', 'SSE_STREAM_MAXLEN',
+    'SSE_CLIENT_QUEUE_MAX', 'SSE_LOCAL_BUFFER_SIZE',
+  ];
+
+  beforeEach(() => {
+    for (const k of KEYS) delete process.env[k];
+  });
+
+  afterEach(() => {
+    process.env = { ...ORIGINAL };
+  });
+
+  it('returns defaults when env vars are absent', () => {
+    const cfg = loadRealtimeConfig();
+    expect(cfg).toEqual({
+      sseMaxConnections: 100,
+      sseHeartbeatMs: 30_000,
+      sseStreamMaxLen: 1000,
+      sseClientQueueMax: 100,
+      sseLocalBufferSize: 200,
+    });
+  });
+
+  it('parses each var from env', () => {
+    process.env.SSE_MAX_CONNECTIONS = '50';
+    process.env.SSE_HEARTBEAT_MS = '15000';
+    process.env.SSE_STREAM_MAXLEN = '5000';
+    process.env.SSE_CLIENT_QUEUE_MAX = '20';
+    process.env.SSE_LOCAL_BUFFER_SIZE = '400';
+
+    const cfg = loadRealtimeConfig();
+    expect(cfg).toEqual({
+      sseMaxConnections: 50,
+      sseHeartbeatMs: 15000,
+      sseStreamMaxLen: 5000,
+      sseClientQueueMax: 20,
+      sseLocalBufferSize: 400,
+    });
+  });
+
+  it('throws a descriptive error for a non-positive-integer value', () => {
+    process.env.SSE_MAX_CONNECTIONS = '-5';
+    expect(() => loadRealtimeConfig()).toThrow('SSE_MAX_CONNECTIONS');
+
+    process.env.SSE_MAX_CONNECTIONS = '3.5';
+    expect(() => loadRealtimeConfig()).toThrow('SSE_MAX_CONNECTIONS');
+
+    process.env.SSE_MAX_CONNECTIONS = 'not-a-number';
+    expect(() => loadRealtimeConfig()).toThrow('SSE_MAX_CONNECTIONS');
   });
 });
 

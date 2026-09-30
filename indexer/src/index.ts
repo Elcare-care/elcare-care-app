@@ -3,10 +3,18 @@ import express from 'express';
 import cors from 'cors';
 import compression from 'compression';
 import dotenv from 'dotenv';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import yaml from 'yaml';
+import swaggerUi from 'swagger-ui-express';
 import routes, { closeSSEClients } from './api/routes.js';
+import auditRoutes from './api/audit-routes.js';
 import { startPolling, registerShutdownHook, stopPoller, gracefulShutdown } from './poller.js';
 import { rateLimiter, globalRateLimiter } from './api/rate-limit-middleware.js';
 import { metricsMiddleware, handleMetrics, requestLogger } from './metrics.js';
+import { isStalled } from './stall.js';
+import { authMiddleware, setPrismaClient } from './api/auth-middleware.js';
 import { errorHandler } from './api/errors.js';
 import { startReconciler } from './reconciler.js';
 import { validateRequiredEnv, loadKeeperConfig, loadConfig } from './config.js';
@@ -16,12 +24,14 @@ import { startGapRepairWorker } from './gap-repair.js';
 import { logger } from './logger.js';
 import prisma from './db.js';
 import docsRouter from './api/docs-router.js';
-import { isStalled } from './stall.js';
 import {
   runAllChecks,
   runReadinessChecks,
 } from './health.js';
+import { VERSION } from './config.js';
 import { warmCache } from './cache-warmer.js';
+import { startDataQualityScheduler } from './data-quality.js';
+import { drainIpfsQueue } from './ipfs-backpressure.js';
 
 dotenv.config();
 
@@ -41,6 +51,9 @@ const cfg  = loadConfig();
 const app  = express();
 const PORT = process.env.PORT || 4000;
 
+// Initialize Prisma client for audit logging
+setPrismaClient(prisma);
+
 // ── CORS ──────────────────────────────────────────────────────────────────────
 const corsOrigins = parseCorsOrigins(process.env.CORS_ORIGIN);
 app.use(cors(buildCorsOptions(corsOrigins)));
@@ -50,6 +63,15 @@ app.use(express.json());
 
 // Global baseline rate limiter
 app.use(globalRateLimiter);
+
+// ── Version headers middleware — attaches version metadata to every response ─
+app.use((_req: express.Request, res: express.Response, next: express.NextFunction) => {
+  res.setHeader('X-Indexer-Version', VERSION.app);
+  res.setHeader('X-API-Version', VERSION.api);
+  res.setHeader('X-Event-Schema-Version', VERSION.eventSchema);
+  res.setHeader('X-DB-Migration-Version', VERSION.dbMigration);
+  next();
+});
 
 // Request logging and metrics
 app.use(requestLogger);
@@ -66,6 +88,7 @@ app.use('/', docsRouter);
 
 // API routes
 app.use('/', routes);
+app.use('/', auditRoutes);
 
 // Sentry error handler must come before the custom error handler
 Sentry.setupExpressErrorHandler(app);
@@ -82,8 +105,20 @@ app.get('/health', async (_req: express.Request, res: express.Response) => {
   res.status(httpStatus).json(result);
 });
 
-// GET /health/details — full diagnostics, requires admin token
-app.get('/health/details', async (req: express.Request, res: express.Response) => {
+// ── Version endpoint — lightweight, no auth required ────────────────────────
+app.get('/version', (_req: express.Request, res: express.Response) => {
+  res.json({
+    app: VERSION.app,
+    api: VERSION.api,
+    eventSchema: VERSION.eventSchema,
+    dbMigration: VERSION.dbMigration,
+    gitSha: VERSION.gitSha,
+    buildTime: VERSION.buildTime,
+  });
+});
+
+// GET /health/details — full diagnostics, requires operator token
+app.get('/health/details', authMiddleware('operator'), async (req: express.Request, res: express.Response) => {
   const adminToken = process.env.HEALTH_DETAILS_TOKEN;
   if (adminToken) {
     const provided = req.headers['x-admin-token'] ?? req.query.token;
@@ -163,7 +198,41 @@ const httpServer = app.listen(PORT, () => {
         logger.error('Fatal error in poller', { err });
         process.exit(1);
     });
-  }
+
+    // ── Reconciler loop ───────────────────────────────────────────────────
+    startReconciler().catch((err: unknown) => {
+      logger.error('Reconciler: fatal error', {
+        err: err instanceof Error ? err.message : String(err),
+      });
+    });
+
+    // ── Gap-repair worker ─────────────────────────────────────────────────
+    if (process.env.GAP_REPAIR_ENABLED === 'true') {
+      startGapRepairWorker().catch((err: unknown) => {
+        logger.error('Gap-repair: fatal error', {
+          err: err instanceof Error ? err.message : String(err),
+        });
+      });
+    }
+
+    // ── Data-quality checks ───────────────────────────────────────────────
+    if (process.env.DATA_QUALITY_ENABLED !== 'false') {
+      const stopDataQuality = startDataQualityScheduler();
+      registerShutdownHook(async () => { stopDataQuality(); });
+    }
+
+    // ── IPFS backpressure drain loop ──────────────────────────────────────
+    // Runs independently of ledger ingestion so slow/unavailable IPFS never
+    // delays chain event application. Interval is tunable via IPFS_DRAIN_INTERVAL_MS.
+    const ipfsDrainIntervalMs = parseInt(process.env.IPFS_DRAIN_INTERVAL_MS || '5000', 10);
+    const ipfsDrainTimer = setInterval(() => {
+      drainIpfsQueue().catch((err: unknown) => {
+        logger.warn('IPFS drain error (non-fatal)', {
+          err: err instanceof Error ? err.message : String(err),
+        });
+      });
+    }, ipfsDrainIntervalMs);
+    registerShutdownHook(async () => { clearInterval(ipfsDrainTimer); });
 
   // ── Keeper loop ───────────────────────────────────────────────────────────
   if (process.env.KEEPER_ENABLED === 'true') {

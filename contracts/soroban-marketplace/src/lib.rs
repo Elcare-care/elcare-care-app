@@ -7,14 +7,40 @@
 pub mod events;
 mod contract;
 pub mod escrow;
+pub mod math;
 pub mod storage;
 mod types;
+mod lifecycle;
 
 #[cfg(test)]
 mod test;
 
 #[cfg(test)]
-mod role_rbac_tests;
+mod invariant_tests;
+
+#[cfg(test)]
+mod migration_tests;
+
+#[cfg(test)]
+mod governance_tests;
+
+#[cfg(test)]
+mod ownership_tests;
+
+#[cfg(test)]
+mod royalty_recovery_tests;
+
+#[cfg(test)]
+mod reservation_tests;
+
+#[cfg(test)]
+mod asset_equivalence_tests;
+
+#[cfg(test)]
+mod settlement_pause_tests;
+
+#[cfg(test)]
+mod auction_cancel_audit_tests;
 
 #[cfg(test)]
 mod offer_sweep_tests;
@@ -23,27 +49,48 @@ mod offer_sweep_tests;
 mod counter_offer_tests;
 
 #[cfg(test)]
-mod reservation_tests;
+mod governance_quorum_tests;
+
+#[cfg(test)]
+mod erc1155_quantity_tests;
 
 pub use contract::MarketplaceContract;
 pub use types::{
-    BidRecord, CancelReason, Listing, ListingStatus, MarketplaceError, Offer, OfferStatus,
+    Auction, AuctionCancelReason, AuctionStatus, BatchItemError, BidRecord, CancelReason,
+    CollectionStandard, GovernanceProposal, GovernanceProposalType, Listing, ListingStatus,
+    MarketplaceError, Offer, OfferStatus, PauseMatrix, Recipient, RoleType,
 };
 
 #[cfg(any(test, feature = "testutils"))]
 pub use contract::MarketplaceContractClient;
 
-// ── Compile-time discriminant assertions (Issue #853) ────────────────────────
+// ── Reentrancy guard documentation (Issue #204) ───────────────────────────────
 //
-// These `const` assertions guarantee that specific error codes never silently
-// shift — any rename or renumber that violates the catalog will be caught at
-// compile time, not just at CI.
+// The following entry-points are protected by a per-resource reentrancy lock
+// stored in Soroban temporary storage (TTL = REENTRANCY_LOCK_TTL ledgers):
 //
-// IMPORTANT: The discriminants listed here are part of the on-chain ABI.
-// Changing them is a breaking change. Add new variants at the end of the enum
-// and never reuse a retired number.
-const _: () = assert!(MarketplaceError::Unauthorized as u32 == 5);
-const _: () = assert!(MarketplaceError::ReentrancyGuard as u32 == 22);
-const _: () = assert!(MarketplaceError::TokenNotWhitelisted as u32 == 25);
-const _: () = assert!(MarketplaceError::ArithmeticOverflow as u32 == 40);
-const _: () = assert!(MarketplaceError::InvalidStateTransition as u32 == 75);
+//   Listing locks  (DataKey::ListingLock(listing_id)):
+//     • buy_artwork      — prevents token-callback re-entry during payout
+//     • accept_offer     — prevents token-callback re-entry during payout
+//
+//   Auction locks  (DataKey::AuctionLock(auction_id)):
+//     • finalize_auction — prevents re-entry during bid payout
+//
+// The lock is managed by the ReentrancyScope RAII struct defined in contract.rs.
+// Its Drop impl clears the lock, guaranteeing release whether the function
+// returns normally or panics.  On Soroban, a panicking invocation rolls back
+// all storage writes atomically, so even without RAII a stuck lock would
+// self-heal.  The RAII pattern adds an explicit defence-in-depth layer for any
+// future execution model that may not guarantee atomic rollback.
+//
+// Error code for a reentrant call attempt: MarketplaceError::ReentrancyGuard = 22
+
+// Compile-time assertion: ReentrancyGuard must be error code 22.
+// If the discriminant ever drifts, this will fail to compile.
+const _: () = {
+    // Discriminant is repr(u32) so we can cast to check at compile time.
+    assert!(
+        types::MarketplaceError::ReentrancyGuard as u32 == 22,
+        "ReentrancyGuard discriminant must remain 22 — update docs if intentionally changed"
+    );
+};

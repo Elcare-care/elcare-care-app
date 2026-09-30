@@ -19,12 +19,19 @@
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, Bytes, Env, String,
-    Vec,
+    Symbol, Vec,
 };
+
+/// Shared metadata validation rules (Issue #476).
+pub mod metadata;
 
 const TTL_THRESHOLD: u32 = 50_000;
 const TTL_BUMP: u32 = 100_000;
 const MAX_BPS: u32 = 10_000; // 100% in basis points
+/// Maximum number of items accepted by any single batch call (#274).
+const MAX_BATCH_SIZE: u32 = 200;
+/// Maximum URI length in bytes (#276).
+const MAX_URI_LEN: u32 = 2048;
 
 // ─── Errors ──────────────────────────────────────────────────────────────────
 
@@ -40,21 +47,39 @@ pub enum Error {
     MaxSupplyReached = 6,
     NotCreator = 7,
     InsufficientBalance = 8,
-    MetadataFrozen = 9,    // base_uri cannot be updated after freeze
-    AlreadyFrozen = 10,    // freeze_metadata called more than once
-    InvalidBps = 11,       // basis points exceed MAX_BPS (10_000)
-    CollectionPaused = 12, // minting is paused
-    ApprovalExpired = 13,  // approval expiry has already passed at set time
-    // Issue #851: Metadata validation errors
-    EmptyName = 14,
-    NameTooLong = 15,
-    EmptySymbol = 16,
-    SymbolTooLong = 17,
-    InvalidSymbolChar = 18,
-    InvalidMaxSupply = 19,
-    EmptyUri = 20,
-    UriTooLong = 21,
-    InvalidUri = 22,
+    MetadataFrozen = 9,
+    AlreadyFrozen = 10,
+    InvalidBps = 11,
+    CollectionPaused = 12,
+    ApprovalExpired = 13,
+    /// migrate() called for a version already marked done in persistent storage.
+    AlreadyMigrated = 14,
+    /// Unsupported version jump — only sequential upgrades are permitted.
+    UnsupportedMigration = 15,
+    /// Empty URI provided.
+    EmptyUri = 16,
+    /// URI exceeds maximum length.
+    UriTooLong = 17,
+    /// Empty batch provided.
+    EmptyBatch = 18,
+    /// Batch exceeds maximum size.
+    BatchTooLarge = 19,
+    /// Collection name is empty (Issue #476).
+    EmptyName = 20,
+    /// Collection name exceeds maximum length (Issue #476).
+    NameTooLong = 21,
+    /// Collection symbol is empty (Issue #476).
+    EmptySymbol = 22,
+    /// Collection symbol exceeds maximum length (Issue #476).
+    SymbolTooLong = 23,
+    /// max_supply is zero or exceeds the platform cap (Issue #476).
+    InvalidMaxSupply = 24,
+    /// accept_creator() called when no succession proposal is pending (#484).
+    NoPendingCreator = 25,
+    /// accept_creator() called by an address that is not the proposed successor (#484).
+    NotPendingCreator = 26,
+    /// accept_creator() called after the pending proposal's expiry ledger (#484).
+    ProposalExpired = 27,
 }
 
 // ─── Storage Keys ─────────────────────────────────────────────────────────────
@@ -65,6 +90,16 @@ pub enum DataKey {
     // Instance storage — cheap, shared TTL with contract instance
     Initialized,
     Creator,
+    /// Original creator address — set once at initialization and never changed
+    /// even after a successful two-step creator succession (#484).  Used to
+    /// preserve historical royalty attribution and voucher revocation authority
+    /// for pre-succession tokens.
+    OriginalCreator,
+    /// Pending successor address proposed via `propose_creator` (#484).
+    PendingCreator,
+    /// Ledger sequence at which the pending proposal expires (#484).
+    /// Redemptions after this sequence are rejected with `ProposalExpired`.
+    PendingCreatorExpiry,
     Name,
     Symbol,
     MaxSupply,
@@ -86,10 +121,18 @@ pub enum DataKey {
     ApprovedForAllExpiry(Address, Address),
     BaseUri,        // String — collection-level base URI (optional)
     MetadataFrozen, // bool   — permanently frozen when true
+    TokenFrozen(u64), // bool  — per-token metadata frozen when true
     // Per-token royalty overrides (persistent, optional)
     TokenRoyaltyReceiver(u64), // Address
     TokenRoyaltyBps(u64),      // u32
     Paused,                    // bool   — minting paused when true
+    // ── Versioned migration registry ─────────────────────────────────────
+    /// Completion marker: present when migration to `version` is done.
+    MigrationDone(String),
+    /// Resumable progress cursor during an in-flight migration.
+    MigrationCursor(String),
+    /// Version string last written to on-chain storage by `migrate()`.
+    ContractVersion,
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -111,6 +154,20 @@ fn u64_to_string(env: &Env, mut n: u64) -> String {
         buf[..len].reverse();
     }
     String::from_bytes(env, &buf[..len])
+}
+
+/// Rejects empty or oversized metadata URIs (#276). Applied to every mint
+/// path and to `set_base_uri` so boundary/malformed values are caught
+/// consistently regardless of entry point.
+fn validate_uri(uri: &String) -> Result<(), Error> {
+    let len = uri.len();
+    if len == 0 {
+        return Err(Error::EmptyUri);
+    }
+    if len > MAX_URI_LEN {
+        return Err(Error::UriTooLong);
+    }
+    Ok(())
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -135,12 +192,19 @@ impl NormalNFT721 {
         if env.storage().instance().has(&DataKey::Initialized) {
             return Err(Error::AlreadyInitialized);
         }
-        metadata::validate_collection_name(&name)?;
-        metadata::validate_collection_symbol(&env, &symbol)?;
-        metadata::validate_max_supply(max_supply)?;
-        metadata::validate_royalty_bps(royalty_bps)?;
+        // Issue #476: apply shared metadata validation rules before writing any
+        // state so an invalid combination cannot leave the collection partially
+        // initialised.
+        metadata::validate_name(&name, Error::EmptyName, Error::NameTooLong)?;
+        metadata::validate_symbol(&symbol, Error::EmptySymbol, Error::SymbolTooLong)?;
+        metadata::validate_max_supply(max_supply, Error::InvalidMaxSupply)?;
+        metadata::validate_royalty_bps(royalty_bps, Error::InvalidBps)?;
+
         env.storage().instance().set(&DataKey::Initialized, &true);
         env.storage().instance().set(&DataKey::Creator, &creator);
+        // OriginalCreator is set once at initialization and never overwritten
+        // by succession — it preserves historical royalty attribution (#484).
+        env.storage().instance().set(&DataKey::OriginalCreator, &creator);
         env.storage().instance().set(&DataKey::Name, &name);
         env.storage().instance().set(&DataKey::Symbol, &symbol);
         env.storage()
@@ -165,6 +229,12 @@ impl NormalNFT721 {
             .unwrap_or(0)
     }
 
+    /// Marketplace compatibility tag (Issue #841). Must match
+    /// `CollectionStandard::Erc721` / Symbol `"ERC721"`.
+    pub fn contract_type(env: Env) -> Symbol {
+        Symbol::new(&env, "ERC721")
+    }
+
     // ── Minting ───────────────────────────────────────────────────────────
 
     /// Creator mints a single token to `to` with the given metadata URI.
@@ -182,7 +252,7 @@ impl NormalNFT721 {
             return Err(Error::CollectionPaused);
         }
 
-        metadata::validate_token_uri(&uri)?;
+        validate_uri(&uri)?;
 
         let token_id: u64 = env
             .storage()
@@ -225,7 +295,16 @@ impl NormalNFT721 {
 
         let uris_len = uris.len();
         if uris_len == 0 {
-            return Ok(());
+            return Err(Error::EmptyBatch);
+        }
+        if uris_len > MAX_BATCH_SIZE {
+            return Err(Error::BatchTooLarge);
+        }
+
+        // Validate every URI up front (#276) — before any storage mutation,
+        // so a single malformed entry can't leave a partially-minted batch.
+        for uri in uris.iter() {
+            validate_uri(&uri)?;
         }
 
         // Read storage ONCE before the loop
@@ -318,14 +397,22 @@ impl NormalNFT721 {
 
     // ── Transfers ─────────────────────────────────────────────────────────
 
-    /// Owner transfers their token.
+    /// Owner transfers their token.  Blocked while collection is paused.
     pub fn transfer(env: Env, from: Address, to: Address, token_id: u64) -> Result<(), Error> {
         Self::extend_instance_ttl(&env);
         from.require_auth();
+        if env
+            .storage()
+            .instance()
+            .get::<DataKey, bool>(&DataKey::Paused)
+            .unwrap_or(false)
+        {
+            return Err(Error::CollectionPaused);
+        }
         Self::_transfer(&env, &from, &to, token_id)
     }
 
-    /// Approved spender (or operator) transfers on behalf of owner.
+    /// Approved spender (or operator) transfers on behalf of owner.  Blocked while paused.
     pub fn transfer_from(
         env: Env,
         spender: Address,
@@ -335,6 +422,14 @@ impl NormalNFT721 {
     ) -> Result<(), Error> {
         Self::extend_instance_ttl(&env);
         spender.require_auth();
+        if env
+            .storage()
+            .instance()
+            .get::<DataKey, bool>(&DataKey::Paused)
+            .unwrap_or(false)
+        {
+            return Err(Error::CollectionPaused);
+        }
         Self::_check_approved(&env, &spender, &from, token_id)?;
         // clear single-token approval + its expiry on transfer
         env.storage()
@@ -505,9 +600,19 @@ impl NormalNFT721 {
 
     // ── Burn ──────────────────────────────────────────────────────────────
 
+    /// Burn a token. Blocked while collection is paused. Also clears any
+    /// per-token royalty override so stale entries cannot accumulate.
     pub fn burn(env: Env, spender: Address, token_id: u64) -> Result<(), Error> {
         Self::extend_instance_ttl(&env);
         spender.require_auth();
+        if env
+            .storage()
+            .instance()
+            .get::<DataKey, bool>(&DataKey::Paused)
+            .unwrap_or(false)
+        {
+            return Err(Error::CollectionPaused);
+        }
         let owner: Address = env
             .storage()
             .persistent()
@@ -541,6 +646,14 @@ impl NormalNFT721 {
         env.storage()
             .persistent()
             .remove(&DataKey::ApprovedExpiry(token_id));
+        // Clear per-token royalty overrides so they cannot be read back as
+        // stale data after the token ceases to exist.
+        env.storage()
+            .persistent()
+            .remove(&DataKey::TokenRoyaltyReceiver(token_id));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::TokenRoyaltyBps(token_id));
 
         let supply: u64 = env
             .storage()
@@ -639,13 +752,17 @@ impl NormalNFT721 {
 
     /// EIP-2981-style royalty query: returns (recipient, royalty_amount) for a
     /// given token and sale price.  Per-token overrides take priority over the
-    /// collection default.  Royalty amount = sale_price * bps / 10_000 using
-    /// checked arithmetic (returns 0 amount when sale_price is 0).
+    /// collection default.  Returns `TokenNotFound` if the token does not exist.
+    /// Royalty amount = sale_price * bps / 10_000 using checked arithmetic.
     pub fn royalty_info_for(
         env: Env,
         token_id: u64,
         sale_price: i128,
     ) -> Result<(Address, i128), Error> {
+        // Reject queries for non-existent (never minted or already burnt) tokens.
+        if !env.storage().persistent().has(&DataKey::Owner(token_id)) {
+            return Err(Error::TokenNotFound);
+        }
         // Resolve recipient and bps — per-token override wins if present.
         let (receiver, bps) = if env
             .storage()
@@ -738,9 +855,138 @@ impl NormalNFT721 {
         Ok(())
     }
 
+    /// Step 1 of the two-step creator succession (#484).
+    ///
+    /// The current creator proposes `new_creator` as the next collection
+    /// administrator.  The proposal expires at `expires_at` (ledger sequence).
+    ///
+    /// - Overwrites any previously pending proposal.
+    /// - Does NOT transfer any authority until `accept_creator` is called.
+    /// - If `expires_at` is in the past the call reverts with `ApprovalExpired`.
+    pub fn propose_creator(
+        env: Env,
+        new_creator: Address,
+        expires_at: u32,
+    ) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
+        let current = Self::only_creator(&env)?;
+        if env.ledger().sequence() >= expires_at {
+            return Err(Error::ApprovalExpired);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingCreator, &new_creator);
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingCreatorExpiry, &expires_at);
+        env.events().publish(
+            (symbol_short!("cr_prop"), current),
+            (new_creator, expires_at),
+        );
+        Ok(())
+    }
+
+    /// Step 2 of the two-step creator succession (#484).
+    ///
+    /// The proposed successor accepts the role.  After a successful call:
+    /// - `Creator` is updated to `new_creator`.
+    /// - `OriginalCreator` is **unchanged** so historical royalty attribution
+    ///    and voucher revocation records remain intact.
+    /// - The pending proposal and expiry are cleared.
+    pub fn accept_creator(env: Env, new_creator: Address) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
+        new_creator.require_auth();
+        let pending: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingCreator)
+            .ok_or(Error::NoPendingCreator)?;
+        if new_creator != pending {
+            return Err(Error::NotPendingCreator);
+        }
+        let expiry: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingCreatorExpiry)
+            .unwrap_or(0);
+        if env.ledger().sequence() >= expiry {
+            return Err(Error::ProposalExpired);
+        }
+        let old_creator: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Creator)
+            .ok_or(Error::NotInitialized)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::Creator, &new_creator);
+        env.storage().instance().remove(&DataKey::PendingCreator);
+        env.storage()
+            .instance()
+            .remove(&DataKey::PendingCreatorExpiry);
+        env.events().publish(
+            (symbol_short!("cr_acc"), old_creator),
+            new_creator,
+        );
+        Ok(())
+    }
+
+    /// Cancel a pending creator succession proposal (#484).  Only the current
+    /// creator may cancel.  Returns `NoPendingCreator` if no proposal exists.
+    pub fn cancel_creator_proposal(env: Env) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
+        let current = Self::only_creator(&env)?;
+        let pending: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingCreator)
+            .ok_or(Error::NoPendingCreator)?;
+        env.storage().instance().remove(&DataKey::PendingCreator);
+        env.storage()
+            .instance()
+            .remove(&DataKey::PendingCreatorExpiry);
+        env.events().publish(
+            (symbol_short!("cr_canc"), current),
+            pending,
+        );
+        Ok(())
+    }
+
+    /// Returns the original creator address set at initialization (#484).
+    /// This never changes even after a successful creator succession.
+    pub fn original_creator(env: Env) -> Address {
+        env.storage()
+            .instance()
+            .get(&DataKey::OriginalCreator)
+            // Fallback for collections initialized before #484: treat the
+            // current Creator as the original creator (safe because succession
+            // could not have happened without OriginalCreator being set first).
+            .unwrap_or_else(|| {
+                env.storage().instance().get(&DataKey::Creator).unwrap()
+            })
+    }
+
+    /// Returns the pending creator address and expiry, or None if no proposal
+    /// is currently active (#484).
+    pub fn pending_creator(env: Env) -> Option<(Address, u32)> {
+        let pending = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::PendingCreator)?;
+        let expiry = env
+            .storage()
+            .instance()
+            .get::<DataKey, u32>(&DataKey::PendingCreatorExpiry)
+            .unwrap_or(0);
+        Some((pending, expiry))
+    }
+
     pub fn update_royalty(env: Env, receiver: Address, bps: u32) -> Result<(), Error> {
         Self::extend_instance_ttl(&env);
         Self::only_creator(&env)?;
+        if bps > MAX_BPS {
+            return Err(Error::InvalidBps);
+        }
         env.storage()
             .instance()
             .set(&DataKey::RoyaltyReceiver, &receiver);
@@ -765,7 +1011,7 @@ impl NormalNFT721 {
 
     /// Set a per-token royalty override with bps validation.
     /// When set, `royalty_info_for(token_id, ..)` uses this instead of the default.
-    /// Callable only by creator.
+    /// Callable only by creator.  The token must exist.
     pub fn set_token_royalty(
         env: Env,
         token_id: u64,
@@ -776,6 +1022,9 @@ impl NormalNFT721 {
         Self::only_creator(&env)?;
         if bps > MAX_BPS {
             return Err(Error::InvalidBps);
+        }
+        if !env.storage().persistent().has(&DataKey::Owner(token_id)) {
+            return Err(Error::TokenNotFound);
         }
         env.storage()
             .persistent()
@@ -824,8 +1073,7 @@ impl NormalNFT721 {
     /// Callable only by creator.
     pub fn set_base_uri(env: Env, base_uri: String) -> Result<(), Error> {
         Self::extend_instance_ttl(&env);
-        Self::only_creator(&env)?;
-        metadata::validate_token_uri(&base_uri)?;
+        let creator = Self::only_creator(&env)?;
         if env
             .storage()
             .instance()
@@ -834,7 +1082,13 @@ impl NormalNFT721 {
         {
             return Err(Error::MetadataFrozen);
         }
+        validate_uri(&base_uri)?;
+        let old_uri: Option<String> = env.storage().instance().get(&DataKey::BaseUri);
         env.storage().instance().set(&DataKey::BaseUri, &base_uri);
+        env.events().publish(
+            (symbol_short!("meta_upd"), creator),
+            (old_uri, base_uri),
+        );
         Ok(())
     }
 
@@ -842,7 +1096,7 @@ impl NormalNFT721 {
     /// revert with `AlreadyFrozen`.  Callable only by creator.
     pub fn freeze_metadata(env: Env) -> Result<(), Error> {
         Self::extend_instance_ttl(&env);
-        Self::only_creator(&env)?;
+        let creator = Self::only_creator(&env)?;
         if env
             .storage()
             .instance()
@@ -854,6 +1108,8 @@ impl NormalNFT721 {
         env.storage()
             .instance()
             .set(&DataKey::MetadataFrozen, &true);
+        env.events()
+            .publish((symbol_short!("meta_frz"),), creator);
         Ok(())
     }
 
@@ -865,9 +1121,172 @@ impl NormalNFT721 {
             .unwrap_or(false)
     }
 
+    /// Permanently freeze metadata for a specific token. Can only be called once
+    /// per token; subsequent calls revert with `AlreadyFrozen`. Callable by the
+    /// collection owner or the token owner.
+    pub fn freeze_token(env: Env, caller: Address, token_id: u64) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
+        caller.require_auth();
+        
+        // Verify token exists
+        let owner: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Owner(token_id))
+            .ok_or(Error::TokenNotFound)?;
+        
+        // Allow creator or token owner
+        let creator = Self::only_creator(&env).ok();
+        if creator != Some(caller.clone()) && owner != caller {
+            return Err(Error::NotOwner);
+        }
+        
+        if env
+            .storage()
+            .persistent()
+            .get::<DataKey, bool>(&DataKey::TokenFrozen(token_id))
+            .unwrap_or(false)
+        {
+            return Err(Error::AlreadyFrozen);
+        }
+        
+        env.storage()
+            .persistent()
+            .set(&DataKey::TokenFrozen(token_id), &true);
+        env.storage().persistent().extend_ttl(
+            &DataKey::TokenFrozen(token_id),
+            TTL_THRESHOLD,
+            TTL_BUMP,
+        );
+        
+        env.events()
+            .publish((symbol_short!("token_frz"),), token_id);
+        Ok(())
+    }
+
+    /// Update the URI for a specific token. Reverts if either the collection
+    /// or the token's metadata is frozen. Callable only by creator.
+    pub fn set_token_uri(env: Env, token_id: u64, uri: String) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
+        let creator = Self::only_creator(&env)?;
+        
+        // Check collection-level freeze
+        if env
+            .storage()
+            .instance()
+            .get::<DataKey, bool>(&DataKey::MetadataFrozen)
+            .unwrap_or(false)
+        {
+            return Err(Error::MetadataFrozen);
+        }
+        
+        // Check token-level freeze
+        if env
+            .storage()
+            .persistent()
+            .get::<DataKey, bool>(&DataKey::TokenFrozen(token_id))
+            .unwrap_or(false)
+        {
+            return Err(Error::MetadataFrozen);
+        }
+        
+        // Verify token exists
+        if !env.storage().persistent().has(&DataKey::Owner(token_id)) {
+            return Err(Error::TokenNotFound);
+        }
+        
+        validate_uri(&uri)?;
+        let old_uri: Option<String> = env.storage().persistent().get(&DataKey::TokenUri(token_id));
+        env.storage()
+            .persistent()
+            .set(&DataKey::TokenUri(token_id), &uri);
+        env.storage().persistent().extend_ttl(
+            &DataKey::TokenUri(token_id),
+            TTL_THRESHOLD,
+            TTL_BUMP,
+        );
+        
+        env.events().publish(
+            (symbol_short!("meta_upd"), creator),
+            (token_id, old_uri, uri),
+        );
+        Ok(())
+    }
+
+    /// Returns `true` if a specific token's metadata has been permanently frozen.
+    pub fn is_token_frozen(env: Env, token_id: u64) -> bool {
+        env.storage()
+            .persistent()
+            .get::<DataKey, bool>(&DataKey::TokenFrozen(token_id))
+            .unwrap_or(false)
+    }
+
     /// Returns the stored base URI, or `None` if unset.
     pub fn base_uri(env: Env) -> Option<String> {
         env.storage().instance().get(&DataKey::BaseUri)
+    }
+
+    // ── Versioning & Migration ─────────────────────────────────────────────
+
+    /// Semantic version compiled into this WASM.
+    pub fn version(env: Env) -> soroban_sdk::String {
+        soroban_sdk::String::from_str(&env, "1.0.0")
+    }
+
+    /// On-chain version string last written by `migrate()`, or `None` before
+    /// the first migration.
+    pub fn contract_version(env: Env) -> Option<String> {
+        env.storage().instance().get(&DataKey::ContractVersion)
+    }
+
+    /// Creator-guarded, idempotent storage migration entry point.
+    ///
+    /// Reverts with `AlreadyMigrated` when the "1.0.0" marker is already set.
+    ///
+    /// **v1.0.0 migration**: this is the initial version; the migration body
+    /// is intentionally empty — calling it simply records the completion marker
+    /// and the on-chain version string so operators can verify the upgrade
+    /// script applied correctly.  Future versions will add data-backfill steps
+    /// here following the same idempotent-by-marker pattern.
+    pub fn migrate(env: Env) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
+        Self::only_creator(&env)?;
+
+        let target = String::from_str(&env, "1.0.0");
+        let done_key = DataKey::MigrationDone(target.clone());
+
+        if env
+            .storage()
+            .persistent()
+            .get::<DataKey, bool>(&done_key)
+            .unwrap_or(false)
+        {
+            return Err(Error::AlreadyMigrated);
+        }
+
+        // ── v1.0.0 migration body ─────────────────────────────────────────
+        // Nothing to migrate for the initial version.  Future versions insert
+        // data-backfill logic here before recording the marker.
+        // ─────────────────────────────────────────────────────────────────
+
+        // Record completion marker (persistent so it survives instance bumps).
+        env.storage().persistent().set(&done_key, &true);
+        env.storage().persistent().extend_ttl(
+            &done_key,
+            TTL_THRESHOLD,
+            TTL_BUMP,
+        );
+
+        // Write the version to instance storage for operator verification.
+        env.storage()
+            .instance()
+            .set(&DataKey::ContractVersion, &target);
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("migrated"), target),
+            (),
+        );
+        Ok(())
     }
 
     // ── Private helpers ───────────────────────────────────────────────────

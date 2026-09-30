@@ -16,7 +16,7 @@ vi.mock('@stellar/stellar-sdk', () => ({
   scValToNative: mockScValToNative,
 }));
 
-import { parseMarketplaceEvent, type DecodedEvent } from '../parser';
+import { parseMarketplaceEvent, KNOWN_EVENT_TYPES, DecodedEvent } from '../parser';
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -25,7 +25,9 @@ import { parseMarketplaceEvent, type DecodedEvent } from '../parser';
  * - topicSymbol: the symbol the XDR topic decodes to (e.g. 'lst_crtd')
  * - valueData:   the plain object returned by scValToNative for the value XDR
  */
-function setupMocks(topicSymbol: string, valueData: Record<string, any> | any[]) {
+function setupMocks(topicSymbol: string, valueData: any) {
+  // First scValToNative call → topic symbol
+  // Second scValToNative call → event value data
   mockScValToNative
     .mockReturnValueOnce(topicSymbol)
     .mockReturnValueOnce(valueData);
@@ -62,24 +64,37 @@ describe('parseMarketplaceEvent — topic mapping', () => {
     mockFromXDR.mockReturnValue({});
   });
 
-  // Each entry: [symbol, expectedType, minimal valid fixture]
-  const cases: [string, string, Record<string, any> | any[]][] = [
-    ['lst_crtd', 'LISTING_CREATED',   LISTING_FIXTURE],
-    ['art_sold', 'ARTWORK_SOLD',      ARTWORK_SOLD_FIXTURE],
-    ['lst_cncl', 'LISTING_CANCELLED', LISTING_CANCELLED_FIXTURE],
-    ['lst_updt', 'LISTING_UPDATED',   LISTING_UPDATED_FIXTURE],
-    ['bid_plcd', 'BID_PLACED',        BID_PLACED_FIXTURE],
-    ['auc_rslv', 'AUCTION_RESOLVED',  AUCTION_RESOLVED_FIXTURE],
-    ['auc_cncl', 'AUCTION_CANCELLED', AUCTION_CANCELLED_FIXTURE],
-    ['ofr_made', 'OFFER_MADE',        OFFER_MADE_FIXTURE],
-    ['ofr_accp', 'OFFER_ACCEPTED',    OFFER_ACCEPTED_FIXTURE],
-    ['ofr_rjct', 'OFFER_REJECTED',    OFFER_REJECTED_FIXTURE],
-    ['ofr_wdrn', 'OFFER_WITHDRAWN',   OFFER_WITHDRAWN_FIXTURE],
-    ['auc_crtd', 'AUCTION_CREATED',   AUCTION_CREATED_FIXTURE],
-    ['dep_n721',  'DEPLOY_NORMAL_721',  DEPLOY_FIXTURE],
-    ['dep_n1155', 'DEPLOY_NORMAL_1155', DEPLOY_FIXTURE],
-    ['dep_l721',  'DEPLOY_LAZY_721',    DEPLOY_FIXTURE],
-    ['dep_l1155', 'DEPLOY_LAZY_1155',   DEPLOY_FIXTURE],
+  // All 24 marketplace symbols from contracts/soroban-marketplace/src/events.rs
+  // plus the 4 launchpad deploy symbols. This table pins symbol → type.
+  const cases: [string, string][] = [
+    ['lst_crtd', 'LISTING_CREATED'],
+    ['art_sold', 'ARTWORK_SOLD'],
+    ['lst_cncl', 'LISTING_CANCELLED'],
+    ['lst_updt', 'LISTING_UPDATED'],
+    ['lst_pru', 'LISTING_PRICE_UPDATED'],
+    ['lst_expd', 'LISTING_EXPIRED'],
+    ['bid_plcd', 'BID_PLACED'],
+    ['auc_rslv', 'AUCTION_RESOLVED'],
+    ['auc_cncl', 'AUCTION_CANCELLED'],
+    ['auc_ext', 'AUCTION_EXTENDED'],
+    ['ofr_made', 'OFFER_MADE'],
+    ['ofr_accp', 'OFFER_ACCEPTED'],
+    ['ofr_rjct', 'OFFER_REJECTED'],
+    ['ofr_wdrn', 'OFFER_WITHDRAWN'],
+    ['ofr_rclm', 'OFFER_RECLAIMED'],
+    ['roy_paid', 'ROYALTY_PAID'],
+    ['fee_cltd', 'PROTOCOL_FEE_COLLECTED'],
+    ['adm_prop', 'ADMIN_TRANSFER_PROPOSED'],
+    ['adm_xfrd', 'ADMIN_TRANSFERRED'],
+    ['art_rvkd', 'ARTIST_REVOKED'],
+    ['art_rnst', 'ARTIST_REINSTATED'],
+    ['ctr_psd', 'CONTRACT_PAUSED'],
+    ['ctr_unpsd', 'CONTRACT_UNPAUSED'],
+    ['auc_crtd', 'AUCTION_CREATED'],
+    ['dep_n721', 'DEPLOY_NORMAL_721'],
+    ['dep_n1155', 'DEPLOY_NORMAL_1155'],
+    ['dep_l721', 'DEPLOY_LAZY_721'],
+    ['dep_l1155', 'DEPLOY_LAZY_1155'],
   ];
 
   for (const [symbol, expectedType, fixture] of cases) {
@@ -90,6 +105,12 @@ describe('parseMarketplaceEvent — topic mapping', () => {
       expect(result!.eventType).toBe(expectedType);
     });
   }
+
+  it('covers every known event type exactly once (no unmapped topics)', () => {
+    const expectedTypes = cases.map(([, type]) => type).sort();
+    expect([...KNOWN_EVENT_TYPES].sort()).toEqual(expectedTypes);
+    expect(KNOWN_EVENT_TYPES).toHaveLength(28);
+  });
 
   it('returns null for an unknown topic symbol', () => {
     setupMocks('unknown_sym', {});
@@ -366,6 +387,20 @@ describe('parseMarketplaceEvent — LISTING_CANCELLED fixture', () => {
     expect(r.actor).toBe('');
     expect(r.data.listing_id).toBe('3');
   });
+
+  it('preserves reason as object when CancelReason::Expired', () => {
+    setupMocks('lst_cncl', { listing_id: 7n, reason: { tag: 2 } });
+    const r = parseMarketplaceEvent(['t'], 'v', 400)!;
+    expect(r.eventType).toBe('LISTING_CANCELLED');
+    expect(r.data.reason).toEqual({ tag: 2 });
+  });
+
+  it('preserves reason as string for non-object values', () => {
+    setupMocks('lst_cncl', { listing_id: 8n, reason: 'owner' });
+    const r = parseMarketplaceEvent(['t'], 'v', 401)!;
+    expect(r.eventType).toBe('LISTING_CANCELLED');
+    expect(r.data.reason).toBe('owner');
+  });
 });
 
 describe('parseMarketplaceEvent — LISTING_UPDATED fixture', () => {
@@ -522,5 +557,82 @@ describe('parseMarketplaceEvent — deploy event fixtures', () => {
     setupMocks('dep_n721', ['GCREATOR', 'CCONTRACT']);
     const r = parseMarketplaceEvent(['t'], 'v', 1)!;
     expect(r.listingId).toBeNull();
+  });
+});
+
+// ── Issue #213: LISTING_PRICE_UPDATED ────────────────────────────────────────
+
+describe('parseMarketplaceEvent — LISTING_PRICE_UPDATED fixture', () => {
+  beforeEach(() => { vi.resetAllMocks(); mockFromXDR.mockReturnValue({}); });
+
+  it('maps listing_price_updated topic to LISTING_PRICE_UPDATED event type', () => {
+    setupMocks('listing_price_updated', {
+      listing_id: 7n,
+      old_price: 10_000_000n,
+      new_price: 20_000_000n,
+      updated_by: 'GARTIST123',
+    });
+    const r = parseMarketplaceEvent(['t'], 'v', 800)!;
+    expect(r).not.toBeNull();
+    expect(r.eventType).toBe('LISTING_PRICE_UPDATED');
+  });
+
+  it('extracts listing_id and serialises old_price and new_price as strings', () => {
+    setupMocks('listing_price_updated', {
+      listing_id: 7n,
+      old_price: 10_000_000n,
+      new_price: 20_000_000n,
+      updated_by: 'GARTIST123',
+    });
+    const r = parseMarketplaceEvent(['t'], 'v', 800)!;
+    expect(r.listingId).toBe(7n);
+    expect(r.data.old_price).toBe('10000000');
+    expect(r.data.new_price).toBe('20000000');
+  });
+
+  it('sets actor from updated_by field', () => {
+    setupMocks('listing_price_updated', {
+      listing_id: 9n,
+      old_price: 5_000_000n,
+      new_price: 15_000_000n,
+      updated_by: 'GUPDATER99',
+    });
+    // updated_by is not one of the standard actor fields (artist/creator/offerer/bidder/buyer)
+    // so actor will be empty string — the indexer uses data.updated_by for changedBy
+    const r = parseMarketplaceEvent(['t'], 'v', 900)!;
+    expect(r.data.updated_by).toBe('GUPDATER99');
+  });
+
+  it('throws SchemaDecodeError when old_price is missing', async () => {
+    const { SchemaDecodeError } = await import('../parser.js');
+    setupMocks('listing_price_updated', {
+      listing_id: 1n,
+      new_price: 20_000_000n,
+      updated_by: 'GA',
+      // old_price intentionally omitted
+    });
+    expect(() => parseMarketplaceEvent(['t'], 'v', 1)).toThrow(SchemaDecodeError);
+  });
+
+  it('throws SchemaDecodeError when new_price is missing', async () => {
+    const { SchemaDecodeError } = await import('../parser.js');
+    setupMocks('listing_price_updated', {
+      listing_id: 1n,
+      old_price: 10_000_000n,
+      updated_by: 'GA',
+      // new_price intentionally omitted
+    });
+    expect(() => parseMarketplaceEvent(['t'], 'v', 1)).toThrow(SchemaDecodeError);
+  });
+
+  it('preserves ledgerSequence on the decoded event', () => {
+    setupMocks('listing_price_updated', {
+      listing_id: 3n,
+      old_price: 1_000_000n,
+      new_price: 2_000_000n,
+      updated_by: 'GA',
+    });
+    const r = parseMarketplaceEvent(['t'], 'v', 1234)!;
+    expect(r.ledgerSequence).toBe(1234);
   });
 });

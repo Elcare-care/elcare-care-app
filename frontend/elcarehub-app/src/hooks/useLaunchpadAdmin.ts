@@ -9,6 +9,8 @@ import {
   getLaunchpadAdmin,
   transferLaunchpadAdmin,
   updatePlatformFee,
+  updateCollectionWasm,
+  upgradeCollection,
   getPlatformFee,
   getAllCollections,
   getCollectionCount,

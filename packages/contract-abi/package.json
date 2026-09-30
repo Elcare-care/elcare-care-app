@@ -1,0 +1,46 @@
+{
+  "name": "@elcarehub/contract-abi",
+  "version": "1.1.0",
+  "description": "Versioned ABI, types, and compatibility utilities for ElcareHub Soroban contracts",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    },
+    "./marketplace": {
+      "import": "./dist/marketplace.js",
+      "types": "./dist/marketplace.d.ts"
+    },
+    "./launchpad": {
+      "import": "./dist/launchpad.js",
+      "types": "./dist/launchpad.d.ts"
+    },
+    "./abi.json": "./abi.json"
+  },
+  "files": [
+    "dist",
+    "abi.json",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "validate": "node --input-type=module < scripts/validate-abi.mjs",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "stellar",
+    "soroban",
+    "elcarehub",
+    "marketplace",
+    "abi",
+    "smart-contracts"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "typescript": "^5.4.5"
+  }
+}

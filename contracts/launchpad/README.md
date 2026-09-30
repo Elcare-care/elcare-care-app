@@ -74,6 +74,14 @@ The `salt` parameter prevents front-running — two `deploy` calls with the same
 
 ---
 
+## Emergency Pause Role (Issue #267)
+
+`pause()` / `unpause()` halt all four `deploy_*` functions and were previously gated by the single `Admin` key only. `set_emergency_pauser(pauser)` (admin-only) now lets an operator designate a separate `EmergencyPauser` address — a dedicated incident-response multisig, for example — that can call `pause`/`unpause` independently of the routine admin authority. While no pauser has been configured, `pause`/`unpause` fall back to `Admin` unchanged, so existing deployments need no migration. `emergency_pauser()` returns the current explicit holder, or `None` while on the admin fallback. Every reassignment emits a `("pauser", "set")` event.
+
+This mirrors the marketplace contract's fuller role-separation model (see `contracts/soroban-marketplace/README.md`'s "Role-Based Authorization" section) scoped to launchpad's smaller privileged surface — routine admin config (`set_wasm_hashes`, `set_fee_config`) and irreversible admin-transfer remain on the existing two-step `Admin` flow.
+
+---
+
 ## Prerequisites
 
 ```bash

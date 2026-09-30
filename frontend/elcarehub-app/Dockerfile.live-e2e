@@ -1,0 +1,41 @@
+# ─────────────────────────────────────────────────────────────
+# Dockerfile.live-e2e
+#
+# Minimal image for running the frontend against the live integration
+# stack (docker-compose.live-e2e.yml). Not used for production builds —
+# this trades image size/layer-caching sophistication for something a
+# reader can verify correct at a glance, since its only job is "boot the
+# real Next.js server against real env vars" for the live E2E suite.
+# ─────────────────────────────────────────────────────────────
+FROM node:20-alpine
+
+WORKDIR /app
+
+COPY package.json package-lock.json ./
+RUN npm ci
+
+COPY . .
+
+# Build-time env vars are baked into the client bundle by Next.js, so the
+# contract/network config must be present before `next build` runs.
+ARG NEXT_PUBLIC_CONTRACT_ID
+ARG NEXT_PUBLIC_LAUNCHPAD_CONTRACT_ID
+ARG NEXT_PUBLIC_STELLAR_NETWORK
+ARG NEXT_PUBLIC_STELLAR_RPC_URL
+ARG NEXT_PUBLIC_STELLAR_HORIZON_URL
+ARG NEXT_PUBLIC_STELLAR_NETWORK_PASSPHRASE
+ARG NEXT_PUBLIC_INDEXER_URL
+ENV NEXT_PUBLIC_CONTRACT_ID=$NEXT_PUBLIC_CONTRACT_ID
+ENV NEXT_PUBLIC_LAUNCHPAD_CONTRACT_ID=$NEXT_PUBLIC_LAUNCHPAD_CONTRACT_ID
+ENV NEXT_PUBLIC_STELLAR_NETWORK=$NEXT_PUBLIC_STELLAR_NETWORK
+ENV NEXT_PUBLIC_STELLAR_RPC_URL=$NEXT_PUBLIC_STELLAR_RPC_URL
+ENV NEXT_PUBLIC_STELLAR_HORIZON_URL=$NEXT_PUBLIC_STELLAR_HORIZON_URL
+ENV NEXT_PUBLIC_STELLAR_NETWORK_PASSPHRASE=$NEXT_PUBLIC_STELLAR_NETWORK_PASSPHRASE
+ENV NEXT_PUBLIC_INDEXER_URL=$NEXT_PUBLIC_INDEXER_URL
+# Explicitly unset — this build must exercise real chain/wallet code paths.
+ENV NEXT_PUBLIC_E2E_MOCK_CHAIN=false
+
+RUN npm run build
+
+EXPOSE 3000
+CMD ["npm", "start"]

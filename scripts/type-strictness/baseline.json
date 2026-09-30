@@ -1,0 +1,11 @@
+{
+  "updated": "2026-08-26",
+  "totals": {
+    "explicit-any": 255,
+    "as-any": 183,
+    "ts-ignore": 0,
+    "ts-nocheck": 0,
+    "ts-expect-error": 0,
+    "eslint-disable-explicit-any": 0
+  }
+}

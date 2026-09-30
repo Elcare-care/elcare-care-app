@@ -1,434 +1,302 @@
-//! reservation_tests.rs — Issue #850: Listing Reservation Window Integration Tests
-//!
-//! Tests the `set_listing_reservation` / `buy_artwork` reservation window:
-//! - set_listing_reservation stores reserved_for, start, end correctly
-//! - buy_artwork during window by reserved address succeeds
-//! - buy_artwork during window by different address returns ReservationWindowActive
-//! - buy_artwork after reservation_end by anyone succeeds
-//! - Invalid window config (end <= start) returns InvalidReservationWindow
-//! - ListingReservationSetEvent emitted correctly including clears
+// reservation_tests.rs — Issue #462
+//
+// Verifies seller-controlled listing reservation windows:
+//   - Reservation blocks non-reserved buyers during the active window
+//   - Reserved buyer can purchase during the window
+//   - Any buyer can purchase after the window expires
+//   - set_listing_reservation with None clears the reservation and emits event
+//   - get_listing_reservation returns current values
+//   - Invalid window configurations are rejected
 
-#![cfg(test)]
-extern crate std;
-
+use crate::test::{mock_nft, valid_recipients, MockNftClient};
+use crate::types::MarketplaceError;
 use soroban_sdk::{
     symbol_short,
-    testutils::{Address as _, Ledger},
-    token::StellarAssetClient,
+    testutils::{Address as _, Events as _, Ledger},
     vec, Address, Env,
 };
+use crate::contract::{MarketplaceContract, MarketplaceContractClient};
+use soroban_sdk::token::StellarAssetClient;
 
-use crate::{
-    types::{ListingStatus, Recipient},
-    MarketplaceContract, MarketplaceContractClient,
-};
-
-// ── Mock NFT ──────────────────────────────────────────────────────────────────
-
-mod mock_nft_res {
-    use soroban_sdk::{contract, contractimpl, Address, Env};
-
-    #[soroban_sdk::contracttype]
-    enum NftKey {
-        Owner(u64),
-    }
-
-    #[contract]
-    pub struct MockNft;
-
-    #[contractimpl]
-    impl MockNft {
-        pub fn owner_of(env: Env, token_id: u64) -> Address {
-            env.storage()
-                .instance()
-                .get::<NftKey, Address>(&NftKey::Owner(token_id))
-                .expect("token has no owner")
-        }
-        pub fn set_owner(env: Env, token_id: u64, owner: Address) {
-            env.storage()
-                .instance()
-                .set(&NftKey::Owner(token_id), &owner);
-        }
-        pub fn transfer_from(
-            env: Env,
-            _spender: Address,
-            from: Address,
-            to: Address,
-            token_id: u64,
-        ) {
-            let cur: Address = env
-                .storage()
-                .instance()
-                .get::<NftKey, Address>(&NftKey::Owner(token_id))
-                .expect("token has no owner");
-            assert_eq!(cur, from, "transfer_from: wrong owner");
-            env.storage()
-                .instance()
-                .set(&NftKey::Owner(token_id), &to);
-        }
-        pub fn royalty_info(env: Env) -> (Address, u32) {
-            use soroban_sdk::testutils::Address as _;
-            (Address::generate(&env), 0u32)
-        }
-    }
-}
-
-use mock_nft_res::MockNftClient;
-
-// ── Setup helper ──────────────────────────────────────────────────────────────
-
-fn setup_res() -> (
+fn setup() -> (
     Env,
     MarketplaceContractClient<'static>,
-    Address, // artist
+    Address, // admin/seller
+    Address, // buyer
     Address, // reserved_buyer
-    Address, // other_buyer
     Address, // payment_token
-    Address, // collection
+    Address, // collection_id
 ) {
     let env = Env::default();
     env.mock_all_auths();
-
     let contract_id = env.register(MarketplaceContract, ());
     let client = MarketplaceContractClient::new(&env, &contract_id);
-
-    let artist = Address::generate(&env);
+    let seller = Address::generate(&env);
+    let buyer = Address::generate(&env);
     let reserved_buyer = Address::generate(&env);
-    let other_buyer = Address::generate(&env);
-
     let token_admin = Address::generate(&env);
-    let payment_token = env
-        .register_stellar_asset_contract_v2(token_admin.clone())
-        .address();
+    let payment_token = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
     let sac = StellarAssetClient::new(&env, &payment_token);
-    sac.mint(&artist, &100_000_000_000_i128);
+    sac.mint(&seller, &100_000_000_000_i128);
+    sac.mint(&buyer, &100_000_000_000_i128);
     sac.mint(&reserved_buyer, &100_000_000_000_i128);
-    sac.mint(&other_buyer, &100_000_000_000_i128);
     sac.mint(&contract_id, &100_000_000_000_i128);
+    let collection_id = env.register(mock_nft::MockNft, ());
+    MockNftClient::new(&env, &collection_id).set_owner(&1u64, &seller);
+    client.set_admin(&seller);
+    client.add_token_to_whitelist(&seller, &payment_token);
+    (env, client, seller, buyer, reserved_buyer, payment_token, collection_id)
+}
 
-    let collection_id = env.register(mock_nft_res::MockNft, ());
-    MockNftClient::new(&env, &collection_id).set_owner(&1u64, &artist);
-
-    client.set_admin(&artist);
-    client.add_token_to_whitelist(&payment_token);
-
-    (
-        env,
-        client,
-        artist,
-        reserved_buyer,
-        other_buyer,
-        payment_token,
-        collection_id,
+fn create_listing(
+    env: &Env,
+    client: &MarketplaceContractClient,
+    seller: &Address,
+    token: &Address,
+    collection: &Address,
+) -> u64 {
+    client.create_listing(
+        seller, &10_000_000_i128, &symbol_short!("XLM"),
+        token, collection, &1u64, &1u64,
+        &valid_recipients(env, seller), &None::<u64>,
     )
 }
 
-fn valid_recipients(env: &Env, artist: &Address) -> soroban_sdk::Vec<Recipient> {
-    vec![
-        env,
-        Recipient {
-            address: artist.clone(),
-            percentage: 10_000,
-        },
-    ]
+// ── Test: reservation blocks non-reserved buyer during active window ──────────
+
+#[test]
+#[should_panic(expected = "Error(Contract, #65)")]
+fn test_reservation_blocks_non_reserved_buyer() {
+    let (env, client, seller, buyer, _reserved, token, col) = setup();
+    let listing_id = create_listing(&env, &client, &seller, &token, &col);
+
+    // Set timestamp so the reservation window is active
+    env.ledger().set_timestamp(1_000);
+    client.set_listing_reservation(
+        &seller, &listing_id,
+        &Some(Address::generate(&env)), // reserved for someone else
+        &None::<u64>,
+        &Some(5_000_u64), // window ends at timestamp 5000
+    );
+
+    // buyer (not the reserved address) tries to buy — must fail
+    client.buy_artwork(&buyer, &listing_id);
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────────
+// ── Test: reserved buyer can purchase during the window ───────────────────────
 
-/// set_listing_reservation stores the correct window fields.
 #[test]
-fn test_set_listing_reservation_stores_correctly() {
-    let (env, client, artist, reserved_buyer, _other, payment_token, collection_id) =
-        setup_res();
+fn test_reserved_buyer_can_purchase_during_window() {
+    let (env, client, seller, _buyer, reserved_buyer, token, col) = setup();
+    let listing_id = create_listing(&env, &client, &seller, &token, &col);
 
-    env.ledger().with_mut(|li| li.timestamp = 1000);
+    env.ledger().set_timestamp(1_000);
+    client.set_listing_reservation(
+        &seller, &listing_id,
+        &Some(reserved_buyer.clone()),
+        &None::<u64>,
+        &Some(5_000_u64),
+    );
 
-    let listing_id = client.create_listing(
-        &artist,
-        &50_000_i128,
-        &symbol_short!("XLM"),
-        &payment_token,
-        &collection_id,
-        &1u64,
-        &valid_recipients(&env, &artist),
+    // reserved_buyer buys — must succeed
+    assert!(client.buy_artwork(&reserved_buyer, &listing_id));
+}
+
+// ── Test: any buyer can purchase after the reservation window expires ─────────
+
+#[test]
+fn test_any_buyer_can_purchase_after_window_expires() {
+    let (env, client, seller, buyer, reserved_buyer, token, col) = setup();
+    let listing_id = create_listing(&env, &client, &seller, &token, &col);
+
+    env.ledger().set_timestamp(1_000);
+    client.set_listing_reservation(
+        &seller, &listing_id,
+        &Some(reserved_buyer.clone()),
+        &None::<u64>,
+        &Some(3_000_u64),
+    );
+
+    // Advance past the window end
+    env.ledger().set_timestamp(3_001);
+    // Non-reserved buyer can now purchase
+    assert!(client.buy_artwork(&buyer, &listing_id));
+}
+
+// ── Test: reservation with start time — before start window is open to all ───
+
+#[test]
+fn test_before_reservation_start_any_buyer_can_purchase() {
+    let (env, client, seller, buyer, reserved_buyer, token, col) = setup();
+    let listing_id = create_listing(&env, &client, &seller, &token, &col);
+
+    env.ledger().set_timestamp(500);
+    client.set_listing_reservation(
+        &seller, &listing_id,
+        &Some(reserved_buyer.clone()),
+        &Some(2_000_u64), // window starts at 2000
+        &Some(5_000_u64), // window ends at 5000
+    );
+
+    // timestamp 500 < 2000 (start) — any buyer can purchase
+    assert!(client.buy_artwork(&buyer, &listing_id));
+}
+
+// ── Test: clear reservation emits event and allows any buyer ─────────────────
+
+#[test]
+fn test_clear_reservation_allows_any_buyer() {
+    let (env, client, seller, buyer, reserved_buyer, token, col) = setup();
+    let listing_id = create_listing(&env, &client, &seller, &token, &col);
+
+    env.ledger().set_timestamp(1_000);
+    client.set_listing_reservation(
+        &seller, &listing_id,
+        &Some(reserved_buyer.clone()),
+        &None::<u64>,
+        &Some(9_999_u64),
+    );
+
+    // Clear the reservation
+    client.set_listing_reservation(
+        &seller, &listing_id,
+        &None::<Address>,
+        &None::<u64>,
         &None::<u64>,
     );
 
-    client.set_listing_reservation(
-        &artist,
-        &listing_id,
-        &reserved_buyer,
-        &2000u64,
-        &5000u64,
-    );
-
-    let res = client.get_listing_reservation(&listing_id);
-    assert!(res.is_some(), "reservation should be stored");
-    let r = res.unwrap();
-    assert_eq!(r.reserved_for, reserved_buyer);
-    assert_eq!(r.reservation_start, 2000u64);
-    assert_eq!(r.reservation_end, 5000u64);
+    // Now any buyer can purchase even during the old window
+    assert!(client.buy_artwork(&buyer, &listing_id));
 }
 
-/// Reserved buyer can purchase during the active window.
-#[test]
-fn test_reserved_buyer_can_buy_during_window() {
-    let (env, client, artist, reserved_buyer, _other, payment_token, collection_id) =
-        setup_res();
+// ── Test: clear reservation emits listing_reservation_set event ───────────────
+// NOTE: env.events().all() in SDK 25.3.0 returns only the last invocation's
+// events, so we assert once per call rather than accumulating across two calls.
 
-    env.ledger().with_mut(|li| li.timestamp = 1000);
-
-    let listing_id = client.create_listing(
-        &artist,
-        &50_000_i128,
-        &symbol_short!("XLM"),
-        &payment_token,
-        &collection_id,
-        &1u64,
-        &valid_recipients(&env, &artist),
-        &None::<u64>,
-    );
-
-    client.set_listing_reservation(
-        &artist,
-        &listing_id,
-        &reserved_buyer,
-        &2000u64,
-        &5000u64,
-    );
-
-    // Advance into the window
-    env.ledger().with_mut(|li| li.timestamp = 3000);
-
-    let result = client.buy_artwork(&reserved_buyer, &listing_id);
-    assert!(result, "reserved buyer should succeed during window");
-
-    let listing = client.get_listing(&listing_id);
-    assert_eq!(listing.status, ListingStatus::Sold);
-    assert_eq!(listing.owner, Some(reserved_buyer));
+fn count_reservation_set_events(env: &Env) -> usize {
+    env.events().all().events().iter().filter(|e| {
+        use soroban_sdk::xdr::{ContractEventBody, ScVal};
+        if let ContractEventBody::V0(v0) = &e.body {
+            if let Some(ScVal::Symbol(s)) = v0.topics.first() {
+                return core::str::from_utf8(s.0.as_slice()).unwrap_or("")
+                    == "listing_reservation_set";
+            }
+        }
+        false
+    }).count()
 }
 
-/// Non-reserved buyer cannot purchase during the active reservation window.
 #[test]
-#[should_panic]
-fn test_non_reserved_buyer_blocked_during_window() {
-    let (env, client, artist, reserved_buyer, other_buyer, payment_token, collection_id) =
-        setup_res();
+fn test_clear_reservation_emits_event() {
+    let (env, client, seller, _buyer, reserved_buyer, token, col) = setup();
+    let listing_id = create_listing(&env, &client, &seller, &token, &col);
 
-    env.ledger().with_mut(|li| li.timestamp = 1000);
-
-    let listing_id = client.create_listing(
-        &artist,
-        &50_000_i128,
-        &symbol_short!("XLM"),
-        &payment_token,
-        &collection_id,
-        &1u64,
-        &valid_recipients(&env, &artist),
+    env.ledger().set_timestamp(1_000);
+    client.set_listing_reservation(
+        &seller, &listing_id,
+        &Some(reserved_buyer.clone()),
         &None::<u64>,
+        &Some(9_999_u64),
     );
+    // Verify the set call emitted one event.
+    assert_eq!(count_reservation_set_events(&env), 1, "setting reservation must emit event");
 
     client.set_listing_reservation(
-        &artist,
-        &listing_id,
-        &reserved_buyer,
-        &2000u64,
-        &5000u64,
+        &seller, &listing_id,
+        &None::<Address>,
+        &None::<u64>,
+        &None::<u64>,
     );
-
-    // Advance into the window
-    env.ledger().with_mut(|li| li.timestamp = 3000);
-
-    // other_buyer is NOT reserved — should panic with ReservationWindowActive
-    client.buy_artwork(&other_buyer, &listing_id);
+    // Verify the clear call also emits one event.
+    assert_eq!(count_reservation_set_events(&env), 1, "clearing reservation must emit event");
 }
 
-/// After the reservation window ends, any buyer can purchase.
+// ── Test: get_listing_reservation returns current values ─────────────────────
+
 #[test]
-fn test_any_buyer_can_buy_after_window_expires() {
-    let (env, client, artist, reserved_buyer, other_buyer, payment_token, collection_id) =
-        setup_res();
+fn test_get_listing_reservation() {
+    let (env, client, seller, _buyer, reserved_buyer, token, col) = setup();
+    let listing_id = create_listing(&env, &client, &seller, &token, &col);
 
-    env.ledger().with_mut(|li| li.timestamp = 1000);
+    // Initially no reservation
+    let (rf, rs, re) = client.get_listing_reservation(&listing_id);
+    assert!(rf.is_none());
+    assert!(rs.is_none());
+    assert!(re.is_none());
 
-    let listing_id = client.create_listing(
-        &artist,
-        &50_000_i128,
-        &symbol_short!("XLM"),
-        &payment_token,
-        &collection_id,
-        &1u64,
-        &valid_recipients(&env, &artist),
-        &None::<u64>,
-    );
-
+    env.ledger().set_timestamp(1_000);
     client.set_listing_reservation(
-        &artist,
-        &listing_id,
-        &reserved_buyer,
-        &2000u64,
-        &5000u64,
+        &seller, &listing_id,
+        &Some(reserved_buyer.clone()),
+        &Some(2_000_u64),
+        &Some(8_000_u64),
     );
 
-    // Advance PAST the window end (timestamp == reservation_end means window closed)
-    env.ledger().with_mut(|li| li.timestamp = 5000);
-
-    let result = client.buy_artwork(&other_buyer, &listing_id);
-    assert!(result, "any buyer should succeed after reservation window ends");
-
-    let listing = client.get_listing(&listing_id);
-    assert_eq!(listing.status, ListingStatus::Sold);
-    assert_eq!(listing.owner, Some(other_buyer));
+    let (rf, rs, re) = client.get_listing_reservation(&listing_id);
+    assert_eq!(rf, Some(reserved_buyer));
+    assert_eq!(rs, Some(2_000_u64));
+    assert_eq!(re, Some(8_000_u64));
 }
 
-/// Exactly at reservation_end the window is expired (exclusive upper bound).
+// ── Test: invalid window — end in the past — rejected ────────────────────────
+
 #[test]
-fn test_reservation_end_is_exclusive_upper_bound() {
-    let (env, client, artist, reserved_buyer, other_buyer, payment_token, collection_id) =
-        setup_res();
+#[should_panic(expected = "Error(Contract, #66)")]
+fn test_invalid_reservation_window_end_in_past() {
+    let (env, client, seller, _buyer, reserved_buyer, token, col) = setup();
+    let listing_id = create_listing(&env, &client, &seller, &token, &col);
 
-    env.ledger().with_mut(|li| li.timestamp = 1000);
-
-    let listing_id = client.create_listing(
-        &artist,
-        &50_000_i128,
-        &symbol_short!("XLM"),
-        &payment_token,
-        &collection_id,
-        &1u64,
-        &valid_recipients(&env, &artist),
-        &None::<u64>,
-    );
-
-    // Window: [2000, 5000)
+    env.ledger().set_timestamp(5_000); // now is 5000
     client.set_listing_reservation(
-        &artist,
-        &listing_id,
-        &reserved_buyer,
-        &2000u64,
-        &5000u64,
-    );
-
-    // At exactly reservation_end (5000), window is expired — other_buyer can buy
-    env.ledger().with_mut(|li| li.timestamp = 5000);
-
-    let result = client.buy_artwork(&other_buyer, &listing_id);
-    assert!(
-        result,
-        "at reservation_end the window is expired; non-reserved buyer should succeed"
+        &seller, &listing_id,
+        &Some(reserved_buyer.clone()),
+        &None::<u64>,
+        &Some(3_000_u64), // end (3000) <= now (5000) → invalid
     );
 }
 
-/// Invalid reservation window (end <= start) must panic.
+// ── Test: invalid window — start >= end — rejected ────────────────────────────
+
 #[test]
-#[should_panic]
-fn test_invalid_reservation_window_end_before_start() {
-    let (env, client, artist, reserved_buyer, _other, payment_token, collection_id) =
-        setup_res();
+#[should_panic(expected = "Error(Contract, #66)")]
+fn test_invalid_reservation_window_start_ge_end() {
+    let (env, client, seller, _buyer, reserved_buyer, token, col) = setup();
+    let listing_id = create_listing(&env, &client, &seller, &token, &col);
 
-    env.ledger().with_mut(|li| li.timestamp = 1000);
-
-    let listing_id = client.create_listing(
-        &artist,
-        &50_000_i128,
-        &symbol_short!("XLM"),
-        &payment_token,
-        &collection_id,
-        &1u64,
-        &valid_recipients(&env, &artist),
-        &None::<u64>,
-    );
-
-    // end <= start — should panic with InvalidReservationWindow
+    env.ledger().set_timestamp(1_000);
     client.set_listing_reservation(
-        &artist,
-        &listing_id,
-        &reserved_buyer,
-        &5000u64,
-        &2000u64, // end < start
+        &seller, &listing_id,
+        &Some(reserved_buyer.clone()),
+        &Some(6_000_u64), // start >= end → invalid
+        &Some(5_000_u64),
     );
 }
 
-/// Clearing a reservation (reservation_end = 0) removes it and emits the event.
+// ── Test: non-seller cannot set reservation ───────────────────────────────────
+
 #[test]
-fn test_clear_reservation_window() {
-    let (env, client, artist, reserved_buyer, other_buyer, payment_token, collection_id) =
-        setup_res();
+#[should_panic(expected = "Error(Contract, #5)")]
+fn test_non_seller_cannot_set_reservation() {
+    let (env, client, seller, buyer, reserved_buyer, token, col) = setup();
+    let listing_id = create_listing(&env, &client, &seller, &token, &col);
 
-    env.ledger().with_mut(|li| li.timestamp = 1000);
-
-    let listing_id = client.create_listing(
-        &artist,
-        &50_000_i128,
-        &symbol_short!("XLM"),
-        &payment_token,
-        &collection_id,
-        &1u64,
-        &valid_recipients(&env, &artist),
+    env.ledger().set_timestamp(1_000);
+    // buyer (not the seller) tries to set reservation — must fail with Unauthorized
+    client.set_listing_reservation(
+        &buyer, &listing_id,
+        &Some(reserved_buyer.clone()),
         &None::<u64>,
+        &Some(9_999_u64),
     );
-
-    // Set a reservation
-    client.set_listing_reservation(
-        &artist,
-        &listing_id,
-        &reserved_buyer,
-        &2000u64,
-        &9999u64,
-    );
-    assert!(client.get_listing_reservation(&listing_id).is_some());
-
-    // Clear it by passing reservation_end = 0
-    client.set_listing_reservation(
-        &artist,
-        &listing_id,
-        &reserved_buyer,
-        &0u64,
-        &0u64,
-    );
-    assert!(
-        client.get_listing_reservation(&listing_id).is_none(),
-        "reservation should be cleared"
-    );
-
-    // Now during what would have been the window, other_buyer can buy
-    env.ledger().with_mut(|li| li.timestamp = 3000);
-    let result = client.buy_artwork(&other_buyer, &listing_id);
-    assert!(result, "any buyer should succeed after reservation is cleared");
 }
 
-/// Before the reservation_start, any buyer can purchase (window not yet active).
+// ── Test: no reservation window — any buyer can purchase ─────────────────────
+
 #[test]
-fn test_any_buyer_can_buy_before_window_starts() {
-    let (env, client, artist, reserved_buyer, other_buyer, payment_token, collection_id) =
-        setup_res();
+fn test_no_reservation_any_buyer_can_purchase() {
+    let (env, client, seller, buyer, _reserved, token, col) = setup();
+    let listing_id = create_listing(&env, &client, &seller, &token, &col);
 
-    env.ledger().with_mut(|li| li.timestamp = 1000);
-
-    let listing_id = client.create_listing(
-        &artist,
-        &50_000_i128,
-        &symbol_short!("XLM"),
-        &payment_token,
-        &collection_id,
-        &1u64,
-        &valid_recipients(&env, &artist),
-        &None::<u64>,
-    );
-
-    // Window starts at 5000, currently at 1000
-    client.set_listing_reservation(
-        &artist,
-        &listing_id,
-        &reserved_buyer,
-        &5000u64,
-        &9999u64,
-    );
-
-    // other_buyer tries at timestamp 1000, before window opens — should succeed
-    let result = client.buy_artwork(&other_buyer, &listing_id);
-    assert!(
-        result,
-        "any buyer should succeed before the reservation window starts"
-    );
+    // No reservation set — any buyer can purchase
+    assert!(client.buy_artwork(&buyer, &listing_id));
 }

@@ -28,7 +28,7 @@ vi.mock('../metrics.js', () => ({
 }));
 
 // ── Stub Prisma so idempotency tests don't need a real DB ────────────────────
-const mockPrisma = {
+const mockPrisma = vi.hoisted(() => ({
   keeperAction: {
     findUnique:  vi.fn(),
     findMany:    vi.fn(),
@@ -36,7 +36,7 @@ const mockPrisma = {
     update:      vi.fn(),
     groupBy:     vi.fn(),
   },
-};
+}));
 
 vi.mock('../db.js', () => ({ default: mockPrisma }));
 

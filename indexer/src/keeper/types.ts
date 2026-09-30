@@ -11,13 +11,15 @@
 export type KeeperTargetType =
   | 'ExpireListing'
   | 'FinalizeAuction'
-  | 'ReclaimOffer';
+  | 'ReclaimOffer'
+  | 'RenewStorage';
 
 // Maps KeeperTargetType → Soroban contract entry-point name
 export const ENTRY_POINT: Record<KeeperTargetType, string> = {
   ExpireListing:   'expire_listing',
   FinalizeAuction: 'finalize_auction',
   ReclaimOffer:    'reclaim_offer',
+  RenewStorage:    'renew_storage',
 };
 
 // Maps KeeperTargetType → Prometheus entry_point label (snake_case)
@@ -25,6 +27,7 @@ export const ENTRY_POINT_LABEL: Record<KeeperTargetType, string> = {
   ExpireListing:   'expire_listing',
   FinalizeAuction: 'finalize_auction',
   ReclaimOffer:    'reclaim_offer',
+  RenewStorage:    'renew_storage',
 };
 
 // ── Action lifecycle ─────────────────────────────────────────────────────────

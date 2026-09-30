@@ -19,6 +19,7 @@ import {
   PreflightResult,
 } from "@/lib/launchpad";
 import { assertSupportedTokenAddress } from "@/lib/token-support";
+import { decodeContractError } from "@/lib/contractErrors/decodeContractError";
 
 // ── useLaunchpadCollections ───────────────────────────────────
 
@@ -330,7 +331,8 @@ export function useDeployCollection(creatorPublicKey: string | null) {
 
         return address;
       } catch (err: unknown) {
-        setError(err instanceof Error ? err.message : "Deployment failed");
+        const decoded = decodeContractError(err, "launchpad");
+        setError(decoded.message);
         return null;
       } finally {
         setIsDeploying(false);

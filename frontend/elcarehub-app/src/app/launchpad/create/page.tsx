@@ -1,6 +1,7 @@
 "use client";
 
 import { Navbar } from "@/components/Navbar";
+import { Breadcrumb } from "@/components/Breadcrumb";
 import { CollectionForm } from "@/components/CollectionForm";
 
 export default function CreateCollectionPage() {
@@ -10,6 +11,13 @@ export default function CreateCollectionPage() {
       
       <div className="pt-24 pb-12">
         <div className="max-w-7xl mx-auto px-4">
+          <Breadcrumb
+            items={[
+              { label: "Launchpad", href: "/launchpad" },
+              { label: "New Collection" },
+            ]}
+            className="mb-6"
+          />
           <div className="flex flex-col items-center mb-8">
             <span className="inline-block px-4 py-1.5 rounded-full bg-brand-100 text-brand-600 text-sm font-bold uppercase tracking-widest mb-4">
               Creator Studio

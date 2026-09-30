@@ -29,6 +29,9 @@ const mockTx = vi.hoisted(() => ({
   backfillJob: {
     update: vi.fn().mockResolvedValue({}),
   },
+  backfillJob: {
+    update: vi.fn().mockResolvedValue({}),
+  },
   marketplaceEvent: {
     findMany:    vi.fn().mockResolvedValue([]),
     findUnique:  vi.fn().mockResolvedValue(null),

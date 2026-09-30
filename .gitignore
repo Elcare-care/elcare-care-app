@@ -11,6 +11,11 @@ out/
 dist/
 build/
 
+# TypeScript build artifacts
+*.tsbuildinfo
+tsconfig.tsbuildinfo
+**/tsconfig.tsbuildinfo
+
 # Environment files — NEVER commit secrets
 .env.local
 .env.*.local
@@ -18,6 +23,16 @@ build/
 scripts/deploy/.env.deploy
 .stellar/
 scripts/deploy/.stellar/
+
+# Live integration environment — generated secrets/state, never commit
+scripts/live-e2e/.env.live-e2e
+scripts/live-e2e/seed_ids.env
+scripts/live-e2e/artifacts/
+frontend/elcarehub-app/playwright-report-live/
+
+# Vercel deployment metadata
+.vercel/
+**/.vercel/
 
 # OS
 .DS_Store
@@ -38,20 +53,42 @@ Thumbs.db
 **/__snapshots__/
 **/*.snap
 **/test_snapshots/
-
-# Coverage reports
-coverage/
-lcov.info
-*.lcov
-
-# Generated test snapshots
+**/__snapshots__/
 **/issues.md
 
+# Windows reserved device name phantom entry (cannot be deleted on NTFS)
+/con
+
+# Loose helper / one-off scripts at repo root
+update_parser.js
+update_events.js
+append_test.js
+
 # PR description files (gitignored — saved locally for reference)
+PR_DESCRIPTION.md
 PR_ISSUE_322.md
 PR_ISSUE_206.md
 PR_ISSUE_204.md
 PR_ISSUE_205.md
+PR_ISSUE_211.md
+PR_ISSUE_212.md
+PR_ISSUE_213.md
+PR_ISSUE_214.md
+PR-217-TTL-Management.md
+PR-issue-215.md
+PR-issue-216.md
+PR_ISSUE_218.md
+PR_DESCRIPTION_560.md
+PR_DESCRIPTION_561.md
+PR-563-game-day-scenario.md
+PR-562-docker-hardening.md
+PR_ISSUES_557_558_559.md
+PR_ISSUES_759_760_761_762.md
+
+# Issue notes (local reference only)
+ISSUE_068_NOTES.md
+IMPLEMENTATION_SUMMARY.md
+SECURITY_SCANNING_TRIAGE.md
 
 # Temporary root-level JS helper scripts (not part of the project)
 append_test.js
@@ -65,8 +102,49 @@ test-results/
 # Kiro AI workspace
 .kiro/
 
-# Vercel deployment cache
-.vercel/
+# Playwright test results / reports
+playwright-report/
+test-results/
 
-# TypeScript build info
-*.tsbuildinfo
+# Vitest / Jest snapshots
+*.snap
+*.snap.new
+**/snapshots/
+
+# Coverage
+coverage/
+*.lcov
+.nyc_output/
+
+# Temporary files
+*.tmp
+*.bak
+*.orig
+*.log
+
+# Build output
+dist/
+
+# Locally generated SBOMs (scripts/sbom/generate-all.sh) — CI generates and
+# uploads these fresh on every run; local runs are for iteration/debugging.
+/sbom-*.cdx.json
+/sbom-*.meta.json
+/cargo-metadata.json
+
+# Editor / AI tool artifacts
+*.swp
+*.swo
+*~
+.codex
+
+# Playwright cache
+/playwright/.cache/
+
+# Local markdown notes / one-off PR descriptions
+IMPLEMENTATION_COMPLETE.md
+LOAD_TEST_RESULTS.md
+DEPLOYMENT.md
+MUTATION_TESTING.md
+COMPATIBILITY.md
+OPERATIONAL_QUICK_REFERENCE.md
+CONTRIBUTING-SCHEMA-CHANGES.md

@@ -1,0 +1,186 @@
+name: Mutation Testing
+
+# ── Trigger policy ─────────────────────────────────────────────────────────────
+#
+# PR mode  — runs automatically on every pull-request that touches a
+#            high-priority Rust module.  Only mutates changed files so it
+#            never blocks developer feedback unnecessarily.
+#
+# Scheduled full run — nightly at 02:00 UTC on main/master.  Analyses all
+#            modules listed in mutants.toml include_globs and publishes a
+#            trend report as a workflow artifact.
+#
+# Manual dispatch — allows ad-hoc full or single-file runs from the Actions UI.
+
+on:
+  pull_request:
+    branches: ["*"]
+    paths:
+      - "contracts/soroban-marketplace/src/math.rs"
+      - "contracts/soroban-marketplace/src/contract.rs"
+      - "contracts/soroban-marketplace/src/storage.rs"
+      - "contracts/soroban-marketplace/src/escrow.rs"
+      - "contracts/launchpad/src/contract.rs"
+
+  schedule:
+    # Nightly full run at 02:00 UTC
+    - cron: "0 2 * * *"
+
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Run mode: pr | full | file"
+        required: true
+        default: "pr"
+        type: choice
+        options: [pr, full, file]
+      target_file:
+        description: "File path for 'file' mode (relative to repo root)"
+        required: false
+        default: ""
+
+env:
+  CARGO_TERM_COLOR: always
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  # cargo-mutants writes here; cached across runs to avoid recompiling
+  CARGO_MUTANTS_OUT: cargo-mutants-out
+
+jobs:
+  # ── PR mode: targeted mutation test on changed high-priority files ───────────
+  mutation-pr:
+    name: Mutation Tests (PR)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history for merge-base detection
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32v1-none
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-mutants
+        run: cargo install cargo-mutants --locked
+
+      - name: Run mutation tests (PR mode)
+        env:
+          BASE_BRANCH: ${{ github.base_ref }}
+          MUTANTS_JOBS: "4"
+        run: bash mutation-tests/run-mutation-tests.sh
+
+      - name: Upload mutation artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutation-pr-${{ github.run_id }}
+          path: |
+            cargo-mutants-out/
+            mutation-tests/reports/
+          retention-days: 14
+
+  # ── Scheduled / manual full run ──────────────────────────────────────────────
+  mutation-full:
+    name: Mutation Tests (Full / Scheduled)
+    if: |
+      github.event_name == 'schedule' ||
+      (github.event_name == 'workflow_dispatch' && inputs.mode == 'full')
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32v1-none
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-mutants
+        run: cargo install cargo-mutants --locked
+
+      - name: Run full mutation analysis
+        env:
+          FULL: "1"
+          MUTANTS_JOBS: "4"
+        run: bash mutation-tests/run-mutation-tests.sh
+
+      - name: Upload full mutation report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutation-full-${{ github.run_id }}
+          path: |
+            cargo-mutants-out/
+            mutation-tests/reports/
+          retention-days: 30
+
+      # Post a comment summarising trend if run on main
+      - name: Comment trend summary on commit
+        if: success() && github.ref == 'refs/heads/main'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const trend = JSON.parse(fs.readFileSync('mutation-tests/reports/trend.json', 'utf8'));
+            const last = trend[trend.length - 1];
+            if (!last) return;
+            const rows = last.files.map(f =>
+              `| \`${f.file.split('/').pop()}\` | ${f.killed}/${f.total} | ${f.score}% |`
+            ).join('\n');
+            const body = `## Mutation Test Trend (${last.timestamp})\n\n| Module | Killed/Total | Score |\n|---|---|---|\n${rows}`;
+            await github.rest.repos.createCommitComment({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              commit_sha: context.sha,
+              body,
+            });
+
+  # ── Manual single-file targeted run ─────────────────────────────────────────
+  mutation-file:
+    name: Mutation Tests (Single File)
+    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'file'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32v1-none
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-mutants
+        run: cargo install cargo-mutants --locked
+
+      - name: Run single-file mutation test
+        env:
+          FILE: ${{ inputs.target_file }}
+          MUTANTS_JOBS: "4"
+        run: bash mutation-tests/run-mutation-tests.sh
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutation-file-${{ github.run_id }}
+          path: |
+            cargo-mutants-out/
+            mutation-tests/reports/
+          retention-days: 14

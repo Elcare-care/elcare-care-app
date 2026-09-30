@@ -34,7 +34,7 @@ export default function LaunchpadAdminPage() {
   const { publicKey } = useWallet();
   const { isAdmin, isLoading: isCheckingAdmin } = useLaunchpadAdminCheck(publicKey);
   const { stats, isLoading: isLoadingStats, refresh: refreshStats } = useLaunchpadAdminStats();
-  const { transferAdmin, updateFee, isProcessing, error: actionError } = useLaunchpadAdminActions(publicKey);
+  const { transferAdmin, updateFee, updateWasm, upgradeCollectionForAddress, isProcessing, error: actionError } = useLaunchpadAdminActions(publicKey);
   const { collections } = useLaunchpadCollections();
   const { isAuthenticated, authenticate, logout, sessionExpiresIn } = useAdminSession();
 
@@ -42,6 +42,10 @@ export default function LaunchpadAdminPage() {
   const [newAdminAddress, setNewAdminAddress] = useState("");
   const [newFeeReceiver, setNewFeeReceiver] = useState("");
   const [newFeeBps, setNewFeeBps] = useState("");
+  const [wasmKind, setWasmKind] = useState<"Normal721" | "Normal1155" | "LazyMint721" | "LazyMint1155">("Normal721");
+  const [wasmHashInput, setWasmHashInput] = useState("");
+  const [collectionAddressInput, setCollectionAddressInput] = useState("");
+  const [wasmStatus, setWasmStatus] = useState<string | null>(null);
 
   // Local state for editing
   const [isEditingAdmin, setIsEditingAdmin] = useState(false);
@@ -115,6 +119,57 @@ export default function LaunchpadAdminPage() {
           setNewFeeBps("");
           setConfirmConfig(prev => ({ ...prev, isOpen: false }));
           refreshStats();
+        }
+      }
+    });
+  };
+
+  const handleUpdateWasm = async () => {
+    if (!wasmHashInput.trim()) return;
+    setConfirmConfig({
+      isOpen: true,
+      title: "Update Collection WASM",
+      actionDescription: `Updating the ${wasmKind} contract WASM to ${wasmHashInput.trim()}.`,
+      consequences: [
+        "Future deployments of this collection kind will use the new executable.",
+        "Existing deployed collections remain unchanged until you upgrade them.",
+        "Double-check the hash before submitting the transaction."
+      ],
+      variant: "warning",
+      onConfirm: async () => {
+        const success = await updateWasm(wasmKind, wasmHashInput.trim());
+        if (success) {
+          setWasmStatus(`Updated ${wasmKind} WASM successfully.`);
+          setWasmHashInput("");
+          setConfirmConfig(prev => ({ ...prev, isOpen: false }));
+        } else {
+          setWasmStatus(actionError ?? "Unable to update WASM.");
+          setConfirmConfig(prev => ({ ...prev, isOpen: false }));
+        }
+      }
+    });
+  };
+
+  const handleUpgradeCollection = async () => {
+    if (!collectionAddressInput.trim()) return;
+    setConfirmConfig({
+      isOpen: true,
+      title: "Upgrade Collection",
+      actionDescription: `Upgrading collection ${collectionAddressInput.trim()} to the current launchpad WASM.`,
+      consequences: [
+        "This operation re-points the deployed collection contract to the active WASM for its kind.",
+        "Only proceed if the collection address is correct."
+      ],
+      variant: "warning",
+      onConfirm: async () => {
+        const success = await upgradeCollectionForAddress(collectionAddressInput.trim());
+        if (success) {
+          setWasmStatus(`Upgraded ${collectionAddressInput.trim()} successfully.`);
+          setCollectionAddressInput("");
+          setConfirmConfig(prev => ({ ...prev, isOpen: false }));
+        } else {
+          setWasmStatus(actionError ?? "Unable to upgrade collection.");
+          setConfirmConfig(prev => ({ ...prev, isOpen: false }));
         }
       }
     });
@@ -216,6 +271,73 @@ export default function LaunchpadAdminPage() {
       </div>
 
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+        <div className="rounded-2xl border border-gray-200 bg-white p-6 shadow-sm mb-8">
+          <div className="flex items-center gap-3 mb-4">
+            <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-brand-100 text-brand-600">
+              <Zap size={20} />
+            </div>
+            <div>
+              <h2 className="text-lg font-display font-semibold text-gray-900">Collection WASM Management</h2>
+              <p className="text-sm text-gray-500">Rotate the executable for a collection kind or upgrade an existing deployment.</p>
+            </div>
+          </div>
+
+          {wasmStatus && (
+            <div className="mb-4 rounded-lg border border-green-200 bg-green-50 px-4 py-3 text-sm text-green-700">
+              {wasmStatus}
+            </div>
+          )}
+
+          <div className="grid gap-6 lg:grid-cols-2">
+            <div className="rounded-xl border border-gray-200 p-4">
+              <label className="mb-2 block text-sm font-semibold text-gray-700">Collection kind</label>
+              <select
+                value={wasmKind}
+                onChange={(e) => setWasmKind(e.target.value as any)}
+                className="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-700"
+              >
+                <option value="Normal721">Normal721</option>
+                <option value="Normal1155">Normal1155</option>
+                <option value="LazyMint721">LazyMint721</option>
+                <option value="LazyMint1155">LazyMint1155</option>
+              </select>
+              <label className="mt-4 mb-2 block text-sm font-semibold text-gray-700">New WASM hash (32-byte hex)</label>
+              <input
+                value={wasmHashInput}
+                onChange={(e) => setWasmHashInput(e.target.value)}
+                placeholder="66..."
+                className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm text-gray-700"
+              />
+              <button
+                onClick={handleUpdateWasm}
+                disabled={isProcessing}
+                className="mt-4 inline-flex items-center gap-2 rounded-lg bg-brand-600 px-4 py-2 text-sm font-semibold text-white transition hover:bg-brand-700 disabled:cursor-not-allowed disabled:bg-brand-300"
+              >
+                {isProcessing ? <Loader2 size={16} className="animate-spin" /> : <Zap size={16} />}
+                Update WASM
+              </button>
+            </div>
+
+            <div className="rounded-xl border border-gray-200 p-4">
+              <label className="mb-2 block text-sm font-semibold text-gray-700">Collection address</label>
+              <input
+                value={collectionAddressInput}
+                onChange={(e) => setCollectionAddressInput(e.target.value)}
+                placeholder="G..."
+                className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm text-gray-700"
+              />
+              <button
+                onClick={handleUpgradeCollection}
+                disabled={isProcessing}
+                className="mt-4 inline-flex items-center gap-2 rounded-lg bg-gray-900 px-4 py-2 text-sm font-semibold text-white transition hover:bg-gray-800 disabled:cursor-not-allowed disabled:bg-gray-400"
+              >
+                {isProcessing ? <Loader2 size={16} className="animate-spin" /> : <Settings size={16} />}
+                Upgrade Collection
+              </button>
+            </div>
+          </div>
+        </div>
+
         {/* Stats Cards */}
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-8">
           <div className="bg-white rounded-xl p-6 border border-gray-200">

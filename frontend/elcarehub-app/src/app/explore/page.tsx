@@ -11,13 +11,21 @@ import { useState, useCallback, useEffect, useRef, useReducer } from "react";
 import { Listing } from "@/lib/contract";
 import { ListingCard } from "@/components/ListingCard";
 import { ListingCardSkeleton } from "@/components/Skeletons";
-import { ChevronLeft, ChevronRight, Search, SlidersHorizontal, ArrowUpDown } from "lucide-react";
+import { ChevronLeft, ChevronRight, Search, SlidersHorizontal, ArrowUpDown, Info } from "lucide-react";
 import { FilterSidebar, filterReducer, SortOption } from "@/components/FilterSidebar";
-import { fetchListings } from "@/lib/indexer";
+import { ActiveFilterChips } from "@/components/ActiveFilterChips";
+import { fetchListings, getCollections, IndexerCollectionRow } from "@/lib/indexer";
 import { getAllListings } from "@/lib/contract";
 import { useFilterUrlSync } from "@/hooks/useFilterUrlSync";
+import { ResourceState } from "@/components/PageStates";
+import { categorizePageError, PageStateError } from "@/lib/pageState";
 
 const PAGE_SIZE = 12;
+
+// Must match FTS_MIN_LENGTH in indexer/src/api/routes.ts — search terms
+// shorter than this use a slower ILIKE fallback instead of the tsvector/
+// GIN-indexed full-text search path.
+const FTS_MIN_LENGTH = 3;
 
 const SORT_OPTIONS: { value: SortOption; label: string }[] = [
   { value: "newest", label: "Newest First" },
@@ -31,7 +39,7 @@ export default function ExplorePage() {
   const [listings, setListings] = useState<Listing[]>([]);
   const [totalCount, setTotalCount] = useState(0);
   const [isLoading, setIsLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<PageStateError | null>(null);
 
   // cursorStack[i] = X-Next-Cursor value returned after fetching page i.
   // currentCursorIdx = index of the page currently displayed (0 = first page).
@@ -41,6 +49,14 @@ export default function ExplorePage() {
   const { initialFilters, initialPage, syncToUrl } = useFilterUrlSync();
   const [filters, dispatch] = useReducer(filterReducer, initialFilters);
   const [showFilters, setShowFilters] = useState(false);
+
+  // Fetched once for chip labels (mapping a collection contract address back
+  // to its display name) — FilterSidebar fetches its own copy independently
+  // for its checkbox list, this is a lightweight, cached read.
+  const [collections, setCollections] = useState<IndexerCollectionRow[]>([]);
+  useEffect(() => {
+    getCollections().then((res) => setCollections(res?.collections ?? [])).catch(() => {});
+  }, []);
 
   // Debounce search input
   const [debouncedSearch, setDebouncedSearch] = useState(initialFilters.search);
@@ -58,7 +74,14 @@ export default function ExplorePage() {
   }, [filters.status, filters.minPrice, filters.maxPrice, filters.search,
       filters.collection, filters.artist, filters.sort]);
 
-  const fetchPage = useCallback(async (cursorLedger?: number): Promise<string> => {
+  // "price-low"/"price-high" order by price, not updatedAtLedger, so the
+  // ledger-based cursor the other sorts use would bound the wrong page
+  // (the indexer rejects that combination outright — see the refine on
+  // listingsQuerySchema). These two sorts fall back to offset pagination
+  // instead; every other sort keeps the cursor stack below.
+  const isOffsetSort = filters.sort === "price-low" || filters.sort === "price-high";
+
+  const fetchPage = useCallback(async (pageArg?: number): Promise<string> => {
     setIsLoading(true);
     setError(null);
     try {
@@ -66,7 +89,11 @@ export default function ExplorePage() {
         limit: PAGE_SIZE,
         cursor_direction: "desc",
       };
-      if (cursorLedger != null) opts.cursor_ledger = cursorLedger;
+      if (isOffsetSort) {
+        if (pageArg != null) opts.offset = pageArg;
+      } else if (pageArg != null) {
+        opts.cursor_ledger = pageArg;
+      }
       if (filters.status !== "All") opts.status = filters.status;
       if (filters.minPrice) opts.minPrice = filters.minPrice;
       if (filters.maxPrice) opts.maxPrice = filters.maxPrice;
@@ -95,14 +122,16 @@ export default function ExplorePage() {
         setListings(all.slice(0, PAGE_SIZE));
         setTotalCount(all.length);
       } catch (e: unknown) {
-        setError(e instanceof Error ? e.message : "Failed to load listings");
+        // Both the indexer and the on-chain fallback failed — this is a real
+        // outage, not "no listings," so it must never render as an empty state.
+        setError(categorizePageError(e, { resourceLabel: "listings" }));
       }
       return "";
     } finally {
       setIsLoading(false);
     }
   }, [filters.status, filters.minPrice, filters.maxPrice, debouncedSearch,
-      filters.collection, filters.artist, filters.sort]);
+      filters.collection, filters.artist, filters.sort, isOffsetSort]);
 
   // Load first page whenever filters change (debounced)
   const loadTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -122,6 +151,13 @@ export default function ExplorePage() {
   }, [filters, currentCursorIdx, syncToUrl]);
 
   const goNext = useCallback(async () => {
+    if (isOffsetSort) {
+      const newIdx = currentCursorIdx + 1;
+      await fetchPage(newIdx * PAGE_SIZE);
+      setCurrentCursorIdx(newIdx);
+      window.scrollTo({ top: 0, behavior: "smooth" });
+      return;
+    }
     const nextCursor = cursorStack[currentCursorIdx];
     if (!nextCursor) return;
     const cursorLedger = parseInt(nextCursor, 10);
@@ -137,23 +173,38 @@ export default function ExplorePage() {
       return newIdx;
     });
     window.scrollTo({ top: 0, behavior: "smooth" });
-  }, [cursorStack, currentCursorIdx, fetchPage]);
+  }, [cursorStack, currentCursorIdx, fetchPage, isOffsetSort]);
 
   const goPrev = useCallback(async () => {
     if (currentCursorIdx === 0) return;
     const newIdx = currentCursorIdx - 1;
+    if (isOffsetSort) {
+      await fetchPage(newIdx * PAGE_SIZE);
+      setCurrentCursorIdx(newIdx);
+      window.scrollTo({ top: 0, behavior: "smooth" });
+      return;
+    }
     const prevCursor = newIdx === 0 ? undefined : parseInt(cursorStack[newIdx - 1], 10);
     await fetchPage(Number.isFinite(prevCursor) ? prevCursor : undefined);
     setCurrentCursorIdx(newIdx);
     window.scrollTo({ top: 0, behavior: "smooth" });
-  }, [currentCursorIdx, cursorStack, fetchPage]);
+  }, [currentCursorIdx, cursorStack, fetchPage, isOffsetSort]);
 
-  const hasNext = !!cursorStack[currentCursorIdx] && listings.length === PAGE_SIZE;
+  const hasNext = isOffsetSort
+    ? listings.length === PAGE_SIZE && (currentCursorIdx + 1) * PAGE_SIZE < totalCount
+    : !!cursorStack[currentCursorIdx] && listings.length === PAGE_SIZE;
   const hasPrev = currentCursorIdx > 0;
   const currentPage = currentCursorIdx + 1;
   const totalPages = totalCount > 0 ? Math.ceil(totalCount / PAGE_SIZE) : 1;
   const activeCnt = listings.filter((l: Listing) => l.status === "Active").length;
   const soldCnt = listings.filter((l: Listing) => l.status === "Sold").length;
+
+  // A non-empty search term shorter than the FTS threshold degrades to a
+  // slower ILIKE scan server-side (see indexer/src/api/routes.ts) — surface
+  // that as an inline hint rather than letting the slow request happen
+  // silently.
+  const trimmedSearch = filters.search.trim();
+  const isSlowSearchTerm = trimmedSearch.length > 0 && trimmedSearch.length < FTS_MIN_LENGTH;
 
   return (
     <div className="min-h-screen bg-gray-50 flex flex-col" data-testid="explore-page">
@@ -199,9 +250,11 @@ export default function ExplorePage() {
             <Search size={18} className="absolute left-4 top-1/2 -translate-y-1/2 text-gray-400" />
             <input
               type="text"
+              id="explore-search-input"
               placeholder="Search by title, artist, or description..."
               value={filters.search}
               onChange={(e) => dispatch({ type: "SET_SEARCH", payload: e.target.value })}
+              aria-describedby={isSlowSearchTerm ? "explore-search-cost-hint" : undefined}
               className="w-full rounded-2xl border border-gray-200 bg-gray-50 py-3 pl-12 pr-4 text-sm text-gray-900 placeholder:text-gray-400 focus:border-brand-500 focus:bg-white focus:outline-none focus:ring-4 focus:ring-brand-500/10 transition-all shadow-sm"
             />
           </div>
@@ -219,6 +272,24 @@ export default function ExplorePage() {
             </select>
           </div>
         </div>
+
+        {/* Query-cost hint: a very short search term skips the indexed
+            full-text path and falls back to a slower ILIKE scan (see
+            FTS_MIN_LENGTH in indexer/src/api/routes.ts). This is an inline,
+            non-blocking hint — the request still goes through — so the user
+            understands why results might take longer or rank differently. */}
+        {isSlowSearchTerm && (
+          <div className="mx-auto max-w-7xl px-4 sm:px-6 pb-3">
+            <p
+              id="explore-search-cost-hint"
+              role="status"
+              className="flex items-center gap-1.5 text-xs text-amber-700"
+            >
+              <Info size={12} aria-hidden="true" />
+              Search terms under {FTS_MIN_LENGTH} characters use a slower fallback search — try a longer term for faster, more relevant results.
+            </p>
+          </div>
+        )}
       </div>
 
       <div className="mx-auto flex w-full max-w-7xl flex-1 gap-8 px-4 sm:px-6 py-8">
@@ -231,6 +302,8 @@ export default function ExplorePage() {
         />
 
         <div className="flex-1">
+          <ActiveFilterChips filters={filters} dispatch={dispatch} collections={collections} className="mb-4" />
+
           {!isLoading && !error && totalCount > 0 && (
             <p className="mb-6 text-sm text-gray-500">
               Page <span className="font-semibold text-gray-700">{currentPage}</span>
@@ -241,26 +314,29 @@ export default function ExplorePage() {
           )}
 
           {error && (
-            <div className="text-red-500 p-4 border border-red-200 bg-red-50 rounded-lg">{error}</div>
+            // Retrying re-runs fetchPage, which closes over the current filter
+            // state — a retry never drops the user's search/filter selections.
+            <ResourceState isLoading={false} error={error} onRetry={() => fetchPage(undefined)} />
           )}
 
           {isLoading && (
-            <div className="grid gap-6 sm:grid-cols-2 lg:grid-cols-3">
+            <div role="status" aria-live="polite" className="grid gap-6 sm:grid-cols-2 lg:grid-cols-3">
+              <span className="sr-only">Loading artworks…</span>
               {Array.from({ length: PAGE_SIZE }).map((_, i) => <ListingCardSkeleton key={i} />)}
             </div>
           )}
 
           {!isLoading && !error && listings.length === 0 && (
-            <div className="py-20 text-center">
-              <h3 className="text-xl font-bold text-gray-900 mb-2">No artworks found</h3>
-              <p className="text-gray-500">Try adjusting your filters or search criteria.</p>
-              <button
-                onClick={() => dispatch({ type: "CLEAR_ALL" })}
-                className="mt-4 text-brand-600 font-medium hover:underline"
-              >
-                Clear all filters
-              </button>
-            </div>
+            <ResourceState
+              isLoading={false}
+              error={null}
+              isEmpty
+              empty={{
+                title: "No artworks found",
+                description: "Try adjusting your filters or search criteria.",
+                action: { label: "Clear all filters", onClick: () => dispatch({ type: "CLEAR_ALL" }) },
+              }}
+            />
           )}
 
           {!isLoading && !error && listings.length > 0 && (

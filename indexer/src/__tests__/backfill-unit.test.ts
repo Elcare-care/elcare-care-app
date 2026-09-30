@@ -37,7 +37,7 @@ vi.mock('../metrics.js', () => ({
 }));
 
 // ── Mock Prisma ───────────────────────────────────────────────────────────────
-const mockPrisma = {
+const mockPrisma = vi.hoisted(() => ({
   backfillJob:  { create: vi.fn(), findUnique: vi.fn(), findMany: vi.fn(), update: vi.fn(), updateMany: vi.fn() },
   ledgerGap:    { upsert: vi.fn(), findMany: vi.fn(), findUnique: vi.fn(), findFirst: vi.fn(), update: vi.fn(), updateMany: vi.fn() },
   syncState:    { findUnique: vi.fn(), upsert: vi.fn(), update: vi.fn() },

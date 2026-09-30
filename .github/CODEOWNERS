@@ -1,0 +1,47 @@
+# Code Owners for High-Risk Path Review Routing
+#
+# These patterns automatically request reviews from domain experts when
+# high-risk files are modified in a PR.
+#
+# See: CONTRIBUTING.md for high-risk change review guidance
+
+# Default owner for all files (optional, remove if not needed)
+# * @org/maintainers
+
+# Smart contracts — require contract security review
+/contracts/ @org/backend-lead-contracts @org/security-lead
+
+# Contract deployment scripts
+/scripts/deploy/ @org/backend-lead-contracts @org/devops
+
+# Database migrations — require data correctness review
+/indexer/prisma/schema.prisma @org/backend-lead-indexer @org/backend-lead-contracts
+/indexer/prisma/migrations/ @org/backend-lead-indexer
+
+# Event parser and catalog — require schema compatibility review
+/indexer/src/event-parser.ts @org/backend-lead-indexer @org/backend-lead-contracts
+/indexer/src/event-catalog.ts @org/backend-lead-indexer @org/backend-lead-contracts
+
+# Wallet signing and transaction simulation
+/frontend/elcarehub-app/src/lib/contract.ts @org/frontend-lead @org/backend-lead-contracts
+/frontend/elcarehub-app/src/lib/freighter.ts @org/frontend-lead @org/security-lead
+/frontend/elcarehub-app/src/lib/magic.ts @org/frontend-lead @org/security-lead
+
+# Security configuration
+/docs/threat-models/ @org/security-lead
+/docs/THREAT_MODEL*.md @org/security-lead
+/.github/workflows/ci.yml @org/devops @org/security-lead
+/.gitleaks.toml @org/security-lead
+
+# Reliability and operational runbooks
+/docs/reliability/ @org/backend-lead-indexer @org/devops
+/docs/runbooks/ @org/devops @org/backend-lead-indexer
+
+# Version and compatibility validation
+/versions.toml @org/backend-lead-contracts @org/backend-lead-indexer @org/devops
+/scripts/validate-compatibility.sh @org/backend-lead-indexer
+
+# Contribution and support templates
+/CONTRIBUTING.md @org/maintainers
+/.github/PULL_REQUEST_TEMPLATE/ @org/maintainers
+/.github/ISSUE_TEMPLATE/ @org/maintainers

@@ -36,7 +36,14 @@ import { logger } from './logger.js';
 import {
   openGapsGauge,
   openGapLedgersTotalGauge,
+  openGapsCountGauge,
+  openGapsLedgersTotalGauge,
 } from './metrics.js';
+import { recoveryFSM } from './recovery-state-machine.js';
+import {
+  gapRepairDurationSeconds,
+  gapLengthLedgers,
+} from './recovery-metrics.js';
 
 dotenv.config();
 
@@ -44,14 +51,17 @@ dotenv.config();
 
 const GAP_REPAIR_INTERVAL_MS = parseInt(
   process.env.GAP_REPAIR_INTERVAL_MS || '120000', // 2 min
+  10,
 );
 
 const GAP_REPAIR_MAX_RETRIES = parseInt(
   process.env.GAP_REPAIR_MAX_RETRIES || '3',
+  10,
 );
 
 const GAP_REPAIR_BATCH_SIZE = parseInt(
   process.env.GAP_REPAIR_BATCH_SIZE || process.env.BACKFILL_BATCH_SIZE || '5000',
+  10,
 );
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -120,6 +130,11 @@ export async function repairGap(gapId: number): Promise<GapRepairResult> {
     gapId, fromLedger: gap.fromLedger, toLedger: gap.toLedger,
   });
 
+  const repairStart = Date.now();
+  const ledgerCount = gap.toLedger - gap.fromLedger + 1;
+  recoveryFSM.toGapRepair(gapId, gap.fromLedger, gap.toLedger);
+  gapLengthLedgers.observe(ledgerCount);
+
   let jobId: number | null = null;
 
   try {
@@ -141,14 +156,19 @@ export async function repairGap(gapId: number): Promise<GapRepairResult> {
     );
 
     jobId = result.jobId;
+    const durationSec = (Date.now() - repairStart) / 1000;
+    gapRepairDurationSeconds.observe(durationSec);
 
     await prisma.ledgerGap.update({
       where: { id: gapId },
       data:  { status: 'Repaired', error: null },
     });
 
+    recoveryFSM.gapRepairComplete(gapId);
     logger.info('gap-repair: gap repaired', {
       gapId, jobId, totalInserted: result.totalInserted,
+      durationSeconds: durationSec.toFixed(2),
+      ledgerCount,
     });
 
     return {
@@ -158,13 +178,19 @@ export async function repairGap(gapId: number): Promise<GapRepairResult> {
 
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);
+    const durationSec = (Date.now() - repairStart) / 1000;
+    gapRepairDurationSeconds.observe(durationSec);
 
     await prisma.ledgerGap.update({
       where: { id: gapId },
       data:  { status: 'Failed', error: errMsg.slice(0, 4096) },
     });
 
-    logger.error('gap-repair: gap repair failed', { gapId, jobId, err: errMsg });
+    recoveryFSM.gapRepairFailed(gapId, errMsg);
+    logger.error('gap-repair: gap repair failed', {
+      gapId, jobId, err: errMsg,
+      durationSeconds: durationSec.toFixed(2),
+    });
 
     return {
       gapId, fromLedger: gap.fromLedger, toLedger: gap.toLedger,
@@ -186,8 +212,10 @@ export async function runRepairCycle(): Promise<GapRepairResult[]> {
     select: { fromLedger: true, toLedger: true },
   });
   openGapsGauge.set(openGaps.length);
+  openGapsCountGauge.set(openGaps.length);
   const totalLedgers = openGaps.reduce((a, g) => a + (g.toLedger - g.fromLedger + 1), 0);
   openGapLedgersTotalGauge.set(totalLedgers);
+  openGapsLedgersTotalGauge.set(totalLedgers);
 
   if (openGaps.length === 0) {
     logger.debug('gap-repair: no open gaps this cycle');

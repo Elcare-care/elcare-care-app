@@ -72,6 +72,15 @@ cd indexer
 docker compose up --build -d
 ```
 
+### Docker Deployment (Production - Hardened)
+For production deployments, always use the hardened configuration:
+```bash
+cd indexer
+docker compose -f docker-compose.yml -f docker-compose.prod.yml up --build -d
+```
+
+> **Important:** Production deployments must use the hardened configuration with non-root users, read-only filesystems, and dropped capabilities. See [Docker Hardening Guide](./docker-hardening.md) for detailed security measures and documented exceptions.
+
 ### Kubernetes Deployment (Production)
 To apply new indexer updates in production:
 ```bash
@@ -85,6 +94,31 @@ kubectl rollout restart deployment/indexer
 kubectl rollout status deployment/indexer
 ```
 
+**Kubernetes Security Context:**
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: indexer
+spec:
+  template:
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+        capabilities:
+          drop:
+            - ALL
+      containers:
+      - name: indexer
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+```
+
 ### Health & Readiness Checks
 The indexer exposes HTTP probes:
 - Liveness Probe: `GET http://localhost:4000/livez` (Returns HTTP 200)
@@ -93,6 +127,21 @@ The indexer exposes HTTP probes:
 ---
 
 ## 4. Frontend Deployment Workflow (Next.js / Vercel)
+
+### Docker Deployment (Local / Staging)
+```bash
+cd frontend/elcarehub-app
+docker compose up --build -d
+```
+
+### Docker Deployment (Production - Hardened)
+For production deployments, always use the hardened configuration:
+```bash
+cd frontend/elcarehub-app
+docker compose -f docker-compose.yml -f docker-compose.prod.yml up --build -d
+```
+
+> **Important:** Production deployments must use the hardened configuration with non-root users, read-only filesystems, and dropped capabilities. See [Docker Hardening Guide](./docker-hardening.md) for detailed security measures and documented exceptions.
 
 ### Production Build Check
 Always run a local production build before pushing to production:
@@ -125,7 +174,68 @@ npm run build
 
 ---
 
-## 6. Safe Redaction Guidance
+## 6. Release Versioning
+
+ElcareHub uses a multi-component versioning scheme. Each component (contracts, indexer, frontend, event schema, database migrations) has an independent version number tracked in `versions.toml` at the repository root.
+
+### Version Source of Truth
+
+| Component | Where version lives | Runtime exposure |
+|-----------|-------------------|-----------------|
+| Marketplace Contract | `contracts/soroban-marketplace/Cargo.toml` + `contract.rs` `CONTRACT_VERSION` | `version()` view function |
+| Launchpad Contract | `contracts/launchpad/Cargo.toml` + `contract.rs` `CONTRACT_VERSION` | `version()` view function |
+| Indexer | `indexer/package.json` | `GET /version`, `GET /health/details`, `X-Indexer-Version` header |
+| Frontend | `frontend/elcarehub-app/package.json` | `NEXT_PUBLIC_APP_VERSION` env, footer `<meta>` tag |
+| Event Schema | `versions.toml` | `X-Event-Schema-Version` header |
+| Database | `versions.toml` `db_migration_version` | `X-DB-Migration-Version` header |
+
+### Checking Versions at Runtime
+
+```bash
+# Indexer version endpoint
+curl http://localhost:4000/version
+
+# Health details (includes versions)
+curl http://localhost:4000/health/details
+
+# Check response headers for any API call
+curl -I http://localhost:4000/listings
+# Returns: X-Indexer-Version, X-API-Version, X-Event-Schema-Version, X-DB-Migration-Version
+```
+
+### Docker Image Versioning
+
+When building the indexer Docker image, pass version build args:
+
+```bash
+docker build \
+  --build-arg BUILD_SHA=$(git rev-parse --short HEAD) \
+  --build-arg BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
+  --build-arg INDEXER_VERSION=1.0.0 \
+  --build-arg API_VERSION=1.0.0 \
+  --build-arg EVENT_SCHEMA_VERSION=1 \
+  --build-arg DB_MIGRATION_VERSION=20260724000000 \
+  -t elcarehub-indexer:1.0.0 \
+  indexer/
+```
+
+### Validating Version Consistency
+
+Run the validation script before any release:
+
+```bash
+bash scripts/validate-compatibility.sh
+```
+
+This checks that `versions.toml`, `package.json`, `Cargo.toml`, `openapi.json`, and the latest Prisma migration all declare consistent versions.
+
+### Compatibility Matrix
+
+See [COMPATIBILITY.md](../../COMPATIBILITY.md) for the full matrix of tested and supported version combinations.
+
+---
+
+## 7. Safe Redaction Guidance
 
 > [!WARNING]
 > During deployment procedures:

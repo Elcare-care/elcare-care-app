@@ -1,0 +1,112 @@
+{
+  "title": "TTL Sweep Staleness — No ttl_extend CleanupSummary in 72h",
+  "description": "Fires when no CleanupSummaryEvent with kind=ttl_extend has been observed for the marketplace contract in the preceding 72 hours. extend_active_ttls must run at least every ~10 days (LEDGER_TTL_THRESHOLD); 72h is an early warning. See docs/guides/storage-retention.md and Issue #847.",
+  "uid": "elcarehub-ttl-sweep-staleness",
+  "orgId": 1,
+  "condition": "C",
+  "data": [
+    {
+      "refId": "A",
+      "queryType": "",
+      "relativeTimeRange": {
+        "from": 259200,
+        "to": 0
+      },
+      "datasourceUid": "${datasource}",
+      "model": {
+        "expr": "increase(elcarehub_cleanup_summary_total{kind=\"ttl_extend\"}[72h])",
+        "intervalMs": 1000,
+        "maxDataPoints": 43200,
+        "refId": "A"
+      }
+    },
+    {
+      "refId": "B",
+      "queryType": "",
+      "relativeTimeRange": {
+        "from": 259200,
+        "to": 0
+      },
+      "datasourceUid": "__expr__",
+      "model": {
+        "conditions": [
+          {
+            "evaluator": {
+              "params": [],
+              "type": "gt"
+            },
+            "operator": {
+              "type": "and"
+            },
+            "query": {
+              "params": ["A"]
+            },
+            "reducer": {
+              "params": [],
+              "type": "last"
+            },
+            "type": "query"
+          }
+        ],
+        "datasource": {
+          "type": "__expr__",
+          "uid": "__expr__"
+        },
+        "expression": "A",
+        "reducer": "last",
+        "refId": "B",
+        "type": "reduce"
+      }
+    },
+    {
+      "refId": "C",
+      "queryType": "",
+      "relativeTimeRange": {
+        "from": 259200,
+        "to": 0
+      },
+      "datasourceUid": "__expr__",
+      "model": {
+        "conditions": [
+          {
+            "evaluator": {
+              "params": [0],
+              "type": "lte"
+            },
+            "operator": {
+              "type": "and"
+            },
+            "query": {
+              "params": ["B"]
+            },
+            "reducer": {
+              "params": [],
+              "type": "last"
+            },
+            "type": "query"
+          }
+        ],
+        "datasource": {
+          "type": "__expr__",
+          "uid": "__expr__"
+        },
+        "expression": "B",
+        "refId": "C",
+        "type": "threshold"
+      }
+    }
+  ],
+  "noDataState": "Alerting",
+  "execErrState": "Error",
+  "for": "1h",
+  "labels": {
+    "severity": "warning",
+    "team": "elcarehub-platform"
+  },
+  "annotations": {
+    "summary": "No ttl_extend CleanupSummaryEvent in the last 72 hours — TTL keeper may be stalled",
+    "description": "Marketplace persistent listings/auctions rely on extend_active_ttls refreshing TTLs before LEDGER_TTL_THRESHOLD (~10 days). Run scripts/ttl-keeper.ts manually for an emergency sweep. Runbook: docs/guides/storage-retention.md",
+    "runbook_url": "https://github.com/Elcare-care/elcare-care-app/blob/main/docs/guides/storage-retention.md"
+  },
+  "isPaused": false
+}
