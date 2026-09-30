@@ -100,8 +100,30 @@ jobs:
         run: npm audit --audit-level=high
         working-directory: indexer
 
+  error-catalog-gate:
+    name: Error Catalog Gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Cache NPM dependencies
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: ${{ runner.os }}-root-node-20-${{ hashFiles('package-lock.json') }}
+          restore-keys: ${{ runner.os }}-root-node-20-
+      - name: Install ts-node and typescript
+        run: npm install --no-save ts-node typescript @types/node
+      - name: Validate error catalog against Rust sources
+        run: npx ts-node scripts/validate-error-catalog.ts
+
   contracts:
     name: Build and Test Contracts
+    needs: error-catalog-gate
     # Guard: the WASM build and `cargo test` below run against the whole
     # workspace and MUST keep including `contracts/launchpad` (soroban-launchpad).
     # Do not narrow these to a `-p` subset — the launchpad crate once bit-rotted

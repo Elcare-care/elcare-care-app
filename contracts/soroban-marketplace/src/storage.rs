@@ -126,6 +126,16 @@ pub enum DataKey {
     /// listing or auction; a double-listing guard reads it and settlement /
     /// cancellation clears it.
     EscrowedToken(Address, u64),
+    // ── Issue #852: Four-Role RBAC ────────────────────────────────────────────
+    /// Stores the Address that holds the given RoleType (other than Admin,
+    /// which lives under DataKey::Admin).
+    RoleAssignment(crate::types::RoleType),
+    /// Pending two-step transfer proposal for a specific RoleType.
+    PendingRoleProposal(crate::types::RoleType),
+    // ── Issue #850: Reservation window ────────────────────────────────────────
+    /// Optional reservation window for a listing.
+    /// Written by `set_listing_reservation`; absent means no active window.
+    ListingReservation(u64),
 }
 
 /// Custody record for an NFT held by the marketplace, keyed by
@@ -1016,48 +1026,6 @@ pub fn get_bid_history_cap_storage(env: &Env) -> u32 {
 
 // ── Escrow record ────────────────────────────────────────────
 
-/// A lightweight record written when an NFT is pulled into escrow and
-/// deleted when the NFT is released.  Supports the double-listing guard
-/// and the `get_escrow` view function.
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct EscrowRecord {
-    /// `true` → held for a listing; `false` → held for an auction.
-    pub is_listing: bool,
-    /// The listing_id or auction_id holding the token.
-    pub id: u64,
-}
-
-#[contracttype]
-#[derive(Clone)]
-pub enum EscrowKey {
-    EscrowedToken(Address, u64),
-}
-
-pub fn set_escrow_record(env: &Env, collection: &Address, token_id: u64, record: &EscrowRecord) {
-    let key = EscrowKey::EscrowedToken(collection.clone(), token_id);
-    env.storage().persistent().set(&key, record);
-    env.storage()
-        .persistent()
-        .extend_ttl(&key, LEDGER_TTL_THRESHOLD, LEDGER_TTL_BUMP);
-}
-
-pub fn get_escrow_record(env: &Env, collection: &Address, token_id: u64) -> Option<EscrowRecord> {
-    let key = EscrowKey::EscrowedToken(collection.clone(), token_id);
-    let value = env.storage().persistent().get::<EscrowKey, EscrowRecord>(&key);
-    if value.is_some() {
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, LEDGER_TTL_THRESHOLD, LEDGER_TTL_BUMP);
-    }
-    value
-}
-
-pub fn clear_escrow_record(env: &Env, collection: &Address, token_id: u64) {
-    let key = EscrowKey::EscrowedToken(collection.clone(), token_id);
-    env.storage().persistent().remove(&key);
-}
-
 // ── Auction max-extensions cap ───────────────────────────────
 
 /// Default: 0 = unlimited extensions (legacy behaviour preserved).
@@ -1081,4 +1049,109 @@ pub fn get_auction_max_extensions_storage(env: &Env) -> u32 {
         bump_entry_ttl(env, &DataKey::AuctionMaxExtensions);
     }
     value.unwrap_or(DEFAULT_AUCTION_MAX_EXTENSIONS)
+}
+
+// ── Issue #852: Four-Role RBAC storage helpers ───────────────────────────────
+
+/// Persist an address as the holder of `role`.
+pub fn set_role_storage(env: &Env, role: &crate::types::RoleType, authority: &Address) {
+    let key = DataKey::RoleAssignment(role.clone());
+    env.storage().persistent().set(&key, authority);
+    bump_entry_ttl(env, &key);
+}
+
+/// Read the address currently holding `role`, if any.
+pub fn get_role_storage(env: &Env, role: &crate::types::RoleType) -> Option<Address> {
+    let key = DataKey::RoleAssignment(role.clone());
+    let value = env
+        .storage()
+        .persistent()
+        .get::<DataKey, Address>(&key);
+    if value.is_some() {
+        bump_entry_ttl(env, &key);
+    }
+    value
+}
+
+/// Store a pending role transfer proposal.
+pub fn set_pending_role_storage(
+    env: &Env,
+    role: &crate::types::RoleType,
+    proposal: &crate::types::PendingRoleProposal,
+) {
+    let key = DataKey::PendingRoleProposal(role.clone());
+    env.storage().persistent().set(&key, proposal);
+    bump_entry_ttl(env, &key);
+}
+
+/// Read the pending role proposal for `role`, if any.
+pub fn get_pending_role_storage(
+    env: &Env,
+    role: &crate::types::RoleType,
+) -> Option<crate::types::PendingRoleProposal> {
+    let key = DataKey::PendingRoleProposal(role.clone());
+    let value = env
+        .storage()
+        .persistent()
+        .get::<DataKey, crate::types::PendingRoleProposal>(&key);
+    if value.is_some() {
+        bump_entry_ttl(env, &key);
+    }
+    value
+}
+
+/// Clear the pending role proposal for `role`.
+pub fn clear_pending_role_storage(env: &Env, role: &crate::types::RoleType) {
+    env.storage()
+        .persistent()
+        .remove(&DataKey::PendingRoleProposal(role.clone()));
+}
+
+// ── Issue #850: Reservation window storage ────────────────────────────────────
+
+/// A reservation window on a listing.  When active, only `reserved_for` may
+/// call `buy_artwork` during `[reservation_start, reservation_end)`.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ListingReservation {
+    /// The address with exclusive purchase rights during the window.
+    pub reserved_for: Address,
+    /// Absolute ledger timestamp when the window opens.
+    pub reservation_start: u64,
+    /// Absolute ledger timestamp when the window closes (exclusive).
+    pub reservation_end: u64,
+}
+
+/// Persist a reservation window for `listing_id`.
+pub fn set_listing_reservation_storage(
+    env: &Env,
+    listing_id: u64,
+    reservation: &ListingReservation,
+) {
+    let key = DataKey::ListingReservation(listing_id);
+    env.storage().persistent().set(&key, reservation);
+    bump_entry_ttl(env, &key);
+}
+
+/// Read the reservation window for `listing_id`, if any.
+pub fn get_listing_reservation_storage(
+    env: &Env,
+    listing_id: u64,
+) -> Option<ListingReservation> {
+    let key = DataKey::ListingReservation(listing_id);
+    let value = env
+        .storage()
+        .persistent()
+        .get::<DataKey, ListingReservation>(&key);
+    if value.is_some() {
+        bump_entry_ttl(env, &key);
+    }
+    value
+}
+
+/// Remove the reservation window for `listing_id`.
+pub fn clear_listing_reservation_storage(env: &Env, listing_id: u64) {
+    env.storage()
+        .persistent()
+        .remove(&DataKey::ListingReservation(listing_id));
 }

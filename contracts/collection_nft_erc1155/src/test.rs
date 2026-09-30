@@ -1171,3 +1171,96 @@ fn balance_of_batch_mismatched_lengths_returns_empty() {
     let result = client.balance_of_batch(&accounts, &ids);
     assert_eq!(result.len(), 0);
 }
+
+
+// ════════════════════════════════════════════════════════════
+// Issue #851 — Metadata Validation Tests (NormalNFT1155)
+// ════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod metadata_tests {
+    use super::*;
+    use crate::metadata;
+    use soroban_sdk::{Env, String};
+
+    fn env() -> Env {
+        Env::default()
+    }
+
+    fn s(env: &Env, val: &str) -> String {
+        String::from_str(env, val)
+    }
+
+    #[test]
+    fn test_empty_name_rejected() {
+        let env = env();
+        assert_eq!(metadata::validate_collection_name(&s(&env, "")), Err(crate::Error::EmptyName));
+    }
+
+    #[test]
+    fn test_name_at_max_len_accepted() {
+        let env = env();
+        let name = s(&env, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+        assert_eq!(name.len(), 64);
+        assert!(metadata::validate_collection_name(&name).is_ok());
+    }
+
+    #[test]
+    fn test_name_over_max_len_rejected() {
+        let env = env();
+        let name = s(&env, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+        assert_eq!(name.len(), 65);
+        assert_eq!(metadata::validate_collection_name(&name), Err(crate::Error::NameTooLong));
+    }
+
+    #[test]
+    fn test_zero_max_supply_rejected() {
+        assert_eq!(metadata::validate_max_supply(0), Err(crate::Error::InvalidMaxSupply));
+    }
+
+    #[test]
+    fn test_max_supply_at_limit_accepted() {
+        assert!(metadata::validate_max_supply(1_000_000).is_ok());
+    }
+
+    #[test]
+    fn test_max_supply_over_limit_rejected() {
+        assert_eq!(metadata::validate_max_supply(1_000_001), Err(crate::Error::InvalidMaxSupply));
+    }
+
+    #[test]
+    fn test_empty_uri_rejected() {
+        let env = env();
+        assert_eq!(metadata::validate_token_uri(&s(&env, "")), Err(crate::Error::EmptyUri));
+    }
+
+    #[test]
+    fn test_data_prefix_uri_rejected() {
+        let env = env();
+        assert_eq!(
+            metadata::validate_token_uri(&s(&env, "data:image/png;base64,abc")),
+            Err(crate::Error::InvalidUri)
+        );
+    }
+
+    #[test]
+    fn test_ipfs_prefix_accepted() {
+        let env = env();
+        assert!(metadata::validate_token_uri(&s(&env, "ipfs://QmHash")).is_ok());
+    }
+
+    #[test]
+    fn test_https_prefix_accepted() {
+        let env = env();
+        assert!(metadata::validate_token_uri(&s(&env, "https://example.com/meta.json")).is_ok());
+    }
+
+    #[test]
+    fn test_royalty_bps_at_max_accepted() {
+        assert!(metadata::validate_royalty_bps(10_000).is_ok());
+    }
+
+    #[test]
+    fn test_royalty_bps_over_max_rejected() {
+        assert_eq!(metadata::validate_royalty_bps(10_001), Err(crate::Error::InvalidBps));
+    }
+}

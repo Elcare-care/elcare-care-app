@@ -65,6 +65,14 @@ pub enum Error {
     InvalidMerkleProof = 15,
     /// Voucher nonce has been explicitly revoked by the creator.
     VoucherRevoked = 16,
+    // Issue #851: Metadata validation errors
+    EmptyName = 17,
+    NameTooLong = 18,
+    EmptyUri = 19,
+    UriTooLong = 20,
+    InvalidUri = 21,
+    InvalidBps = 22,
+    InvalidMaxSupply = 23,
 }
 
 // ─── Data types ───────────────────────────────────────────────────────────────
@@ -376,6 +384,8 @@ impl LazyMint1155 {
         if env.storage().instance().has(&DataKey::Initialized) {
             return Err(Error::AlreadyInitialized);
         }
+        metadata::validate_collection_name(&name)?;
+        metadata::validate_royalty_bps(royalty_bps)?;
         env.storage().instance().set(&DataKey::Initialized, &true);
         env.storage().instance().set(&DataKey::Creator, &creator);
         env.storage()
@@ -1055,3 +1065,5 @@ impl LazyMint1155 {
 
 #[cfg(test)]
 mod test;
+
+pub mod metadata;

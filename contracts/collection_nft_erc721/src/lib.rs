@@ -45,6 +45,16 @@ pub enum Error {
     InvalidBps = 11,       // basis points exceed MAX_BPS (10_000)
     CollectionPaused = 12, // minting is paused
     ApprovalExpired = 13,  // approval expiry has already passed at set time
+    // Issue #851: Metadata validation errors
+    EmptyName = 14,
+    NameTooLong = 15,
+    EmptySymbol = 16,
+    SymbolTooLong = 17,
+    InvalidSymbolChar = 18,
+    InvalidMaxSupply = 19,
+    EmptyUri = 20,
+    UriTooLong = 21,
+    InvalidUri = 22,
 }
 
 // ─── Storage Keys ─────────────────────────────────────────────────────────────
@@ -125,7 +135,10 @@ impl NormalNFT721 {
         if env.storage().instance().has(&DataKey::Initialized) {
             return Err(Error::AlreadyInitialized);
         }
-
+        metadata::validate_collection_name(&name)?;
+        metadata::validate_collection_symbol(&env, &symbol)?;
+        metadata::validate_max_supply(max_supply)?;
+        metadata::validate_royalty_bps(royalty_bps)?;
         env.storage().instance().set(&DataKey::Initialized, &true);
         env.storage().instance().set(&DataKey::Creator, &creator);
         env.storage().instance().set(&DataKey::Name, &name);
@@ -168,6 +181,8 @@ impl NormalNFT721 {
         {
             return Err(Error::CollectionPaused);
         }
+
+        metadata::validate_token_uri(&uri)?;
 
         let token_id: u64 = env
             .storage()
@@ -810,6 +825,7 @@ impl NormalNFT721 {
     pub fn set_base_uri(env: Env, base_uri: String) -> Result<(), Error> {
         Self::extend_instance_ttl(&env);
         Self::only_creator(&env)?;
+        metadata::validate_token_uri(&base_uri)?;
         if env
             .storage()
             .instance()
@@ -1006,6 +1022,8 @@ impl NormalNFT721 {
         Err(Error::NotApproved)
     }
 }
+
+pub mod metadata;
 
 #[cfg(test)]
 mod test;

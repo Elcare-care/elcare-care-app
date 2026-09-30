@@ -588,3 +588,29 @@ pub fn emit_function_paused(env: &Env, function_name: soroban_sdk::Symbol) {
 pub fn emit_function_unpaused(env: &Env, function_name: soroban_sdk::Symbol) {
     FunctionUnpausedEvent { function_name }.publish(env);
 }
+
+// ── Issue #850: Reservation window event ────────────────────────────────────
+
+pub const LISTING_RESERVATION_SET: &str = "listing_reservation_set";
+
+/// Emitted when a listing reservation window is created, updated, or cleared.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ListingReservationSetEvent {
+    pub listing_id: u64,
+    /// The address with exclusive purchase rights; `None` when clearing.
+    pub reserved_for: Option<soroban_sdk::Address>,
+    pub reservation_start: u64,
+    pub reservation_end: u64,
+    pub ledger_sequence: u32,
+}
+
+impl ListingReservationSetEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events().publish(
+            (soroban_sdk::Symbol::new(env, LISTING_RESERVATION_SET),),
+            self,
+        );
+    }
+}

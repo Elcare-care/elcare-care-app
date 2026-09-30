@@ -110,6 +110,17 @@ pub enum MarketplaceError {
     /// The auction has reached its `max_extensions` cap and can no longer be
     /// extended by the anti-sniping logic.
     MaxExtensionsReached = 48,
+    // ── Issue #850: Reservation window (discriminants 65/66) ─────────────────
+    /// A buy attempt was made during an active reservation window by an address
+    /// that is not the reserved buyer.
+    ReservationWindowActive = 65,
+    /// `set_listing_reservation` was called with an invalid window configuration
+    /// (e.g. end time in the past, or end ≤ start).
+    InvalidReservationWindow = 66,
+    // ── Issue #850: Counter-offer / state transitions (discriminant 75) ──────
+    /// A state transition was attempted that is not permitted from the current
+    /// state (e.g. proposing a counter-offer on a non-Pending offer).
+    InvalidStateTransition = 75,
 }
 
 #[contracttype]
@@ -228,4 +239,62 @@ pub struct Offer {
     pub status: OfferStatus,
     pub created_at: u32,
     pub expires_at: Option<u64>,
+}
+
+// ── Issue #852: Four-Role RBAC types ─────────────────────────────────────────
+
+/// The four named roles in the marketplace governance model.
+///
+/// * `Admin`      — full governance authority (existing).
+/// * `Operator`   — can create/cancel listings and auctions on behalf of artists.
+/// * `Moderator`  — can revoke/reinstate artists and pause collections/functions.
+/// * `TreasuryManager` — can update treasury address and fee settings.
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum RoleType {
+    Admin,
+    Operator,
+    Moderator,
+    TreasuryManager,
+}
+
+/// A single assigned role entry: the role type and the authority that holds it.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct RoleEntry {
+    pub role: RoleType,
+    pub authority: Address,
+}
+
+/// Snapshot of all four role assignments.  When a role has not been explicitly
+/// assigned, the `Admin` address is returned as the fallback authority.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct RoleInventory {
+    pub admin: Address,
+    pub operator: Option<Address>,
+    pub moderator: Option<Address>,
+    pub treasury_manager: Option<Address>,
+}
+
+/// Config struct passed to `migrate_roles` for a bulk, idempotent role assignment.
+/// Only roles whose corresponding field is `Some(..)` are considered; roles
+/// already assigned are left untouched (idempotency).
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct MigrateRolesConfig {
+    pub operator: Option<Address>,
+    pub moderator: Option<Address>,
+    pub treasury_manager: Option<Address>,
+}
+
+/// A pending two-step role transfer proposal.
+/// Stored under `DataKey::PendingRoleProposal(role)` until accepted or overwritten.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PendingRoleProposal {
+    pub role: RoleType,
+    pub candidate: Address,
+    pub proposed_by: Address,
+    pub expires_at: u64,
 }

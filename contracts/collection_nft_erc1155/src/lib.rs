@@ -54,6 +54,13 @@ pub enum Error {
     AlreadyFrozen = 11,
     /// basis points exceed MAX_BPS (10_000).
     InvalidBps = 12,
+    // Issue #851: Metadata validation errors
+    EmptyName = 13,
+    NameTooLong = 14,
+    EmptyUri = 15,
+    UriTooLong = 16,
+    InvalidUri = 17,
+    InvalidMaxSupply = 18,
 }
 
 // ─── Storage Keys ─────────────────────────────────────────────────────────────
@@ -131,6 +138,8 @@ impl NormalNFT1155 {
         if env.storage().instance().has(&DataKey::Initialized) {
             return Err(Error::AlreadyInitialized);
         }
+        metadata::validate_collection_name(&name)?;
+        metadata::validate_royalty_bps(royalty_bps)?;
         env.storage().instance().set(&DataKey::Initialized, &true);
         env.storage().instance().set(&DataKey::Creator, &creator);
         env.storage().instance().set(&DataKey::Name, &name);
@@ -237,6 +246,8 @@ impl NormalNFT1155 {
     /// Callable only by creator.
     pub fn set_base_uri(env: Env, base_uri: String) -> Result<(), Error> {
         Self::extend_instance_ttl(&env);
+        Self::only_creator(&env)?;
+        metadata::validate_token_uri(&base_uri)?;
         Self::only_creator(&env)?;
         if env
             .storage()
@@ -393,6 +404,7 @@ impl NormalNFT1155 {
         Self::extend_instance_ttl(&env);
         Self::only_creator(&env)?;
         Self::require_not_paused(&env)?;
+        metadata::validate_token_uri(&uri)?;
         let token_id: u64 = env
             .storage()
             .instance()
@@ -420,6 +432,7 @@ impl NormalNFT1155 {
         Self::extend_instance_ttl(&env);
         Self::only_creator(&env)?;
         Self::require_not_paused(&env)?;
+        metadata::validate_token_uri(&uri)?;
         Self::_check_supply_cap(&env, token_id, amount)?;
         Self::_check_wallet_limit(&env, &to, token_id, amount)?;
         Self::_mint(&env, &to, token_id, amount, &uri);
@@ -1006,3 +1019,5 @@ impl NormalNFT1155 {
 
 #[cfg(test)]
 mod test;
+
+pub mod metadata;

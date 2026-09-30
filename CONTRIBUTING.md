@@ -81,6 +81,25 @@ When introducing schema updates, new event topics, smart contract entry points, 
 2. Verify all path links and environment variable names match the repository.
 3. Ensure no example command or log output requests or prints un-redacted secrets.
 
+## Adding a new error code
+
+The marketplace and all four collection contracts maintain a canonical error-code registry in `error-catalog.json` at the workspace root. Every `#[contracterror]` discriminant is a permanent part of the on-chain ABI — changing a number silently breaks all clients that decode errors from transaction result XDR.
+
+**Rules:**
+
+1. **Append only.** Always add new variants at the very end of the enum, never insert between existing variants.
+2. **Increment by 1.** The new discriminant must be `current_maximum + 1` unless a gap is intentional and documented.
+3. **Update the catalog.** Add the new entry to `error-catalog.json` under the correct contract key with the version it is being introduced in:
+   ```json
+   { "discriminant": 76, "variant": "MyNewError", "added_in": "1.2.0" }
+   ```
+   You can regenerate the full catalog from scratch with:
+   ```bash
+   npx ts-node scripts/generate-error-catalog.ts
+   ```
+4. **CI gate.** The `error-catalog-gate` job runs `scripts/validate-error-catalog.ts` before the Rust build. A PR that adds a variant without updating the catalog will fail CI. Confirm `npx ts-node scripts/validate-error-catalog.ts` exits with code 0 before requesting review.
+5. **Never reuse.** A retired discriminant number must never be reassigned to a different variant, even if the original variant was removed.
+
 ## Commit messages
 
 Follow [Conventional Commits](https://www.conventionalcommits.org/), e.g. `feat(frontend): add checkout coverage thresholds`.
