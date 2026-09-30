@@ -64,7 +64,7 @@ describe('parseMarketplaceEvent — topic mapping', () => {
     mockFromXDR.mockReturnValue({});
   });
 
-  // All 24 marketplace symbols from contracts/soroban-marketplace/src/events.rs
+  // Every marketplace symbol from contracts/soroban-marketplace/src/events.rs
   // plus the 4 launchpad deploy symbols. This table pins symbol → type.
   const cases: [string, string][] = [
     ['lst_crtd', 'LISTING_CREATED'],
@@ -84,6 +84,7 @@ describe('parseMarketplaceEvent — topic mapping', () => {
     ['ofr_rclm', 'OFFER_RECLAIMED'],
     ['roy_paid', 'ROYALTY_PAID'],
     ['fee_cltd', 'PROTOCOL_FEE_COLLECTED'],
+    ['fee_attribution', 'FEE_ATTRIBUTION'],
     ['adm_prop', 'ADMIN_TRANSFER_PROPOSED'],
     ['adm_xfrd', 'ADMIN_TRANSFERRED'],
     ['art_rvkd', 'ARTIST_REVOKED'],
@@ -95,6 +96,29 @@ describe('parseMarketplaceEvent — topic mapping', () => {
     ['dep_n1155', 'DEPLOY_NORMAL_1155'],
     ['dep_l721', 'DEPLOY_LAZY_721'],
     ['dep_l1155', 'DEPLOY_LAZY_1155'],
+
+    // Issue #846: the entries above predate a handful of topics that were
+    // already mapped in TOPIC_MAP but missing from this table, which is why
+    // the coverage assertion below was failing; the long-form spellings of
+    // the versioned events are pinned here too so both spellings stay mapped.
+    ['listing_price_updated', 'LISTING_PRICE_UPDATED'],
+    ['auc_res_upd', 'AUCTION_RESERVE_UPDATED'],
+    ['own_reconciled', 'LISTING_OWNERSHIP_RECONCILED'],
+    ['revoke', 'VOUCHER_REVOKED'],
+    ['c_psd', 'COLLECTION_PAUSED'],
+    ['c_unpsd', 'COLLECTION_UNPAUSED'],
+    ['dep_idem', 'DEPLOY_IDEMPOTENT'],
+    ['artwork_sold', 'ARTWORK_SOLD'],
+    ['auction_admin_cancelled', 'AUCTION_ADMIN_CANCELLED'],
+    ['auction_bid_refunded', 'AUCTION_BID_REFUNDED'],
+    ['auction_cancelled', 'AUCTION_CANCELLED'],
+    ['auction_created', 'AUCTION_CREATED'],
+    ['auction_resolved', 'AUCTION_RESOLVED'],
+    ['listing_created', 'LISTING_CREATED'],
+    ['offer_accepted', 'OFFER_ACCEPTED'],
+    ['offer_made', 'OFFER_MADE'],
+    ['protocol_fee_collected', 'PROTOCOL_FEE_COLLECTED'],
+    ['royalty_settlement', 'ROYALTY_SETTLEMENT'],
   ];
 
   for (const [symbol, expectedType, fixture] of cases) {
@@ -106,10 +130,13 @@ describe('parseMarketplaceEvent — topic mapping', () => {
     });
   }
 
-  it('covers every known event type exactly once (no unmapped topics)', () => {
-    const expectedTypes = cases.map(([, type]) => type).sort();
+  it('covers every known event type (no unmapped topics)', () => {
+    // A type may legitimately have more than one topic symbol (the long form the
+    // contract publishes today plus the legacy short form historical backfills
+    // carry), so the table is compared after de-duplicating its types.
+    const expectedTypes = [...new Set(cases.map(([, type]) => type))].sort();
     expect([...KNOWN_EVENT_TYPES].sort()).toEqual(expectedTypes);
-    expect(KNOWN_EVENT_TYPES).toHaveLength(28);
+    expect(KNOWN_EVENT_TYPES).toHaveLength(38);
   });
 
   it('returns null for an unknown topic symbol', () => {

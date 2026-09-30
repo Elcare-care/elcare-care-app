@@ -23,7 +23,8 @@
     "lint:frontend": "npm run lint --prefix frontend/elcarehub-app",
     "lint:indexer": "npm run lint --prefix indexer",
     "install:all": "npm ci",
-    "ttl:keeper": "tsx scripts/ttl-keeper.ts"
+    "ttl:keeper": "tsx scripts/ttl-keeper.ts",
+    "check-event-schemas": "node scripts/check-event-schemas.mjs"
   },
   "workspaces": [
     "packages/config",
