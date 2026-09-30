@@ -1349,3 +1349,5 @@ impl LazyMint721 {
 
 #[cfg(test)]
 mod test;
+
+pub mod metadata;
