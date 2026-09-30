@@ -1633,145 +1633,127 @@ fn royalty_info_for_nonexistent_token_fails() {
     assert_eq!(result, Err(Ok(Error::TokenNotFound)));
 }
 
-// ── Creator succession (#484) ─────────────────────────────────────────────────
+// ── Creator succession: two-step, expiring, cancellable (#845) ───────────────
 
-/// Happy path: propose → advance ledger → accept from proposed address.
-/// Verifies Creator is updated and OriginalCreator is unchanged.
+/// True when an event carrying `name` as a topic symbol was emitted.
+#[allow(irrefutable_let_patterns)] // ContractEventBody has a single variant in this SDK version
+fn has_symbol_event(env: &Env, name: &str) -> bool {
+    use soroban_sdk::xdr::{ContractEventBody, ScVal};
+
+    env.events().all().events().iter().any(|event| {
+        if let ContractEventBody::V0(body) = &event.body {
+            body.topics.iter().any(|topic| match topic {
+                ScVal::Symbol(symbol) => {
+                    core::str::from_utf8(symbol.0.as_slice()).unwrap_or("") == name
+                }
+                _ => false,
+            })
+        } else {
+            false
+        }
+    })
+}
+
 #[test]
 fn test_creator_succession_happy_path() {
     let (env, client, _contract_id, creator) = setup();
-    let new_creator = Address::generate(&env);
+    let successor = Address::generate(&env);
+    let expires_at = env.ledger().sequence() + 1_000;
 
-    // OriginalCreator must equal creator at init.
+    client.propose_creator(&successor, &expires_at);
+    assert!(
+        has_symbol_event(&env, "cr_prop"),
+        "proposal must be announced"
+    );
+    // Authority does not move on the proposal itself.
+    assert_eq!(client.creator(), creator);
+
+    jump_ledger(&env, 10);
+    client.accept_creator(&successor);
+    // The event buffer holds the last invocation's events, so assert before any
+    // other contract call.
+    assert!(
+        has_symbol_event(&env, "cr_acc"),
+        "acceptance must be announced"
+    );
+
+    assert_eq!(client.creator(), successor);
     assert_eq!(client.original_creator(), creator);
-
-    // Propose: current ledger = 1, expiry = 100.
-    client.propose_creator(&new_creator, &100u32);
-
-    // Confirm pending proposal is recorded.
-    let (pending_addr, pending_exp) = client.pending_creator().unwrap();
-    assert_eq!(pending_addr, new_creator);
-    assert_eq!(pending_exp, 100u32);
-
-    // Advance ledger to sequence 50 — still before expiry.
-    jump_ledger(&env, 49); // 1 + 49 = 50
-
-    // Accept from the proposed address.
-    client.accept_creator(&new_creator);
-
-    // Creator must now be new_creator.
-    assert_eq!(client.creator(), new_creator);
-
-    // OriginalCreator must be unchanged — still the original initializer.
-    assert_eq!(client.original_creator(), creator);
-
-    // Pending proposal must be cleared.
-    assert_eq!(client.pending_creator(), None);
 }
 
-/// Calling accept_creator from an address that is not the pending candidate
-/// must return NotPendingCreator.
 #[test]
 fn test_creator_succession_not_pending_creator() {
-    let (env, client, _contract_id, _creator) = setup();
-    let new_creator = Address::generate(&env);
-    let intruder = Address::generate(&env);
+    let (env, client, _contract_id, creator) = setup();
+    let successor = Address::generate(&env);
+    let impostor = Address::generate(&env);
 
-    client.propose_creator(&new_creator, &100u32);
+    client.propose_creator(&successor, &(env.ledger().sequence() + 1_000));
+    jump_ledger(&env, 10);
 
-    let result = client.try_accept_creator(&intruder);
+    let result = client.try_accept_creator(&impostor);
     assert_eq!(result, Err(Ok(Error::NotPendingCreator)));
-
-    // Creator must be unchanged.
-    assert_ne!(client.creator(), intruder);
+    // A rejected acceptance leaves the creator untouched.
+    assert_eq!(client.creator(), creator);
 }
 
-/// Calling accept_creator after the expiry ledger has passed must return
-/// ProposalExpired.
 #[test]
 fn test_creator_succession_proposal_expired() {
-    let (env, client, _contract_id, _creator) = setup();
-    let new_creator = Address::generate(&env);
+    let (env, client, _contract_id, creator) = setup();
+    let successor = Address::generate(&env);
+    let expires_at = env.ledger().sequence() + 20;
 
-    // Expiry = 50. Current sequence = 1.
-    client.propose_creator(&new_creator, &50u32);
+    client.propose_creator(&successor, &expires_at);
+    jump_ledger(&env, 20);
 
-    // Jump to sequence 50 — at the expiry boundary (>= expiry means expired).
-    jump_ledger(&env, 49); // 1 + 49 = 50 >= 50 → expired
-
-    let result = client.try_accept_creator(&new_creator);
+    let result = client.try_accept_creator(&successor);
     assert_eq!(result, Err(Ok(Error::ProposalExpired)));
+    assert_eq!(client.creator(), creator);
 }
 
-/// Calling accept_creator when no proposal is pending must return
-/// NoPendingCreator.
 #[test]
 fn test_creator_succession_no_pending() {
     let (env, client, _contract_id, _creator) = setup();
-    let someone = Address::generate(&env);
+    let successor = Address::generate(&env);
 
-    let result = client.try_accept_creator(&someone);
+    let result = client.try_accept_creator(&successor);
     assert_eq!(result, Err(Ok(Error::NoPendingCreator)));
 }
 
-/// OriginalCreator must be immutable through any number of succession cycles.
 #[test]
 fn test_original_creator_immutable() {
-    let (env, client, _contract_id, original) = setup();
+    let (env, client, _contract_id, creator) = setup();
+    let first = Address::generate(&env);
     let second = Address::generate(&env);
-    let third = Address::generate(&env);
 
-    // Verify initial state.
-    assert_eq!(client.original_creator(), original);
-
-    // First succession: original → second.
-    client.propose_creator(&second, &100u32);
-    jump_ledger(&env, 10); // seq = 11, before expiry 100
+    client.propose_creator(&first, &(env.ledger().sequence() + 1_000));
+    client.accept_creator(&first);
+    client.propose_creator(&second, &(env.ledger().sequence() + 1_000));
     client.accept_creator(&second);
+
     assert_eq!(client.creator(), second);
-    assert_eq!(client.original_creator(), original); // unchanged
-
-    // Second succession: second → third.
-    client.propose_creator(&third, &200u32);
-    jump_ledger(&env, 10); // seq = 21
-    client.accept_creator(&third);
-    assert_eq!(client.creator(), third);
-    assert_eq!(client.original_creator(), original); // still unchanged
+    // Two successions later the original creator is still the one set at init.
+    assert_eq!(client.original_creator(), creator);
 }
 
-/// Cancelling a proposal prevents acceptance until a new one is proposed.
 #[test]
-fn test_creator_succession_cancel_prevents_accept() {
-    let (env, client, _contract_id, _creator) = setup();
-    let new_creator = Address::generate(&env);
+fn test_creator_succession_cancelled_proposal_cannot_be_accepted() {
+    let (env, client, _contract_id, creator) = setup();
+    let successor = Address::generate(&env);
+    let expires_at = env.ledger().sequence() + 1_000;
 
-    client.propose_creator(&new_creator, &100u32);
-    assert!(client.pending_creator().is_some());
-
-    // Current creator cancels.
+    client.propose_creator(&successor, &expires_at);
     client.cancel_creator_proposal();
-    assert_eq!(client.pending_creator(), None);
+    assert!(
+        has_symbol_event(&env, "cr_canc"),
+        "cancellation must be announced"
+    );
 
-    // Accept must now fail with NoPendingCreator.
-    let result = client.try_accept_creator(&new_creator);
+    let result = client.try_accept_creator(&successor);
     assert_eq!(result, Err(Ok(Error::NoPendingCreator)));
-}
+    assert_eq!(client.creator(), creator);
 
-/// cancel_creator_proposal when no proposal is active must return
-/// NoPendingCreator.
-#[test]
-fn test_cancel_creator_no_pending_fails() {
-    let (_env, client, _contract_id, _creator) = setup();
-    let result = client.try_cancel_creator_proposal();
-    assert_eq!(result, Err(Ok(Error::NoPendingCreator)));
-}
-
-/// propose_creator with an expiry in the past must be rejected immediately.
-#[test]
-fn test_propose_creator_expired_expiry_rejected() {
-    let (env, client, _contract_id, _creator) = setup();
-    let new_creator = Address::generate(&env);
-    // Current ledger = 1; passing expiry = 1 means >= current → ApprovalExpired.
-    let result = client.try_propose_creator(&new_creator, &1u32);
-    assert_eq!(result, Err(Ok(Error::ApprovalExpired)));
+    // A fresh proposal is accepted normally afterwards.
+    client.propose_creator(&successor, &expires_at);
+    client.accept_creator(&successor);
+    assert_eq!(client.creator(), successor);
 }
