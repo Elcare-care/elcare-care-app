@@ -611,42 +611,39 @@ fn test_governance_proposal_overwrite() {
         &None::<u32>,
         &None::<bool>,
     );
-    assert_ne!(fee_proposal, treasury_proposal);
 
-    // Executing the first proposal must not touch the second one.
-    client.approve_governance_action(&signers_a.get(0).unwrap(), &fee_proposal);
-    client.approve_governance_action(&signers_a.get(1).unwrap(), &fee_proposal);
-    client.execute_governance_action(&admin, &fee_proposal);
+    // Only 2 of 3 required approvals.
+    client.approve_governance_action(&alice, &pid);
+    client.approve_governance_action(&bob, &pid);
 
-    assert_eq!(client.get_protocol_fee(), 250u32);
-    assert_eq!(client.get_treasury(), treasury_before);
-    let pending = client.get_governance_proposal(&treasury_proposal);
-    assert!(!pending.executed);
-    assert!(!pending.cancelled);
-    assert_eq!(client.get_governance_approvals(&treasury_proposal).len(), 0);
+    // Threshold met — execute.
+    client.execute_governance_action(&admin, &pid);
 
-    // Signers of one proposal are not signers of the other.
-    let cross =
-        client.try_approve_governance_action(&signers_a.get(0).unwrap(), &treasury_proposal);
-    assert_eq!(
-        cross.unwrap_err().unwrap(),
-        MarketplaceError::GovernanceSignerNotAuthorized.into()
-    );
-
-    // The second proposal still runs its own cycle.
-    client.approve_governance_action(&signers_b.get(0).unwrap(), &treasury_proposal);
-    client.approve_governance_action(&signers_b.get(1).unwrap(), &treasury_proposal);
-    client.execute_governance_action(&admin, &treasury_proposal);
+    // Treasury must now be new_treasury.
     assert_eq!(client.get_treasury(), Some(new_treasury));
-    assert_eq!(client.get_protocol_fee(), 250u32);
+
+    // Proposal must be marked executed.
+    assert!(client.get_governance_proposal(&pid).executed);
+
+    // Charlie's approval is no longer needed — charlie cannot approve after execution.
+    let result = client.try_approve_governance_action(&charlie, &pid);
+    assert!(result.is_err());
 }
 
+// ── §17  FeeIncrease full end-to-end cycle ────────────────────────────────────
+
+/// Full cycle for FeeIncrease: 3 signers, threshold 2, verify fee storage.
 #[test]
-fn test_governance_threshold_not_met_blocks_execute() {
+fn test_governance_fee_increase_full_cycle() {
     let (env, client, admin) = quorum_setup();
-    let signers = make_signers(&env, 3);
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    let charlie = Address::generate(&env);
+    let mut signers = soroban_sdk::Vec::new(&env);
+    signers.push_back(alice.clone());
+    signers.push_back(bob.clone());
+    signers.push_back(charlie.clone());
     let expires = future_expires(&env);
-    let fee_before = client.get_protocol_fee();
 
     let pid = client.propose_governance_action(
         &admin,

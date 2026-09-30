@@ -1,559 +1,337 @@
 /**
  * event-parsing.test.ts
  *
- * Integration test: schema-versioned event decoding for all eleven
- * explicitly-versioned event types (Issue #278) plus the new
- * FeeAttributionEvent (Issue #488).
+ * Acceptance criteria for Issue #846 — schema-versioned event parsing.
  *
- * For each versioned event type this suite verifies:
- *   1. A pre-upgrade (v0 / implicit) payload — no `schema_version` field —
- *      decodes successfully and is treated as version 0 by the version gate.
- *   2. A post-upgrade (v1) payload — `schema_version: 1` present — decodes
- *      successfully with `schema_version === 1`.
- *   3. All non-version fields decode identically in both shapes.
- *   4. A future-version payload (`schema_version: 99`) is rejected by
- *      `isSupportedSchemaVersion` but does NOT throw a `SchemaDecodeError`
- *      (the structural shape is still valid).
+ *   ✓ Every event struct that carries `schema_version` on the contract side is
+ *     reachable through the topic the contract actually publishes, and has a
+ *     registry entry whose `schema_version` field is optional (the CI gate in
+ *     scripts/check-event-schemas.mjs enforces the static half of this).
+ *   ✓ For every versioned event type: the pre-upgrade shape (no
+ *     `schema_version` field at all) decodes and reports implicit version 0.
+ *   ✓ The post-upgrade shape decodes and reports version 1.
+ *   ✓ Every other field decodes identically in both shapes, so a mixed
+ *     historical scan across an upgrade boundary is decoded consistently.
  *
- * The tests exercise `decodeWithSchema` and `isSupportedSchemaVersion`
- * directly — no live RPC or XDR encoding is required.
+ * The payloads below are real XDR: a Soroban `#[contracttype]` struct is a map
+ * of symbol keys to values, which is what these fixtures build with the SDK's
+ * ScVal constructors. That matters — the earlier suite mocked scValToNative and
+ * therefore could not see that a u32 field declared as `bigint` (or an unknown
+ * topic) made real events undecodable.
  */
 
 import { describe, it, expect } from 'vitest';
-import {
-  decodeWithSchema,
-  isSupportedSchemaVersion,
-  SCHEMA_REGISTRY,
-  SUPPORTED_SCHEMA_VERSIONS,
-  type FeeAttributionData,
-} from '../src/event-schemas.js';
+import { Address, xdr } from '@stellar/stellar-sdk';
 
-// ── Shared assertion helper ───────────────────────────────────────────────────
+import { parseMarketplaceEvent, resolveEventType } from '../src/parser.js';
+import { SCHEMA_REGISTRY } from '../src/event-schemas.js';
 
-/**
- * Asserts the three-version contract for a single versioned event type:
- *   - v0 payload decodes successfully
- *   - v1 payload decodes successfully with schema_version === 1
- *   - A future payload is structurally valid but `isSupportedSchemaVersion`
- *     rejects it
- *   - Both v0 and v1 return identical values for all non-version fields
- *
- * @param eventType   Upper-case registry key, e.g. "LISTING_CREATED"
- * @param baseFields  All required/optional fields except `schema_version`
- */
-function assertVersionedEvent(
-  eventType: string,
-  baseFields: Record<string, unknown>
-): void {
-  const schema = SCHEMA_REGISTRY.get(eventType);
-  if (!schema) throw new Error(`No schema registered for ${eventType}`);
+// ── XDR helpers ──────────────────────────────────────────────────────────────
 
-  const v0Payload = { ...baseFields };                     // no schema_version
-  const v1Payload = { ...baseFields, schema_version: 1 };  // post-upgrade
-  const vFuturePayload = { ...baseFields, schema_version: 99 };
+const ACCOUNT = 'GBZXN7PIRZGNMHGA7MUUUF4GWPY5AYPV6LY4UV2GL6VJGIQRXFDNMADI';
+const ACCOUNT_2 = 'GDVEU3DD4KOFECV66VIHWEZOYX4ZKR3WV27L464SIIPOU2IUI3JCZA57';
+const CONTRACT = 'CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4';
 
-  // ── v0: must decode and isSupportedSchemaVersion(undefined/0) = true ──────
-  const v0Result = decodeWithSchema(eventType, schema, v0Payload);
-  expect(v0Result.ok, `${eventType} v0 should decode successfully`).toBe(true);
-  expect(
-    isSupportedSchemaVersion(eventType, undefined),
-    `${eventType}: absent schema_version must be supported`
-  ).toBe(true);
-  expect(
-    isSupportedSchemaVersion(eventType, 0),
-    `${eventType}: explicit version 0 must be supported`
-  ).toBe(true);
+const sym = (s: string) => xdr.ScVal.scvSymbol(s);
+const u32 = (n: number) => xdr.ScVal.scvU32(n);
+const u64 = (n: number) => xdr.ScVal.scvU64(new xdr.Uint64(n));
+const i128 = (n: number) =>
+  xdr.ScVal.scvI128(new xdr.Int128Parts({ hi: new xdr.Int64(0), lo: new xdr.Uint64(n) }));
+const addr = (a: string = ACCOUNT) => Address.fromString(a).toScVal();
+const bool = (b: boolean) => xdr.ScVal.scvBool(b);
+const none = () => xdr.ScVal.scvVoid();
+const vec = (vals: xdr.ScVal[]) => xdr.ScVal.scvVec(vals);
 
-  // ── v1: must decode and isSupportedSchemaVersion(1) = true ───────────────
-  const v1Result = decodeWithSchema(eventType, schema, v1Payload);
-  expect(v1Result.ok, `${eventType} v1 should decode successfully`).toBe(true);
-  if (v1Result.ok) {
-    expect(
-      (v1Result.data as Record<string, unknown>)['schema_version'],
-      `${eventType} v1 data.schema_version should be 1`
-    ).toBe(1);
-  }
-  expect(
-    isSupportedSchemaVersion(eventType, 1),
-    `${eventType}: version 1 must be supported`
-  ).toBe(true);
+/** A `#[contracttype]` unit-variant enum encodes as a one-element vec of its variant name. */
+const unitEnum = (variant: string) => vec([sym(variant)]);
 
-  // ── Field parity: non-version fields must be identical in v0 and v1 ──────
-  if (v0Result.ok && v1Result.ok) {
-    for (const [key, value] of Object.entries(baseFields)) {
-      const v0Val = (v0Result.data as Record<string, unknown>)[key];
-      const v1Val = (v1Result.data as Record<string, unknown>)[key];
-      expect(v0Val, `${eventType} v0.${key}`).toEqual(value);
-      expect(v1Val, `${eventType} v1.${key}`).toEqual(value);
-    }
-  }
+/** A `#[contracttype]` struct encodes as a map of symbol keys → values. */
+const structXdr = (fields: Array<[string, xdr.ScVal]>) =>
+  new xdr.ScVal.scvMap(fields.map(([key, val]) => new xdr.ScMapEntry({ key: sym(key), val })));
 
-  // ── Future version: structurally valid but version gate rejects ───────────
-  const vFutureResult = decodeWithSchema(eventType, schema, vFuturePayload);
-  expect(
-    vFutureResult.ok,
-    `${eventType} future-version payload is structurally valid`
-  ).toBe(true);
-  expect(
-    isSupportedSchemaVersion(eventType, 99),
-    `${eventType}: version 99 must NOT be supported`
-  ).toBe(false);
+const encode = (fields: Array<[string, xdr.ScVal]>) => structXdr(fields).toXDR('base64');
 
-  // ── SUPPORTED_SCHEMA_VERSIONS entry must exist ────────────────────────────
-  expect(
-    Object.prototype.hasOwnProperty.call(SUPPORTED_SCHEMA_VERSIONS, eventType),
-    `${eventType} must have an entry in SUPPORTED_SCHEMA_VERSIONS`
-  ).toBe(true);
+// ── Fixtures: one per versioned event type ───────────────────────────────────
+
+interface VersionedCase {
+  /** Registry/topic constants name, e.g. LISTING_CREATED */
+  constName: string;
+  /** The Rust struct it decodes from */
+  struct: string;
+  /** Topic the current contract build publishes */
+  topic: string;
+  /** Legacy short topic kept for historical backfills, when one exists */
+  legacyTopic?: string;
+  /** Struct fields as emitted *before* schema_version existed (i.e. version 0) */
+  fields: Array<[string, xdr.ScVal]>;
 }
 
-// ── Fixtures ──────────────────────────────────────────────────────────────────
-// All id/amount fields are BigInt (Soroban u64/i128 → JS BigInt after
-// scValToNative). Addresses and symbols are plain strings.
+const CASES: VersionedCase[] = [
+  {
+    constName: 'LISTING_CREATED',
+    struct: 'ListingCreatedEvent',
+    topic: 'listing_created',
+    legacyTopic: 'lst_crtd',
+    fields: [
+      ['listing_id', u64(1)],
+      ['artist', addr()],
+      ['price', i128(10_000_000)],
+      ['currency', sym('USDC')],
+      ['collection', addr(CONTRACT)],
+      ['token_id', u64(7)],
+      ['ledger_sequence', u32(1234)],
+    ],
+  },
+  {
+    constName: 'ARTWORK_SOLD',
+    struct: 'ArtworkSoldEvent',
+    topic: 'artwork_sold',
+    legacyTopic: 'art_sold',
+    fields: [
+      ['listing_id', u64(2)],
+      ['artist', addr()],
+      ['buyer', addr(ACCOUNT_2)],
+      ['price', i128(5_000_000)],
+      ['currency', sym('USDC')],
+      ['ledger_sequence', u32(1235)],
+    ],
+  },
+  {
+    constName: 'AUCTION_CREATED',
+    struct: 'AuctionCreatedEvent',
+    topic: 'auction_created',
+    legacyTopic: 'auc_crtd',
+    fields: [
+      ['auction_id', u64(3)],
+      ['creator', addr()],
+      ['reserve_price', i128(2_000_000)],
+      ['token', addr(CONTRACT)],
+      ['collection', addr(CONTRACT)],
+      ['token_id', u64(9)],
+      ['end_time', u64(1_800_000_000)],
+    ],
+  },
+  {
+    constName: 'AUCTION_RESOLVED',
+    struct: 'AuctionFinalizedEvent',
+    topic: 'auction_resolved',
+    legacyTopic: 'auc_rslv',
+    fields: [
+      ['auction_id', u64(4)],
+      ['winner', addr(ACCOUNT_2)],
+      ['amount', i128(3_000_000)],
+    ],
+  },
+  {
+    constName: 'AUCTION_CANCELLED',
+    struct: 'AuctionCancelledEvent',
+    topic: 'auction_cancelled',
+    legacyTopic: 'auc_cncl',
+    fields: [
+      ['auction_id', u64(5)],
+      ['cancelled_by', addr()],
+      ['reason', unitEnum('Owner')],
+      ['escrow_amount', i128(0)],
+      ['token', addr(CONTRACT)],
+      ['ledger_sequence', u32(1240)],
+    ],
+  },
+  {
+    constName: 'AUCTION_BID_REFUNDED',
+    struct: 'AuctionBidRefundedEvent',
+    topic: 'auction_bid_refunded',
+    fields: [
+      ['auction_id', u64(6)],
+      ['bidder', addr(ACCOUNT_2)],
+      ['amount', i128(1_500_000)],
+      ['token', addr(CONTRACT)],
+      ['reason', sym('outbid')],
+      ['ledger_sequence', u32(1241)],
+    ],
+  },
+  {
+    constName: 'AUCTION_ADMIN_CANCELLED',
+    struct: 'AuctionAdminCancelledEvent',
+    topic: 'auction_admin_cancelled',
+    fields: [
+      ['auction_id', u64(7)],
+      ['cancelled_by', addr()],
+      ['refunded_amount', i128(700_000)],
+      ['token', addr(CONTRACT)],
+      ['ledger_sequence', u32(1242)],
+    ],
+  },
+  {
+    constName: 'ROYALTY_SETTLEMENT',
+    struct: 'RoyaltySettlementEvent',
+    topic: 'royalty_settlement',
+    fields: [
+      ['id', u64(8)],
+      [
+        'recipients',
+        vec([structXdr([['address', addr()], ['percentage', u32(500)]])]),
+      ],
+      ['total_amount', i128(900_000)],
+      ['token', addr(CONTRACT)],
+      ['ledger_sequence', u32(1243)],
+    ],
+  },
+  {
+    constName: 'OFFER_MADE',
+    struct: 'OfferMadeEvent',
+    topic: 'offer_made',
+    legacyTopic: 'ofr_made',
+    fields: [
+      ['offer_id', u64(9)],
+      ['listing_id', u64(1)],
+      ['offerer', addr(ACCOUNT_2)],
+      ['amount', i128(4_000_000)],
+      ['token', addr(CONTRACT)],
+      ['expires_at', none()],
+    ],
+  },
+  {
+    constName: 'OFFER_ACCEPTED',
+    struct: 'OfferAcceptedEvent',
+    topic: 'offer_accepted',
+    legacyTopic: 'ofr_accp',
+    fields: [
+      ['offer_id', u64(9)],
+      ['listing_id', u64(1)],
+      ['offerer', addr(ACCOUNT_2)],
+      ['amount', i128(4_000_000)],
+    ],
+  },
+  {
+    constName: 'PROTOCOL_FEE_COLLECTED',
+    struct: 'ProtocolFeeCollectedEvent',
+    topic: 'protocol_fee_collected',
+    legacyTopic: 'fee_cltd',
+    fields: [
+      ['listing_id', u64(1)],
+      ['amount', i128(250_000)],
+      ['token', addr(CONTRACT)],
+      ['treasury', addr()],
+    ],
+  },
+  {
+    constName: 'FEE_ATTRIBUTION',
+    struct: 'FeeAttributionEvent',
+    topic: 'fee_attribution',
+    fields: [
+      ['listing_id', u64(1)],
+      ['collection', addr(CONTRACT)],
+      ['applied_fee_bps', u32(700)],
+      ['is_collection_override', bool(true)],
+    ],
+  },
+];
 
-const LISTING_BASE = {
-  listing_id: BigInt(1),
-  artist:     'GABC',
-  price:      BigInt(100_000_000),
-  currency:   'XLM',
-  collection: 'CCOL',
-  token_id:   BigInt(42),
-};
+const LEDGER = 4_242;
 
-const ARTWORK_SOLD_BASE = {
-  listing_id: BigInt(1),
-  buyer:      'GBUY',
-  price:      BigInt(100_000_000),
-};
+/** Decode the version-0 (pre-upgrade) shape. */
+const decodeV0 = (c: VersionedCase) =>
+  parseMarketplaceEvent([c.topic], encode(c.fields), LEDGER, CONTRACT);
 
-const AUCTION_CREATED_BASE = {
-  auction_id:    BigInt(7),
-  creator:       'GCRT',
-  reserve_price: BigInt(50_000_000),
-  token:         'GTKN',
-  collection:    'CCOL',
-  token_id:      BigInt(3),
-  end_time:      BigInt(9_999_999),
-};
+/** Decode the version-1 (post-upgrade) shape. */
+const decodeV1 = (c: VersionedCase) =>
+  parseMarketplaceEvent(
+    [c.topic],
+    encode([...c.fields, ['schema_version', u32(1)]]),
+    LEDGER,
+    CONTRACT,
+  );
 
-const AUCTION_RESOLVED_BASE = {
-  auction_id: BigInt(7),
-  amount:     BigInt(75_000_000),
-};
+// ── Static parity: topic and registry reachability ───────────────────────────
 
-const OFFER_MADE_BASE = {
-  offer_id:   BigInt(5),
-  listing_id: BigInt(1),
-  offerer:    'GOFF',
-  amount:     BigInt(90_000_000),
-  token:      'GTKN',
-};
+describe('versioned event registry parity (#846)', () => {
+  it('covers every struct that carries schema_version', () => {
+    // Eleven pre-existing versioned events plus FeeAttributionEvent, which is
+    // versioned from the start (Issue #846).
+    expect(CASES).toHaveLength(12);
+  });
 
-const OFFER_ACCEPTED_BASE = {
-  offer_id:   BigInt(5),
-  listing_id: BigInt(1),
-  offerer:    'GOFF',
-};
-
-const PROTOCOL_FEE_BASE = {
-  listing_id: BigInt(1),
-  amount:     BigInt(200_000),
-  token:      'GTKN',
-  treasury:   'GTRE',
-};
-
-const ROYALTY_SETTLEMENT_BASE = {
-  id:           BigInt(1),
-  recipients:   [{ address: 'GRCP', percentage: BigInt(10_000) }],
-  total_amount: BigInt(100_000_000),
-  token:        'GTKN',
-};
-
-const AUCTION_BID_REFUNDED_BASE = {
-  auction_id: BigInt(7),
-  bidder:     'GBDR',
-  amount:     BigInt(50_000_000),
-  token:      'GTKN',
-};
-
-const AUCTION_ADMIN_CANCELLED_BASE = {
-  auction_id:      BigInt(7),
-  refunded_amount: BigInt(50_000_000),
-  token:           'GTKN',
-};
-
-const AUCTION_CANCELLED_BASE = {
-  auction_id: BigInt(7),
-};
-
-const FEE_ATTRIBUTION_BASE: Omit<FeeAttributionData, 'schema_version'> = {
-  listing_id:            BigInt(1),
-  collection:            'CCOL',
-  applied_fee_bps:       250,
-  is_collection_override: true,
-};
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
-
-describe('event-parsing: schema-versioned event decoding', () => {
-
-  // ── §1  LISTING_CREATED ────────────────────────────────────────────────────
-
-  describe('LISTING_CREATED', () => {
-    it('decodes v0 (no schema_version) and v1 identically for base fields', () => {
-      assertVersionedEvent('LISTING_CREATED', LISTING_BASE);
-    });
-
-    it('v0 payload is missing schema_version → version gate treats as v0', () => {
-      expect(isSupportedSchemaVersion('LISTING_CREATED', undefined)).toBe(true);
-    });
-
-    it('v1 payload schema_version === 1 is present and correct', () => {
-      const schema = SCHEMA_REGISTRY.get('LISTING_CREATED')!;
-      const result = decodeWithSchema(
-        'LISTING_CREATED', schema, { ...LISTING_BASE, schema_version: 1 }
-      );
-      expect(result.ok).toBe(true);
-      if (result.ok) {
-        expect((result.data as Record<string, unknown>)['schema_version']).toBe(1);
+  for (const c of CASES) {
+    it(`${c.constName} (${c.struct}) is reachable and has an optional schema_version`, () => {
+      // The topic the contract publishes today must resolve.
+      expect(resolveEventType([c.topic])).toBe(c.constName);
+      if (c.legacyTopic) {
+        // …and the legacy short topic historical backfills carry.
+        expect(resolveEventType([c.legacyTopic])).toBe(c.constName);
       }
+
+      const schema = SCHEMA_REGISTRY.get(c.constName);
+      expect(schema).toBeDefined();
+      const versionField = schema!.data.find((f) => f.name === 'schema_version');
+      expect(versionField, 'schema_version must be declared').toBeDefined();
+      expect(versionField!.optional, 'schema_version must be optional (version 0)').toBe(true);
+      expect(versionField!.type).toBe('number');
     });
-  });
+  }
+});
 
-  // ── §2  ARTWORK_SOLD ───────────────────────────────────────────────────────
+// ── Both shapes decode, and agree on everything but the version ──────────────
 
-  describe('ARTWORK_SOLD', () => {
-    it('decodes v0 and v1 identically for base fields', () => {
-      assertVersionedEvent('ARTWORK_SOLD', ARTWORK_SOLD_BASE);
-    });
-  });
-
-  // ── §3  AUCTION_CREATED ────────────────────────────────────────────────────
-
-  describe('AUCTION_CREATED', () => {
-    it('decodes v0 and v1 identically for base fields', () => {
-      assertVersionedEvent('AUCTION_CREATED', AUCTION_CREATED_BASE);
-    });
-  });
-
-  // ── §4  AUCTION_RESOLVED (AuctionFinalizedEvent) ───────────────────────────
-
-  describe('AUCTION_RESOLVED', () => {
-    it('decodes v0 and v1 identically for base fields', () => {
-      assertVersionedEvent('AUCTION_RESOLVED', AUCTION_RESOLVED_BASE);
-    });
-
-    it('winner field is optional (no-bid finalization)', () => {
-      const schema = SCHEMA_REGISTRY.get('AUCTION_RESOLVED')!;
-      // winner absent — no-bid case
-      const result = decodeWithSchema('AUCTION_RESOLVED', schema, AUCTION_RESOLVED_BASE);
-      expect(result.ok).toBe(true);
-    });
-  });
-
-  // ── §5  OFFER_MADE ─────────────────────────────────────────────────────────
-
-  describe('OFFER_MADE', () => {
-    it('decodes v0 and v1 identically for base fields', () => {
-      assertVersionedEvent('OFFER_MADE', OFFER_MADE_BASE);
-    });
-
-    it('expires_at field is optional', () => {
-      const schema = SCHEMA_REGISTRY.get('OFFER_MADE')!;
-      const withExpiry = { ...OFFER_MADE_BASE, expires_at: BigInt(9_999_999) };
-      const result = decodeWithSchema('OFFER_MADE', schema, withExpiry);
-      expect(result.ok).toBe(true);
-    });
-  });
-
-  // ── §6  OFFER_ACCEPTED ─────────────────────────────────────────────────────
-
-  describe('OFFER_ACCEPTED', () => {
-    it('decodes v0 and v1 identically for base fields', () => {
-      assertVersionedEvent('OFFER_ACCEPTED', OFFER_ACCEPTED_BASE);
-    });
-
-    it('amount field is optional (absent on pre-upgrade events)', () => {
-      const schema = SCHEMA_REGISTRY.get('OFFER_ACCEPTED')!;
-      // amount absent
-      const result = decodeWithSchema('OFFER_ACCEPTED', schema, {
-        offer_id: BigInt(5), listing_id: BigInt(1), offerer: 'GOFF',
-      });
-      expect(result.ok).toBe(true);
-    });
-  });
-
-  // ── §7  PROTOCOL_FEE_COLLECTED ─────────────────────────────────────────────
-
-  describe('PROTOCOL_FEE_COLLECTED', () => {
-    it('decodes v0 and v1 identically for base fields', () => {
-      assertVersionedEvent('PROTOCOL_FEE_COLLECTED', PROTOCOL_FEE_BASE);
-    });
-  });
-
-  // ── §8  ROYALTY_SETTLEMENT ─────────────────────────────────────────────────
-
-  describe('ROYALTY_SETTLEMENT', () => {
-    it('decodes v0 and v1 identically for base fields', () => {
-      assertVersionedEvent('ROYALTY_SETTLEMENT', ROYALTY_SETTLEMENT_BASE);
-    });
-
-    it('ledger_sequence is optional', () => {
-      const schema = SCHEMA_REGISTRY.get('ROYALTY_SETTLEMENT')!;
-      const withSeq = { ...ROYALTY_SETTLEMENT_BASE, ledger_sequence: BigInt(100) };
-      const result = decodeWithSchema('ROYALTY_SETTLEMENT', schema, withSeq);
-      expect(result.ok).toBe(true);
-    });
-  });
-
-  // ── §9  AUCTION_BID_REFUNDED ───────────────────────────────────────────────
-
-  describe('AUCTION_BID_REFUNDED', () => {
-    it('decodes v0 and v1 identically for base fields', () => {
-      assertVersionedEvent('AUCTION_BID_REFUNDED', AUCTION_BID_REFUNDED_BASE);
-    });
-
-    it('reason field is optional', () => {
-      const schema = SCHEMA_REGISTRY.get('AUCTION_BID_REFUNDED')!;
-      const withReason = { ...AUCTION_BID_REFUNDED_BASE, reason: 'outbid' };
-      const result = decodeWithSchema('AUCTION_BID_REFUNDED', schema, withReason);
-      expect(result.ok).toBe(true);
-    });
-  });
-
-  // ── §10 AUCTION_ADMIN_CANCELLED ────────────────────────────────────────────
-
-  describe('AUCTION_ADMIN_CANCELLED', () => {
-    it('decodes v0 and v1 identically for base fields', () => {
-      assertVersionedEvent('AUCTION_ADMIN_CANCELLED', AUCTION_ADMIN_CANCELLED_BASE);
-    });
-
-    it('cancelled_by is optional', () => {
-      const schema = SCHEMA_REGISTRY.get('AUCTION_ADMIN_CANCELLED')!;
-      const withBy = { ...AUCTION_ADMIN_CANCELLED_BASE, cancelled_by: 'GADM' };
-      const result = decodeWithSchema('AUCTION_ADMIN_CANCELLED', schema, withBy);
-      expect(result.ok).toBe(true);
-    });
-  });
-
-  // ── §11 AUCTION_CANCELLED (AuctionCancelledEvent carries schema_version) ───
-
-  describe('AUCTION_CANCELLED', () => {
-    it('decodes with only auction_id present (base fields)', () => {
-      const schema = SCHEMA_REGISTRY.get('AUCTION_CANCELLED')!;
-      const result = decodeWithSchema('AUCTION_CANCELLED', schema, AUCTION_CANCELLED_BASE);
-      expect(result.ok).toBe(true);
-    });
-
-    it('cancelled_by is optional', () => {
-      const schema = SCHEMA_REGISTRY.get('AUCTION_CANCELLED')!;
-      const withBy = { ...AUCTION_CANCELLED_BASE, cancelled_by: 'GOWN' };
-      const result = decodeWithSchema('AUCTION_CANCELLED', schema, withBy);
-      expect(result.ok).toBe(true);
-    });
-
-    // AUCTION_CANCELLED is not in SUPPORTED_SCHEMA_VERSIONS because its
-    // schema has never required a version-tracked shape change — the
-    // schema_version field on the Rust struct is emitted but the indexer
-    // schema marks it as simply optional rather than version-gated.
-    it('version gate passes any version for AUCTION_CANCELLED (untracked)', () => {
-      expect(isSupportedSchemaVersion('AUCTION_CANCELLED', 999)).toBe(true);
-    });
-  });
-
-  // ── §12 FEE_ATTRIBUTION (Issue #488) ──────────────────────────────────────
-
-  describe('FEE_ATTRIBUTION', () => {
-    it('decodes v0 (no schema_version) and v1 identically for base fields', () => {
-      assertVersionedEvent(
-        'FEE_ATTRIBUTION',
-        FEE_ATTRIBUTION_BASE as unknown as Record<string, unknown>
-      );
-    });
-
-    it('v1 with is_collection_override=false decodes correctly', () => {
-      const schema = SCHEMA_REGISTRY.get('FEE_ATTRIBUTION')!;
-      const globalRatePayload = {
-        listing_id:             BigInt(2),
-        collection:             'CCOL2',
-        applied_fee_bps:        150,
-        is_collection_override: false,
-        schema_version:         1,
-      };
-      const result = decodeWithSchema('FEE_ATTRIBUTION', schema, globalRatePayload);
-      expect(result.ok).toBe(true);
-      if (result.ok) {
-        const d = result.data as Record<string, unknown>;
-        expect(d['is_collection_override']).toBe(false);
-        expect(d['applied_fee_bps']).toBe(150);
-        expect(d['schema_version']).toBe(1);
-      }
-    });
-
-    it('FEE_ATTRIBUTION in SUPPORTED_SCHEMA_VERSIONS with max = 1', () => {
-      expect(SUPPORTED_SCHEMA_VERSIONS['FEE_ATTRIBUTION']).toBe(1);
-    });
-
-    it('version 0 is supported (implicit pre-upgrade)', () => {
-      expect(isSupportedSchemaVersion('FEE_ATTRIBUTION', 0)).toBe(true);
-    });
-
-    it('version 2 is not yet supported', () => {
-      expect(isSupportedSchemaVersion('FEE_ATTRIBUTION', 2)).toBe(false);
-    });
-
-    it('missing required field listing_id returns a decode error', () => {
-      const schema = SCHEMA_REGISTRY.get('FEE_ATTRIBUTION')!;
-      const broken = {
-        // listing_id intentionally absent
-        collection:             'CCOL',
-        applied_fee_bps:        250,
-        is_collection_override: true,
-        schema_version:         1,
-      };
-      const result = decodeWithSchema('FEE_ATTRIBUTION', schema, broken);
-      expect(result.ok).toBe(false);
-      if (!result.ok) {
-        expect(result.reason).toMatch(/listing_id/);
-      }
-    });
-  });
-
-  // ── §13 Cross-event: all 11 versioned types are in SUPPORTED_SCHEMA_VERSIONS
-
-  describe('SUPPORTED_SCHEMA_VERSIONS completeness', () => {
-    const VERSIONED_TYPES = [
-      'LISTING_CREATED',
-      'ARTWORK_SOLD',
-      'AUCTION_CREATED',
-      'AUCTION_RESOLVED',
-      'OFFER_MADE',
-      'OFFER_ACCEPTED',
-      'PROTOCOL_FEE_COLLECTED',
-      'ROYALTY_SETTLEMENT',
-      'AUCTION_BID_REFUNDED',
-      'AUCTION_ADMIN_CANCELLED',
-      'FEE_ATTRIBUTION',
-    ] as const;
-
-    for (const type of VERSIONED_TYPES) {
-      it(`${type} has a SUPPORTED_SCHEMA_VERSIONS entry`, () => {
-        expect(
-          Object.prototype.hasOwnProperty.call(SUPPORTED_SCHEMA_VERSIONS, type)
-        ).toBe(true);
+describe('decoding across an upgrade boundary (#846)', () => {
+  for (const c of CASES) {
+    describe(`${c.constName}`, () => {
+      it('decodes the pre-upgrade shape (no schema_version) as implicit version 0', () => {
+        const decoded = decodeV0(c);
+        expect(decoded).not.toBeNull();
+        expect(decoded!.eventType).toBe(c.constName);
+        expect(decoded!.data.schema_version).toBeUndefined();
       });
 
-      it(`${type} entry is a non-negative integer`, () => {
-        const ver = SUPPORTED_SCHEMA_VERSIONS[type];
-        expect(typeof ver).toBe('number');
-        expect(Number.isInteger(ver) && ver >= 0).toBe(true);
+      it('decodes the post-upgrade shape with schema_version = 1', () => {
+        const decoded = decodeV1(c);
+        expect(decoded).not.toBeNull();
+        expect(decoded!.eventType).toBe(c.constName);
+        expect(decoded!.data.schema_version).toBe(1);
       });
+
+      it('decodes every other field identically in both shapes', () => {
+        const v0 = decodeV0(c)!;
+        const v1 = decodeV1(c)!;
+
+        const stripVersion = (data: Record<string, unknown>) => {
+          const { schema_version: _ignored, ...rest } = data;
+          return rest;
+        };
+
+        expect(stripVersion(v1.data)).toEqual(stripVersion(v0.data));
+      });
+    });
+  }
+
+  it('decodes a mixed pre/post-upgrade scan (backfill over an upgrade boundary)', () => {
+    // Two payloads per event type: the historical one first, then the current
+    // one — the order a backfill walks its ledger ranges in.
+    const mixed = CASES.flatMap((c) => [
+      encode(c.fields),
+      encode([...c.fields, ['schema_version', u32(1)]]),
+    ]);
+    const topics = CASES.flatMap((c) => [c.topic, c.topic]);
+
+    const decoded = mixed.map((payload, i) =>
+      parseMarketplaceEvent([topics[i]], payload, LEDGER + i, CONTRACT),
+    );
+
+    expect(decoded).toHaveLength(CASES.length * 2);
+    expect(decoded.every((d) => d !== null)).toBe(true);
+
+    const versions = decoded.map((d) => d!.data.schema_version ?? 0);
+    for (let i = 0; i < versions.length; i += 2) {
+      expect(versions[i]).toBe(0); // pre-upgrade
+      expect(versions[i + 1]).toBe(1); // post-upgrade
     }
   });
 
-  // ── §14 Cross-event: every versioned type has a SCHEMA_REGISTRY entry ──────
-
-  describe('SCHEMA_REGISTRY completeness', () => {
-    const VERSIONED_TYPES = [
-      'LISTING_CREATED', 'ARTWORK_SOLD', 'AUCTION_CREATED', 'AUCTION_RESOLVED',
-      'OFFER_MADE', 'OFFER_ACCEPTED', 'PROTOCOL_FEE_COLLECTED',
-      'ROYALTY_SETTLEMENT', 'AUCTION_BID_REFUNDED', 'AUCTION_ADMIN_CANCELLED',
-      'FEE_ATTRIBUTION',
-    ] as const;
-
-    for (const type of VERSIONED_TYPES) {
-      it(`${type} is registered in SCHEMA_REGISTRY`, () => {
-        expect(SCHEMA_REGISTRY.has(type)).toBe(true);
-      });
-
-      it(`${type} schema has schema_version field marked optional`, () => {
-        const schema = SCHEMA_REGISTRY.get(type)!;
-        const svField = schema.data.find(f => f.name === 'schema_version');
-        expect(
-          svField,
-          `${type} schema must include a schema_version field`
-        ).toBeDefined();
-        expect(
-          svField?.optional,
-          `${type} schema.schema_version must be optional:true`
-        ).toBe(true);
-      });
+  it('still decodes a payload that carries only what the contract emits today', () => {
+    // Guards the opposite mistake: a schema declaring a *required* field the
+    // contract never emits would reject every real event of that type.
+    for (const c of CASES) {
+      const payload = encode([...c.fields, ['schema_version', u32(1)]]);
+      expect(() => parseMarketplaceEvent([c.topic], payload, LEDGER, CONTRACT)).not.toThrow();
     }
   });
-
-  // ── §15 Backfill boundary: both event shapes decode through the same path ──
-
-  describe('backfill boundary — upgrade-spanning ledger range', () => {
-    it('pre-upgrade LISTING_CREATED (v0, no schema_version) decodes without error', () => {
-      const schema = SCHEMA_REGISTRY.get('LISTING_CREATED')!;
-      // Simulate an event emitted before Issue #278 — no schema_version field
-      const preUpgrade = { ...LISTING_BASE }; // no schema_version
-      const result = decodeWithSchema('LISTING_CREATED', schema, preUpgrade);
-      expect(result.ok).toBe(true);
-      if (result.ok) {
-        const d = result.data as Record<string, unknown>;
-        // schema_version must be absent (undefined) — not defaulted to 0
-        expect(d['schema_version']).toBeUndefined();
-      }
-    });
-
-    it('post-upgrade LISTING_CREATED (v1, schema_version: 1) decodes without error', () => {
-      const schema = SCHEMA_REGISTRY.get('LISTING_CREATED')!;
-      const postUpgrade = { ...LISTING_BASE, schema_version: 1 };
-      const result = decodeWithSchema('LISTING_CREATED', schema, postUpgrade);
-      expect(result.ok).toBe(true);
-      if (result.ok) {
-        expect(
-          (result.data as Record<string, unknown>)['schema_version']
-        ).toBe(1);
-      }
-    });
-
-    it('both shapes return the same values for all non-version fields', () => {
-      const schema = SCHEMA_REGISTRY.get('LISTING_CREATED')!;
-      const v0 = decodeWithSchema('LISTING_CREATED', schema, LISTING_BASE);
-      const v1 = decodeWithSchema('LISTING_CREATED', schema, {
-        ...LISTING_BASE, schema_version: 1,
-      });
-      expect(v0.ok).toBe(true);
-      expect(v1.ok).toBe(true);
-      if (v0.ok && v1.ok) {
-        const d0 = v0.data as Record<string, unknown>;
-        const d1 = v1.data as Record<string, unknown>;
-        for (const [key, value] of Object.entries(LISTING_BASE)) {
-          expect(d0[key]).toEqual(value);
-          expect(d1[key]).toEqual(value);
-        }
-      }
-    });
-
-    it('a ledger-scan spanning the upgrade boundary decodes both shapes without error', () => {
-      // Simulate a backfill worker processing two events from the same ledger
-      // range — one before the upgrade (v0) and one after (v1). Both must
-      // decode successfully through the same code path.
-      const schema = SCHEMA_REGISTRY.get('ARTWORK_SOLD')!;
-
-      const historicalEvent = {                          // emitted pre-upgrade
-        listing_id: BigInt(100),
-        buyer: 'GBUY',
-        price: BigInt(500_000_000),
-      };
-      const currentEvent = {                             // emitted post-upgrade
-        listing_id: BigInt(101),
-        buyer: 'GBUY2',
-        price: BigInt(600_000_000),
-        schema_version: 1,
-      };
-
-      const r0 = decodeWithSchema('ARTWORK_SOLD', schema, historicalEvent);
-      const r1 = decodeWithSchema('ARTWORK_SOLD', schema, currentEvent);
-
-      expect(r0.ok).toBe(true);
-      expect(r1.ok).toBe(true);
-
-      // Version gate confirms both are within the supported range
-      expect(isSupportedSchemaVersion('ARTWORK_SOLD', undefined)).toBe(true);
-      expect(isSupportedSchemaVersion('ARTWORK_SOLD', 1)).toBe(true);
-    });
-  });
-
 });

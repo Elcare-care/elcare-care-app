@@ -676,6 +676,55 @@ pub fn emit_collection_fee_cleared(env: &Env, collection: Address) {
     CollectionFeeClearedEvent { collection }.publish(env);
 }
 
+// ── Fee attribution (Issue #846) ─────────────────────────────────────────────
+
+pub const FEE_ATTRIBUTION: &str = "fee_attribution";
+
+/// Emitted at settlement with the fee rate the payout split actually used, so
+/// operators can tell override-driven fee income from income at the rate
+/// snapshotted on the listing/auction (Issue #846).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeAttributionEvent {
+    /// Listing id for listing/offer settlements, auction id for auction ones.
+    pub listing_id: u64,
+    pub collection: Address,
+    /// The rate applied to this settlement, in basis points (0 when no treasury
+    /// is configured and therefore no fee is taken).
+    pub applied_fee_bps: u32,
+    /// True when `applied_fee_bps` came from the collection's `CollectionFeeBps`
+    /// override rather than the rate snapshotted on the listing/auction.
+    pub is_collection_override: bool,
+    /// Event schema version (Issue #278): versioned from the start.
+    pub schema_version: u32,
+}
+
+impl FeeAttributionEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, FEE_ATTRIBUTION),), self);
+    }
+}
+
+/// Emit `fee_attribution` for a settlement (Issue #846).
+pub fn emit_fee_attribution(
+    env: &Env,
+    listing_id: u64,
+    collection: Address,
+    applied_fee_bps: u32,
+    is_collection_override: bool,
+) {
+    FeeAttributionEvent {
+        listing_id,
+        collection,
+        applied_fee_bps,
+        is_collection_override,
+        schema_version: EVENT_SCHEMA_VERSION,
+    }
+    .publish(env);
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProtocolFeeCollectedEvent {

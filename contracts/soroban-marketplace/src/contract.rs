@@ -5100,11 +5100,28 @@ impl MarketplaceContract {
         }
 
         // ── Fee + recipient split via math::distribute ────────────────────────
+        // Issue #846: a collection-level fee override, when one is configured,
+        // is the rate that actually applies to this collection's settlements;
+        // the rate snapshotted on the listing/auction is the fallback. The
+        // attribution event records which of the two was used so the indexer can
+        // separate override-driven fee income from snapshot-rate income.
+        let collection_override_bps = crate::storage::get_collection_fee_bps_storage(env, collection_addr);
+        let (settlement_fee_bps, is_collection_override) = match collection_override_bps {
+            Some(bps) => (bps, true),
+            None => (fee_bps, false),
+        };
         let effective_fee_bps = if crate::storage::get_treasury_storage(env).is_some() {
-            fee_bps
+            settlement_fee_bps
         } else {
             0
         };
+        crate::events::emit_fee_attribution(
+            env,
+            settlement_id,
+            collection_addr.clone(),
+            effective_fee_bps,
+            is_collection_override,
+        );
         let dist = crate::math::distribute(env, payout, effective_fee_bps, recipients);
 
         let mut fee_collected: i128 = 0;

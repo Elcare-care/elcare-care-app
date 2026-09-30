@@ -10,6 +10,7 @@
  *
  * JS types after scValToNative:
  *   Soroban u64 / i128  → BigInt
+ *   Soroban u32 / i32   → number (verified against @stellar/stellar-sdk)
  *   Soroban Address     → string
  *   Soroban Symbol      → string
  *   Soroban bool        → boolean
@@ -64,6 +65,7 @@ export const SUPPORTED_SCHEMA_VERSIONS: Record<string, number> = {
   OFFER_MADE: 1,
   OFFER_ACCEPTED: 1,
   PROTOCOL_FEE_COLLECTED: 1,
+  FEE_ATTRIBUTION: 1,
   ROYALTY_SETTLEMENT: 1,
   AUCTION_BID_REFUNDED: 1,
   AUCTION_ADMIN_CANCELLED: 1,
@@ -439,7 +441,7 @@ export const LISTING_CREATED_SCHEMA: ContractEventSchema = {
     { name: 'currency', type: 'string' },
     { name: 'collection', type: 'string' },
     { name: 'token_id', type: 'bigint' },
-    { name: 'ledger_sequence', type: 'bigint', optional: true },
+    { name: 'ledger_sequence', type: 'number', optional: true },
     { name: 'token', type: 'string', optional: true },
     { name: 'recipients', type: 'array', optional: true },
     // Issue #278: additive, absent on pre-upgrade historical events.
@@ -455,7 +457,7 @@ export const ARTWORK_SOLD_SCHEMA: ContractEventSchema = {
     { name: 'price', type: 'bigint' },
     { name: 'artist', type: 'string', optional: true },
     { name: 'currency', type: 'string', optional: true },
-    { name: 'ledger_sequence', type: 'bigint', optional: true },
+    { name: 'ledger_sequence', type: 'number', optional: true },
     // Issue #278: additive, absent on pre-upgrade historical events.
     { name: 'schema_version', type: 'number', optional: true },
   ],
@@ -468,7 +470,7 @@ export const LISTING_CANCELLED_SCHEMA: ContractEventSchema = {
     { name: 'cancelled_by', type: 'string', optional: true },
     // reason can be an enum object { tag: N } OR a plain string in legacy builds
     { name: 'reason', type: 'any', optional: true },
-    { name: 'ledger_sequence', type: 'bigint', optional: true },
+    { name: 'ledger_sequence', type: 'number', optional: true },
   ],
 };
 
@@ -480,7 +482,7 @@ export const LISTING_UPDATED_SCHEMA: ContractEventSchema = {
     { name: 'artist', type: 'string', optional: true },
     { name: 'collection', type: 'string', optional: true },
     { name: 'token_id', type: 'bigint', optional: true },
-    { name: 'ledger_sequence', type: 'bigint', optional: true },
+    { name: 'ledger_sequence', type: 'number', optional: true },
   ],
 };
 
@@ -499,7 +501,7 @@ export const LISTING_EXPIRED_SCHEMA: ContractEventSchema = {
   data: [
     { name: 'listing_id', type: 'bigint' },
     { name: 'expired_at', type: 'bigint' },
-    { name: 'ledger_sequence', type: 'bigint', optional: true },
+    { name: 'ledger_sequence', type: 'number', optional: true },
   ],
 };
 
@@ -550,7 +552,8 @@ export const AUCTION_BID_REFUNDED_SCHEMA: ContractEventSchema = {
     { name: 'amount', type: 'bigint' },
     { name: 'token', type: 'string' },
     { name: 'reason', type: 'string', optional: true },
-    { name: 'ledger_sequence', type: 'bigint', optional: true },
+    // u32 on the contract side, so scValToNative yields a JS number.
+    { name: 'ledger_sequence', type: 'number', optional: true },
     // Issue #278: additive, absent on pre-upgrade historical events.
     { name: 'schema_version', type: 'number', optional: true },
   ],
@@ -564,7 +567,8 @@ export const AUCTION_ADMIN_CANCELLED_SCHEMA: ContractEventSchema = {
     { name: 'cancelled_by', type: 'string', optional: true },
     { name: 'refunded_amount', type: 'bigint' },
     { name: 'token', type: 'string' },
-    { name: 'ledger_sequence', type: 'bigint', optional: true },
+    // u32 on the contract side, so scValToNative yields a JS number.
+    { name: 'ledger_sequence', type: 'number', optional: true },
     // Issue #278: additive, absent on pre-upgrade historical events.
     { name: 'schema_version', type: 'number', optional: true },
   ],
@@ -575,6 +579,11 @@ export const AUCTION_CANCELLED_SCHEMA: ContractEventSchema = {
   data: [
     { name: 'auction_id', type: 'bigint' },
     { name: 'cancelled_by', type: 'string', optional: true },
+    // Issue #278: additive, absent on pre-upgrade historical events. Without
+    // this entry a versioned event has no schema_version field to validate,
+    // so the version gate in parser.ts never sees it (see the audit in
+    // Issue #846 and scripts/check-event-schemas.mjs, which now enforces it).
+    { name: 'schema_version', type: 'number', optional: true },
   ],
 };
 
@@ -669,7 +678,25 @@ export const ROYALTY_PAID_SCHEMA: ContractEventSchema = {
     { name: 'protocol_fee_amount', type: 'bigint' },
     { name: 'token', type: 'string' },
     { name: 'recipients', type: 'array' },
-    { name: 'ledger_sequence', type: 'bigint', optional: true },
+    { name: 'ledger_sequence', type: 'number', optional: true },
+  ],
+};
+
+/**
+ * Fee attribution for a settlement (Issue #846): the fee rate the payout split
+ * actually applied and whether it came from the collection's fee override
+ * rather than the rate snapshotted on the listing/auction. Versioned from the
+ * start, so `schema_version` is only ever absent if a producer omits it.
+ */
+export const FEE_ATTRIBUTION_SCHEMA: ContractEventSchema = {
+  type: 'FEE_ATTRIBUTION',
+  data: [
+    { name: 'listing_id', type: 'bigint' },
+    { name: 'collection', type: 'string' },
+    // u32 on the contract side → JS number
+    { name: 'applied_fee_bps', type: 'number' },
+    { name: 'is_collection_override', type: 'boolean' },
+    { name: 'schema_version', type: 'number', optional: true },
   ],
 };
 
@@ -693,7 +720,7 @@ export const ROYALTY_SETTLEMENT_SCHEMA: ContractEventSchema = {
     { name: 'recipients', type: 'array' },
     { name: 'total_amount', type: 'bigint' },
     { name: 'token', type: 'string' },
-    { name: 'ledger_sequence', type: 'bigint', optional: true },
+    { name: 'ledger_sequence', type: 'number', optional: true },
     // Issue #278: additive, absent on pre-upgrade historical events.
     { name: 'schema_version', type: 'number', optional: true },
   ],
@@ -855,7 +882,7 @@ export const LISTING_OWNERSHIP_RECONCILED_SCHEMA: ContractEventSchema = {
     { name: 'reconciled_by', type: 'string' },
     // previous_owner is Option<Address> — absent on first-ever reconciliation
     { name: 'previous_owner',  type: 'string',  optional: true },
-    { name: 'ledger_sequence', type: 'bigint',  optional: true },
+    { name: 'ledger_sequence', type: 'number', optional: true },
   ],
 };
 
@@ -932,6 +959,11 @@ export const SCHEMA_REGISTRY: Map<string, ContractEventSchema> = new Map([
   ['AUCTION_RESOLVED', AUCTION_RESOLVED_SCHEMA],
   ['AUCTION_CANCELLED', AUCTION_CANCELLED_SCHEMA],
   ['AUCTION_EXTENDED', AUCTION_EXTENDED_SCHEMA],
+  // Issue #271 events that were defined but never registered, so the indexer
+  // had no schema to validate them against (found by the Issue #846 audit,
+  // enforced by scripts/check-event-schemas.mjs from now on).
+  ['AUCTION_BID_REFUNDED', AUCTION_BID_REFUNDED_SCHEMA],
+  ['AUCTION_ADMIN_CANCELLED', AUCTION_ADMIN_CANCELLED_SCHEMA],
   ['OFFER_MADE', OFFER_MADE_SCHEMA],
   ['OFFER_ACCEPTED', OFFER_ACCEPTED_SCHEMA],
   ['OFFER_REJECTED', OFFER_REJECTED_SCHEMA],
@@ -939,6 +971,7 @@ export const SCHEMA_REGISTRY: Map<string, ContractEventSchema> = new Map([
   ['OFFER_RECLAIMED', OFFER_RECLAIMED_SCHEMA],
   ['ROYALTY_PAID', ROYALTY_PAID_SCHEMA],
   ['PROTOCOL_FEE_COLLECTED', PROTOCOL_FEE_COLLECTED_SCHEMA],
+  ['FEE_ATTRIBUTION', FEE_ATTRIBUTION_SCHEMA],
   ['ROYALTY_SETTLEMENT', ROYALTY_SETTLEMENT_SCHEMA],
   ['TOKEN_WHITELISTED', TOKEN_WHITELISTED_SCHEMA],
   ['TOKEN_REMOVED', TOKEN_REMOVED_SCHEMA],
