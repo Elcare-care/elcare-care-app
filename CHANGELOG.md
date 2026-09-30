@@ -2,6 +2,12 @@
 
 All notable changes to ElcareHub are documented here. Each release entry lists component versions, required migrations, rollback notes, and compatibility constraints.
 
+## [Unreleased]
+
+### Added
+
+- **`set_collection_protocol_fee` on the launchpad (Issue #849).** The launchpad admin can now configure the marketplace's per-collection protocol fee override for any collection the launchpad deployed: `set_marketplace_address` points the launchpad at its marketplace, and the new entry point forwards to the marketplace's `set_collection_fee_bps` (which is what enforces the `ProtocolConfig` role on the marketplace side) and emits a launchpad-side `fee_cfg` audit event. Guard rails: `MarketplaceNotConfigured` when no marketplace is set, `CollectionNotOurs` for addresses this launchpad did not deploy, `InvalidFeeBps` above 10 000 bps. The marketplace's storage helpers and its own `collection_fee_set` / `collection_fee_cleared` events are unchanged.
+
 ## [Release 1] - 2026-07-26
 
 ### Components

@@ -239,3 +239,31 @@ pub fn publish_migration_completed(env: &Env, version: &soroban_sdk::String) {
         (),
     );
 }
+
+/// Emitted when the launchpad configures the marketplace's per-collection
+/// protocol fee override (Issue #849).
+///
+/// Topics: ("fee_cfg", collection)
+/// Data:   (bps: u32, admin: Address)
+///
+/// The override itself lives on the marketplace; this event is the launchpad's
+/// audit record that its admin requested it, alongside the marketplace's own
+/// `collection_fee_set`.
+#[allow(deprecated)]
+pub fn publish_collection_fee_configured(env: &Env, collection: &Address, bps: u32, admin: &Address) {
+    env.events().publish(
+        (symbol_short!("fee_cfg"), collection.clone()),
+        (bps, admin.clone()),
+    );
+}
+
+/// Emitted when the admin sets the marketplace address the launchpad forwards
+/// collection fee-override requests to (Issue #849).
+///
+/// Topics: ("mkt_set",)
+/// Data:   (marketplace: Address,)
+#[allow(deprecated)]
+pub fn publish_marketplace_address_set(env: &Env, marketplace: &Address) {
+    env.events()
+        .publish((symbol_short!("mkt_set"),), (marketplace.clone(),));
+}

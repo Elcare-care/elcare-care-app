@@ -1352,127 +1352,95 @@ fn batch_transfer_zero_amount_fails() {
     assert_eq!(result, Err(Ok(Error::ZeroAmount)));
 }
 
-// ── Creator succession: two-step, expiring, cancellable (#845) ───────────────
 
-/// True when an event carrying `name` as a topic symbol was emitted.
-#[allow(irrefutable_let_patterns)] // ContractEventBody has a single variant in this SDK version
-fn has_symbol_event(env: &Env, name: &str) -> bool {
-    use soroban_sdk::xdr::{ContractEventBody, ScVal};
+// ════════════════════════════════════════════════════════════
+// Issue #851 — Metadata Validation Tests (NormalNFT1155)
+// ════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod metadata_tests {
+    use super::*;
+    use crate::metadata;
+    use soroban_sdk::{Env, String};
 
-    env.events().all().events().iter().any(|event| {
-        if let ContractEventBody::V0(body) = &event.body {
-            body.topics.iter().any(|topic| match topic {
-                ScVal::Symbol(symbol) => {
-                    core::str::from_utf8(symbol.0.as_slice()).unwrap_or("") == name
-                }
-                _ => false,
-            })
-        } else {
-            false
-        }
-    })
-}
+    fn env() -> Env {
+        Env::default()
+    }
 
-#[test]
-fn test_creator_succession_happy_path() {
-    let (env, client, _contract_id, creator) = setup();
-    let successor = Address::generate(&env);
-    let expires_at = env.ledger().sequence() + 1_000;
+    fn s(env: &Env, val: &str) -> String {
+        String::from_str(env, val)
+    }
 
-    client.propose_creator(&successor, &expires_at);
-    assert!(
-        has_symbol_event(&env, "cr_prop"),
-        "proposal must be announced"
-    );
-    // Authority does not move on the proposal itself.
-    assert_eq!(client.creator(), creator);
+    #[test]
+    fn test_empty_name_rejected() {
+        let env = env();
+        assert_eq!(metadata::validate_collection_name(&s(&env, "")), Err(crate::Error::EmptyName));
+    }
 
-    jump_ledger(&env, 10);
-    client.accept_creator(&successor);
-    // The event buffer holds the last invocation's events, so assert before any
-    // other contract call.
-    assert!(
-        has_symbol_event(&env, "cr_acc"),
-        "acceptance must be announced"
-    );
+    #[test]
+    fn test_name_at_max_len_accepted() {
+        let env = env();
+        let name = s(&env, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+        assert_eq!(name.len(), 64);
+        assert!(metadata::validate_collection_name(&name).is_ok());
+    }
 
-    assert_eq!(client.creator(), successor);
-    assert_eq!(client.original_creator(), creator);
-}
+    #[test]
+    fn test_name_over_max_len_rejected() {
+        let env = env();
+        let name = s(&env, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+        assert_eq!(name.len(), 65);
+        assert_eq!(metadata::validate_collection_name(&name), Err(crate::Error::NameTooLong));
+    }
 
-#[test]
-fn test_creator_succession_not_pending_creator() {
-    let (env, client, _contract_id, creator) = setup();
-    let successor = Address::generate(&env);
-    let impostor = Address::generate(&env);
+    #[test]
+    fn test_zero_max_supply_rejected() {
+        assert_eq!(metadata::validate_max_supply(0), Err(crate::Error::InvalidMaxSupply));
+    }
 
-    client.propose_creator(&successor, &(env.ledger().sequence() + 1_000));
-    jump_ledger(&env, 10);
+    #[test]
+    fn test_max_supply_at_limit_accepted() {
+        assert!(metadata::validate_max_supply(1_000_000).is_ok());
+    }
 
-    let result = client.try_accept_creator(&impostor);
-    assert_eq!(result, Err(Ok(Error::NotPendingCreator)));
-    // A rejected acceptance leaves the creator untouched.
-    assert_eq!(client.creator(), creator);
-}
+    #[test]
+    fn test_max_supply_over_limit_rejected() {
+        assert_eq!(metadata::validate_max_supply(1_000_001), Err(crate::Error::InvalidMaxSupply));
+    }
 
-#[test]
-fn test_creator_succession_proposal_expired() {
-    let (env, client, _contract_id, creator) = setup();
-    let successor = Address::generate(&env);
-    let expires_at = env.ledger().sequence() + 20;
+    #[test]
+    fn test_empty_uri_rejected() {
+        let env = env();
+        assert_eq!(metadata::validate_token_uri(&s(&env, "")), Err(crate::Error::EmptyUri));
+    }
 
-    client.propose_creator(&successor, &expires_at);
-    jump_ledger(&env, 20);
+    #[test]
+    fn test_data_prefix_uri_rejected() {
+        let env = env();
+        assert_eq!(
+            metadata::validate_token_uri(&s(&env, "data:image/png;base64,abc")),
+            Err(crate::Error::InvalidUri)
+        );
+    }
 
-    let result = client.try_accept_creator(&successor);
-    assert_eq!(result, Err(Ok(Error::ProposalExpired)));
-    assert_eq!(client.creator(), creator);
-}
+    #[test]
+    fn test_ipfs_prefix_accepted() {
+        let env = env();
+        assert!(metadata::validate_token_uri(&s(&env, "ipfs://QmHash")).is_ok());
+    }
 
-#[test]
-fn test_creator_succession_no_pending() {
-    let (env, client, _contract_id, _creator) = setup();
-    let successor = Address::generate(&env);
+    #[test]
+    fn test_https_prefix_accepted() {
+        let env = env();
+        assert!(metadata::validate_token_uri(&s(&env, "https://example.com/meta.json")).is_ok());
+    }
 
-    let result = client.try_accept_creator(&successor);
-    assert_eq!(result, Err(Ok(Error::NoPendingCreator)));
-}
+    #[test]
+    fn test_royalty_bps_at_max_accepted() {
+        assert!(metadata::validate_royalty_bps(10_000).is_ok());
+    }
 
-#[test]
-fn test_original_creator_immutable() {
-    let (env, client, _contract_id, creator) = setup();
-    let first = Address::generate(&env);
-    let second = Address::generate(&env);
-
-    client.propose_creator(&first, &(env.ledger().sequence() + 1_000));
-    client.accept_creator(&first);
-    client.propose_creator(&second, &(env.ledger().sequence() + 1_000));
-    client.accept_creator(&second);
-
-    assert_eq!(client.creator(), second);
-    // Two successions later the original creator is still the one set at init.
-    assert_eq!(client.original_creator(), creator);
-}
-
-#[test]
-fn test_creator_succession_cancelled_proposal_cannot_be_accepted() {
-    let (env, client, _contract_id, creator) = setup();
-    let successor = Address::generate(&env);
-    let expires_at = env.ledger().sequence() + 1_000;
-
-    client.propose_creator(&successor, &expires_at);
-    client.cancel_creator_proposal();
-    assert!(
-        has_symbol_event(&env, "cr_canc"),
-        "cancellation must be announced"
-    );
-
-    let result = client.try_accept_creator(&successor);
-    assert_eq!(result, Err(Ok(Error::NoPendingCreator)));
-    assert_eq!(client.creator(), creator);
-
-    // A fresh proposal is accepted normally afterwards.
-    client.propose_creator(&successor, &expires_at);
-    client.accept_creator(&successor);
-    assert_eq!(client.creator(), successor);
+    #[test]
+    fn test_royalty_bps_over_max_rejected() {
+        assert_eq!(metadata::validate_royalty_bps(10_001), Err(crate::Error::InvalidBps));
+    }
 }

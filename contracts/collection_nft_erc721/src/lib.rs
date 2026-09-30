@@ -1442,5 +1442,7 @@ impl NormalNFT721 {
     }
 }
 
+pub mod metadata;
+
 #[cfg(test)]
 mod test;
