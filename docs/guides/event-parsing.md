@@ -187,6 +187,7 @@ Contract events and the indexer are separate deployables with independent releas
 | `AuctionAdminCancelledEvent` | `AUCTION_ADMIN_CANCELLED` | yes | 1 |
 | `FeeAttributionEvent` | `FEE_ATTRIBUTION` | yes (versioned from the start, Issue #846) | 1 |
 | Launchpad deploy events (`publish_deploy`) | `DEPLOY_NORMAL_721` / `DEPLOY_NORMAL_1155` / `DEPLOY_LAZY_721` / `DEPLOY_LAZY_1155` | yes (3rd tuple element) | 1 |
+| `FeeAttributionEvent` | `FEE_ATTRIBUTION` | yes | 1 |
 | All other events in the tables above | (as listed) | no | not tracked — never required a shape change |
 
 All other event structs (`ListingCancelledEvent`, `BidPlacedEvent`, `AuctionExtendedEvent`, admin-rotation events, pause events, etc.) do not carry `schema_version` because they've never needed a shape change; if one ever does, add the field and a `SUPPORTED_SCHEMA_VERSIONS` entry at that time, following the same convention.
@@ -246,3 +247,94 @@ The **CI/fixture requirement** from `CONTRIBUTING.md`'s Documentation Review Pol
 
 - Raw XDR strings and decoded event JSON objects contain **only public blockchain data** (addresses, token IDs, prices, CIDs) and are safe to publish.
 - Do not log or attach environment variable files (`.env`) alongside event logs.
+
+---
+
+## 9. Backfill Boundary Behavior (Issue #488)
+
+This section explains what operators must understand when running
+`backfill.ts` over a ledger range that **spans a contract upgrade boundary**
+— meaning some ledgers in the range were produced before a schema change and
+some after.
+
+### What "schema version 0" means
+
+"Schema version 0" is an **implicit** state, not an explicit field value.
+An event emitted before `EVENT_SCHEMA_VERSION` was introduced (i.e. before
+Issue #278) simply has no `schema_version` key in its XDR-encoded data map.
+When the indexer decodes such an event the `schema_version` field will be
+`undefined` (absent) in the decoded native object. This is treated throughout
+the indexer as **implicit version 0** and is always supported — there is no
+version-0 sunset.
+
+Concretely:
+- `isSupportedSchemaVersion(eventType, undefined)` returns `true` for all
+  event types.
+- `isSupportedSchemaVersion(eventType, 0)` also returns `true`.
+- `decodeWithSchema` treats an absent optional field as a valid decode — no
+  `DecodeError` is produced.
+
+### How the indexer populates schema_version in its database
+
+When the indexer stores a decoded event it records the value of
+`schema_version` exactly as decoded:
+
+| Event shape | Decoded value | Database column |
+|---|---|---|
+| Pre-upgrade (field absent) | `undefined` | `NULL` or `0` depending on schema (see `prisma/schema.prisma`) |
+| Post-upgrade v1 | `1` | `1` |
+| Future version n | `n` | `n` (stored but flagged as `UnsupportedSchemaVersionError` — see §4) |
+
+Indexer code that queries by version should treat `NULL` and `0` equivalently
+since both represent pre-upgrade events.
+
+### What operators should do when re-indexing a range that spans an upgrade
+
+1. **No special handling is required.** The same `backfill.ts` worker and the
+   same `collectMarketplaceEvents` / `decodeWithSchema` code path handles both
+   pre- and post-upgrade events — the optional `schema_version` field simply
+   decodes to `undefined` for historical events and to the correct version for
+   post-upgrade events.
+
+2. **Do not split the range.** There is no need to run separate backfill jobs
+   for the pre-upgrade and post-upgrade portions of a range. The decoder is
+   additive-only and backward-compatible by design.
+
+3. **Verify idempotency.** `backfill.ts` uses per-batch checkpointing and an
+   advisory lock (`pg_try_advisory_lock`) to prevent double-processing.
+   Re-running a completed backfill job over the same range is safe — duplicate
+   events are rejected by the idempotency hash (`SHA256(contractId +
+   ledgerSequence + txHash + eventIndex)`).
+
+4. **Check `SUPPORTED_SCHEMA_VERSIONS` before backfilling new event types.**
+   If the purpose of the backfill is to re-ingest events whose schema was
+   previously unsupported (e.g. a new versioned event added in a contract
+   upgrade), confirm that the indexer build being used has an entry for that
+   event type in `SUPPORTED_SCHEMA_VERSIONS` **before** starting the backfill.
+   Otherwise any event with a `schema_version` above the supported maximum will
+   be quarantined as `UnsupportedSchemaVersionError` rather than stored.
+
+### Example: upgrading from no `FeeAttributionEvent` to v1
+
+`FeeAttributionEvent` (Issue #488) was added in contract version X. Before
+this version, no `fee_attribution` events exist on-chain. After it, every
+settlement emits one.
+
+A backfill over a range that includes both pre- and post-upgrade ledgers will:
+- Emit zero `FEE_ATTRIBUTION` decodes for pre-upgrade ledgers (the topic
+  `"fee_attribution"` simply doesn't appear — `resolveEventType` returns
+  `null` and the event is skipped cleanly).
+- Decode and store `FEE_ATTRIBUTION` events for post-upgrade ledgers
+  normally, with `schema_version: 1`.
+
+No operator action is needed to handle the boundary — the topic absence is
+not an error.
+
+### Prometheus signals for upgrade-boundary monitoring
+
+| Metric | Description |
+|---|---|
+| `indexer_unsupported_schema_version_total{event_type, schema_version}` | Count of events quarantined because `schema_version > SUPPORTED_SCHEMA_VERSIONS[eventType]`. A spike here after a contract upgrade means the indexer binary is behind. |
+| `indexer_decode_errors_total{event_type}` | Count of structural decode failures. If this spikes on a known versioned type, check whether a non-additive field change was made (policy violation). |
+| `indexer_backfill_batch_inserted` | Events successfully stored per batch. Compare against expected event volume for the range to confirm no silent drops. |
+

@@ -94,3 +94,29 @@ jobs:
         run: |
           bash scripts/migrations/lint-migration.sh \
             indexer/prisma/migrations/20260827000000_example_expand_contract/migration.sql
+
+  # ── Event schema coverage lint (Issue #488) ──────────────────────────────────
+  # Fails when a Rust event struct in events.rs carries a `schema_version: u32`
+  # field but the corresponding indexer schema registry entry is missing, is not
+  # registered in SUPPORTED_SCHEMA_VERSIONS, or does not mark the
+  # `schema_version` field as `optional: true`.
+  #
+  # How to fix a failure:
+  #   1. Add the event type to SUPPORTED_SCHEMA_VERSIONS in
+  #      indexer/src/event-schemas.ts.
+  #   2. Add a ContractEventSchema constant with a
+  #      { name: 'schema_version', type: 'number', optional: true } field entry.
+  #   3. Register the schema in SCHEMA_REGISTRY.
+  #   4. Add the Rust struct → eventType mapping to STRUCT_TO_EVENT_TYPE in
+  #      scripts/lint-event-schemas.mjs.
+  # See docs/guides/event-parsing.md §5 for the full versioning policy.
+  event-schema-lint:
+    name: Event Schema Coverage Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Lint event schema registry coverage
+        run: node scripts/lint-event-schemas.mjs
