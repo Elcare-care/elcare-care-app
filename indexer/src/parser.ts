@@ -71,6 +71,7 @@ const TOPIC_MAP: Record<string, string> = {
   // ── Settlement / fee events ──────────────────────────────────────────────
   'roy_paid':  'ROYALTY_PAID',
   'fee_cltd':  'PROTOCOL_FEE_COLLECTED',
+  'fee_attribution': 'FEE_ATTRIBUTION',
   // ── Governance / admin events ────────────────────────────────────────────
   'adm_prop':  'ADMIN_TRANSFER_PROPOSED',
   'adm_xfrd':  'ADMIN_TRANSFERRED',
@@ -92,6 +93,33 @@ const TOPIC_MAP: Record<string, string> = {
   'c_unpsd': 'COLLECTION_UNPAUSED',
   // ── Deployment idempotency (Issue #477) ───────────────────────────────
   'dep_idem': 'DEPLOY_IDEMPOTENT',
+
+  // ── Long-form topics published by the current contract build (Issue #846) ──
+  // events.rs publishes `Symbol::new(env, LISTING_CREATED)` i.e. "listing_created",
+  // while this map only carried the legacy short forms ('lst_crtd' and friends).
+  // resolveEventType() therefore returned null for these topics and the events
+  // were dropped before any schema ran — verified with a real ScVal payload (see
+  // the Issue #846 PR description). The short forms stay for historical
+  // backfills; these entries cover what the contract emits today, for every
+  // event type that carries a `schema_version`.
+  //
+  // The remaining topic constants in events.rs still have no entry here (52 of
+  // them at the time of writing: governance, role, treasury, escrow, pause and
+  // claim events). That is the same defect for those types and is deliberately
+  // left as a separate change: it would switch ~45 further event types from
+  // silently-dropped to decoded, which deserves its own review (and, for the 31
+  // of them without a schema entry, their own schema work).
+  'artwork_sold': 'ARTWORK_SOLD',
+  'auction_admin_cancelled': 'AUCTION_ADMIN_CANCELLED',
+  'auction_bid_refunded': 'AUCTION_BID_REFUNDED',
+  'auction_cancelled': 'AUCTION_CANCELLED',
+  'auction_created': 'AUCTION_CREATED',
+  'auction_resolved': 'AUCTION_RESOLVED',
+  'listing_created': 'LISTING_CREATED',
+  'offer_accepted': 'OFFER_ACCEPTED',
+  'offer_made': 'OFFER_MADE',
+  'protocol_fee_collected': 'PROTOCOL_FEE_COLLECTED',
+  'royalty_settlement': 'ROYALTY_SETTLEMENT',
 };
 
 /** All event type names this parser can produce (exported for tests/UI). */
