@@ -55,7 +55,7 @@ mod governance_quorum_tests;
 mod erc1155_quantity_tests;
 
 #[cfg(test)]
-mod fee_attribution_tests;
+mod batch_listing_tests;
 
 pub use contract::MarketplaceContract;
 pub use types::{

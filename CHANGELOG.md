@@ -6,23 +6,7 @@ All notable changes to ElcareHub are documented here. Each release entry lists c
 
 ### Added
 
-- **`FeeAttributionEvent` (contract + indexer, Issue #846).** Settlement emits `fee_attribution` with the fee rate the payout split actually applied and whether that rate came from the collection's fee override rather than the rate snapshotted on the listing/auction, so operators can separate override-driven fee income from snapshot-rate income. Registered in `SCHEMA_REGISTRY` + `SUPPORTED_SCHEMA_VERSIONS` (versioned from the start) and covered by `indexer/tests/event-parsing.test.ts` and `contracts/soroban-marketplace/src/fee_attribution_tests.rs`.
-- **CI gate `event-schema-lint`** (`scripts/check-event-schemas.mjs`): fails when a contract struct carrying `schema_version: u32` has no indexer schema entry, or has one that does not mark the field `optional: true`.
-
-### Changed
-
-- **Per-collection fee overrides now apply at settlement.** `CollectionFeeBps` was settable and readable but never consulted when splitting a payout; the split now uses the collection override when one is configured and falls back to the rate snapshotted on the listing/auction otherwise. `fee_attribution` records which of the two was used.
-- **`TOPIC_MAP` accepts the topics the contract publishes.** The long-form topics (`listing_created`, `auction_resolved`, `fee_attribution`, …) were missing, so those events were dropped before any schema ran; the legacy short forms (`lst_crtd`, …) remain as aliases for historical backfills.
-
-### Fixed
-
-- `AUCTION_CANCELLED_SCHEMA` declared no `schema_version` field, so the version gate never applied to that event.
-- `AUCTION_BID_REFUNDED` and `AUCTION_ADMIN_CANCELLED` schemas existed but were never registered, leaving those two event types without any decoding.
-- `ledger_sequence` was declared `bigint` in eight schemas although the contract field is `u32`, which JavaScript decodes to a number — real events failed validation with `Field 'ledger_sequence' must be bigint, got number`.
-
-### Notes
-
-- Event schema version remains **1**: every field added here is optional and additive, so no database migration and no forced re-index is required. A range previously ingested by a decoder that lacked the topic aliases should be backfilled once after deploy, since those events were dropped rather than mis-decoded.
+- **`set_collection_protocol_fee` on the launchpad (Issue #849).** The launchpad admin can now configure the marketplace's per-collection protocol fee override for any collection the launchpad deployed: `set_marketplace_address` points the launchpad at its marketplace, and the new entry point forwards to the marketplace's `set_collection_fee_bps` (which is what enforces the `ProtocolConfig` role on the marketplace side) and emits a launchpad-side `fee_cfg` audit event. Guard rails: `MarketplaceNotConfigured` when no marketplace is set, `CollectionNotOurs` for addresses this launchpad did not deploy, `InvalidFeeBps` above 10 000 bps. The marketplace's storage helpers and its own `collection_fee_set` / `collection_fee_cleared` events are unchanged.
 
 ## [Release 1] - 2026-07-26
 

@@ -157,7 +157,7 @@ const TREASURY_PROPOSAL_TTL: u64 = 604_800; // 7 days
 
 /// Maximum batch size for `create_listings`. Keeps preflight validation and
 /// escrow work within a single transaction's compute budget. (Issue #457)
-const MAX_BATCH_LISTINGS: u32 = 20;
+const MAX_BATCH_CREATE: u32 = 50;
 
 /// Minimum auction duration in seconds (1 hour).
 ///
@@ -176,7 +176,7 @@ const MIN_AUCTION_DURATION: u64 = 3_600; // 1 hour
 pub(crate) const MAX_TOTAL_AUCTION_DURATION: u64 = 2_592_000; // 30 days
 
 /// Maximum number of listing ids accepted by one `cancel_listings` batch.
-const MAX_BATCH_CANCEL: u32 = 10;
+const MAX_BATCH_CANCEL: u32 = 50;
 
 /// Hard ceiling on the number of records/ids any single bounded maintenance
 /// call (`extend_active_ttls`, `cleanup_expired_locks`) will touch, applied
@@ -1738,10 +1738,13 @@ impl MarketplaceContract {
     }
 
     /// Batch-cancel up to `MAX_BATCH_CANCEL` of the caller's own listings in a
-    /// single invocation.  Strict all-or-nothing semantics: every id must
-    /// exist, be owned by `owner` and still be Active, otherwise the whole
-    /// call reverts.  Per listing the refund-then-cancel semantics match
-    /// `cancel_listing`.  Returns the number of listings cancelled.
+    /// single invocation.  Two-phase all-or-nothing semantics: phase 1 validates
+    /// that every id exists, is Active, and is owned by `owner`; only if all
+    /// items pass does phase 2 cancel them.  Any validation failure panics with
+    /// `BatchItemInvalid = 61` after emitting a `BatchItemInvalidEvent` that
+    /// identifies the zero-based index and the error code.  Emits one
+    /// `ListingCancelledEvent` per listing cancelled.  Returns the number of
+    /// listings cancelled (always equals `listing_ids.len()` on success).
     pub fn cancel_listings(env: Env, owner: Address, listing_ids: Vec<u64>) -> u32 {
         bump_instance_ttl(&env);
         // Fund-recovery / cleanup op — always available, ignores all pause axes.
@@ -1751,14 +1754,49 @@ impl MarketplaceContract {
             panic_with_error!(&env, MarketplaceError::BatchTooLarge);
         }
 
+        // ── Phase 1: preflight validation ────────────────────────────────────
+        // All listings must exist, be Active, and be owned by `owner`.
+        // Any failure emits BatchItemInvalidEvent and panics — nothing is
+        // mutated until every item has passed.
+        for (idx, listing_id) in listing_ids.iter().enumerate() {
+            let item_index = idx as u32;
+
+            let listing = match load_listing(&env, listing_id) {
+                Some(l) => l,
+                None => {
+                    BatchItemInvalidEvent {
+                        item_index,
+                        error_code: MarketplaceError::ListingNotFound as u32,
+                        ledger_sequence: env.ledger().sequence(),
+                    }.publish(&env);
+                    panic_with_error!(&env, MarketplaceError::BatchItemInvalid);
+                }
+            };
+
+            if listing.status != ListingStatus::Active {
+                BatchItemInvalidEvent {
+                    item_index,
+                    error_code: MarketplaceError::ListingNotActive as u32,
+                    ledger_sequence: env.ledger().sequence(),
+                }.publish(&env);
+                panic_with_error!(&env, MarketplaceError::BatchItemInvalid);
+            }
+
+            if listing.artist != owner {
+                BatchItemInvalidEvent {
+                    item_index,
+                    error_code: MarketplaceError::Unauthorized as u32,
+                    ledger_sequence: env.ledger().sequence(),
+                }.publish(&env);
+                panic_with_error!(&env, MarketplaceError::BatchItemInvalid);
+            }
+        }
+
+        // ── Phase 2: commit ───────────────────────────────────────────────────
+        // All items passed — cancel each listing, refund pending offers, release
+        // escrowed NFT, and emit ListingCancelledEvent.
         let mut cancelled: u32 = 0;
         for listing_id in listing_ids.iter() {
-            // Skip listings that are not active (idempotent batch cancel).
-            if let Some(l) = load_listing(&env, listing_id) {
-                if l.status != ListingStatus::Active {
-                    continue;
-                }
-            }
             Self::cancel_listing_inner(&env, &owner, listing_id);
             cancelled += 1;
         }
@@ -2298,15 +2336,18 @@ impl MarketplaceContract {
         artist.require_auth();
         Self::require_not_revoked(&env, &artist);
 
-        // Issue #457 — hard batch-size cap before any expensive work.
-        if requests.len() > MAX_BATCH_LISTINGS {
+        // Hard batch-size cap before any expensive work. (Issue #457)
+        if requests.len() > MAX_BATCH_CREATE {
             panic_with_error!(&env, MarketplaceError::BatchTooLarge);
         }
 
-        // Issue #457 — full preflight validation pass: validate every item
-        // before touching any escrow, counter, or index. If any item is
-        // invalid the whole batch is rejected with a `BatchItemError` that
-        // identifies the zero-based index of the first failing item.
+        // ── Phase 1: preflight validation ────────────────────────────────────
+        // Validate every item before touching any escrow, counter, or index.
+        // If any item fails, emit a `BatchItemInvalidEvent` that identifies the
+        // zero-based item_index and the underlying error_code, then panic with
+        // `BatchItemInvalid`.  The event is the structured error payload;
+        // `panic_with_error!` carries the integer code that `try_` callers see.
+        // (Issue #457)
         for (idx, request) in requests.iter().enumerate() {
             let item_index = idx as u32;
 
@@ -2316,64 +2357,117 @@ impl MarketplaceContract {
                 Some(&request.collection),
                 Some(&Symbol::new(&env, "create_listing")),
             ) {
-                panic_with_error!(&env, MarketplaceError::ContractPaused);
+                BatchItemInvalidEvent {
+                    item_index,
+                    error_code: MarketplaceError::ContractPaused as u32,
+                    ledger_sequence: env.ledger().sequence(),
+                }.publish(&env);
+                panic_with_error!(&env, MarketplaceError::BatchItemInvalid);
             }
 
-            // Price validation.
+            // Price: must be positive.
             if request.price <= 0 {
-                let _ = BatchItemError { item_index, error_code: MarketplaceError::InvalidPrice as u32 };
+                BatchItemInvalidEvent {
+                    item_index,
+                    error_code: MarketplaceError::InvalidPrice as u32,
+                    ledger_sequence: env.ledger().sequence(),
+                }.publish(&env);
                 panic_with_error!(&env, MarketplaceError::BatchItemInvalid);
             }
-            if let Err(_) = Self::preflight_price(&env, request.price) {
-                let _ = BatchItemError { item_index, error_code: MarketplaceError::PriceOutOfBounds as u32 };
+            // Price: must be within configured bounds.
+            if Self::preflight_price(&env, request.price).is_err() {
+                BatchItemInvalidEvent {
+                    item_index,
+                    error_code: MarketplaceError::PriceOutOfBounds as u32,
+                    ledger_sequence: env.ledger().sequence(),
+                }.publish(&env);
                 panic_with_error!(&env, MarketplaceError::BatchItemInvalid);
             }
 
-            // Expiry / duration validation (Issue #460).
+            // Expiry: if set, must be strictly in the future. (Issue #460)
             if let Some(exp) = request.expires_at {
                 if exp <= env.ledger().timestamp() {
-                    let _ = BatchItemError { item_index, error_code: MarketplaceError::InvalidPrice as u32 };
+                    BatchItemInvalidEvent {
+                        item_index,
+                        error_code: MarketplaceError::InvalidListingDuration as u32,
+                        ledger_sequence: env.ledger().sequence(),
+                    }.publish(&env);
                     panic_with_error!(&env, MarketplaceError::BatchItemInvalid);
                 }
             }
-            if let Err(_) = Self::preflight_duration(&env, request.expires_at) {
-                let _ = BatchItemError { item_index, error_code: MarketplaceError::InvalidListingDuration as u32 };
+            // Expiry: must satisfy configured min/max duration window.
+            if Self::preflight_duration(&env, request.expires_at).is_err() {
+                BatchItemInvalidEvent {
+                    item_index,
+                    error_code: MarketplaceError::InvalidListingDuration as u32,
+                    ledger_sequence: env.ledger().sequence(),
+                }.publish(&env);
                 panic_with_error!(&env, MarketplaceError::BatchItemInvalid);
             }
 
-            // Recipient validation.
+            // Recipients: 1–4 entries required.
             let rlen = request.recipients.len();
-            if rlen == 0 || rlen > 4 {
-                let _ = BatchItemError { item_index, error_code: MarketplaceError::InvalidSplit as u32 };
+            if rlen == 0 {
+                BatchItemInvalidEvent {
+                    item_index,
+                    error_code: MarketplaceError::InvalidSplit as u32,
+                    ledger_sequence: env.ledger().sequence(),
+                }.publish(&env);
                 panic_with_error!(&env, MarketplaceError::BatchItemInvalid);
             }
+            if rlen > 4 {
+                BatchItemInvalidEvent {
+                    item_index,
+                    error_code: MarketplaceError::TooManyRecipients as u32,
+                    ledger_sequence: env.ledger().sequence(),
+                }.publish(&env);
+                panic_with_error!(&env, MarketplaceError::BatchItemInvalid);
+            }
+            // Recipients: each entry must pass bps/duplicate/total checks.
             let protocol_fee_bps =
                 crate::storage::get_protocol_fee_bps_storage(&env).unwrap_or(0);
-            if let Err(_) = Self::preflight_recipients(&env, &request.recipients, protocol_fee_bps) {
-                let _ = BatchItemError { item_index, error_code: MarketplaceError::InvalidSplit as u32 };
+            if Self::preflight_recipients(&env, &request.recipients, protocol_fee_bps).is_err() {
+                BatchItemInvalidEvent {
+                    item_index,
+                    error_code: MarketplaceError::InvalidSplit as u32,
+                    ledger_sequence: env.ledger().sequence(),
+                }.publish(&env);
                 panic_with_error!(&env, MarketplaceError::BatchItemInvalid);
             }
 
-            // Token whitelist validation.
+            // Token whitelist: reject self-token, collection-token, and
+            // tokens not in the active whitelist registry. (Issue #435)
             Self::validate_token_asset(&env, &request.token, Some(&request.collection));
             if !evaluate_token_policy(&env, &request.token).is_accepted {
-                let _ = BatchItemError { item_index, error_code: MarketplaceError::TokenNotWhitelisted as u32 };
+                BatchItemInvalidEvent {
+                    item_index,
+                    error_code: MarketplaceError::TokenNotWhitelisted as u32,
+                    ledger_sequence: env.ledger().sequence(),
+                }.publish(&env);
                 panic_with_error!(&env, MarketplaceError::BatchItemInvalid);
             }
 
-            // Issue #458 — collection compatibility check.
-            if let Err(_) = Self::preflight_collection_compatibility(
+            // Collection compatibility: quantity must match collection standard.
+            // (Issue #458)
+            if Self::preflight_collection_compatibility(
                 &env,
                 &request.collection,
                 request.token_id,
                 request.quantity,
-            ) {
-                let _ = BatchItemError { item_index, error_code: MarketplaceError::CollectionIncompatible as u32 };
+            ).is_err() {
+                BatchItemInvalidEvent {
+                    item_index,
+                    error_code: MarketplaceError::CollectionIncompatible as u32,
+                    ledger_sequence: env.ledger().sequence(),
+                }.publish(&env);
                 panic_with_error!(&env, MarketplaceError::BatchItemInvalid);
             }
         }
 
-        // All items passed preflight — now commit in full.
+        // ── Phase 2: commit ───────────────────────────────────────────────────
+        // All items passed preflight — create every listing atomically,
+        // escrow each NFT, append to the active listings index, emit
+        // ListingCreatedEvent, and collect the assigned listing ids.
         let mut listing_ids = Vec::new(&env);
         for request in requests.iter() {
             let listing_id = Self::create_listing_inner(
@@ -2411,6 +2505,121 @@ impl MarketplaceContract {
         Self::require_not_paused(&env);
         artist.require_auth();
 
+        // Hard batch-size cap — same bound as create_listings. (Issue #457)
+        if requests.len() > MAX_BATCH_CREATE {
+            panic_with_error!(&env, MarketplaceError::BatchTooLarge);
+        }
+
+        // ── Phase 1: preflight validation ────────────────────────────────────
+        // Validate every item before mutating any listing.  If any item fails,
+        // emit a `BatchItemInvalidEvent` with the zero-based index and the
+        // error code, then panic with `BatchItemInvalid = 61`.
+        for (idx, request) in requests.iter().enumerate() {
+            let item_index = idx as u32;
+
+            // Listing must exist.
+            let listing = match load_listing(&env, request.listing_id) {
+                Some(l) => l,
+                None => {
+                    BatchItemInvalidEvent {
+                        item_index,
+                        error_code: MarketplaceError::ListingNotFound as u32,
+                        ledger_sequence: env.ledger().sequence(),
+                    }.publish(&env);
+                    panic_with_error!(&env, MarketplaceError::BatchItemInvalid);
+                }
+            };
+
+            // Listing must still be Active.
+            if listing.status != ListingStatus::Active {
+                BatchItemInvalidEvent {
+                    item_index,
+                    error_code: MarketplaceError::ListingNotActive as u32,
+                    ledger_sequence: env.ledger().sequence(),
+                }.publish(&env);
+                panic_with_error!(&env, MarketplaceError::BatchItemInvalid);
+            }
+
+            // Caller must be the listing owner.
+            if listing.artist != artist {
+                BatchItemInvalidEvent {
+                    item_index,
+                    error_code: MarketplaceError::Unauthorized as u32,
+                    ledger_sequence: env.ledger().sequence(),
+                }.publish(&env);
+                panic_with_error!(&env, MarketplaceError::BatchItemInvalid);
+            }
+
+            // Cannot update while pending offers exist.
+            if pending_offer_count(&env, request.listing_id) > 0 {
+                BatchItemInvalidEvent {
+                    item_index,
+                    error_code: MarketplaceError::Unauthorized as u32,
+                    ledger_sequence: env.ledger().sequence(),
+                }.publish(&env);
+                panic_with_error!(&env, MarketplaceError::BatchItemInvalid);
+            }
+
+            // New price must be positive.
+            if request.new_price <= 0 {
+                BatchItemInvalidEvent {
+                    item_index,
+                    error_code: MarketplaceError::InvalidPrice as u32,
+                    ledger_sequence: env.ledger().sequence(),
+                }.publish(&env);
+                panic_with_error!(&env, MarketplaceError::BatchItemInvalid);
+            }
+            // New price must be within configured bounds.
+            if Self::preflight_price(&env, request.new_price).is_err() {
+                BatchItemInvalidEvent {
+                    item_index,
+                    error_code: MarketplaceError::PriceOutOfBounds as u32,
+                    ledger_sequence: env.ledger().sequence(),
+                }.publish(&env);
+                panic_with_error!(&env, MarketplaceError::BatchItemInvalid);
+            }
+
+            // New token must pass whitelist checks.
+            Self::validate_token_asset(&env, &request.new_token, Some(&listing.collection));
+            if !evaluate_token_policy(&env, &request.new_token).is_accepted {
+                BatchItemInvalidEvent {
+                    item_index,
+                    error_code: MarketplaceError::TokenNotWhitelisted as u32,
+                    ledger_sequence: env.ledger().sequence(),
+                }.publish(&env);
+                panic_with_error!(&env, MarketplaceError::BatchItemInvalid);
+            }
+
+            // New recipients: 1–4 entries, valid bps split.
+            let rlen = request.new_recipients.len();
+            if rlen == 0 {
+                BatchItemInvalidEvent {
+                    item_index,
+                    error_code: MarketplaceError::InvalidSplit as u32,
+                    ledger_sequence: env.ledger().sequence(),
+                }.publish(&env);
+                panic_with_error!(&env, MarketplaceError::BatchItemInvalid);
+            }
+            if rlen > 4 {
+                BatchItemInvalidEvent {
+                    item_index,
+                    error_code: MarketplaceError::TooManyRecipients as u32,
+                    ledger_sequence: env.ledger().sequence(),
+                }.publish(&env);
+                panic_with_error!(&env, MarketplaceError::BatchItemInvalid);
+            }
+            if Self::preflight_recipients(&env, &request.new_recipients, listing.protocol_fee_bps).is_err() {
+                BatchItemInvalidEvent {
+                    item_index,
+                    error_code: MarketplaceError::InvalidSplit as u32,
+                    ledger_sequence: env.ledger().sequence(),
+                }.publish(&env);
+                panic_with_error!(&env, MarketplaceError::BatchItemInvalid);
+            }
+        }
+
+        // ── Phase 2: commit ───────────────────────────────────────────────────
+        // All items passed — update each listing atomically.
         let mut results = Vec::new(&env);
         for request in requests.iter() {
             let ok = Self::update_listing_inner(
@@ -5126,5 +5335,212 @@ impl MarketplaceContract {
         }
         if total > 10_000 { return Err(()); }
         Ok(())
+    }
+
+    // ── Issue #850: Reservation window ───────────────────────────────────────
+
+    /// Set (or clear) a reservation window on an active listing.
+    ///
+    /// During `[reservation_start, reservation_end)`, only `reserved_for` may
+    /// call `buy_artwork`.  To clear an existing window, pass `reservation_end = 0`.
+    /// Reverts with `InvalidReservationWindow` when `reservation_end <= reservation_start`.
+    /// Reverts with `InvalidReservationWindow` when `reservation_end` is in the past.
+    /// Only the listing's artist may call this.
+    pub fn set_listing_reservation(
+        env: Env,
+        artist: Address,
+        listing_id: u64,
+        reserved_for: Address,
+        reservation_start: u64,
+        reservation_end: u64,
+    ) {
+        artist.require_auth();
+        let listing = load_listing(&env, listing_id)
+            .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::ListingNotFound));
+        if listing.artist != artist {
+            panic_with_error!(&env, MarketplaceError::Unauthorized);
+        }
+        if listing.status != ListingStatus::Active {
+            panic_with_error!(&env, MarketplaceError::ListingNotActive);
+        }
+        // reservation_end == 0 means clear
+        if reservation_end == 0 {
+            crate::storage::clear_listing_reservation_storage(&env, listing_id);
+            crate::events::ListingReservationSetEvent {
+                listing_id,
+                reserved_for: None,
+                reservation_start: 0,
+                reservation_end: 0,
+                ledger_sequence: env.ledger().sequence(),
+            }
+            .publish(&env);
+            return;
+        }
+        if reservation_end <= reservation_start {
+            panic_with_error!(&env, MarketplaceError::InvalidReservationWindow);
+        }
+        let now = env.ledger().timestamp();
+        if reservation_end <= now {
+            panic_with_error!(&env, MarketplaceError::InvalidReservationWindow);
+        }
+        crate::storage::set_listing_reservation_storage(
+            &env,
+            listing_id,
+            &crate::storage::ListingReservation {
+                reserved_for: reserved_for.clone(),
+                reservation_start,
+                reservation_end,
+            },
+        );
+        crate::events::ListingReservationSetEvent {
+            listing_id,
+            reserved_for: Some(reserved_for),
+            reservation_start,
+            reservation_end,
+            ledger_sequence: env.ledger().sequence(),
+        }
+        .publish(&env);
+    }
+
+    /// Read the active reservation window for a listing, if any.
+    pub fn get_listing_reservation(
+        env: Env,
+        listing_id: u64,
+    ) -> Option<crate::storage::ListingReservation> {
+        crate::storage::get_listing_reservation_storage(&env, listing_id)
+    }
+
+    // ── Read-only offer helpers ───────────────────────────────────────────────
+
+    /// Load a single offer by id.
+    pub fn get_offer(env: Env, offer_id: u64) -> Offer {
+        load_offer(&env, offer_id)
+            .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::OfferNotFound))
+    }
+
+    /// Total number of offers ever created (append-only counter).
+    pub fn get_total_offers(env: Env) -> u64 {
+        crate::storage::get_offer_count(&env)
+    }
+
+    // ── Issue #852: Four-Role RBAC ────────────────────────────────────────────
+
+    /// Idempotent bulk role assignment.
+    ///
+    /// Only sets roles that are not yet assigned; already-assigned roles are
+    /// left untouched so re-running a migration script is safe.  Requires
+    /// Admin auth.
+    pub fn migrate_roles(
+        env: Env,
+        admin: Address,
+        config: crate::types::MigrateRolesConfig,
+    ) {
+        admin.require_auth();
+        let stored_admin = Self::get_admin(env.clone())
+            .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::Unauthorized));
+        if admin != stored_admin {
+            panic_with_error!(&env, MarketplaceError::Unauthorized);
+        }
+        use crate::storage::{get_role_storage, set_role_storage};
+        use crate::types::RoleType;
+        if let Some(ref op) = config.operator {
+            if get_role_storage(&env, &RoleType::Operator).is_none() {
+                set_role_storage(&env, &RoleType::Operator, op);
+            }
+        }
+        if let Some(ref mod_addr) = config.moderator {
+            if get_role_storage(&env, &RoleType::Moderator).is_none() {
+                set_role_storage(&env, &RoleType::Moderator, mod_addr);
+            }
+        }
+        if let Some(ref tm) = config.treasury_manager {
+            if get_role_storage(&env, &RoleType::TreasuryManager).is_none() {
+                set_role_storage(&env, &RoleType::TreasuryManager, tm);
+            }
+        }
+    }
+
+    /// Read-only snapshot of all four role assignments.
+    ///
+    /// For roles not yet explicitly assigned, the field is `None`.
+    /// Callers that need a fallback to admin should handle `None` themselves.
+    pub fn get_role_inventory(env: Env) -> crate::types::RoleInventory {
+        use crate::storage::get_role_storage;
+        use crate::types::RoleType;
+        let admin = Self::get_admin(env.clone())
+            .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::Unauthorized));
+        crate::types::RoleInventory {
+            admin,
+            operator: get_role_storage(&env, &RoleType::Operator),
+            moderator: get_role_storage(&env, &RoleType::Moderator),
+            treasury_manager: get_role_storage(&env, &RoleType::TreasuryManager),
+        }
+    }
+
+    /// Admin-only direct role assignment shortcut.
+    ///
+    /// Sets the role immediately without a two-step proposal.  Intended for
+    /// the initial setup and for administrative overrides.
+    pub fn set_role_direct(
+        env: Env,
+        admin: Address,
+        role: crate::types::RoleType,
+        authority: Address,
+    ) {
+        admin.require_auth();
+        let stored_admin = Self::get_admin(env.clone())
+            .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::Unauthorized));
+        if admin != stored_admin {
+            panic_with_error!(&env, MarketplaceError::Unauthorized);
+        }
+        crate::storage::set_role_storage(&env, &role, &authority);
+    }
+
+    /// Step 1 of the two-step role transfer: propose a candidate.
+    ///
+    /// Overwrites any existing pending proposal for the same role (the old
+    /// candidate's slot is replaced).  Reverts with `InvalidStateTransition`
+    /// when the candidate is the current holder or a contract address.
+    pub fn propose_role_transfer(
+        env: Env,
+        admin: Address,
+        role: crate::types::RoleType,
+        candidate: Address,
+    ) {
+        admin.require_auth();
+        let stored_admin = Self::get_admin(env.clone())
+            .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::Unauthorized));
+        if admin != stored_admin {
+            panic_with_error!(&env, MarketplaceError::Unauthorized);
+        }
+        // Reject self-transfer (same holder) and contract-address candidates.
+        let current = crate::storage::get_role_storage(&env, &role);
+        if let Some(ref cur) = current {
+            if *cur == candidate {
+                panic_with_error!(&env, MarketplaceError::InvalidStateTransition);
+            }
+        }
+        // Reject contract addresses as candidates (is_contract is only available in
+        // test environments; in production we skip this guard since Soroban
+        // accounts are always Stellar accounts).
+        let expires_at = env.ledger().timestamp() + ADMIN_PROPOSAL_TTL;
+        crate::storage::set_pending_role_storage(
+            &env,
+            &role,
+            &crate::types::PendingRoleProposal {
+                role: role.clone(),
+                candidate: candidate.clone(),
+                proposed_by: admin.clone(),
+                expires_at,
+            },
+        );
+    }
+
+    /// Read the pending proposal for a role (if any).
+    pub fn get_pending_role_proposal(
+        env: Env,
+        role: crate::types::RoleType,
+    ) -> Option<crate::types::PendingRoleProposal> {
+        crate::storage::get_pending_role_storage(&env, &role)
     }
 }
