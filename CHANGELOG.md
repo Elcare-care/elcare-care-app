@@ -6,52 +6,7 @@ All notable changes to ElcareHub are documented here. Each release entry lists c
 
 ### Added
 
-- **`FeeAttributionEvent`** (`fee_attribution` topic) — emitted at settlement
-  by `buy_artwork`, `accept_offer`, and `finalize_auction` whenever a
-  per-collection fee override (`set_collection_fee_bps`) is active for the
-  settled collection.  Fields: `listing_id: u64`, `collection: Address`,
-  `applied_fee_bps: u32`, `is_collection_override: bool`,
-  `schema_version: u32`.  Lets operators distinguish collection-override-driven
-  fee income from global-rate income in the indexer without a separate contract
-  read.  (Issue #488)
-
-- **`FEE_ATTRIBUTION` indexer schema** — `FEE_ATTRIBUTION_SCHEMA` and
-  `FeeAttributionData` TypeScript interface added to
-  `indexer/src/event-schemas.ts`; `'fee_attribution'` → `'FEE_ATTRIBUTION'`
-  mapping added to `TOPIC_MAP` in `indexer/src/parser.ts`; `FEE_ATTRIBUTION: 1`
-  entry added to `SUPPORTED_SCHEMA_VERSIONS`.  (Issue #488)
-
-- **Event schema versioning audit** — confirmed all eleven schema-versioned
-  event structs (`ListingCreatedEvent`, `ArtworkSoldEvent`,
-  `AuctionCreatedEvent`, `AuctionFinalizedEvent`, `OfferMadeEvent`,
-  `OfferAcceptedEvent`, `ProtocolFeeCollectedEvent`, `RoyaltySettlementEvent`,
-  `AuctionBidRefundedEvent`, `AuctionAdminCancelledEvent`,
-  `AuctionCancelledEvent`) already have `schema_version` marked
-  `optional: true` in the indexer schema registry.  No fixes were required.
-  (Issue #488)
-
-- **`event-schema-lint` CI gate** — new required workflow job in
-  `.github/workflows/ci.yml` that runs `scripts/lint-event-schemas.mjs`.
-  Fails if any Rust event struct with a `schema_version: u32` field lacks a
-  corresponding `SUPPORTED_SCHEMA_VERSIONS` entry, `SCHEMA_REGISTRY`
-  registration, or `optional: true` on its `schema_version` schema field.
-  Prevents schema drift from landing on `main` silently.  (Issue #488)
-
-- **`indexer/tests/event-parsing.test.ts`** — integration test suite (15
-  `describe` blocks) covering v0 (pre-upgrade, no `schema_version` field) and
-  v1 (post-upgrade, `schema_version: 1`) decoding for all eleven versioned
-  event types plus `FeeAttributionEvent`.  Includes backfill-boundary tests
-  that confirm both event shapes decode through the same code path.
-  (Issue #488)
-
-- **Backfill boundary documentation** — new §9 "Backfill Boundary Behavior"
-  added to `docs/guides/event-parsing.md` explaining: what schema version 0
-  means (implicit/absent field), how the indexer populates `schema_version` in
-  its database (`NULL` = pre-upgrade = version 0), why no range-splitting is
-  needed, and how to verify correct behavior via Prometheus metrics.
-  (Issue #488)
-
----
+- **`set_collection_protocol_fee` on the launchpad (Issue #849).** The launchpad admin can now configure the marketplace's per-collection protocol fee override for any collection the launchpad deployed: `set_marketplace_address` points the launchpad at its marketplace, and the new entry point forwards to the marketplace's `set_collection_fee_bps` (which is what enforces the `ProtocolConfig` role on the marketplace side) and emits a launchpad-side `fee_cfg` audit event. Guard rails: `MarketplaceNotConfigured` when no marketplace is set, `CollectionNotOurs` for addresses this launchpad did not deploy, `InvalidFeeBps` above 10 000 bps. The marketplace's storage helpers and its own `collection_fee_set` / `collection_fee_cleared` events are unchanged.
 
 ## [Release 1] - 2026-07-26
 

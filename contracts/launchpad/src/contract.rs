@@ -99,6 +99,13 @@ mod iface {
         fn upgrade(env: Env, new_wasm_hash: BytesN<32>);
     }
 
+    /// Issue #849: per-collection protocol fee overrides are stored on the
+    /// marketplace, so the launchpad forwards its admin's request to it.
+    #[contractclient(name = "MarketplaceClient")]
+    pub trait IMarketplace {
+        fn set_collection_fee_bps(env: Env, admin: Address, collection: Address, bps: u32);
+    }
+
     #[contractclient(name = "Lazy1155Client")]
     #[allow(clippy::too_many_arguments)]
     pub trait ILazy1155 {
@@ -117,7 +124,7 @@ mod iface {
     }
 }
 
-use iface::{Lazy1155Client, Lazy721Client, Normal1155Client, Normal721Client};
+use iface::{Lazy1155Client, Lazy721Client, MarketplaceClient, Normal1155Client, Normal721Client};
 
 // â”€â”€â”€ Salt hardening â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 fn make_secure_salt(env: &Env, creator: &Address, raw_salt: &BytesN<32>) -> BytesN<32> {
@@ -1060,6 +1067,53 @@ impl Launchpad {
         Ok(())
     }
 
+    /// Set the marketplace address this launchpad configures collection fee
+    /// overrides on (Issue #849). Admin-only.
+    pub fn set_marketplace_address(
+        env: Env,
+        marketplace: Address,
+    ) -> Result<(), Error> {
+        storage::extend_instance_ttl(&env);
+        storage::require_admin(&env)?;
+        storage::set_marketplace(&env, &marketplace);
+        events::publish_marketplace_address_set(&env, &marketplace);
+        Ok(())
+    }
+
+    /// Configure the marketplace's per-collection protocol fee override for a
+    /// collection this launchpad deployed (Issue #849).
+    ///
+    /// Forwards to the marketplace's `set_collection_fee_bps`, which is scoped
+    /// to the marketplace's `ProtocolConfig` role — so whoever holds the
+    /// launchpad admin role must also hold that role on the marketplace for the
+    /// call to succeed, and the marketplace address must be configured first
+    /// with `set_marketplace_address`. The collection must be one this launchpad
+    /// deployed, otherwise `CollectionNotOurs` is returned.
+    pub fn set_collection_protocol_fee(
+        env: Env,
+        collection: Address,
+        bps: u32,
+    ) -> Result<(), Error> {
+        storage::extend_instance_ttl(&env);
+        let admin = storage::require_admin(&env)?;
+        // Mirrors the marketplace's own cap on collection fee overrides.
+        if bps > 10_000 {
+            return Err(Error::InvalidFeeBps);
+        }
+        if storage::get_collection_by_address(&env, &collection).is_none() {
+            return Err(Error::CollectionNotOurs);
+        }
+        let marketplace = storage::get_marketplace(&env).ok_or(Error::MarketplaceNotConfigured)?;
+
+        MarketplaceClient::new(&env, &marketplace).set_collection_fee_bps(
+            &admin,
+            &collection,
+            &bps,
+        );
+        events::publish_collection_fee_configured(&env, &collection, bps, &admin);
+        Ok(())
+    }
+
     // â”€â”€ View functions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     /// Returns the royalty default (bps, receiver) snapshotted into the registry
@@ -1137,6 +1191,12 @@ impl Launchpad {
     }
 
     /// (fee_receiver, deploy_fee) â€” the treasury and flat deployment fee.
+    /// View: the marketplace address configured for fee overrides, if any
+    /// (Issue #849).
+    pub fn marketplace_address(env: Env) -> Option<Address> {
+        storage::get_marketplace(&env)
+    }
+
     pub fn fee_config(env: Env) -> (Address, i128) {
         storage::get_fee_config(&env)
     }
