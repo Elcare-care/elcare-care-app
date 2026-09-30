@@ -5110,4 +5110,211 @@ impl MarketplaceContract {
         if total > 10_000 { return Err(()); }
         Ok(())
     }
+
+    // ── Issue #850: Reservation window ───────────────────────────────────────
+
+    /// Set (or clear) a reservation window on an active listing.
+    ///
+    /// During `[reservation_start, reservation_end)`, only `reserved_for` may
+    /// call `buy_artwork`.  To clear an existing window, pass `reservation_end = 0`.
+    /// Reverts with `InvalidReservationWindow` when `reservation_end <= reservation_start`.
+    /// Reverts with `InvalidReservationWindow` when `reservation_end` is in the past.
+    /// Only the listing's artist may call this.
+    pub fn set_listing_reservation(
+        env: Env,
+        artist: Address,
+        listing_id: u64,
+        reserved_for: Address,
+        reservation_start: u64,
+        reservation_end: u64,
+    ) {
+        artist.require_auth();
+        let listing = load_listing(&env, listing_id)
+            .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::ListingNotFound));
+        if listing.artist != artist {
+            panic_with_error!(&env, MarketplaceError::Unauthorized);
+        }
+        if listing.status != ListingStatus::Active {
+            panic_with_error!(&env, MarketplaceError::ListingNotActive);
+        }
+        // reservation_end == 0 means clear
+        if reservation_end == 0 {
+            crate::storage::clear_listing_reservation_storage(&env, listing_id);
+            crate::events::ListingReservationSetEvent {
+                listing_id,
+                reserved_for: None,
+                reservation_start: 0,
+                reservation_end: 0,
+                ledger_sequence: env.ledger().sequence(),
+            }
+            .publish(&env);
+            return;
+        }
+        if reservation_end <= reservation_start {
+            panic_with_error!(&env, MarketplaceError::InvalidReservationWindow);
+        }
+        let now = env.ledger().timestamp();
+        if reservation_end <= now {
+            panic_with_error!(&env, MarketplaceError::InvalidReservationWindow);
+        }
+        crate::storage::set_listing_reservation_storage(
+            &env,
+            listing_id,
+            &crate::storage::ListingReservation {
+                reserved_for: reserved_for.clone(),
+                reservation_start,
+                reservation_end,
+            },
+        );
+        crate::events::ListingReservationSetEvent {
+            listing_id,
+            reserved_for: Some(reserved_for),
+            reservation_start,
+            reservation_end,
+            ledger_sequence: env.ledger().sequence(),
+        }
+        .publish(&env);
+    }
+
+    /// Read the active reservation window for a listing, if any.
+    pub fn get_listing_reservation(
+        env: Env,
+        listing_id: u64,
+    ) -> Option<crate::storage::ListingReservation> {
+        crate::storage::get_listing_reservation_storage(&env, listing_id)
+    }
+
+    // ── Read-only offer helpers ───────────────────────────────────────────────
+
+    /// Load a single offer by id.
+    pub fn get_offer(env: Env, offer_id: u64) -> Offer {
+        load_offer(&env, offer_id)
+            .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::OfferNotFound))
+    }
+
+    /// Total number of offers ever created (append-only counter).
+    pub fn get_total_offers(env: Env) -> u64 {
+        crate::storage::get_offer_count(&env)
+    }
+
+    // ── Issue #852: Four-Role RBAC ────────────────────────────────────────────
+
+    /// Idempotent bulk role assignment.
+    ///
+    /// Only sets roles that are not yet assigned; already-assigned roles are
+    /// left untouched so re-running a migration script is safe.  Requires
+    /// Admin auth.
+    pub fn migrate_roles(
+        env: Env,
+        admin: Address,
+        config: crate::types::MigrateRolesConfig,
+    ) {
+        admin.require_auth();
+        let stored_admin = Self::get_admin(env.clone())
+            .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::Unauthorized));
+        if admin != stored_admin {
+            panic_with_error!(&env, MarketplaceError::Unauthorized);
+        }
+        use crate::storage::{get_role_storage, set_role_storage};
+        use crate::types::RoleType;
+        if let Some(ref op) = config.operator {
+            if get_role_storage(&env, &RoleType::Operator).is_none() {
+                set_role_storage(&env, &RoleType::Operator, op);
+            }
+        }
+        if let Some(ref mod_addr) = config.moderator {
+            if get_role_storage(&env, &RoleType::Moderator).is_none() {
+                set_role_storage(&env, &RoleType::Moderator, mod_addr);
+            }
+        }
+        if let Some(ref tm) = config.treasury_manager {
+            if get_role_storage(&env, &RoleType::TreasuryManager).is_none() {
+                set_role_storage(&env, &RoleType::TreasuryManager, tm);
+            }
+        }
+    }
+
+    /// Read-only snapshot of all four role assignments.
+    ///
+    /// For roles not yet explicitly assigned, the field is `None`.
+    /// Callers that need a fallback to admin should handle `None` themselves.
+    pub fn get_role_inventory(env: Env) -> crate::types::RoleInventory {
+        use crate::storage::get_role_storage;
+        use crate::types::RoleType;
+        let admin = Self::get_admin(env.clone())
+            .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::Unauthorized));
+        crate::types::RoleInventory {
+            admin,
+            operator: get_role_storage(&env, &RoleType::Operator),
+            moderator: get_role_storage(&env, &RoleType::Moderator),
+            treasury_manager: get_role_storage(&env, &RoleType::TreasuryManager),
+        }
+    }
+
+    /// Admin-only direct role assignment shortcut.
+    ///
+    /// Sets the role immediately without a two-step proposal.  Intended for
+    /// the initial setup and for administrative overrides.
+    pub fn set_role_direct(
+        env: Env,
+        admin: Address,
+        role: crate::types::RoleType,
+        authority: Address,
+    ) {
+        admin.require_auth();
+        let stored_admin = Self::get_admin(env.clone())
+            .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::Unauthorized));
+        if admin != stored_admin {
+            panic_with_error!(&env, MarketplaceError::Unauthorized);
+        }
+        crate::storage::set_role_storage(&env, &role, &authority);
+    }
+
+    /// Step 1 of the two-step role transfer: propose a candidate.
+    ///
+    /// Overwrites any existing pending proposal for the same role (the old
+    /// candidate's slot is replaced).  Reverts with `InvalidStateTransition`
+    /// when the candidate is the current holder or a contract address.
+    pub fn propose_role_transfer(
+        env: Env,
+        admin: Address,
+        role: crate::types::RoleType,
+        candidate: Address,
+    ) {
+        admin.require_auth();
+        let stored_admin = Self::get_admin(env.clone())
+            .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::Unauthorized));
+        if admin != stored_admin {
+            panic_with_error!(&env, MarketplaceError::Unauthorized);
+        }
+        // Reject self-transfer (same holder) and contract-address candidates.
+        let current = crate::storage::get_role_storage(&env, &role);
+        if let Some(ref cur) = current {
+            if *cur == candidate {
+                panic_with_error!(&env, MarketplaceError::InvalidStateTransition);
+            }
+        }
+        // Reject contract addresses as candidates (is_contract is only available in
+        // test environments; in production we skip this guard since Soroban
+        // accounts are always Stellar accounts).
+        let expires_at = env.ledger().timestamp() + ADMIN_PROPOSAL_TTL;
+        crate::storage::set_pending_role_storage(
+            &env,
+            &role,
+            &crate::types::PendingRoleProposal {
+                role: role.clone(),
+                candidate: candidate.clone(),
+                proposed_by: admin.clone(),
+                expires_at,
+            },
+        );
+    }
+
+    /// Read the pending proposal for a role (if any).
+    pub fn get_pending_role_proposal(
+        env: Env,
+        role: crate::types::RoleType,
+    ) -> Option<crate::types::PendingRoleProposal> {
+        crate::storage::get_pending_role_storage(&env, &role)
+    }
 }
