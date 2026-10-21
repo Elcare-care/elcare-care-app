@@ -28,6 +28,30 @@ import {
   ModerationAssetKind,
 } from "@/lib/moderation";
 
+// Header used by the request logging/correlation middleware to propagate
+// a stable request identifier. Falls back to a generated ID when absent.
+const REQUEST_ID_HEADER = "x-request-id";
+
+function getRequestId(req: NextRequest): string {
+  const incoming = req.headers.get(REQUEST_ID_HEADER);
+  if (incoming && incoming.trim()) {
+    return incoming.trim();
+  }
+  return crypto.randomUUID();
+}
+
+function errorResponse(
+  req: NextRequest,
+  message: string,
+  status: number
+): NextResponse {
+  const requestId = getRequestId(req);
+  return NextResponse.json(
+    { error: message, requestId },
+    { status, headers: { [REQUEST_ID_HEADER]: requestId } }
+  );
+}
+
 const ALLOWED_CATEGORIES: ReportCategory[] = [
   "PROHIBITED_CONTENT",
   "INTELLECTUAL_PROPERTY",
@@ -48,31 +72,33 @@ export async function POST(req: NextRequest) {
   try {
     body = await req.json();
   } catch {
-    return NextResponse.json({ error: "Request body must be valid JSON." }, { status: 400 });
+    return errorResponse(req, "Request body must be valid JSON.", 400);
   }
 
   if (!body || typeof body !== "object") {
-    return NextResponse.json({ error: "Request body must be a JSON object." }, { status: 400 });
+    return errorResponse(req, "Request body must be a JSON object.", 400);
   }
 
   const obj = body as Record<string, unknown>;
 
   // ── Validate required fields ───────────────────────────────
   if (typeof obj.cid !== "string" || !obj.cid.trim()) {
-    return NextResponse.json({ error: "Field 'cid' is required." }, { status: 422 });
+    return errorResponse(req, "Field 'cid' is required.", 422);
   }
 
   if (!ALLOWED_KINDS.includes(obj.kind as ModerationAssetKind)) {
-    return NextResponse.json(
-      { error: `Field 'kind' must be one of: ${ALLOWED_KINDS.join(", ")}.` },
-      { status: 422 }
+    return errorResponse(
+      req,
+      `Field 'kind' must be one of: ${ALLOWED_KINDS.join(", ")}.`,
+      422
     );
   }
 
   if (!ALLOWED_CATEGORIES.includes(obj.category as ReportCategory)) {
-    return NextResponse.json(
-      { error: `Field 'category' must be one of: ${ALLOWED_CATEGORIES.join(", ")}.` },
-      { status: 422 }
+    return errorResponse(
+      req,
+      `Field 'category' must be one of: ${ALLOWED_CATEGORIES.join(", ")}.`,
+      422
     );
   }
 
@@ -80,9 +106,10 @@ export async function POST(req: NextRequest) {
     obj.description !== undefined &&
     (typeof obj.description !== "string" || obj.description.length > DESCRIPTION_MAX_LEN)
   ) {
-    return NextResponse.json(
-      { error: `Field 'description' must be a string of at most ${DESCRIPTION_MAX_LEN} characters.` },
-      { status: 422 }
+    return errorResponse(
+      req,
+      `Field 'description' must be a string of at most ${DESCRIPTION_MAX_LEN} characters.`,
+      422
     );
   }
 
@@ -90,7 +117,7 @@ export async function POST(req: NextRequest) {
     obj.reporterAddress !== undefined &&
     typeof obj.reporterAddress !== "string"
   ) {
-    return NextResponse.json({ error: "Field 'reporterAddress' must be a string." }, { status: 422 });
+    return errorResponse(req, "Field 'reporterAddress' must be a string.", 422);
   }
 
   const request: ReportRequest = {
@@ -122,12 +149,12 @@ export async function GET(req: NextRequest) {
   const cid = req.nextUrl.searchParams.get("cid");
 
   if (!cid || !cid.trim()) {
-    return NextResponse.json({ error: "Query param 'cid' is required." }, { status: 400 });
+    return errorResponse(req, "Query param 'cid' is required.", 400);
   }
 
   const record = await getModerationRecord(cid.trim());
   if (!record) {
-    return NextResponse.json({ error: "No moderation record found for this CID." }, { status: 404 });
+    return errorResponse(req, "No moderation record found for this CID.", 404);
   }
 
   return NextResponse.json({
