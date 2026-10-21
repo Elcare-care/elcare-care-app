@@ -29,6 +29,17 @@ const VALID_STATES: ModerationState[] = [
   "REPORTED",
 ];
 
+function getRequestId(req: NextRequest): string | undefined {
+  const headerId =
+    req.headers.get("x-request-id") ?? req.headers.get("x-correlation-id");
+  if (headerId && headerId.trim()) return headerId.trim();
+  const anyReq = req as unknown as { requestId?: unknown };
+  if (typeof anyReq.requestId === "string" && anyReq.requestId.trim()) {
+    return anyReq.requestId.trim();
+  }
+  return undefined;
+}
+
 // ── GET — list all moderation records ────────────────────────
 
 export async function GET(_req: NextRequest) {
@@ -39,19 +50,23 @@ export async function GET(_req: NextRequest) {
 // ── PATCH — update a record's state ──────────────────────────
 
 export async function PATCH(req: NextRequest) {
+  const requestId = getRequestId(req);
+  const errorBody = (error: string) =>
+    requestId ? { error, requestId } : { error };
+
   let body: unknown;
   try {
     body = await req.json();
   } catch {
     return NextResponse.json(
-      { error: "Request body must be valid JSON." },
+      errorBody("Request body must be valid JSON."),
       { status: 400 }
     );
   }
 
   if (!body || typeof body !== "object") {
     return NextResponse.json(
-      { error: "Request body must be a JSON object." },
+      errorBody("Request body must be a JSON object."),
       { status: 400 }
     );
   }
@@ -62,28 +77,28 @@ export async function PATCH(req: NextRequest) {
 
   if (typeof obj.cid !== "string" || !obj.cid.trim()) {
     return NextResponse.json(
-      { error: "Field 'cid' is required." },
+      errorBody("Field 'cid' is required."),
       { status: 422 }
     );
   }
 
   if (!VALID_STATES.includes(obj.newState as ModerationState)) {
     return NextResponse.json(
-      { error: `Field 'newState' must be one of: ${VALID_STATES.join(", ")}.` },
+      errorBody(`Field 'newState' must be one of: ${VALID_STATES.join(", ")}.`),
       { status: 422 }
     );
   }
 
   if (typeof obj.actor !== "string" || !obj.actor.trim()) {
     return NextResponse.json(
-      { error: "Field 'actor' is required." },
+      errorBody("Field 'actor' is required."),
       { status: 422 }
     );
   }
 
   if (obj.reason !== undefined && typeof obj.reason !== "string") {
     return NextResponse.json(
-      { error: "Field 'reason' must be a string." },
+      errorBody("Field 'reason' must be a string."),
       { status: 422 }
     );
   }
@@ -97,7 +112,7 @@ export async function PATCH(req: NextRequest) {
   const existing = getModerationRecord(cid);
   if (!existing) {
     return NextResponse.json(
-      { error: "No moderation record found for this CID." },
+      errorBody("No moderation record found for this CID."),
       { status: 404 }
     );
   }
@@ -105,7 +120,7 @@ export async function PATCH(req: NextRequest) {
   const updated = setModerationState(cid, newState, actor, reason);
   if (!updated) {
     return NextResponse.json(
-      { error: "Failed to update moderation record." },
+      errorBody("Failed to update moderation record."),
       { status: 500 }
     );
   }

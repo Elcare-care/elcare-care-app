@@ -44,6 +44,7 @@ export type UploadErrorCategory =
 interface UploadErrorResponse {
   error: string;
   category: UploadErrorCategory;
+  requestId?: string;
   uploadId?: string;
 }
 
@@ -163,12 +164,26 @@ export async function POST(req: Request) {
   // Generate a stable upload ID (shared with caller for workflow tracking)
   const uploadId = `img_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
 
+  // Reuse the request ID assigned by the correlation/logging middleware.
+  // Common header names are checked so this works regardless of which
+  // middleware populated it. Only included in the response when present.
+  const requestId =
+    req.headers.get("x-request-id") ??
+    req.headers.get("x-correlation-id") ??
+    req.headers.get("request-id") ??
+    undefined;
+
   const errorResponse = (
     message: string,
     category: UploadErrorCategory,
     status: number
   ): NextResponse<UploadErrorResponse> =>
-    NextResponse.json({ error: message, category, uploadId }, { status });
+    NextResponse.json(
+      requestId
+        ? { error: message, category, requestId, uploadId }
+        : { error: message, category, uploadId },
+      { status }
+    );
 
   try {
     // ── Parse multipart ──────────────────────────────────────
