@@ -1,4 +1,4 @@
-/**
+/*
  * app/api/support/route.ts
  *
  * Work item B — Support report submission endpoint.
@@ -6,12 +6,12 @@
  * POST /api/support
  *   Body: SupportFormInput (JSON)
  *   Returns: { id, status, responseSlaHours } on success
- *            { error } on validation failure
+ *            { error, requestId } on failure
  *
  * Security notes:
  *  • Rejects submissions containing secret-key patterns server-side.
  *  • Does not persist reporter secrets; wallet address is optional.
- *  • Support staff cannot alter on-chain state through this endpoint.
+ *  “ Support staff cannot alter on-chain state through this endpoint.
  *  • In production, replace the in-memory store with an indexer API call.
  */
 
@@ -28,12 +28,45 @@ import {
 // In-memory store (dev/MVP). Replace with indexer DB call in production.
 const _reports = new Map<string, SupportReport>();
 
+/**
+ * Resolve the request ID assigned by the correlation middleware.
+ * Prefers the canonical `x-request-id` header, falling back to other
+ * common correlation headers. Returns `undefined` when no ID is available.
+ */
+function getRequestId(req: NextRequest): string | undefined {
+  const candidates = [
+    req.headers.get('x-request-id'),
+    req.headers.get('x-correlation-id'),
+    req.headers.get('x-request-id'),
+  ];
+  for (const value of candidates) {
+    const trimmed = value?.trim();
+    if (trimmed) return trimmed;
+  }
+  return undefined;
+}
+
+/**
+ * Build a safe, stable API error payload.
+ * Includes the request ID when the correlation middleware has assigned one.
+ * Never includes stack traces or internal fields.
+ */
+function errorResponse(
+  req: NextRequest,
+  payload: Record<string, unknown>,
+  status: number
+): NextResponse {
+  const requestId = getRequestId(req);
+  const body = requestId ? { ...payload, requestId } : { ...payload };
+  return NextResponse.json(body, { status });
+}
+
 export async function POST(req: NextRequest) {
   let body: SupportFormInput;
   try {
     body = await req.json();
   } catch {
-    return NextResponse.json({ error: 'Invalid JSON body.' }, { status: 400 });
+    return errorResponse(req, { error: 'Invalid JSON body.' }, 400);
   }
 
   // Server-side secret guard (defence-in-depth; client also validates)
@@ -42,9 +75,10 @@ export async function POST(req: NextRequest) {
     body.screenshotUrl ?? '', body.description ?? '', body.reporterAddress ?? '',
   ].join(' ');
   if (containsSecret(allText)) {
-    return NextResponse.json(
+    return errorResponse(
+      req,
       { error: 'Submission rejected: contains a pattern that looks like a private key or seed phrase. Remove it and resubmit.' },
-      { status: 422 }
+      422
     );
   }
 
@@ -59,7 +93,7 @@ export async function POST(req: NextRequest) {
   });
 
   if (Object.keys(errors).length > 0) {
-    return NextResponse.json({ error: 'Validation failed.', fields: errors }, { status: 422 });
+    return errorResponse(req, { error: 'Validation failed.', fields: errors }, 422);
   }
 
   const category = body.category as keyof typeof SUPPORT_CATEGORIES;
@@ -93,11 +127,11 @@ export async function GET(req: NextRequest) {
   const { searchParams } = new URL(req.url);
   const id = searchParams.get('id');
   if (!id) {
-    return NextResponse.json({ error: 'Missing ?id= param.' }, { status: 400 });
+    return errorResponse(req, { error: 'Missing ?id= param.' }, 400);
   }
   const report = _reports.get(id);
   if (!report) {
-    return NextResponse.json({ error: 'Report not found.' }, { status: 404 });
+    return errorResponse(req, { error: 'Report not found.' }, 404);
   }
   // Do not expose internal fields to the public endpoint
   const { resolutionNote, ...publicReport } = report;
