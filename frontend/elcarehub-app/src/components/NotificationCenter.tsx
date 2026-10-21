@@ -1,6 +1,6 @@
 "use client";
 
-import { useRef, useState, useEffect } from "react";
+import { useRef, useState, useEffect, useId } from "react";
 import Link from "next/link";
 import {
   Bell,
@@ -206,6 +206,8 @@ export function NotificationCenter() {
   const [open, setOpen] = useState(false);
   const [showPrefs, setShowPrefs] = useState(false);
   const panelRef = useRef<HTMLDivElement>(null);
+  const bellRef = useRef<HTMLButtonElement>(null);
+  const panelId = useId();
 
   const {
     notifications,
@@ -237,10 +239,23 @@ export function NotificationCenter() {
   const lowUnread    = unread.filter((n) => CATEGORY_PRIORITY[n.category] === "LOW");
 
   return (
-    <div className="relative" ref={panelRef}>
+    <div
+      className="relative [&_button:focus-visible]:outline [&_button:focus-visible]:outline-2 [&_button:focus-visible]:outline-offset-2 [&_button:focus-visible]:outline-brand-400 [&_a:focus-visible]:outline [&_a:focus-visible]:outline-2 [&_a:focus-visible]:outline-offset-2 [&_a:focus-visible]:outline-brand-400"
+      ref={panelRef}
+      onKeyDown={(event) => {
+        if (open && event.key === "Escape" && !event.defaultPrevented) {
+          event.stopPropagation();
+          setOpen(false);
+          bellRef.current?.focus();
+        }
+      }}
+    >
       {/* Bell button */}
       <button
         type="button"
+        ref={bellRef}
+        aria-expanded={open}
+        aria-controls={open ? panelId : undefined}
         onClick={() => setOpen((v) => !v)}
         className="relative flex items-center justify-center w-9 h-9 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10 transition-colors"
         aria-label={
@@ -267,6 +282,7 @@ export function NotificationCenter() {
       {/* Dropdown panel */}
       {open && (
         <div
+          id={panelId}
           className="absolute right-0 top-full mt-3 w-84 rounded-2xl border border-white/10 bg-midnight-900 shadow-2xl shadow-midnight-950/50 overflow-hidden animate-in fade-in slide-in-from-top-2 duration-200"
           style={{ width: "22rem" }}
           data-testid="notification-panel"
