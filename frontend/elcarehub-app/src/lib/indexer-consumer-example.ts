@@ -23,6 +23,12 @@ interface RateLimitHeaders {
   reset: number;
 }
 
+// GET /listings wraps the page in this envelope whenever limit/offset is set
+interface ListingsPage {
+  listings: ListingResponse[];
+  total: number;
+}
+
 class IndexerConsumer {
   private config: IndexerConfig;
   private lastEventId: string | null = null;
@@ -93,14 +99,13 @@ class IndexerConsumer {
   }
 
   /**
-   * Paginated list with rate limit handling
+   * One page of listings (offset pagination) with rate limit handling
    */
-  async listListings(page: number = 1, limit: number = 20): Promise<{
-    listings: ListingResponse[];
-    rateLimits: RateLimitHeaders;
-  }> {
+  async listListings(offset: number = 0, limit: number = 20): Promise<
+    ListingsPage & { rateLimits: RateLimitHeaders }
+  > {
     const res = await fetch(
-      `${this.config.baseUrl}/listings?page=${page}&limit=${limit}`
+      `${this.config.baseUrl}/listings?limit=${limit}&offset=${offset}`
     );
 
     if (res.status === 429) {
@@ -111,7 +116,7 @@ class IndexerConsumer {
 
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
 
-    const listings = (await res.json()) as ListingResponse[];
+    const { listings, total } = (await res.json()) as ListingsPage;
     const rateLimits: RateLimitHeaders = {
       limit: parseInt(res.headers.get("RateLimit-Limit") || "0"),
       remaining: parseInt(res.headers.get("RateLimit-Remaining") || "0"),
@@ -121,7 +126,28 @@ class IndexerConsumer {
     console.log(
       `✓ Fetched ${listings.length} listings (${rateLimits.remaining}/${rateLimits.limit} remaining)`
     );
-    return { listings, rateLimits };
+    return { listings, total, rateLimits };
+  }
+
+  /**
+   * Walk every page of listings. Pagination ends at an empty page, so a
+   * short (non-empty) final page is still yielded before stopping.
+   * The offset and `total` count rows before moderated listings are filtered
+   * out, so a page can hold fewer than `limit` items (or none) mid-stream:
+   * always advance by `limit`, and only treat an empty page as the end once
+   * `total` says no rows follow it.
+   * The API caps `offset` at 10 000; for larger catalogues poll by ledger
+   * instead (see the guide).
+   */
+  async *listAllListings(limit: number = 20): AsyncGenerator<ListingResponse[]> {
+    for (let offset = 0; ; offset += limit) {
+      const { listings, total } = await this.listListings(offset, limit);
+      if (listings.length === 0) {
+        if (offset + limit >= total) return; // no further records
+        continue; // every row on this page was moderated out
+      }
+      yield listings;
+    }
   }
 
   /**
@@ -249,9 +275,10 @@ async function example() {
     console.log(`Price: ${listing.priceDecimal} (raw: ${listing.price})`);
   }
 
-  // 3. Paginated list
-  const { listings, rateLimits } = await consumer.listListings(1, 10);
-  console.log(`Fetched ${listings.length} listings`);
+  // 3. Paginated list, until an empty page ends pagination
+  for await (const page of consumer.listAllListings(10)) {
+    console.log(`Fetched ${page.length} listings`);
+  }
 
   // 4. Subscribe to SSE
   const unsubscribe = consumer.subscribeToEvents((event) => {

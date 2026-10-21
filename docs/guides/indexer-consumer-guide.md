@@ -45,11 +45,13 @@ Compare against your client's supported range at startup. The OpenAPI `info.vers
 
 ## 3. Pagination & cursors
 
-List endpoints accept `page` + `limit` (defaults vary by route). Activity/history endpoints may return `hasMore: true`.
+List endpoints accept `limit` + `offset` (defaults vary by route). Activity/history endpoints may return `hasMore: true`.
 
 ```bash
-curl -s "$INDEXER_URL/listings?page=1&limit=20"
+curl -s "$INDEXER_URL/listings?limit=20&offset=0"
 ```
+
+With `limit` or `offset` set, `/listings` returns `{ "listings": [...], "total": n }`. Advance `offset` by `limit` until a page returns no listings and `offset + limit >= total`, and process a short final page before stopping (see `IndexerConsumer.listAllListings()` in the example). Moderated listings are filtered out after paging, so a page can be short, or even empty, before the end.
 
 For large backfills prefer incremental polling by `lastIndexedLedger` from `/health` rather than deep pagination.
 
@@ -257,7 +259,7 @@ curl -s "$INDEXER_URL/health" | jq '{status, lastIndexedLedger}'
 curl -sI "$INDEXER_URL/listings" | grep -i x-api-version
 
 # Paginated listings with decimal amounts
-curl -s "$INDEXER_URL/listings?limit=5" | jq '.[0] | {listingId, price, priceDecimal, token}'
+curl -s "$INDEXER_URL/listings?limit=5" | jq '.listings[0] | {listingId, price, priceDecimal, token}'
 
 # Conditional GET
 ETAG=$(curl -sI "$INDEXER_URL/listings/1" | grep -i etag | awk '{print $2}' | tr -d '\r')

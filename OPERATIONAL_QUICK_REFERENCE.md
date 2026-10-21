@@ -136,8 +136,9 @@ curl -sI http://localhost:4000/listings | grep -i x-api-version
 
 ### Paginated list with rate limits
 ```bash
-curl -s "http://localhost:4000/listings?page=1&limit=20" | jq '.[] | {listingId, priceDecimal, token}'
+curl -s "http://localhost:4000/listings?limit=20&offset=0" | jq '.listings[] | {listingId, priceDecimal, token}'
 ```
+Advance `offset` by `limit` until a page returns no listings and `offset + limit >= total`; a short final page is still processed (see `IndexerConsumer.listAllListings()`).
 
 ### Conditional GET (ETag)
 ```bash

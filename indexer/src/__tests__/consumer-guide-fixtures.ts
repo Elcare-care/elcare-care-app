@@ -3,6 +3,13 @@
  * Reference: docs/guides/indexer-consumer-guide.md
  */
 
+const pagedListings = [
+  { listingId: "1", artist: "GABC...111", price: "50000000", priceDecimal: "5.0000000", token: "CDLZ...CYSC", status: "Active" },
+  { listingId: "2", artist: "GABC...222", price: "200000000", priceDecimal: "20.0000000", token: "CDLZ...CYSC", status: "Active" },
+  { listingId: "3", artist: "GABC...333", price: "75000000", priceDecimal: "7.5000000", token: "CDLZ...CYSC", status: "Active" },
+  { listingId: "4", artist: "GABC...444", price: "10000000", priceDecimal: "1.0000000", token: "CDLZ...CYSC", status: "Active" },
+];
+
 export const indexerFixtures = {
   /**
    * Health check response with version
@@ -45,28 +52,15 @@ export const indexerFixtures = {
   },
 
   /**
-   * Paginated listings response
+   * Paginated listings response (limit/offset set, so the API returns the
+   * { listings, total } envelope)
    */
   listingsList: {
     status: 200,
-    body: [
-      {
-        listingId: "1",
-        artist: "GABC...111",
-        price: "50000000",
-        priceDecimal: "5.0000000",
-        token: "CDLZ...CYSC",
-        status: "Active",
-      },
-      {
-        listingId: "2",
-        artist: "GABC...222",
-        price: "200000000",
-        priceDecimal: "20.0000000",
-        token: "CDLZ...CYSC",
-        status: "Active",
-      },
-    ],
+    body: {
+      listings: pagedListings.slice(0, 2),
+      total: 2,
+    },
     headers: {
       "X-API-Version": "1.0.0",
       "RateLimit-Limit": "100",
@@ -74,6 +68,34 @@ export const indexerFixtures = {
       "RateLimit-Reset": "1710000000",
       "Content-Type": "application/json",
     },
+  },
+
+  /**
+   * Pages served for limit=2 when the last page is full: only the empty page
+   * that follows tells the consumer there are no further records.
+   */
+  listingsPagesEndingEmpty: {
+    total: 4,
+    pages: [pagedListings.slice(0, 2), pagedListings.slice(2, 4), []],
+  },
+
+  /**
+   * Pages served for limit=2 when the final page is partial: it must still
+   * be processed before the empty page ends pagination.
+   */
+  listingsPagesEndingPartial: {
+    total: 3,
+    pages: [pagedListings.slice(0, 2), pagedListings.slice(2, 3), []],
+  },
+
+  /**
+   * Pages served for limit=2 when both rows of the first page were moderated
+   * out: that empty page is not the end, because `total` (raw rows) says a
+   * third row follows.
+   */
+  listingsPagesWithModeratedPage: {
+    total: 3,
+    pages: [[], pagedListings.slice(2, 3), []],
   },
 
   /**
@@ -317,6 +339,32 @@ export function createMockFetch(
     // Default 404
     return mockResponse(fixtures.notFound);
   };
+}
+
+/**
+ * Mock fetch for GET /listings?limit=&offset= that serves `pages` in order
+ * (page index = offset / limit; past the end is an empty page) with the given
+ * raw-row `total`, and records the query string of every request.
+ */
+export function createPagedListingsFetch({ total, pages }: { total: number; pages: unknown[][] }): {
+  fetch: (url: string) => Promise<Response>;
+  queries: string[];
+} {
+  const queries: string[] = [];
+
+  const fetch = async (url: string) => {
+    const { search, searchParams } = new URL(url);
+    queries.push(search);
+    const limit = Number(searchParams.get("limit"));
+    const offset = Number(searchParams.get("offset"));
+    const listings = pages[offset / limit] ?? [];
+    return mockResponse({
+      ...indexerFixtures.listingsList,
+      body: { listings, total },
+    });
+  };
+
+  return { fetch, queries };
 }
 
 /**
