@@ -149,6 +149,29 @@ export const statsQuerySchema = z.object({
   to:    z.string().optional(),
 });
 
+// ── GET /events resume cursor ────────────────────────────────────────────────
+//
+// /events emits plain integer ids from the in-process counter in routes.ts
+// (docs/sse-protocol.md: `id: <number>`), so a resume cursor is a non-negative
+// decimal integer. Redis Stream ids ("<ms>-<seq>", realtime/stream-ids.ts)
+// belong to RealtimeHub and /notifications/stream and are never emitted here.
+//
+// 15 digits keeps every accepted value below Number.MAX_SAFE_INTEGER
+// (2^53 - 1, 16 digits), so the conversion after validation is exact.
+export const SSE_CURSOR_MAX_DIGITS = 15;
+const SSE_CURSOR_RE = /^\d+$/;
+export const SSE_CURSOR_ERROR = `must be a non-negative integer event id of at most ${SSE_CURSOR_MAX_DIGITS} digits`;
+
+/**
+ * Validates an /events resume cursor (Last-Event-ID header or ?lastEventId=).
+ * The length is checked before the pattern so oversized input is never
+ * scanned. Returns the numeric id, or null when the value is not a cursor.
+ */
+export function parseSseCursor(raw: string): number | null {
+  if (raw.length > SSE_CURSOR_MAX_DIGITS || !SSE_CURSOR_RE.test(raw)) return null;
+  return Number(raw);
+}
+
 export const eventsQuerySchema = z.object({
   types: z
     .string()
@@ -160,7 +183,7 @@ export const eventsQuerySchema = z.object({
     .optional(),
   lastEventId: z
     .string()
-    .regex(/^\d+(-\d+)?$/, 'lastEventId must be an SSE event id')
+    .refine((v) => parseSseCursor(v) !== null, `lastEventId ${SSE_CURSOR_ERROR}`)
     .optional(),
 });
 
