@@ -41,6 +41,8 @@ import {
   searchQuerySchema,
   eventsQuerySchema,
   collectionTokensQuerySchema,
+  parseSseCursor,
+  SSE_CURSOR_ERROR,
 } from './query-schemas.js';
 import {
   CursorEndpoint,
@@ -292,7 +294,7 @@ const serializeOffers = (rows: any[]) => serialize(rows).map((row: any) => withD
 
 // ── GET /events (SSE) ─────────────────────────────────────────────────────────
 
-router.get('/events', abuseDetection('sse'), sseConcurrencyGuard, validateQuery(eventsQuerySchema), (req: Request, res: Response) => {
+router.get('/events', abuseDetection('sse'), sseConcurrencyGuard, validateQuery(eventsQuerySchema), (req: Request, res: Response, next: NextFunction) => {
   if (sseClients.size >= MAX_SSE_CONNECTIONS) {
     return res.status(503).json({ error: { code: 'SERVICE_UNAVAILABLE', message: 'Too many SSE connections', class: 'CLIENT_ERROR' } });
   }
@@ -306,21 +308,29 @@ router.get('/events', abuseDetection('sse'), sseConcurrencyGuard, validateQuery(
     : undefined;
   const listingIdFilter: string | undefined = listingIdParam ? String(listingIdParam) : undefined;
 
+  // Determine resume cursor — Last-Event-ID header takes precedence over ?lastEventId=
+  // (an empty header is treated as absent, as EventSource never sends one).
+  const headerLastId = req.headers['last-event-id'];
+  const resumeFrom: string | null = (headerLastId ? String(headerLastId) : null) ?? (queryLastEventId ? String(queryLastEventId) : null);
+
+  // Validate the whole cursor before the stream opens (#920). ?lastEventId= has
+  // already passed the same check in eventsQuerySchema, so this only rejects a
+  // malformed or oversized header, with the same 400 instead of a full replay.
+  const resumeNum = resumeFrom === null ? null : parseSseCursor(resumeFrom);
+  if (resumeFrom !== null && resumeNum === null) {
+    return next(badRequest(`Last-Event-ID ${SSE_CURSOR_ERROR}`));
+  }
+
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
   res.setHeader('X-Accel-Buffering', 'no');
   res.flushHeaders();
 
-  // Determine resume cursor — Last-Event-ID header takes precedence over ?lastEventId=
-  const headerLastId = req.headers['last-event-id'];
-  const resumeFrom: string | null = (headerLastId ? String(headerLastId) : null) ?? (queryLastEventId ? String(queryLastEventId) : null);
-
   sseClients.set(res, resumeFrom ?? '0');
 
   // Replay missed events from the buffer when the client provides a resume cursor.
-  if (resumeFrom !== null) {
-    const resumeNum = parseInt(resumeFrom, 10);
+  if (resumeNum !== null) {
     const missed = sseBuffer.filter((e) => {
       const eventNum = parseInt(e.id, 10);
       if (isNaN(eventNum) || eventNum <= resumeNum) return false;

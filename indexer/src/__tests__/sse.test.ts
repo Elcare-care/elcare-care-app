@@ -233,6 +233,127 @@ describe('GET /events — reconnect replay via Last-Event-ID', () => {
   });
 });
 
+// Resolve with the status and whatever body arrives within `timeoutMs`: a 400
+// ends immediately, an SSE stream is cut off at the timeout.
+function getResponse(
+  url: string,
+  headers: Record<string, string> = {},
+  timeoutMs = 150,
+): Promise<{ status: number; contentType: string; body: string; ids: string[] }> {
+  return new Promise((resolve, reject) => {
+    const req = http.get(url, { headers }, (res) => {
+      let body = '';
+      const done = () => {
+        clearTimeout(timer);
+        const ids = [...body.matchAll(/^id: (.*)$/gm)].map((m) => m[1]);
+        resolve({ status: res.statusCode ?? 0, contentType: String(res.headers['content-type'] ?? ''), body, ids });
+      };
+      const timer = setTimeout(() => { req.destroy(); done(); }, timeoutMs);
+      res.on('data', (chunk: Buffer) => { body += chunk.toString(); });
+      res.on('end', done);
+    });
+    req.on('error', (err) => {
+      if ((err as any).code === 'ECONNRESET') return;
+      reject(err);
+    });
+  });
+}
+
+describe('GET /events — Last-Event-ID cursor validation (#920)', () => {
+  // /events only ever emits plain integer ids, so the cursor is integer-only
+  // (no Redis "<ms>-<seq>" form) and at most 15 digits.
+  beforeEach(() => {
+    emitSSEEvent({ type: 'first' });  // id 1
+    emitSSEEvent({ type: 'second' }); // id 2
+    emitSSEEvent({ type: 'third' });  // id 3
+  });
+
+  it('a valid Last-Event-ID still resumes from the next event', async () => {
+    const res = await getResponse(`${baseUrl}/events`, { 'Last-Event-ID': '1' });
+    expect(res.status).toBe(200);
+    expect(res.ids).toEqual(['2', '3']);
+  });
+
+  it('accepts a cursor at the 15-digit bound', async () => {
+    const res = await getResponse(`${baseUrl}/events`, { 'Last-Event-ID': '9'.repeat(15) });
+    expect(res.status).toBe(200);
+    expect(res.ids).toEqual([]);
+    expect(res.body).toContain('CONNECTED');
+  });
+
+  it.each([
+    ['non-numeric', 'abc'],
+    ['trailing junk', '2abc'],
+    ['negative', '-1'],
+    ['plus sign', '+2'],
+    ['decimal', '2.5'],
+    ['scientific notation', '2e0'],
+    ['hex', '0x2'],
+    ['Redis stream id', '1710000000000-2'],
+    ['inner whitespace', '2 3'],
+    ['comma list (how Node joins duplicate headers)', '1, 2'],
+  ])('rejects a malformed Last-Event-ID (%s) with 400 and replays nothing', async (_label, value) => {
+    const res = await getResponse(`${baseUrl}/events`, { 'Last-Event-ID': value });
+    expect(res.status).toBe(400);
+    expect(res.contentType).toContain('application/json');
+    expect(JSON.parse(res.body).error.code).toBe('BAD_REQUEST');
+    expect(res.ids).toEqual([]);
+  });
+
+  it.each([
+    ['16 digits', '9'.repeat(16)],
+    ['8000 digits', '9'.repeat(8000)],
+    ['8000 letters', 'a'.repeat(8000)],
+  ])('rejects an oversized Last-Event-ID (%s) with 400 and replays nothing', async (_label, value) => {
+    const res = await getResponse(`${baseUrl}/events`, { 'Last-Event-ID': value });
+    expect(res.status).toBe(400);
+    expect(res.ids).toEqual([]);
+  });
+
+  it('never reaches the replay filter for an invalid cursor', async () => {
+    const filterSpy = vi.spyOn(_getSseBuffer(), 'filter');
+    try {
+      await getResponse(`${baseUrl}/events`, { 'Last-Event-ID': 'a'.repeat(8000) });
+      expect(filterSpy).not.toHaveBeenCalled();
+
+      // Sanity check that the spy observes the replay path at all.
+      await getResponse(`${baseUrl}/events`, { 'Last-Event-ID': '1' });
+      expect(filterSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      filterSpy.mockRestore();
+    }
+  });
+
+  it('a malformed header is rejected rather than falling back to a valid ?lastEventId=', async () => {
+    const res = await getResponse(`${baseUrl}/events?lastEventId=1`, { 'Last-Event-ID': 'abc' });
+    expect(res.status).toBe(400);
+    expect(res.ids).toEqual([]);
+  });
+
+  it('a valid header still takes precedence over a valid ?lastEventId=', async () => {
+    const res = await getResponse(`${baseUrl}/events?lastEventId=1`, { 'Last-Event-ID': '2' });
+    expect(res.status).toBe(200);
+    expect(res.ids).toEqual(['3']);
+  });
+
+  it('an empty Last-Event-ID is treated as absent and ?lastEventId= applies', async () => {
+    const res = await getResponse(`${baseUrl}/events?lastEventId=1`, { 'Last-Event-ID': '' });
+    expect(res.status).toBe(200);
+    expect(res.ids).toEqual(['2', '3']);
+  });
+
+  it.each([
+    ['Redis stream id', '1-2'],
+    ['16 digits', '9'.repeat(16)],
+    ['decimal', '1.5'],
+  ])('rejects a malformed ?lastEventId= (%s) with 400', async (_label, value) => {
+    const res = await getResponse(`${baseUrl}/events?lastEventId=${encodeURIComponent(value)}`);
+    expect(res.status).toBe(400);
+    expect(JSON.parse(res.body).error.code).toBe('BAD_REQUEST');
+    expect(res.ids).toEqual([]);
+  });
+});
+
 describe('GET /events — topic filtering', () => {
   it('delivers only events matching ?types=', async () => {
     const framesPromise = collectSseFrames(`${baseUrl}/events?types=BID_PLACED`, {}, 1, 300);
