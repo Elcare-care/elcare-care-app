@@ -56,6 +56,7 @@ import {
   type FieldError,
 } from '../api/errors.js';
 import apiRouter from '../api/routes.js';
+import { logger } from '../logger.js';
 
 // ── Test-app factories ────────────────────────────────────────────────────────
 
@@ -383,6 +384,46 @@ describe('Prisma error mapping', () => {
 // ── Sensitive data leak prevention ────────────────────────────────────────────
 
 describe('Sensitive data is never leaked', () => {
+  it('GET /listings redacts a database failure while retaining the public error contract', async () => {
+    const internalMessage = 'fixture-only database failure in private_listing_index';
+    const secretValue = 'fixture-only-database-password';
+    const failure = Object.assign(new Error(internalMessage), {
+      password: secretValue,
+      details: { databasePassword: secretValue },
+    });
+    const requestId = 'route-redaction-regression';
+    // Keep diagnostics in production, but never print this fixture from the test.
+    const logError = vi.spyOn(logger, 'error').mockImplementation(() => {});
+    mockPrisma.listing.findMany.mockClear().mockRejectedValueOnce(failure);
+
+    try {
+      const res = await request(fullApp).get('/listings').set('X-Request-Id', requestId);
+
+      expect(res.status).toBe(500);
+      expect(mockPrisma.listing.findMany).toHaveBeenCalledTimes(1);
+      // Boolean assertions prevent a regression from dumping the unsafe response
+      // (or the sensitive expected value) into Vitest's assertion diagnostics.
+      const body = JSON.stringify(res.body);
+      expect(body.includes(internalMessage)).toBe(false);
+      expect(body.includes(secretValue)).toBe(false);
+      expect(body.includes('private_listing_index')).toBe(false);
+      expect(Object.hasOwn(res.body.error ?? {}, 'details')).toBe(false);
+      expect(Object.hasOwn(res.body.error ?? {}, 'stack')).toBe(false);
+      expect(res.body.error?.message === 'Failed to fetch listings').toBe(true);
+      expect(res.body.error?.code === ErrorCode.INTERNAL).toBe(true);
+      expect(res.body.error?.class === 'SERVER_ERROR').toBe(true);
+      expect(res.body.error?.requestId === requestId).toBe(true);
+      expect(res.headers['x-request-id'] === requestId).toBe(true);
+      expect(res.body.error?.retryable === true).toBe(true);
+      expect(res.body.error?.retryAfterSeconds === 10).toBe(true);
+      expect(res.headers['retry-after'] === '10').toBe(true);
+      expect(logError).toHaveBeenCalledTimes(1);
+    } finally {
+      mockPrisma.listing.findMany.mockReset().mockResolvedValue([]);
+      logError.mockRestore();
+    }
+  });
+
   it('500 does not include stack trace in production', async () => {
     const originalEnv = process.env.NODE_ENV;
     process.env.NODE_ENV = 'production';
