@@ -6,6 +6,9 @@ import { isValidStellarAddress, STELLAR_ADDRESS_ERROR } from '../stellar-address
 // ── Reusable field schemas ────────────────────────────────────────────────────
 
 const positiveInt = (max: number) =>
+  z.coerce.number().int().min(1).max(max);
+
+const nonnegativeInt = (max: number) =>
   z.coerce.number().int().nonnegative().max(max);
 
 const optionalString = z.string().optional();
@@ -80,7 +83,7 @@ export const listingsQuerySchema = z.object({
   collection: collectionField,
   token:      optionalString,
   limit:      positiveInt(100).optional(),
-  offset:     positiveInt(10_000).optional(),
+  offset:     nonnegativeInt(10_000).optional(),
   ...cursorFields,
 }).refine(
   (d) => d.minPrice === undefined || d.maxPrice === undefined || d.minPrice <= d.maxPrice,
@@ -100,7 +103,7 @@ export const auctionsQuerySchema = z.object({
   creator: optionalStellarAddress,
   status:  z.enum(['Active', 'Finalized', 'Cancelled']).optional(),
   limit:   positiveInt(100).optional(),
-  offset:  positiveInt(10_000).optional(),
+  offset:  nonnegativeInt(10_000).optional(),
   ...cursorFields,
 });
 
@@ -114,13 +117,13 @@ export const offersQuerySchema = z.object({
   // every offer id from the contract and filtering client-side.
   offerer: optionalStellarAddress,
   limit:  positiveInt(100).optional(),
-  offset: positiveInt(10_000).optional(),
+  offset: nonnegativeInt(10_000).optional(),
   ...cursorFields,
 });
 
 export const walletActivityQuerySchema = z.object({
   limit:  positiveInt(200).optional(),
-  offset: positiveInt(10_000).optional(),
+  offset: nonnegativeInt(10_000).optional(),
   ...cursorFields,
 });
 
@@ -128,19 +131,19 @@ export const collectionsQuerySchema = z.object({
   kind:    z.enum(['normal_721', 'normal_1155', 'lazy_721', 'lazy_1155']).optional(),
   creator: optionalString,
   limit:   positiveInt(100).optional(),
-  offset:  positiveInt(10_000).optional(),
+  offset:  nonnegativeInt(10_000).optional(),
   ...cursorFields,
 });
 
 export const creatorCollectionsQuerySchema = z.object({
   limit:  positiveInt(100).optional(),
-  offset: positiveInt(10_000).optional(),
+  offset: nonnegativeInt(10_000).optional(),
   ...cursorFields,
 });
 
 export const collectionTokensQuerySchema = z.object({
   limit:  positiveInt(100).optional(),
-  offset: positiveInt(10_000).optional(),
+  offset: nonnegativeInt(10_000).optional(),
 });
 
 export const statsQuerySchema = z.object({
@@ -168,7 +171,7 @@ export const syncGapsQuerySchema = z.object({
   status: z.enum(['Open', 'Repairing', 'Repaired', 'Failed']).optional(),
   source: z.enum(['rpc_window_skip', 'reorg', 'manual']).optional(),
   limit:  positiveInt(500).optional(),
-  offset: positiveInt(10_000).optional(),
+  offset: nonnegativeInt(10_000).optional(),
 });
 
 export const royaltyBreakdownQuerySchema = z.object({
@@ -177,7 +180,7 @@ export const royaltyBreakdownQuerySchema = z.object({
   /** Inclusive upper ledger-sequence bound. */
   to:     z.coerce.number().int().min(0).optional(),
   limit:  positiveInt(1000).optional(),
-  offset: positiveInt(10_000).optional(),
+  offset: nonnegativeInt(10_000).optional(),
 });
 
 export const artistMetricsQuerySchema = z.object({

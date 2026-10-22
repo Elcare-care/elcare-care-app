@@ -159,10 +159,12 @@ describe('listingsQuerySchema', () => {
 
   it('rejects limit = 0', () => {
     const r = listingsQuerySchema.safeParse({ limit: '0' });
-    // 0 is non-negative but we require positiveInt(100) — nonnegative includes 0
-    // Per our schema positiveInt = z.coerce.number().int().nonnegative().max(max)
-    // 0 is technically valid by nonnegative; check boundary behaviour
-    expect(r.success).toBe(true); // 0 is allowed as "no limit" signal
+    expect(r.success).toBe(false);
+  });
+
+  it('accepts offset = 0', () => {
+    const r = listingsQuerySchema.safeParse({ offset: '0' });
+    expect(r.success).toBe(true);
   });
 
   it('rejects negative offset', () => {
@@ -222,6 +224,34 @@ describe('collectionsQuerySchema', () => {
 // ── 4. HTTP integration tests ─────────────────────────────────────────────────
 
 describe('GET /listings — HTTP validation', () => {
+  it('preserves the default pagination values', async () => {
+    const res = await request(app).get('/listings');
+    expect(res.status).toBe(200);
+    expect(mockPrisma.listing.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({ take: 20, skip: 0 })
+    );
+  });
+
+  it('accepts the limit and offset boundaries', async () => {
+    const res = await request(app).get('/listings?limit=100&offset=10000');
+    expect(res.status).toBe(200);
+    expect(mockPrisma.listing.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({ take: 100, skip: 10000 })
+    );
+  });
+
+  it.each(['abc', '0', '101'])('returns the shared 400 error envelope for limit=%s', async (limit) => {
+    const res = await request(app).get(`/listings?limit=${limit}`);
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatchObject({
+      code: 'BAD_REQUEST',
+      class: 'CLIENT_ERROR',
+      retryable: false,
+    });
+    expect(typeof res.body.error.message).toBe('string');
+    expect(mockPrisma.listing.findMany).not.toHaveBeenCalled();
+  });
+
   it('accepts valid limit and offset', async () => {
     const res = await request(app).get('/listings?limit=10&offset=5');
     expect(res.status).toBe(200);
