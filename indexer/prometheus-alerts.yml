@@ -5,16 +5,25 @@ groups:
 
       # ── Sync health ──────────────────────────────────────────────────────────
 
+      # Sync-lag severity definitions (REL-003 canonical thresholds):
+      #   > 100 ledgers  → degraded  (warning)  — indexer is behind but still running
+      #   > 1000 ledgers → down/stalled (critical) — indexer is likely stalled or RPC unreachable
+      # These same values are reflected in the Grafana "Sync Lag (ledgers)" panel thresholds
+      # (yellow at 100, red at 1000) and in the stalled-ingestion runbook.
+      # Do not change these values without an explicit REL-series reliability decision.
+
       - alert: IndexerSyncLagHigh
         expr: elcarehub_sync_lag_ledgers > 100
         for: 2m
         labels:
           severity: warning
         annotations:
-          summary: "Indexer is lagging behind the network tip"
+          summary: "Indexer sync degraded — more than 100 ledgers behind network tip"
           description: >
-            Sync lag is {{ $value }} ledgers. The indexer has not caught up
-            within 2 minutes. Check poller connectivity and Stellar RPC health.
+            Sync lag is {{ $value }} ledgers (degraded threshold: 100).
+            The indexer is running but falling behind; no immediate data loss.
+            Check poller connectivity and Stellar RPC health.
+            See runbook: docs/runbooks/stalled-ingestion.md
 
       - alert: IndexerSyncLagCritical
         expr: elcarehub_sync_lag_ledgers > 1000
@@ -22,10 +31,12 @@ groups:
         labels:
           severity: critical
         annotations:
-          summary: "Indexer is critically far behind the network"
+          summary: "Indexer sync down — more than 1,000 ledgers behind network tip"
           description: >
-            Sync lag is {{ $value }} ledgers — more than 1,000 ledgers behind.
-            The indexer may be stalled or the Stellar RPC unreachable.
+            Sync lag is {{ $value }} ledgers (down/stalled threshold: 1,000).
+            The indexer is likely stalled or the Stellar RPC is unreachable.
+            Users see stale data. Page on-call immediately.
+            See runbook: docs/runbooks/stalled-ingestion.md
 
       - alert: IndexerStalled
         expr: indexer_stalled == 1

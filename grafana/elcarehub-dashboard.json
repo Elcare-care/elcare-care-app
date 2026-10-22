@@ -51,7 +51,8 @@
       "gridPos": { "h": 4, "w": 6, "x": 0, "y": 1 },
       "id": 1,
       "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "orientation": "auto", "textMode": "auto", "colorMode": "background" },
-      "title": "Sync Lag (ledgers)",
+      "title": "Sync Lag (ledgers) — green <100 | yellow ≥100 degraded | red ≥1000 down",
+      "description": "Canonical thresholds (REL-003): >100 = degraded (warning); >1000 = down/stalled (critical). Matches IndexerSyncLagHigh and IndexerSyncLagCritical Prometheus alerts.",
       "type": "stat",
       "targets": [
         {

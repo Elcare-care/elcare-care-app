@@ -20,10 +20,19 @@ curl -s -o /dev/null -w "%{http_code}" \
   https://api.pinata.cloud/data/testAuthentication
 # Expected: 200
 
-# Test IPFS gateway (public, no auth needed)
+# Test IPFS public gateway with a known-good CID.
+# Replace KNOWN_CID with a CID you have previously confirmed is reachable
+# (e.g. retrieve one from the database — see Verification section below).
+# Do NOT use a placeholder value; an unknown CID cannot prove gateway health.
+#
+#   KNOWN_CID=<paste a real CID here, e.g. QmAbc123...>
+#
 curl -s -o /dev/null -w "%{http_code}" \
-  "https://gateway.pinata.cloud/ipfs/QmXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
-# Expected: 200
+  "https://gateway.pinata.cloud/ipfs/$KNOWN_CID"
+# Expected: 200 for a known-reachable CID.
+# A non-200 result means either the gateway is down OR this specific CID is
+# unavailable. Before declaring a gateway outage, verify the same CID on a
+# second gateway (see Section A below).
 
 # Check Pinata status page
 curl -s https://status.pinata.cloud/ | grep -i "operational\|incident"
@@ -64,22 +73,45 @@ curl -s https://status.pinata.cloud/ | grep -i "operational\|incident"
 - Images at `https://gateway.pinata.cloud/ipfs/<CID>` return 503 or timeout
 - Browser console shows: `net::ERR_NAME_NOT_RESOLVED` or `ERR_TIMED_OUT`
 
+### Confirming a Gateway Outage vs. Unavailable Content
+
+A CID that returns a non-200 response may mean the gateway is down **or** that the
+specific content was never pinned / is no longer available. To distinguish between
+the two, test the same known-good CID across multiple gateways before declaring an
+outage. Only if **all** gateways fail for a CID you have previously confirmed is
+reachable should you treat it as a gateway outage.
+
+```bash
+# 1. Get a known CID from the database (no secrets printed — uses env var)
+KNOWN_CID=$(psql "$DATABASE_URL" -tAc "
+  SELECT token FROM \"IpfsMetadata\" WHERE status = 'ok' LIMIT 1
+")
+echo "Testing CID: $KNOWN_CID"
+
+# 2. Test across multiple gateways with the same CID
+curl -s -o /dev/null -w "pinata:    %{http_code}\n" "https://gateway.pinata.cloud/ipfs/$KNOWN_CID"
+curl -s -o /dev/null -w "cloudflare: %{http_code}\n" "https://cloudflare-ipfs.com/ipfs/$KNOWN_CID"
+curl -s -o /dev/null -w "ipfs.io:    %{http_code}\n" "https://ipfs.io/ipfs/$KNOWN_CID"
+
+# If pinata returns non-200 but cloudflare/ipfs.io return 200 → Pinata gateway is down
+# If all return non-200 → this CID may simply be unavailable; try a different known CID
+# before declaring a gateway outage
+```
+
 ### Mitigation — Use Fallback Public Gateway
 
 The IPFS CID is stored permanently in the contract and database. Any IPFS gateway can serve it.
 
 ```bash
-# Test fallback gateways
-CID="QmExample..."
-
+# Test fallback gateways (use KNOWN_CID from above)
 # Cloudflare IPFS (most reliable free option)
-curl -s -o /dev/null -w "%{http_code}" "https://cloudflare-ipfs.com/ipfs/$CID"
+curl -s -o /dev/null -w "%{http_code}" "https://cloudflare-ipfs.com/ipfs/$KNOWN_CID"
 
 # IPFS public gateway
-curl -s -o /dev/null -w "%{http_code}" "https://ipfs.io/ipfs/$CID"
+curl -s -o /dev/null -w "%{http_code}" "https://ipfs.io/ipfs/$KNOWN_CID"
 
 # Dweb.link (Protocol Labs)
-curl -s -o /dev/null -w "%{http_code}" "https://dweb.link/ipfs/$CID"
+curl -s -o /dev/null -w "%{http_code}" "https://dweb.link/ipfs/$KNOWN_CID"
 ```
 
 **Temporary fix for frontend:**
@@ -204,14 +236,17 @@ curl -s -H "Authorization: Bearer $PINATA_JWT" \
 # Expected: 200
 
 # 2. Confirm gateway serves existing CIDs
-# Use a known CID from the database
+# Retrieve a known-good CID from the database (no secret is printed)
 KNOWN_CID=$(psql "$DATABASE_URL" -tAc "
   SELECT data->>'cid' FROM \"MarketplaceEvent\"
   WHERE \"eventType\" = 'LISTING_CREATED' LIMIT 1
 ")
+echo "Testing CID: $KNOWN_CID"
 curl -s -o /dev/null -w "%{http_code}" \
   "$NEXT_PUBLIC_PINATA_GATEWAY/ipfs/$KNOWN_CID"
-# Expected: 200
+# Expected: 200 for a CID that was previously reachable.
+# A non-200 for this CID after Pinata recovery may mean the specific content
+# was unpinned — test a second CID before concluding gateway is still down.
 
 # 3. Test listing creation end-to-end (manual)
 # Use the staging environment if available

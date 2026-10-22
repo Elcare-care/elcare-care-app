@@ -335,4 +335,49 @@ describe('RpcProviderPool', () => {
     ]);
     expect(() => pool.destroy()).not.toThrow();
   });
+
+  // ── destroy() stops recovery probe with fake timers ───────────────────────
+  //
+  // Verifies that a destroyed multi-provider pool does not run a later recovery
+  // probe. Uses fake timers so the test completes without real waiting and
+  // avoids leaking timer state into subsequent suites.
+
+  it('does not run a recovery probe after destroy()', async () => {
+    vi.useFakeTimers();
+
+    try {
+      const { pool, providers } = buildPool([
+        { url: 'https://primary.rpc',  priority: 0 },
+        { url: 'https://fallback.rpc', priority: 1 },
+      ]);
+
+      // Active is fallback; set up primary so it would pass recovery checks
+      ;(pool as any).activeIndex = 1;
+      ;(pool as any).expectedNetworkPassphrase = PASSPHRASE;
+      ;(pool as any).globalLatestLedger = 990;
+
+      const primaryServer = makeFakeServer({ passphrase: PASSPHRASE, ledger: 1000 });
+      providers[0].server = primaryServer;
+      providers[0].cooldownSince = null;
+      providers[0].networkPassphrase = PASSPHRASE;
+      providers[0].chainVerified = true;
+
+      // Spy on the internal probe method to confirm it never runs post-destroy
+      const probeSpy = vi.spyOn(pool as any, 'probePrimaryRecovery');
+
+      pool.destroy();
+
+      // Advance time well past the recovery interval — probe must not fire
+      const RECOVERY_PROBE_INTERVAL_MS = (pool as any).recoveryTimer === null
+        ? 30_000  // timer already cleared; any advance is fine
+        : 30_000;
+      await vi.advanceTimersByTimeAsync(RECOVERY_PROBE_INTERVAL_MS * 3);
+
+      expect(probeSpy).not.toHaveBeenCalled();
+      // Internal timer reference must be null after destroy
+      expect((pool as any).recoveryTimer).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

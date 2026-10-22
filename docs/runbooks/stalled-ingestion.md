@@ -7,6 +7,21 @@
 
 ## Detection
 
+### Sync-Lag Severity Thresholds (REL-003 canonical values)
+
+These are the single source of truth for sync-lag severity. The same values appear
+in `indexer/prometheus-alerts.yml` (IndexerSyncLagHigh / IndexerSyncLagCritical)
+and the Grafana "Sync Lag (ledgers)" panel (yellow at 100, red at 1000).
+
+| Lag (ledgers) | Severity | Meaning | Action |
+|---|---|---|---|
+| < 100 | Normal | Indexer is healthy and tracking the tip | No action needed |
+| ≥ 100 | **Degraded** (warning) | Indexer is running but falling behind; no immediate data loss | Monitor; investigate if sustained > 2 min |
+| ≥ 1,000 | **Down / Stalled** (critical) | Indexer is likely stalled or RPC unreachable; users see stale data | Page on-call immediately; follow diagnosis tree below |
+
+Do not use other threshold values in incident notes or status updates. Any change to
+these values requires an explicit reliability decision recorded in `docs/reliability/backlog.md`.
+
 ### Automatic Signals
 - **Prometheus:** `indexer_stalled` gauge == 1
 - **Prometheus:** `elcarehub_poller_stall_total{level="critical"}` rate > 0
@@ -280,9 +295,45 @@ npm run reconcile:dry-run
 ### Monitoring
 - **Alert:** Prometheus alert on `indexer_stalled == 1` for > 2 minutes
 - **Alert:** `elcarehub_poller_stall_total{level="critical"}` rate > 0.01/sec
-- **Alert:** `sync_lag_ledgers > 100` for > 5 minutes
+- **Alert:** `sync_lag_ledgers > 100` for > 2 min → degraded (IndexerSyncLagHigh, warning)
+- **Alert:** `sync_lag_ledgers > 1000` for > 1 min → down/stalled (IndexerSyncLagCritical, critical)
+
+See the threshold table at the top of the Detection section for severity meanings.
 
 ### Configuration Hardening
+
+#### GAP_REPAIR_ENABLED (REL-001)
+
+The gap-repair worker discovers `LedgerGap` rows (created when the poller skips a
+window or detects a re-org) and runs `BackfillJob` scans against the archival RPC
+to fill them in automatically.
+
+**Default:** `false` — the worker does **not** start unless explicitly enabled.
+
+**Production requirement:** Set `GAP_REPAIR_ENABLED=true` in production. Leaving
+it disabled means missed ledger windows accumulate silently. They will not be filled
+without manual operator action, and the indexer will not surface a gap-repair error
+to signal the omission.
+
+**Rollback consideration:** The worker holds a per-gap advisory lock
+(`pg_try_advisory_lock`) so it is safe to restart. Disabling mid-run by restarting
+with `GAP_REPAIR_ENABLED=false` is safe — in-flight gaps are re-attempted on the
+next run.
+
+**Verification (does not require secrets):**
+```bash
+# Confirm the running pod has the flag enabled
+kubectl exec -n default deploy/indexer -- env | grep GAP_REPAIR_ENABLED
+# Expected: GAP_REPAIR_ENABLED=true
+
+# Check for open gaps via the health endpoint
+curl http://localhost:4000/health/details \
+  -H "Authorization: Bearer $HEALTH_DETAILS_TOKEN" \
+  | jq '.checks.openGaps'
+# Healthy: {"status": "ok", "count": 0}
+# Needs attention: {"status": "warn", "count": N}
+```
+
 ```bash
 # Increase RPC timeout for flaky networks
 STELLAR_RPC_REQUEST_TIMEOUT_MS=10000
