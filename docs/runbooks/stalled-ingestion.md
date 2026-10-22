@@ -297,15 +297,35 @@ ARCHIVAL_STELLAR_RPC_URL=https://mainnet.sorobanrpc.com
 
 ### Fallback RPC Configuration
 
-Add multiple RPC endpoints in `.env`:
+The RPC provider pool (`indexer/src/rpc-provider-pool.ts`) supports automatic ordered failover, cooldown, stale-ledger checks, and recovery to the primary. The feature is **fully implemented in code**; the remaining gap is supplying more than one endpoint in the deployment configuration.
+
+**To enable multi-provider failover**, set `RPC_PROVIDER_POOL` in the deployment secret (replaces `STELLAR_RPC_URL` when present):
 
 ```bash
-# Primary
-STELLAR_RPC_URL=https://soroban-testnet.stellar.org
-
-# Fallback (requires code change to support round-robin)
-# For now, document manual switch procedure
+# Example: primary + fallback in RPC_PROVIDER_POOL (JSON array, no credentials shown)
+# Set via Kubernetes secret or .env — do NOT commit real endpoint credentials.
+RPC_PROVIDER_POOL='[
+  {"url":"https://<primary-rpc-host>","priority":0,"label":"primary"},
+  {"url":"https://<fallback-rpc-host>","priority":1,"label":"fallback"}
+]'
 ```
+
+**To verify whether your running deployment has a fallback configured:**
+
+```bash
+# Check the pool status endpoint (requires operator token)
+curl -s http://localhost:4000/admin/rpc-pool/status \
+  -H "Authorization: Bearer $OPERATOR_TOKEN" | jq '.providers | length'
+# Returns 1 → single provider (no automatic failover)
+# Returns 2+ → multi-provider failover is active
+
+# Alternatively, inspect the running environment
+kubectl exec -n default deploy/indexer -- env | grep -E 'RPC_PROVIDER_POOL|STELLAR_RPC_URL'
+```
+
+**Production rollout tracking:** REL-002 in `docs/reliability/backlog.md` — target 2026-Q4.
+
+The current production deployment (`k8s/indexer-deployment.yaml`) supplies only `STELLAR_RPC_URL`, so automatic failover is **not active** in that configuration. Add `RPC_PROVIDER_POOL` to the `indexer-secrets` Kubernetes secret to activate it.
 
 ---
 
@@ -337,9 +357,9 @@ STELLAR_RPC_URL=https://soroban-testnet.stellar.org
 - T+15m: Verified recovery; sync lag returned to < 10 ledgers
 
 **Action Items:**
-- [ ] Implement fallback RPC auto-switching (Issue #XXX)
+- [ ] Configure `RPC_PROVIDER_POOL` in production deployment with primary + fallback endpoints (REL-002 — see `docs/reliability/backlog.md`)
 - [ ] Increase DB connection pool to 5 (done)
-- [ ] Add pre-emptive alert on `consecutiveRpcFailures >= 3` (Issue #YYY)
+- [ ] Add pre-emptive alert on `consecutiveRpcFailures >= 3` (resolved: `RpcProviderRepeatedFailures` alert added in `indexer/prometheus-alerts.yml`)
 ```
 
 ---

@@ -575,7 +575,9 @@ export const reconcilerSkippedTotal = new client.Counter({
   labelNames: ['reason'],
 });
 
-// ── Financial reconciliation metrics (Issue #XXX) ─────────────────────────────
+// ── Financial reconciliation metrics ──────────────────────────────────────────
+// Runbook: docs/financial-reconciliation-runbook.md
+// Architecture: docs/financial-reconciliation-architecture.md
 
 /** Total financial reconciliation runs completed, by outcome. */
 export const financialReconcileRunsTotal = new client.Counter({
