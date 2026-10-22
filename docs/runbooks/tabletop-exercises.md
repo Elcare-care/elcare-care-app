@@ -46,7 +46,7 @@ No live systems are modified during a tabletop exercise.
 - [ ] **HIGH:** GAP_REPAIR_ENABLED is false by default. Enable for production deployments.
 - [ ] **MEDIUM:** Fallback RPC switching is manual. Add `STELLAR_RPC_FALLBACK_URL` support.
 - [ ] **LOW:** The 180-ledger lag is within `SYNC_LAG_DOWN` threshold (1000) but not `SYNC_LAG_DEGRADED` (100). Update alert thresholds.
-- [x] **DONE:** Confirmed `POLL_INTERVAL_MS` can be changed without restart (env var hot-reload via TODO).
+- [x] **DONE:** Verified `POLL_INTERVAL_MS` is read once at startup via `loadConfig()` in `indexer/src/config.ts`; changing it requires a restart (no hot-reload mechanism exists).
 
 **Time to Identify Root Cause:** 12 minutes  
 **Time to Apply Fix:** 22 minutes  
