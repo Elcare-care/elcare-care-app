@@ -44,20 +44,23 @@ the mock only decides *when* to fail, never how the app reacts.
   points is straightforward follow-up work.
 - **Indexer lag is not waited out.** In production,
   `useTxLifecycle`'s `indexer_pending` phase waits up to
-  `indexerConfirmTimeoutMs` (default 30s) before declaring success. The
+  `indexerConfirmTimeoutMs` (default 30s) before transitioning to the
+  non-fatal `indexer_delay` notice state (Issue #1002). The
   mock chain never returns a trackable tx hash, so the RPC-confirmation
   phase is skipped entirely and the flow goes straight to
   `indexer_pending`. The test asserts the transient "Waiting for indexer
   confirmation…" state is reachable but does not wait out the full 30s
-  to observe the eventual `success` transition, to keep the suite fast.
-- **`indexer_delay` as a terminal error category is effectively dead code
-  today.** Reading `useTxLifecycle.run()`, the `indexer_pending` phase
-  always resolves to `success` after the timeout elapses — nothing in the
-  current lifecycle ever sets `error.category = "indexer_delay"`. The
-  `IndexerDelayNotice` UI component exists and is wired into
-  `TxErrorPanel`, but nothing currently triggers it. This suite therefore
-  cannot exercise that specific UI state and treats indexer lag as the
-  transient in-flight label instead. Worth a follow-up issue.
+  to observe the eventual `indexer_delay` transition, to keep the suite fast.
+- **`indexer_delay` is now a reachable non-fatal notice state (Issue #1002).**
+  When the `indexer_pending` timeout fires, `useTxLifecycle` transitions to
+  the `indexer_delay` state (not `success`) and populates `error.category =
+  "indexer_delay"` so the `IndexerDelayNotice` UI renders a non-fatal
+  message: the tx confirmed on-chain but the indexer is still catching up.
+  The lifecycle test suite (`useTxLifecycle.test.tsx`) covers
+  before-timeout (`indexer_pending`, active) and after-timeout
+  (`indexer_delay`, terminal, non-fatal) behavior using fake timers. This
+  E2E suite still does not wait out the full 30s timeout, but the lifecycle
+  unit tests verify the transition deterministically.
 - **"Reorg reset" models an indexer reconciliation blip, not a true
   consensus reorg.** Stellar/Soroban has fast finality; there is no
   chain-level reorg concept comparable to probabilistic-finality chains.

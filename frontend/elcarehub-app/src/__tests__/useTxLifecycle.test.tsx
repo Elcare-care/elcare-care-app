@@ -205,7 +205,8 @@ describe("useTxLifecycle — happy path", () => {
       await runPromise;
     });
 
-    expect(result.current.txState.state).toBe("success");
+    // Issue #1002: timeout fires → indexer_delay (non-fatal notice), not success
+    expect(result.current.txState.state).toBe("indexer_delay");
     expect(result.current.txState.txHash).toBe("abc123");
     expect(result.current.isActive).toBe(false);
   });
@@ -300,7 +301,8 @@ describe("useTxLifecycle — reset", () => {
       jest.advanceTimersByTime(100);
       await p;
     });
-    expect(result.current.txState.state).toBe("success");
+    // Issue #1002: timeout fires → indexer_delay, not success
+    expect(result.current.txState.state).toBe("indexer_delay");
 
     act(() => {
       result.current.reset();
@@ -521,13 +523,14 @@ describe("useTxLifecycle — duplicate-submission guard (thorough)", () => {
       })
     );
 
-    // Run 1 — succeeds
+    // Run 1 — succeeds (goes through indexer_delay on timeout)
     await act(async () => {
       const p = result.current.run(successFn("run1-hash"));
       jest.advanceTimersByTime(200);
       await p;
     });
-    expect(result.current.txState.state).toBe("success");
+    // Issue #1002: timeout fires → indexer_delay, not success
+    expect(result.current.txState.state).toBe("indexer_delay");
 
     // Reset
     act(() => result.current.reset());
@@ -539,7 +542,8 @@ describe("useTxLifecycle — duplicate-submission guard (thorough)", () => {
       jest.advanceTimersByTime(200);
       await p;
     });
-    expect(result.current.txState.state).toBe("success");
+    // Issue #1002: timeout fires → indexer_delay, not success
+    expect(result.current.txState.state).toBe("indexer_delay");
     expect(result.current.txState.txHash).toBe("run2-hash");
   });
 });
@@ -640,10 +644,10 @@ describe("useTxLifecycle — RPC poll timeout", () => {
   });
 });
 
-// ── indexer_pending → success with indexer_delay warning ─────────────────────
+// ── indexer_pending → indexer_delay (Issue #1002) ────────────────────────────
 
-describe("useTxLifecycle — indexer_pending → success via timeout", () => {
-  it("reaches success when indexerConfirmTimeoutMs elapses", async () => {
+describe("useTxLifecycle — indexer_pending → indexer_delay on timeout (Issue #1002)", () => {
+  it("transitions to indexer_delay (not success) when indexerConfirmTimeoutMs elapses", async () => {
     getMockedLookupTxOnRpc().mockResolvedValue({ chainStatus: "success", ledger: 200 });
 
     const { result } = renderHook(() =>
@@ -661,7 +665,6 @@ describe("useTxLifecycle — indexer_pending → success via timeout", () => {
 
     // After RPC succeeds but before indexer timeout we should be in indexer_pending
     await act(async () => {
-      // Advance past RPC poll (which resolves immediately in mock)
       jest.advanceTimersByTime(10);
       await Promise.resolve(); // flush microtasks
     });
@@ -672,11 +675,40 @@ describe("useTxLifecycle — indexer_pending → success via timeout", () => {
       await runPromise!;
     });
 
-    expect(result.current.txState.state).toBe("success");
+    // Issue #1002: timeout fires → non-fatal indexer_delay state (not success)
+    expect(result.current.txState.state).toBe("indexer_delay");
     expect(result.current.txState.txHash).toBe("idx-hash");
+    // The error field carries the indexer_delay category for UI rendering
+    expect(result.current.txState.error?.category).toBe("indexer_delay");
+    // It is NOT an active state — the lifecycle is terminal
+    expect(result.current.isActive).toBe(false);
+    // run() still returns the result (non-null) — the tx succeeded on-chain
   });
 
-  it("clears sessionStorage when reaching success after indexer timeout", async () => {
+  it("returns the result (non-null) even after indexer_delay transition", async () => {
+    getMockedLookupTxOnRpc().mockResolvedValue({ chainStatus: "success", ledger: 201 });
+
+    const { result } = renderHook(() =>
+      useTxLifecycle({
+        persistKey: null,
+        indexerConfirmTimeoutMs: 10,
+        rpcConfirmTimeoutMs: 5000,
+      })
+    );
+
+    let returnValue: unknown;
+    await act(async () => {
+      const p = result.current.run(async () => ({ hash: "delay-hash", value: 99 }));
+      jest.advanceTimersByTime(100);
+      returnValue = await p;
+    });
+
+    expect(result.current.txState.state).toBe("indexer_delay");
+    // The caller should see this as a successful submission
+    expect((returnValue as any).value).toBe(99);
+  });
+
+  it("clears sessionStorage when transitioning to indexer_delay", async () => {
     getMockedLookupTxOnRpc().mockResolvedValue({ chainStatus: "success", ledger: 300 });
 
     const { result } = renderHook(() =>
@@ -694,7 +726,102 @@ describe("useTxLifecycle — indexer_pending → success via timeout", () => {
     });
 
     expect(sessionStorageMock.getItem("idx-clear-test:pending")).toBeNull();
-    expect(result.current.txState.state).toBe("success");
+    expect(result.current.txState.state).toBe("indexer_delay");
+  });
+
+  it("before timeout: state is indexer_pending and isActive is true", async () => {
+    getMockedLookupTxOnRpc().mockResolvedValue({ chainStatus: "success", ledger: 400 });
+
+    const { result } = renderHook(() =>
+      useTxLifecycle({
+        persistKey: null,
+        indexerConfirmTimeoutMs: 5000,
+        rpcConfirmTimeoutMs: 5000,
+      })
+    );
+
+    let runPromise: Promise<unknown>;
+    act(() => {
+      runPromise = result.current.run(successFn("pending-hash"), { action: "List" });
+    });
+
+    // Advance past RPC poll but NOT past indexer timeout
+    await act(async () => {
+      jest.advanceTimersByTime(10);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    // Should be in indexer_pending, still active
+    expect(result.current.txState.state).toBe("indexer_pending");
+    expect(result.current.isActive).toBe(true);
+    expect(result.current.txState.txHash).toBe("pending-hash");
+    expect(result.current.txState.error).toBeNull();
+
+    // Clean up: let the run finish
+    await act(async () => {
+      jest.advanceTimersByTime(6000);
+      await runPromise!;
+    });
+  });
+
+  it("after timeout: indexer_delay state is terminal and non-fatal", async () => {
+    getMockedLookupTxOnRpc().mockResolvedValue({ chainStatus: "success", ledger: 500 });
+
+    const { result } = renderHook(() =>
+      useTxLifecycle({
+        persistKey: null,
+        indexerConfirmTimeoutMs: 50,
+        rpcConfirmTimeoutMs: 5000,
+      })
+    );
+
+    let runPromise: Promise<unknown>;
+    act(() => {
+      runPromise = result.current.run(successFn("terminal-hash"), { action: "Offer" });
+    });
+
+    // Advance past indexer timeout
+    await act(async () => {
+      jest.advanceTimersByTime(100);
+      await runPromise!;
+    });
+
+    // indexer_delay is terminal — not active, not idle, not error
+    expect(result.current.txState.state).toBe("indexer_delay");
+    expect(result.current.isActive).toBe(false);
+    // It carries the indexer_delay error category for the notice UI
+    expect(result.current.txState.error?.category).toBe("indexer_delay");
+    // But it's a notice, not an actual error — the message should mention on-chain confirmation
+    expect(result.current.txState.error?.message).toMatch(/confirmed on-chain/i);
+    expect(result.current.txState.error?.message).toMatch(/indexer/i);
+    expect(result.current.txState.error?.message).toMatch(/moment to appear/i);
+  });
+
+  it("reset() clears indexer_delay state back to idle", async () => {
+    getMockedLookupTxOnRpc().mockResolvedValue({ chainStatus: "success", ledger: 600 });
+
+    const { result } = renderHook(() =>
+      useTxLifecycle({
+        persistKey: null,
+        indexerConfirmTimeoutMs: 10,
+        rpcConfirmTimeoutMs: 5000,
+      })
+    );
+
+    await act(async () => {
+      const p = result.current.run(successFn("reset-delay-hash"));
+      jest.advanceTimersByTime(100);
+      await p;
+    });
+    expect(result.current.txState.state).toBe("indexer_delay");
+
+    act(() => {
+      result.current.reset();
+    });
+    expect(result.current.txState.state).toBe("idle");
+    expect(result.current.txState.error).toBeNull();
+    expect(result.current.txState.txHash).toBeNull();
   });
 });
 

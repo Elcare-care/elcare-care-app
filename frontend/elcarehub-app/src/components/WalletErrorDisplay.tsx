@@ -574,7 +574,8 @@ export function WalletErrorInline({
 
 /**
  * Displayed when a transaction is confirmed on-chain but the indexer
- * has not confirmed it yet (indexer_delay category).
+ * has not confirmed it yet (indexer_delay — Issue #1002: non-fatal notice,
+ * not an error).
  */
 export function IndexerDelayNotice({
   txHash,
@@ -600,8 +601,8 @@ export function IndexerDelayNotice({
           Transaction Confirmed — Waiting for Indexer
         </p>
         <p className="mt-0.5 text-xs text-amber-800">
-          Your transaction landed on-chain, but the marketplace indexer hasn't
-          picked it up yet. This usually resolves within 30 seconds.
+          Your transaction was confirmed on-chain, but the indexer is still
+          catching up. Your listing may take a moment to appear.
         </p>
         {txHash && (
           <p className="mt-1 font-mono text-[10px] text-amber-700 break-all">

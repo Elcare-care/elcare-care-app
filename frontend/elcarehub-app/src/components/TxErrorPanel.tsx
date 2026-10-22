@@ -80,7 +80,7 @@ function getCategoryConfig(category: TxErrorCategory): CategoryConfig {
         icon: <Clock size={20} aria-hidden="true" />,
         title: "Transaction Confirmed — Indexer Catching Up",
         explanation:
-          "Your transaction landed on-chain successfully, but the ELCARE-HUB indexer hasn't processed it yet.",
+          "Your transaction was confirmed on-chain, but the indexer is still catching up. Your listing may take a moment to appear.",
         instruction:
           "This usually resolves within 30 seconds. Refresh the page to check for the updated state.",
         primaryLabel: "Refresh",

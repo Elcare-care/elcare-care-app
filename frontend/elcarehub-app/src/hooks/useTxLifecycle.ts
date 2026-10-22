@@ -5,6 +5,7 @@
 // deployment, minting) shares this single lifecycle. It records:
 //   idle → simulating → signing → broadcasting → confirming
 //       → indexer_pending → success
+//       → indexer_pending → indexer_delay (non-fatal, on timeout)
 //       ↘ (at any stage) → error
 //
 // Key features:
@@ -43,6 +44,10 @@ import {
  * Transitions (happy path):
  *   idle → simulating → signing → broadcasting → confirming → indexer_pending → success
  *
+ * Indexer-delay path (Issue #1002):
+ *   indexer_pending → indexer_delay  (non-fatal: tx confirmed on-chain,
+ *   indexer hasn't caught up yet — shown as a notice, not an error)
+ *
  * Error path from any non-idle state:
  *   * → error
  */
@@ -53,7 +58,8 @@ export type TxState =
   | "broadcasting"    // submitted to the network, awaiting inclusion
   | "confirming"      // polling RPC until ledger inclusion is confirmed
   | "indexer_pending" // confirmed on-chain, not yet visible in indexer
-  | "success"         // confirmed on-chain AND visible in indexer (or timeout elapsed)
+  | "indexer_delay"   // confirmed on-chain, indexer confirmation timed out (non-fatal notice)
+  | "success"         // confirmed on-chain AND visible in indexer
   | "error";          // terminal failure
 
 /** Low-cardinality categories that let the UI distinguish failure causes. */
@@ -61,7 +67,7 @@ export type TxErrorCategory =
   | "wallet_rejection"    // user cancelled in wallet
   | "simulation_failure"  // contract simulation failed (pre-flight check)
   | "rpc_failure"         // network / RPC submission error
-  | "indexer_delay"       // on-chain success but indexer confirmation timed out
+  | "indexer_delay"       // Issue #1002: on-chain success but indexer confirmation timed out — non-fatal notice (not an error)
   | "intent_mismatch"     // Issue #536: assembled tx didn't match the displayed intent — aborted before signing
   | "unknown";            // catch-all
 
@@ -117,7 +123,8 @@ export interface TxLifecycleOptions {
 
   /**
    * How long (ms) to wait for indexer confirmation before transitioning to
-   * success anyway, showing an "indexer_delay" warning.
+   * the non-fatal `indexer_delay` notice state (the tx is confirmed on-chain
+   * but the indexer hasn't caught up yet).
    * Defaults to 30 000 ms (30 s).
    */
   indexerConfirmTimeoutMs?: number;
@@ -308,7 +315,7 @@ export function buildTxErrorMessage(
       return `A network error occurred during ${action}. Check your connection and try again.`;
 
     case "indexer_delay":
-      return `Your ${action} was confirmed on-chain but the indexer hasn't caught up yet. This usually resolves within 30 seconds.`;
+      return `Your ${action} was confirmed on-chain, but the indexer is still catching up. Your listing may take a moment to appear.`;
 
     case "intent_mismatch":
       return `We stopped your ${action} before asking your wallet to sign it because the transaction details changed unexpectedly. Nothing was sent to your wallet. Please refresh and try again.`;
@@ -722,8 +729,10 @@ export function useTxLifecycle(
       transition({ state: "indexer_pending", txHash });
 
       // Set a timeout: if indexer confirmation doesn't arrive within the
-      // configured window we transition to success anyway with an indexer_delay
-      // note so the user is not stuck.
+      // configured window we transition to the non-fatal `indexer_delay`
+      // notice state — the tx succeeded on-chain but the indexer hasn't
+      // caught up yet. This is NOT an error; the user should see a notice
+      // and a refresh button rather than a silent success or a failure.
       await new Promise<void>((resolve) =>
         setTimeout(resolve, indexerConfirmTimeoutMs)
       );
@@ -738,12 +747,24 @@ export function useTxLifecycle(
         return result;
       }
 
-      // ── Phase: success ─────────────────────────────────────────────────────
+      // ── Phase: indexer_delay (non-fatal notice) ──────────────────────────
+      // The indexer did not confirm within the timeout. The transaction is
+      // confirmed on-chain, so this is not an error — but we surface a
+      // non-fatal notice so the user knows their listing may take a moment
+      // to appear. We still return the result (non-null) so callers treat
+      // this as a successful submission.
       if (resolvedPersistKey) clearPersistedTx(resolvedPersistKey);
       runningRef.current = false;
       abortControllerRef.current = null;
       finalizeDedupe("success", txHash);
-      transition({ state: "success", txHash });
+      transition({
+        state: "indexer_delay",
+        txHash,
+        error: {
+          category: "indexer_delay",
+          message: buildTxErrorMessage(null, action, "indexer_delay"),
+        },
+      });
 
       return result;
     },
@@ -753,6 +774,7 @@ export function useTxLifecycle(
   const isActive =
     txState.state !== "idle" &&
     txState.state !== "success" &&
+    txState.state !== "indexer_delay" &&
     txState.state !== "error";
 
   return { txState, isActive, run, abort, reset };
@@ -768,6 +790,7 @@ export function txStateLabel(state: TxState): string {
     case "broadcasting":    return "Broadcasting to network…";
     case "confirming":      return "Confirming on-chain…";
     case "indexer_pending": return "Waiting for indexer confirmation…";
+    case "indexer_delay":   return "Confirmed — indexer catching up";
     case "success":         return "Confirmed!";
     case "error":           return "Failed";
   }
@@ -775,7 +798,7 @@ export function txStateLabel(state: TxState): string {
 
 /** True when the state is one of the terminal states. */
 export function isTxTerminal(state: TxState): boolean {
-  return state === "success" || state === "error";
+  return state === "success" || state === "indexer_delay" || state === "error";
 }
 
 /** True when the state is one of the active (in-flight) states. */
