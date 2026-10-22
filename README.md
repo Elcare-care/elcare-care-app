@@ -15,7 +15,7 @@ Every piece is verified on-chain — ensuring provenance and empowering artists 
 
 <br />
 
-[![CI](https://github.com/your-org/elcarehub/actions/workflows/ci.yml/badge.svg)](https://github.com/your-org/elcarehub/actions/workflows/ci.yml)
+[![CI](https://github.com/Elcare-care/elcare-care-app/actions/workflows/ci.yml/badge.svg)](https://github.com/Elcare-care/elcare-care-app/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Node.js](https://img.shields.io/badge/Node.js-20.x-green)](https://nodejs.org)
 [![Rust](https://img.shields.io/badge/Rust-stable-orange)](https://www.rust-lang.org)
@@ -24,7 +24,7 @@ Every piece is verified on-chain — ensuring provenance and empowering artists 
 
 <br />
 
-[Live Demo](http://localhost:3000) · [Report a Bug](https://github.com/your-org/elcarehub/issues) · [Request a Feature](https://github.com/your-org/elcarehub/issues)
+[Live Demo](http://localhost:3000) · [Report a Bug](https://github.com/Elcare-care/elcare-care-app/issues) · [Request a Feature](https://github.com/Elcare-care/elcare-care-app/issues)
 
 </div>
 
@@ -241,8 +241,8 @@ elcarehub/
 ### Step 1 — Clone the repository
 
 ```bash
-git clone https://github.com/your-org/elcarehub.git
-cd elcarehub
+git clone https://github.com/Elcare-care/elcare-care-app.git
+cd elcare-care-app
 ```
 
 ---
@@ -484,7 +484,7 @@ Quick start:
 
 Built with ❤️ for African artists and collectors everywhere.
 
-**[Live Demo](http://localhost:3000)** · **[Report a Bug](https://github.com/your-org/elcarehub/issues)** · **[Request a Feature](https://github.com/your-org/elcarehub/issues)**
+**[Live Demo](http://localhost:3000)** · **[Report a Bug](https://github.com/Elcare-care/elcare-care-app/issues)** · **[Request a Feature](https://github.com/Elcare-care/elcare-care-app/issues)**
 
 © 2026 ElcareHub · Built on [Stellar](https://stellar.org)
 

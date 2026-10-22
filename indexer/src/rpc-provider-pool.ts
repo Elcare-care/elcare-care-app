@@ -101,20 +101,77 @@ export interface ProviderConfig {
   label?: string;
 }
 
-const FAILOVER_COOLDOWN_MS = parseInt(
-  process.env.RPC_FAILOVER_COOLDOWN_MS || '60000', 10
-); // 60s default
+/**
+ * Parse an environment variable as a positive integer within an inclusive
+ * [min, max] range.  Fails fast at startup so misconfigured timers or
+ * thresholds are caught before they influence any failover or recovery
+ * decision.
+ *
+ * - When the variable is unset the `defaultValue` is returned without
+ *   validation (defaults are always in-range by construction).
+ * - The error message names the environment variable but never echoes its
+ *   value — this prevents endpoint URLs or tokens embedded in the string
+ *   from appearing in logs or process output.
+ */
+export function parsePositiveIntEnv(
+  name: string,
+  defaultValue: number,
+  min: number,
+  max: number,
+): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') {
+    return defaultValue;
+  }
 
-const STALE_LEDGER_THRESHOLD = parseInt(
-  process.env.RPC_STALE_LEDGER_THRESHOLD || '50', 10
-); // ledgers
+  const parsed = parseInt(raw, 10);
 
-const RECOVERY_PROBE_INTERVAL_MS = parseInt(
-  process.env.RPC_RECOVERY_PROBE_MS || '30000', 10
-); // 30s
+  if (!Number.isFinite(parsed) || String(parsed) !== raw.trim()) {
+    throw new Error(
+      `[RpcProviderPool] ${name} must be a finite integer (received non-numeric value)`,
+    );
+  }
+  if (parsed < min || parsed > max) {
+    throw new Error(
+      `[RpcProviderPool] ${name} must be between ${min} and ${max} (inclusive)`,
+    );
+  }
 
-const MAX_CONSECUTIVE_ERRORS = parseInt(
-  process.env.RPC_MAX_CONSECUTIVE_ERRORS || '5', 10
+  return parsed;
+}
+
+// Accepted bounds are chosen to match operational expectations:
+//   FAILOVER_COOLDOWN_MS     : 1 s – 1 h  (prevents instant re-promotion or infinite lockout)
+//   STALE_LEDGER_THRESHOLD   : 1 – 10 000 (one ledger minimum; 10 k ledgers ≈ ~14 hours of drift)
+//   RECOVERY_PROBE_INTERVAL_MS: 1 s – 1 h  (prevents hammering or no-op recovery timer)
+//   MAX_CONSECUTIVE_ERRORS   : 1 – 1 000  (at least one error before failover; upper cap prevents overflow)
+
+const FAILOVER_COOLDOWN_MS = parsePositiveIntEnv(
+  'RPC_FAILOVER_COOLDOWN_MS',
+  60_000,   // 60 s default
+  1_000,    // min: 1 s
+  3_600_000 // max: 1 h
+);
+
+const STALE_LEDGER_THRESHOLD = parsePositiveIntEnv(
+  'RPC_STALE_LEDGER_THRESHOLD',
+  50,    // default: 50 ledgers
+  1,     // min: 1 ledger
+  10_000 // max: ~14 h of ledgers
+);
+
+const RECOVERY_PROBE_INTERVAL_MS = parsePositiveIntEnv(
+  'RPC_RECOVERY_PROBE_MS',
+  30_000,   // 30 s default
+  1_000,    // min: 1 s
+  3_600_000 // max: 1 h
+);
+
+const MAX_CONSECUTIVE_ERRORS = parsePositiveIntEnv(
+  'RPC_MAX_CONSECUTIVE_ERRORS',
+  5,    // default: 5 errors
+  1,    // min: 1 (fail over after the very first error if desired)
+  1_000 // max: 1 000 (sanity cap)
 );
 
 // ── Provider health state ──────────────────────────────────────────────────────
