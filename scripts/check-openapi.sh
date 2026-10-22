@@ -8,7 +8,7 @@ echo "==> Generating OpenAPI spec..."
 npx tsx indexer/src/generate-openapi.ts
 
 echo "==> Diffing against committed openapi.json..."
-if git diff --quiet openapi.json; then
+if git diff --quiet -- indexer/openapi.json; then
   echo "==> OpenAPI spec is up to date."
 else
   echo "FAIL: openapi.json is out of sync with route definitions." >&2
