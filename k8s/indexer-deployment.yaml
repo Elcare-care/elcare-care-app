@@ -76,6 +76,15 @@ spec:
               key: pinata-jwt
         - name: KEEPER_ENABLED
           value: "false"
+        - name: GAP_REPAIR_ENABLED
+          value: "true"
+        # ARCHIVAL_STELLAR_RPC_URL defaults to STELLAR_RPC_URL when unset.
+        # Set this to a full-history archival endpoint if one is available.
+        # - name: ARCHIVAL_STELLAR_RPC_URL
+        #   valueFrom:
+        #     secretKeyRef:
+        #       name: indexer-secrets
+        #       key: archival-rpc-url
         resources:
           requests:
             cpu: "100m"

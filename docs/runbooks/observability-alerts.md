@@ -10,8 +10,8 @@ Redis, RPC), see the companion files in this directory.
 
 | Alert | Severity | What it means |
 |---|---|---|
-| IndexerSyncLagHigh | warning | >100 ledgers behind network tip |
-| IndexerSyncLagCritical | critical | >1,000 ledgers behind — likely stalled |
+| IndexerSyncLagHigh | warning | Degraded — >100 ledgers behind network tip; indexer running but falling behind |
+| IndexerSyncLagCritical | critical | Down/stalled — >1,000 ledgers behind; likely stalled or RPC unreachable |
 | IndexerStalled | critical | Poller completely stopped for 3+ minutes |
 | IndexerPollerRestartHigh | critical | 3+ automatic restarts in 10 min (process exit imminent) |
 | HighDecodeErrorRate | warning | XDR parse failures spike — possible contract schema drift |
@@ -32,7 +32,7 @@ Open the Grafana dashboard **ElcareHub Indexer** (import `grafana/elcarehub-dash
 
 Key panels to check first during an incident:
 
-- **Sync Lag (ledgers)** — should be < 100 at all times
+- **Sync Lag (ledgers)** — green < 100 (normal); yellow ≥ 100 (degraded); red ≥ 1,000 (down/stalled)
 - **Indexer Stalled** — should be 0
 - **Sync Lag Over Time** — shows trend; a flat line means the poller is stuck
 - **API P99 Latency** — should stay below 500 ms under normal load

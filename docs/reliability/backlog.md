@@ -37,9 +37,9 @@ Impact / Likelihood / Effort / Dependency: **1–5** (see [quarterly-review-proc
 
 | ID | Domain | Summary | I | L | E | D | Priority | Owner | Target | Status |
 |---|---|---|---|---|---|---|---|---|---|---|
-| REL-001 | Availability | Enable `GAP_REPAIR_ENABLED` for production; document default risk | 4 | 3 | 2 | 1 | 10.3 | DevOps Engineer | `release_id ≥ 2` | Open |
+| REL-001 | Availability | Enable `GAP_REPAIR_ENABLED` for production; document default risk | 4 | 3 | 2 | 1 | 10.3 | DevOps Engineer | `release_id ≥ 2` | Done |
 | REL-002 | Availability | Automated Stellar RPC fallback (`STELLAR_RPC_FALLBACK_URL`) | 4 | 3 | 4 | 2 | 9.4 | DevOps Engineer | 2026-Q4 | Open |
-| REL-003 | Data correctness | Clarify sync lag alert thresholds (degraded vs down) in runbooks + alerts | 3 | 4 | 2 | 1 | 10.7 | Backend Lead (indexer) | 2026-Q4 | Open |
+| REL-003 | Data correctness | Clarify sync lag alert thresholds (degraded vs down) in runbooks + alerts | 3 | 4 | 2 | 1 | 10.7 | Backend Lead (indexer) | 2026-Q4 | Done |
 | REL-004 | On-chain safety | Property tests coverage gaps for auction edge cases (post Issue-116) | 3 | 2 | 3 | 1 | 4.8 | Backend Lead (contracts) | 2027-Q1 | Open |
 | REL-005 | Security | Quarterly secret inventory reconciliation vs production | 4 | 2 | 2 | 1 | 7.3 | Security Lead | Quarterly | Open |
 | REL-006 | Security | Dependency audit SLA for high/critical findings | 4 | 3 | 2 | 1 | 10.3 | Security Lead | Ongoing | Open |
