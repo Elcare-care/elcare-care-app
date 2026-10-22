@@ -34,20 +34,60 @@ import client from 'prom-client';
 // just the hostname extracted from the URL (strips scheme, credentials, path,
 // and query string).  This keeps cardinality bounded and secrets out of labels.
 //
+// Label length limit (MAX_PROVIDER_LABEL_LENGTH = 64):
+//   Explicit labels are capped at 64 characters — consistent with other stable
+//   labels in this codebase (e.g. "primary", "fallback", "regional-eu").
+//   A label that exceeds this limit is almost certainly a misconfiguration
+//   (e.g. a raw URL pasted into the label field).  Rather than silently
+//   truncating to an arbitrary prefix, the function rejects the value and
+//   falls back to the sanitised hostname, which is always safe and bounded.
+//   If the hostname itself exceeds the limit it is truncated and suffixed with
+//   "..." to signal that truncation occurred, while still keeping the label
+//   within the allowed length.
+//
 // Examples:
-//   label="primary"                  → "primary"
+//   label="primary"                       → "primary"
+//   label="a".repeat(65)                  → hostname fallback (label too long)
 //   label=undefined, url="https://user:pass@rpc.example.com/v1?key=abc"
-//                                    → "rpc.example.com"
+//                                         → "rpc.example.com"
+
+/** Maximum permitted length for an explicit provider label. */
+export const MAX_PROVIDER_LABEL_LENGTH = 64;
 
 export function resolveProviderLabel(config: Pick<ProviderConfig, 'url' | 'label'>): string {
-  if (config.label && config.label.trim() !== '') {
-    // Use the human-readable label as-is — it is always operator-supplied and
-    // bounded by convention (e.g. "primary", "fallback", "regional-eu").
-    return config.label.trim();
+  const trimmed = config.label?.trim() ?? '';
+
+  if (trimmed !== '') {
+    if (trimmed.length > MAX_PROVIDER_LABEL_LENGTH) {
+      // Explicit label is too long — almost certainly a misconfiguration
+      // (e.g. a raw URL pasted as a label).  Fall through to the hostname
+      // fallback rather than silently truncating to a meaningless prefix.
+      logger.warn(
+        '[RpcProviderPool] Provider label exceeds MAX_PROVIDER_LABEL_LENGTH — ' +
+        'falling back to hostname. Set a short human-readable label (e.g. "primary").',
+        {
+          labelLength: trimmed.length,
+          maxLength: MAX_PROVIDER_LABEL_LENGTH,
+          // Log the first 16 characters only — enough to identify the value
+          // without risking that a URL-as-label leaks credentials.
+          labelPrefix: trimmed.slice(0, 16),
+        }
+      );
+      // Fall through to hostname derivation below.
+    } else {
+      return trimmed;
+    }
   }
+
   // Extract just the hostname; discard scheme, credentials, path, and query.
   try {
-    return new URL(config.url).hostname;
+    const hostname = new URL(config.url).hostname;
+    // Hostnames are almost never longer than 64 chars, but enforce the limit
+    // defensively so labels are always bounded regardless of input.
+    if (hostname.length > MAX_PROVIDER_LABEL_LENGTH) {
+      return hostname.slice(0, MAX_PROVIDER_LABEL_LENGTH - 3) + '...';
+    }
+    return hostname;
   } catch {
     // URL is malformed — use a fixed placeholder so labels remain bounded.
     return 'unknown';
@@ -514,6 +554,21 @@ export function buildProviderPoolFromEnv(): RpcProviderPool {
     const configs = parsed as ProviderConfig[];
     if (configs.length === 0) {
       throw new Error('[RpcProviderPool] RPC_PROVIDER_POOL must have at least one entry');
+    }
+
+    // Validate labels at startup so operators get a clear error rather than
+    // silently surprising metric label values at runtime.  An overlong label
+    // is almost always a misconfiguration (e.g. a raw URL pasted as a label),
+    // so we reject it here to produce a deterministic startup error.
+    for (let i = 0; i < configs.length; i++) {
+      const label = configs[i].label;
+      if (label !== undefined && label !== null && label.trim().length > MAX_PROVIDER_LABEL_LENGTH) {
+        throw new Error(
+          `[RpcProviderPool] RPC_PROVIDER_POOL entry ${i} has a label that exceeds ` +
+          `MAX_PROVIDER_LABEL_LENGTH (${MAX_PROVIDER_LABEL_LENGTH}). ` +
+          `Set a short human-readable label such as "primary" or "fallback".`
+        );
+      }
     }
 
     return new RpcProviderPool(configs);

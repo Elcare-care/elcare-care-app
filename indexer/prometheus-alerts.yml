@@ -146,6 +146,48 @@ groups:
             {{ $value | humanize }} times/second. This may indicate an
             automated probe or exploit attempt — investigate immediately.
 
+      # ── RPC provider pool health ─────────────────────────────────────────────
+
+      # Fires when a single RPC provider accumulates sustained errors over a
+      # short window.  The 5-minute rate window avoids paging on a single
+      # transient call failure; a provider must be failing at a meaningful rate
+      # before this triggers.  Labels use the bounded provider identifier
+      # (resolveProviderLabel output) — never raw URLs or credentials.
+      - alert: RpcProviderRepeatedFailures
+        expr: >
+          rate(indexer_rpc_provider_errors_total[5m]) > 0.1
+        for: 2m
+        labels:
+          severity: warning
+          owner: indexer-team
+        annotations:
+          summary: "Sustained RPC errors on provider {{ $labels.provider }}"
+          description: >
+            Provider "{{ $labels.provider }}" is failing at
+            {{ $value | humanize }} errors/second over the last 5 minutes.
+            This may indicate the provider is degraded or unreachable.
+            A failover will occur automatically after MAX_CONSECUTIVE_ERRORS
+            (default 5) consecutive failures; act now to avoid an ingestion stall.
+            Runbook: docs/runbooks/stalled-ingestion.md — Section A (RPC Failures).
+
+      # Fires when a provider failover has occurred.  A single failover is
+      # noteworthy but may be transient; use this to confirm the pool has
+      # switched and to start investigating the failing provider.
+      - alert: RpcProviderFailoverOccurred
+        expr: >
+          increase(indexer_rpc_provider_failovers_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          owner: indexer-team
+        annotations:
+          summary: "RPC provider failover from {{ $labels.from }} to {{ $labels.to }}"
+          description: >
+            The RPC provider pool failed over from "{{ $labels.from }}" to
+            "{{ $labels.to }}". The primary provider may be degraded.
+            Check the primary provider health and monitor for recovery.
+            Runbook: docs/runbooks/stalled-ingestion.md — Section A (RPC Failures).
+
       # ── Infrastructure health ────────────────────────────────────────────────
 
       - alert: RpcRetryExhausted
@@ -170,7 +212,9 @@ groups:
             {{ $value }} records showed drift in the last reconciliation run.
             Review the reconciler logs and consider triggering a targeted repair.
 
-      # ── Financial reconciliation alerts (Issue #XXX) ─────────────────────────────
+      # ── Financial reconciliation alerts ──────────────────────────────────────
+      # Runbook: docs/financial-reconciliation-runbook.md
+      # Architecture: docs/financial-reconciliation-architecture.md
 
       - alert: FinancialDriftCritical
         expr: financial_drifts_open{severity="Critical"} > 0

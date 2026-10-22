@@ -10,6 +10,8 @@
 ### Automatic Signals
 - **Prometheus:** `indexer_stalled` gauge == 1
 - **Prometheus:** `elcarehub_poller_stall_total{level="critical"}` rate > 0
+- **Prometheus:** `RpcProviderRepeatedFailures` alert fires before a stall occurs (early warning — see Section A)
+- **Prometheus:** `RpcProviderFailoverOccurred` alert fires when the pool switches providers (early warning — see Section A)
 - **Health endpoint:** `GET /readyz` returns 503 with `"stalled": true`
 - **SSE:** Frontend receives `indexer-stalled` event with `stallDurationMs`
 
@@ -78,6 +80,48 @@ See Section A       See Section B        See Section C
 ---
 
 ## A. RPC Failures
+
+### Early-Warning Alerts
+
+Before a stall occurs, the following Prometheus alerts fire to give operators time to act:
+
+| Alert | Condition | What it means |
+|---|---|---|
+| `RpcProviderRepeatedFailures` | `rate(indexer_rpc_provider_errors_total[5m]) > 0.1` for 2 min | A provider is failing at a sustained rate; pool may failover soon |
+| `RpcProviderFailoverOccurred` | `increase(indexer_rpc_provider_failovers_total[5m]) > 0` | Pool has switched from primary to fallback; investigate primary |
+
+> **Note:** A single transient RPC error does **not** trigger these alerts. The rate threshold (>0.1/s sustained for 2 minutes) and the use of `increase()` over a 5-minute window filter out isolated blips.
+
+### Distinguishing RPC failure from DB or parser failure
+
+Use the following signals to identify the root cause before acting:
+
+| Signal | RPC failure | DB failure | Parser/decode failure |
+|---|---|---|---|
+| `RpcProviderRepeatedFailures` alert | ✅ fires | ❌ does not fire | ❌ does not fire |
+| `indexer_rpc_provider_errors_total` rising | ✅ yes | ❌ no | ❌ no |
+| `indexer_stalled` == 1 but RPC metrics flat | ❌ | ✅ likely | ✅ possible |
+| `indexer_decode_errors_total` rising | ❌ | ❌ | ✅ yes |
+| `HighDecodeErrorRate` alert | ❌ | ❌ | ✅ fires |
+| Logs: `ECONNREFUSED`, `429`, `timeout` | ✅ yes | ❌ | ❌ |
+| Logs: `Pool timeout`, `P1001` | ❌ | ✅ yes | ❌ |
+
+### Verifying recovery
+
+After switching providers or restarting the indexer:
+
+```bash
+# Confirm the pool is on a healthy provider
+curl http://localhost:4000/metrics | grep indexer_rpc_provider_active
+# Expected: indexer_rpc_provider_active{provider="primary"} 1
+
+# Confirm errors are no longer accumulating
+curl http://localhost:4000/metrics | grep indexer_rpc_provider_errors_total
+# Value should not be climbing
+
+# Confirm the RpcProviderRepeatedFailures alert has resolved in Prometheus
+# (alert state should move from "firing" to "inactive" within 5–7 minutes)
+```
 
 ### Symptoms
 - Logs show: `Error fetching events: ECONNREFUSED`, `429 Rate Limit`, `timeout`
@@ -281,6 +325,8 @@ npm run reconcile:dry-run
 - **Alert:** Prometheus alert on `indexer_stalled == 1` for > 2 minutes
 - **Alert:** `elcarehub_poller_stall_total{level="critical"}` rate > 0.01/sec
 - **Alert:** `sync_lag_ledgers > 100` for > 5 minutes
+- **Alert:** `RpcProviderRepeatedFailures` — early warning before a stall; fires on sustained provider errors (rate > 0.1/s for 2 min)
+- **Alert:** `RpcProviderFailoverOccurred` — fires immediately when the pool switches to a fallback provider
 
 ### Configuration Hardening
 ```bash
@@ -297,15 +343,35 @@ ARCHIVAL_STELLAR_RPC_URL=https://mainnet.sorobanrpc.com
 
 ### Fallback RPC Configuration
 
-Add multiple RPC endpoints in `.env`:
+The RPC provider pool (`indexer/src/rpc-provider-pool.ts`) supports automatic ordered failover, cooldown, stale-ledger checks, and recovery to the primary. The feature is **fully implemented in code**; the remaining gap is supplying more than one endpoint in the deployment configuration.
+
+**To enable multi-provider failover**, set `RPC_PROVIDER_POOL` in the deployment secret (replaces `STELLAR_RPC_URL` when present):
 
 ```bash
-# Primary
-STELLAR_RPC_URL=https://soroban-testnet.stellar.org
-
-# Fallback (requires code change to support round-robin)
-# For now, document manual switch procedure
+# Example: primary + fallback in RPC_PROVIDER_POOL (JSON array, no credentials shown)
+# Set via Kubernetes secret or .env — do NOT commit real endpoint credentials.
+RPC_PROVIDER_POOL='[
+  {"url":"https://<primary-rpc-host>","priority":0,"label":"primary"},
+  {"url":"https://<fallback-rpc-host>","priority":1,"label":"fallback"}
+]'
 ```
+
+**To verify whether your running deployment has a fallback configured:**
+
+```bash
+# Check the pool status endpoint (requires operator token)
+curl -s http://localhost:4000/admin/rpc-pool/status \
+  -H "Authorization: Bearer $OPERATOR_TOKEN" | jq '.providers | length'
+# Returns 1 → single provider (no automatic failover)
+# Returns 2+ → multi-provider failover is active
+
+# Alternatively, inspect the running environment
+kubectl exec -n default deploy/indexer -- env | grep -E 'RPC_PROVIDER_POOL|STELLAR_RPC_URL'
+```
+
+**Production rollout tracking:** REL-002 in `docs/reliability/backlog.md` — target 2026-Q4.
+
+The current production deployment (`k8s/indexer-deployment.yaml`) supplies only `STELLAR_RPC_URL`, so automatic failover is **not active** in that configuration. Add `RPC_PROVIDER_POOL` to the `indexer-secrets` Kubernetes secret to activate it.
 
 ---
 
@@ -337,9 +403,9 @@ STELLAR_RPC_URL=https://soroban-testnet.stellar.org
 - T+15m: Verified recovery; sync lag returned to < 10 ledgers
 
 **Action Items:**
-- [ ] Implement fallback RPC auto-switching (Issue #XXX)
+- [ ] Configure `RPC_PROVIDER_POOL` in production deployment with primary + fallback endpoints (REL-002 — see `docs/reliability/backlog.md`)
 - [ ] Increase DB connection pool to 5 (done)
-- [ ] Add pre-emptive alert on `consecutiveRpcFailures >= 3` (Issue #YYY)
+- [ ] Add pre-emptive alert on `consecutiveRpcFailures >= 3` (resolved: `RpcProviderRepeatedFailures` alert added in `indexer/prometheus-alerts.yml`)
 ```
 
 ---

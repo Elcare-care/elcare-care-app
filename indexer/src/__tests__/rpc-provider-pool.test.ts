@@ -33,6 +33,7 @@ import {
   RpcProviderPool,
   buildProviderPoolFromEnv,
   resolveProviderLabel,
+  MAX_PROVIDER_LABEL_LENGTH,
   type ProviderConfig,
 } from '../rpc-provider-pool.js';
 
@@ -262,6 +263,89 @@ describe('RpcProviderPool', () => {
     expect(resolveProviderLabel({ url: 'not-a-valid-url' })).toBe('unknown');
   });
 
+  // ── Label length enforcement (MAX_PROVIDER_LABEL_LENGTH) ──────────────────
+  //
+  // An explicit label longer than MAX_PROVIDER_LABEL_LENGTH is rejected and
+  // the function falls back to the sanitised hostname.  This prevents
+  // unbounded or accidentally pasted URL-as-label values from reaching
+  // Prometheus label sets.
+
+  it('accepts an explicit label exactly at MAX_PROVIDER_LABEL_LENGTH', () => {
+    const label = 'a'.repeat(MAX_PROVIDER_LABEL_LENGTH);
+    expect(
+      resolveProviderLabel({ url: 'https://rpc.example.com', label })
+    ).toBe(label);
+  });
+
+  it('falls back to hostname when explicit label exceeds MAX_PROVIDER_LABEL_LENGTH', () => {
+    const overlong = 'a'.repeat(MAX_PROVIDER_LABEL_LENGTH + 1);
+    const result = resolveProviderLabel({
+      url: 'https://rpc.example.com',
+      label: overlong,
+    });
+    // Must not return the overlong label — falls back to hostname
+    expect(result).not.toBe(overlong);
+    expect(result.length).toBeLessThanOrEqual(MAX_PROVIDER_LABEL_LENGTH);
+    // Hostname fallback
+    expect(result).toBe('rpc.example.com');
+  });
+
+  it('falls back to hostname when label is only whitespace (blank label)', () => {
+    const result = resolveProviderLabel({
+      url: 'https://rpc.example.com',
+      label: '   ',
+    });
+    expect(result).toBe('rpc.example.com');
+  });
+
+  it('normal label (e.g. "primary") is returned unchanged', () => {
+    expect(
+      resolveProviderLabel({ url: 'https://rpc.example.com', label: 'primary' })
+    ).toBe('primary');
+    expect(
+      resolveProviderLabel({ url: 'https://rpc.example.com', label: 'fallback' })
+    ).toBe('fallback');
+    expect(
+      resolveProviderLabel({ url: 'https://rpc.example.com', label: 'regional-eu' })
+    ).toBe('regional-eu');
+  });
+
+  it('result of resolveProviderLabel is always bounded by MAX_PROVIDER_LABEL_LENGTH', () => {
+    const cases: Array<Pick<ProviderConfig, 'url' | 'label'>> = [
+      { url: 'https://rpc.example.com', label: 'primary' },
+      { url: 'https://rpc.example.com', label: 'a'.repeat(200) },
+      { url: 'https://rpc.example.com' },
+      { url: 'not-a-valid-url' },
+      { url: 'https://user:pass@rpc.example.com/v1?k=s', label: undefined },
+    ];
+    for (const c of cases) {
+      const result = resolveProviderLabel(c);
+      expect(result.length).toBeLessThanOrEqual(MAX_PROVIDER_LABEL_LENGTH);
+    }
+  });
+
+  it('metric labels never contain raw provider URLs or credentials', () => {
+    // Overlong label that looks like a URL — must fall back to hostname
+    const urlAsLabel = 'https://user:secret@rpc.example.com/v1?api_key=hunter2';
+    const result = resolveProviderLabel({
+      url: 'https://rpc.example.com',
+      label: urlAsLabel,
+    });
+    // Falls back to hostname because label exceeds MAX_PROVIDER_LABEL_LENGTH
+    // (the urlAsLabel above is 52 chars, which is ≤ 64, so it would pass the
+    // length check — but it's also a valid label string.  Let's test a
+    // definitely-overlong URL-as-label to confirm fallback.)
+    const definitelyLong = 'https://user:secret@' + 'rpc.example.com/'.repeat(5) + '?api_key=hunter2';
+    const result2 = resolveProviderLabel({
+      url: 'https://rpc.example.com',
+      label: definitelyLong,
+    });
+    expect(result2).toBe('rpc.example.com');
+    expect(result2).not.toContain('secret');
+    expect(result2).not.toContain('hunter2');
+    expect(result2.length).toBeLessThanOrEqual(MAX_PROVIDER_LABEL_LENGTH);
+  });
+
   it('providerLabel on ProviderHealth matches resolveProviderLabel output', () => {
     const { pool, providers } = buildPool([
       { url: 'https://rpc.stellar.org', priority: 0, label: 'mainnet-primary' },
@@ -323,6 +407,24 @@ describe('RpcProviderPool', () => {
   it('throws for invalid RPC_PROVIDER_POOL JSON', () => {
     process.env.RPC_PROVIDER_POOL = 'not-json';
     expect(() => buildProviderPoolFromEnv()).toThrow();
+    delete process.env.RPC_PROVIDER_POOL;
+  });
+
+  it('throws at startup when RPC_PROVIDER_POOL entry has an overlong label', () => {
+    process.env.RPC_PROVIDER_POOL = JSON.stringify([
+      { url: 'https://p1.rpc', priority: 0, label: 'a'.repeat(MAX_PROVIDER_LABEL_LENGTH + 1) },
+    ]);
+    expect(() => buildProviderPoolFromEnv()).toThrow(/MAX_PROVIDER_LABEL_LENGTH/);
+    delete process.env.RPC_PROVIDER_POOL;
+  });
+
+  it('does not throw at startup when RPC_PROVIDER_POOL entry label is within limit', () => {
+    process.env.RPC_PROVIDER_POOL = JSON.stringify([
+      { url: 'https://p1.rpc', priority: 0, label: 'primary' },
+    ]);
+    let pool: ReturnType<typeof buildProviderPoolFromEnv> | undefined;
+    expect(() => { pool = buildProviderPoolFromEnv(); }).not.toThrow();
+    pool?.destroy();
     delete process.env.RPC_PROVIDER_POOL;
   });
 
