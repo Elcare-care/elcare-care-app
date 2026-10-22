@@ -208,6 +208,18 @@ export async function resetE2eListingsInBrowser(page: Page) {
   });
 }
 
+export async function resetE2eAuctionsInBrowser(page: Page) {
+  await page.evaluate(() => {
+    (window as Window & { __E2E_RESET_AUCTIONS__?: () => void }).__E2E_RESET_AUCTIONS__?.();
+  });
+}
+
+export async function resetE2eOffersInBrowser(page: Page) {
+  await page.evaluate(() => {
+    (window as Window & { __E2E_RESET_OFFERS__?: () => void }).__E2E_RESET_OFFERS__?.();
+  });
+}
+
 /** Seeds the in-browser mock chain listing used by buy_artwork in E2E mode. */
 export async function seedE2eChainListing(
   page: Page,
@@ -240,4 +252,55 @@ export async function seedE2eChainListing(
       created_at: Math.floor(Date.now() / 1000),
     });
   }, listing);
+}
+
+/**
+ * Seeds an in-browser mock auction used by e2eMockPlaceBid in E2E mode
+ * (Issue #1000 — auction-bid failure matrix).
+ */
+export async function seedE2eChainAuction(
+  page: Page,
+  auction: {
+    auction_id: number;
+    creator: string;
+    token: string;
+    reserve_price: string;
+    highest_bid?: string;
+    highest_bidder?: string | null;
+    end_time?: number;
+  }
+) {
+  await page.evaluate((row) => {
+    const upsert = (
+      window as Window & { __E2E_UPSERT_AUCTION__?: (auction: unknown) => void }
+    ).__E2E_UPSERT_AUCTION__;
+    upsert?.({
+      auction_id: row.auction_id,
+      creator: row.creator,
+      token: row.token,
+      reserve_price: BigInt(row.reserve_price),
+      highest_bid: BigInt(row.highest_bid ?? '0'),
+      highest_bidder: row.highest_bidder ?? null,
+      end_time: row.end_time ?? Math.floor(Date.now() / 1000) + 3600,
+      status: 'Active',
+    });
+  }, auction);
+}
+
+/**
+ * Seeds an in-browser mock listing for offer submission used by
+ * e2eMockSubmitOffer in E2E mode (Issue #1001 — offer-submission failure matrix).
+ * The listing must already be seeded; this simply ensures the chain-mock listing
+ * exists so offer submission validation passes.
+ */
+export async function seedE2eChainListingForOffer(
+  page: Page,
+  listing: {
+    listing_id: number;
+    artist: string;
+    price: string;
+    token: string;
+  }
+) {
+  return seedE2eChainListing(page, listing);
 }

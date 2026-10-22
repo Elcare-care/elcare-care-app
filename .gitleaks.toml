@@ -77,6 +77,13 @@ regexes = [
   # credentials, only exercise config-presence checks.
   '''pj_test_secret''',
   '''e2e-test-pinata-jwt''',
+
+  # Synthetic Stellar-shaped key in the image-layer scan gate fixture
+  # (indexer/src/__tests__/image-layer-scan-gate.fixture.ts, Issue #998).
+  # Constructed from a repeating pattern — not a valid Stellar keypair seed,
+  # cannot sign or derive any real account. Remove this entry to confirm the
+  # gitleaks-docker-image CI gate fires and redacts (not prints) the value.
+  '''SIMAGEL4YERSCANGATE000000000000000000000000000000000000X''',
 ]
 
 paths = [
