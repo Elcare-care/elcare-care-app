@@ -297,14 +297,147 @@ ARCHIVAL_STELLAR_RPC_URL=https://mainnet.sorobanrpc.com
 
 ### Fallback RPC Configuration
 
-Add multiple RPC endpoints in `.env`:
+The indexer supports automatic failover via `RPC_PROVIDER_POOL`. Configure both endpoints in `indexer/.env` before deploying:
 
 ```bash
-# Primary
-STELLAR_RPC_URL=https://soroban-testnet.stellar.org
+# Multi-provider pool — primary at priority 0, fallback at priority 1
+RPC_PROVIDER_POOL='[
+  {"url":"https://primary-rpc.example.com","priority":0,"label":"primary"},
+  {"url":"https://fallback-rpc.example.com","priority":1,"label":"fallback"}
+]'
+STELLAR_NETWORK=testnet
+```
 
-# Fallback (requires code change to support round-robin)
-# For now, document manual switch procedure
+See [RPC Provider Pool Configuration](../guides/deployment.md#2-rpc-provider-pool-configuration) for the full variable reference and tuning options.
+
+---
+
+## Failover and Recovery Verification (Staging Only)
+
+> ⚠️ **Production safety:** Never induce provider failure against a production RPC endpoint to verify failover. All steps below must be performed in a staging environment configured with two compatible RPC endpoints that serve the same Stellar network passphrase.
+
+### Prerequisites
+
+Before running this checklist, confirm:
+
+1. The staging indexer is running with `RPC_PROVIDER_POOL` set to two endpoints on the same network (both testnet or both mainnet).
+2. Unit tests pass: `npm run test:indexer` (covers failover and recovery in isolation without a live network).
+3. You have access to the staging metrics and health endpoints.
+
+```bash
+# Confirm the pool sees two providers
+curl -s http://localhost:4000/health/details \
+  -H "Authorization: Bearer $HEALTH_DETAILS_TOKEN" \
+  | jq '.rpcPool.providers | length'
+# Expected: 2
+
+# Confirm primary is active
+curl -s http://localhost:4000/metrics | grep 'indexer_rpc_provider_active'
+# Expected: indexer_rpc_provider_active{provider="primary"} 1
+#           indexer_rpc_provider_active{provider="fallback"} 0
+```
+
+### Step 1 — Verify normal operation on primary
+
+```bash
+# Watch ledger counter advance — should increment every ~5 s
+watch -n 5 'curl -s http://localhost:4000/metrics | grep indexer_latest_ledger_processed'
+
+# Confirm readiness
+curl -s http://localhost:4000/readyz | jq '.status'
+# Expected: "ok"
+```
+
+### Step 2 — Simulate primary failure (staging network block or DNS override)
+
+Block the primary endpoint at the network level in staging (firewall rule, DNS redirect, or by pointing `primary-rpc.example.com` at a non-responsive host in your staging `/etc/hosts`). Do **not** change the running indexer's configuration.
+
+```bash
+# After blocking primary, monitor logs for failover
+docker compose logs -f indexer | grep -iE 'failover|consecutive|cooldown'
+
+# Expected log sequence (within RPC_MAX_CONSECUTIVE_ERRORS × poll cycles):
+# [warn]  [RpcProviderPool] Failover triggered { from: 'primary', to: 'fallback', ... }
+```
+
+### Step 3 — Confirm fallback is serving traffic
+
+```bash
+# Active provider should switch to fallback
+curl -s http://localhost:4000/metrics | grep 'indexer_rpc_provider_active'
+# Expected: indexer_rpc_provider_active{provider="primary"}  0
+#           indexer_rpc_provider_active{provider="fallback"} 1
+
+# Failover counter should have incremented
+curl -s http://localhost:4000/metrics | grep 'indexer_rpc_provider_failovers_total'
+# Expected: indexer_rpc_provider_failovers_total{from="primary",to="fallback"} 1
+
+# Ledger counter should still advance — ingestion continues on fallback
+watch -n 5 'curl -s http://localhost:4000/metrics | grep indexer_latest_ledger_processed'
+```
+
+### Step 4 — Verify stale-ledger guard (optional)
+
+If your staging primary can be made to return an old ledger (e.g. via a mock or frozen snapshot), confirm the pool defers recovery:
+
+```bash
+# Pool status should show primary NOT recovered despite cooldown expiry
+curl -s http://localhost:4000/health/details \
+  -H "Authorization: Bearer $HEALTH_DETAILS_TOKEN" \
+  | jq '.rpcPool.providers[] | select(.label=="primary") | {inCooldown, lastKnownLedger}'
+# Expected: inCooldown: false, lastKnownLedger: <significantly behind global latest>
+# Recovery counter should NOT increment
+curl -s http://localhost:4000/metrics | grep 'indexer_rpc_provider_recoveries_total'
+# Expected: 0 or unchanged from before
+```
+
+### Step 5 — Restore primary and verify recovery
+
+Unblock the primary endpoint (remove firewall rule or revert `/etc/hosts`).
+
+```bash
+# After RPC_RECOVERY_PROBE_MS (default 30 s), watch for recovery log
+docker compose logs -f indexer | grep -iE 'recover'
+# Expected: [info] [RpcProviderPool] Recovered to primary { provider: 'primary', ledger: ... }
+
+# Active provider returns to primary
+curl -s http://localhost:4000/metrics | grep 'indexer_rpc_provider_active'
+# Expected: indexer_rpc_provider_active{provider="primary"}  1
+#           indexer_rpc_provider_active{provider="fallback"} 0
+
+# Recovery counter incremented
+curl -s http://localhost:4000/metrics | grep 'indexer_rpc_provider_recoveries_total'
+# Expected: indexer_rpc_provider_recoveries_total{provider="primary"} 1
+```
+
+### Expected provider transitions summary
+
+```
+[Normal]   primary ACTIVE   → fallback STANDBY
+[Failure]  primary COOLDOWN → fallback ACTIVE    (failovers_total +1)
+[Recovery] primary ACTIVE   → fallback STANDBY   (recoveries_total +1)
+```
+
+### If failover does not trigger
+
+- Check that `RPC_MAX_CONSECUTIVE_ERRORS` errors have actually occurred — each poll cycle produces at most one error, so failover takes at least `MAX_CONSECUTIVE_ERRORS × POLL_INTERVAL_MS` ms.
+- Confirm the primary endpoint is genuinely unreachable from inside the indexer container, not just from the host: `docker compose exec indexer curl -s https://primary-rpc.example.com`.
+- Review logs for chain-compatibility rejection: the fallback may be on a different network passphrase.
+
+### If recovery does not trigger
+
+- Confirm the primary cooldown has expired: `jq '.rpcPool.providers[] | select(.label=="primary").cooldownRemainingMs'` on `/health/details` should be 0.
+- Confirm the primary ledger is within `RPC_STALE_LEDGER_THRESHOLD` (default 50) of the global latest.
+- Recovery is probed every `RPC_RECOVERY_PROBE_MS` (default 30 s) — wait at least one full interval after unblocking.
+
+### Manual emergency failover (production only)
+
+If automatic failover fails in a production incident, fall back to the manual procedure:
+
+```bash
+# Update STELLAR_RPC_URL to the fallback endpoint and restart
+sed -i 's|^STELLAR_RPC_URL=.*|STELLAR_RPC_URL=https://fallback-rpc.example.com|' indexer/.env
+docker compose restart indexer
 ```
 
 ---
@@ -337,7 +470,7 @@ STELLAR_RPC_URL=https://soroban-testnet.stellar.org
 - T+15m: Verified recovery; sync lag returned to < 10 ledgers
 
 **Action Items:**
-- [ ] Implement fallback RPC auto-switching (Issue #XXX)
+- [ ] Verify provider-pool failover/recovery in staging if not already done (see [Failover Verification Procedure](#failover-and-recovery-verification-staging-only))
 - [ ] Increase DB connection pool to 5 (done)
 - [ ] Add pre-emptive alert on `consecutiveRpcFailures >= 3` (Issue #YYY)
 ```

@@ -14,7 +14,9 @@ Before deploying any service, verify that the required environment variables are
 | | `STELLAR_NETWORK_PASSPHRASE` | `"Test SDF Network ; November 2015"` or `"Public Global Stellar Network ; September 2015"` |
 | **Indexer** | `DATABASE_URL` | PostgreSQL connection string |
 | | `REDIS_URL` | Redis connection URL |
-| | `STELLAR_RPC_URL` | Soroban RPC endpoint |
+| | `STELLAR_RPC_URL` | Primary Soroban RPC endpoint (used when `RPC_PROVIDER_POOL` is unset) |
+| | `RPC_PROVIDER_POOL` | JSON array of provider objects for multi-provider failover (optional; takes priority over `STELLAR_RPC_URL`) |
+| | `STELLAR_NETWORK` | `"testnet"` or `"mainnet"` — sets the expected network passphrase guard |
 | | `MARKETPLACE_CONTRACT_ID` | Deployed marketplace contract address (`C...`) |
 | | `LAUNCHPAD_CONTRACT_ID` | Deployed launchpad contract address (`C...`) |
 | **Frontend** | `NEXT_PUBLIC_STELLAR_NETWORK` | `"testnet"` or `"mainnet"` |
@@ -23,7 +25,81 @@ Before deploying any service, verify that the required environment variables are
 
 ---
 
-## 2. Smart Contract Deployment Workflow
+## 2. RPC Provider Pool Configuration
+
+The indexer supports a single primary RPC endpoint or an ordered pool of providers with automatic failover and primary recovery. Configure one of these two modes before deploying.
+
+### Single-provider mode (default)
+
+Set `STELLAR_RPC_URL` and omit `RPC_PROVIDER_POOL`. The indexer creates a one-entry pool from this URL.
+
+```bash
+STELLAR_RPC_URL=https://soroban-testnet.stellar.org
+STELLAR_NETWORK=testnet
+```
+
+### Multi-provider mode (recommended for production)
+
+Set `RPC_PROVIDER_POOL` to a JSON array of provider objects. Each entry requires `url` and `priority` (0 = primary, higher numbers = lower priority fallbacks). An optional `label` is used for Prometheus metrics and logs; when omitted, the hostname is extracted automatically.
+
+```bash
+RPC_PROVIDER_POOL='[
+  {"url":"https://primary-rpc.example.com","priority":0,"label":"primary"},
+  {"url":"https://fallback-rpc.example.com","priority":1,"label":"fallback"}
+]'
+STELLAR_NETWORK=testnet
+```
+
+> **Note:** Use placeholder hostnames in examples and staging configs. Never commit real endpoint URLs that contain credentials or API keys in query strings.
+
+When `RPC_PROVIDER_POOL` is set it takes full priority over `STELLAR_RPC_URL`; the `STELLAR_RPC_URL` value is ignored.
+
+### Provider selection and failover
+
+Providers are tried in ascending `priority` order. The pool tracks each provider's health separately:
+
+| Behaviour | Detail |
+|---|---|
+| **Failover trigger** | After `RPC_MAX_CONSECUTIVE_ERRORS` consecutive errors on the active provider (default: 5), that provider enters a cooldown period and the next healthy, chain-compatible provider is promoted. |
+| **Cooldown duration** | Configured by `RPC_FAILOVER_COOLDOWN_MS` (default: 60 000 ms / 60 s). A failed provider is not eligible for promotion until its cooldown expires. |
+| **Primary recovery** | Every `RPC_RECOVERY_PROBE_MS` (default: 30 000 ms / 30 s) the pool probes the primary. If the primary has recovered and its latest ledger is within `RPC_STALE_LEDGER_THRESHOLD` ledgers of the global latest (default: 50), the pool promotes back to primary automatically. |
+| **Network passphrase guard** | On first contact, each provider's network passphrase is fetched via `getNetwork()`. Any provider returning a passphrase that does not match the baseline is permanently rejected for the lifetime of the process. Set `STELLAR_NETWORK` to `testnet` or `mainnet` to seed the expected passphrase before any provider is contacted. |
+| **Stale ledger guard** | During primary recovery, if the primary's latest ledger is more than `RPC_STALE_LEDGER_THRESHOLD` behind the global latest seen ledger, recovery is deferred until the primary catches up. |
+
+### Optional pool tuning variables
+
+All four variables are validated at startup. Malformed, zero, negative, or out-of-range values cause the process to exit with an error naming the offending variable.
+
+| Variable | Default | Accepted range | Description |
+|---|---|---|---|
+| `RPC_FAILOVER_COOLDOWN_MS` | `60000` | 1 000 – 3 600 000 | Cooldown duration before a failed provider can be re-promoted (ms) |
+| `RPC_STALE_LEDGER_THRESHOLD` | `50` | 1 – 10 000 | Max ledgers a recovering primary may lag behind the global latest |
+| `RPC_RECOVERY_PROBE_MS` | `30000` | 1 000 – 3 600 000 | Interval between primary recovery probes (ms) |
+| `RPC_MAX_CONSECUTIVE_ERRORS` | `5` | 1 – 1 000 | Consecutive errors on the active provider before failover |
+
+### Verifying the active provider
+
+At runtime, the pool's current state is available without exposing endpoint credentials:
+
+```bash
+# Prometheus — check which provider is active (label = hostname or configured label)
+curl -s http://localhost:4000/metrics | grep indexer_rpc_provider_active
+
+# Status endpoint — inspect provider list, cooldown, ledger, and chain verification
+curl http://localhost:4000/health/details \
+  -H "Authorization: Bearer $HEALTH_DETAILS_TOKEN" \
+  | jq '.rpcPool'
+```
+
+The `label` field in every response uses the configured `label` value or the hostname only — credentials and query strings are never exposed.
+
+### Confirming failover and recovery
+
+See the [Failover Verification Procedure](../runbooks/stalled-ingestion.md#failover-and-recovery-verification-staging-only) in the stalled-ingestion runbook for a step-by-step staging checklist.
+
+---
+
+## 3. Smart Contract Deployment Workflow
 
 ### 1. Build and Optimize WASM
 ```bash
@@ -64,7 +140,7 @@ stellar contract invoke \
 
 ---
 
-## 3. Indexer Deployment Workflow (Docker & Kubernetes)
+## 4. Indexer Deployment Workflow (Docker & Kubernetes)
 
 ### Docker Deployment (Local / Staging)
 ```bash
@@ -126,7 +202,7 @@ The indexer exposes HTTP probes:
 
 ---
 
-## 4. Frontend Deployment Workflow (Next.js / Vercel)
+## 5. Frontend Deployment Workflow (Next.js / Vercel)
 
 ### Docker Deployment (Local / Staging)
 ```bash
@@ -153,7 +229,7 @@ npm run build
 
 ---
 
-## 5. Decision Tree for Deployment Troubleshooting
+## 6. Decision Tree for Deployment Troubleshooting
 
 ```
                       [ Deployment Failure ]
@@ -174,7 +250,7 @@ npm run build
 
 ---
 
-## 6. Release Versioning
+## 7. Release Versioning
 
 ElcareHub uses a multi-component versioning scheme. Each component (contracts, indexer, frontend, event schema, database migrations) has an independent version number tracked in `versions.toml` at the repository root.
 
@@ -235,7 +311,7 @@ See [COMPATIBILITY.md](../../COMPATIBILITY.md) for the full matrix of tested and
 
 ---
 
-## 7. Safe Redaction Guidance
+## 8. Safe Redaction Guidance
 
 > [!WARNING]
 > During deployment procedures:

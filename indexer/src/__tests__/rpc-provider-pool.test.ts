@@ -9,6 +9,8 @@
  *   - Recovery back to primary after cooldown
  *   - Rate-limit (429) handled as failover trigger
  *   - All providers exhausted throws last error
+ *   - parsePositiveIntEnv: unset vars, valid overrides, malformed strings,
+ *     zero, negative, and out-of-range values
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
@@ -33,6 +35,7 @@ import {
   RpcProviderPool,
   buildProviderPoolFromEnv,
   resolveProviderLabel,
+  parsePositiveIntEnv,
   type ProviderConfig,
 } from '../rpc-provider-pool.js';
 
@@ -335,4 +338,187 @@ describe('RpcProviderPool', () => {
     ]);
     expect(() => pool.destroy()).not.toThrow();
   });
+});
+
+// ── parsePositiveIntEnv ───────────────────────────────────────────────────────
+//
+// Validates startup-time parsing and bounds-checking of the four provider-pool
+// timing/count environment variables.  Tests use the exported helper directly
+// so they are isolated from pool construction side-effects (timers, prom
+// registrations) and from each other.
+//
+// Coverage matrix:
+//   • Unset variable   → default returned, no error
+//   • Empty string     → default returned, no error
+//   • Valid integer string within range → parsed value returned
+//   • Minimum boundary (exactly min) → accepted
+//   • Maximum boundary (exactly max) → accepted
+//   • Float string     → rejected (parseInt would silently truncate)
+//   • Non-numeric string → rejected
+//   • Zero             → rejected (below any positive min)
+//   • Negative integer → rejected
+//   • Below minimum    → rejected
+//   • Above maximum    → rejected
+//   • Error message names the variable, does not echo its raw value
+
+describe('parsePositiveIntEnv', () => {
+  // Shared bounds used across tests — mirror the production constants.
+  const NAME = 'TEST_PARSE_INT_VAR';
+  const DEFAULT = 100;
+  const MIN = 10;
+  const MAX = 1_000;
+
+  // Save and restore process.env around each test.
+  let savedValue: string | undefined;
+
+  beforeEach(() => {
+    savedValue = process.env[NAME];
+    delete process.env[NAME];
+  });
+
+  afterEach(() => {
+    if (savedValue === undefined) {
+      delete process.env[NAME];
+    } else {
+      process.env[NAME] = savedValue;
+    }
+  });
+
+  // ── Unset / empty → default ───────────────────────────────────────────────
+
+  it('returns the default when the variable is unset', () => {
+    expect(parsePositiveIntEnv(NAME, DEFAULT, MIN, MAX)).toBe(DEFAULT);
+  });
+
+  it('returns the default when the variable is an empty string', () => {
+    process.env[NAME] = '';
+    expect(parsePositiveIntEnv(NAME, DEFAULT, MIN, MAX)).toBe(DEFAULT);
+  });
+
+  // ── Valid integer strings ─────────────────────────────────────────────────
+
+  it('parses a valid integer string within range', () => {
+    process.env[NAME] = '500';
+    expect(parsePositiveIntEnv(NAME, DEFAULT, MIN, MAX)).toBe(500);
+  });
+
+  it('accepts the exact minimum boundary value', () => {
+    process.env[NAME] = String(MIN);
+    expect(parsePositiveIntEnv(NAME, DEFAULT, MIN, MAX)).toBe(MIN);
+  });
+
+  it('accepts the exact maximum boundary value', () => {
+    process.env[NAME] = String(MAX);
+    expect(parsePositiveIntEnv(NAME, DEFAULT, MIN, MAX)).toBe(MAX);
+  });
+
+  // ── Malformed strings ────────────────────────────────────────────────────
+
+  it('rejects a non-numeric string', () => {
+    process.env[NAME] = 'abc';
+    expect(() => parsePositiveIntEnv(NAME, DEFAULT, MIN, MAX)).toThrow(NAME);
+  });
+
+  it('rejects a float string (would be silently truncated by parseInt)', () => {
+    process.env[NAME] = '99.9';
+    expect(() => parsePositiveIntEnv(NAME, DEFAULT, MIN, MAX)).toThrow(NAME);
+  });
+
+  it('rejects a string with leading/trailing non-numeric characters', () => {
+    process.env[NAME] = '100ms';
+    expect(() => parsePositiveIntEnv(NAME, DEFAULT, MIN, MAX)).toThrow(NAME);
+  });
+
+  it('rejects an empty-whitespace-only string as non-numeric', () => {
+    process.env[NAME] = '   ';
+    // parseInt('   ', 10) → NaN; String(NaN) !== '   '.trim() === 'NaN'
+    expect(() => parsePositiveIntEnv(NAME, DEFAULT, MIN, MAX)).toThrow(NAME);
+  });
+
+  // ── Zero and negative ─────────────────────────────────────────────────────
+
+  it('rejects zero (below any positive minimum)', () => {
+    process.env[NAME] = '0';
+    expect(() => parsePositiveIntEnv(NAME, DEFAULT, MIN, MAX)).toThrow(NAME);
+  });
+
+  it('rejects a negative integer', () => {
+    process.env[NAME] = '-50';
+    expect(() => parsePositiveIntEnv(NAME, DEFAULT, MIN, MAX)).toThrow(NAME);
+  });
+
+  // ── Out-of-range values ───────────────────────────────────────────────────
+
+  it('rejects a value one below the minimum', () => {
+    process.env[NAME] = String(MIN - 1);
+    expect(() => parsePositiveIntEnv(NAME, DEFAULT, MIN, MAX)).toThrow(NAME);
+  });
+
+  it('rejects a value one above the maximum', () => {
+    process.env[NAME] = String(MAX + 1);
+    expect(() => parsePositiveIntEnv(NAME, DEFAULT, MIN, MAX)).toThrow(NAME);
+  });
+
+  // ── Error message safety ──────────────────────────────────────────────────
+
+  it('error message names the variable and does not echo the raw value', () => {
+    const badValue = 'https://secret-endpoint.example.com?api_key=tok_abc123';
+    process.env[NAME] = badValue;
+    let message = '';
+    try {
+      parsePositiveIntEnv(NAME, DEFAULT, MIN, MAX);
+    } catch (err) {
+      message = err instanceof Error ? err.message : String(err);
+    }
+    expect(message).toContain(NAME);          // names the variable
+    expect(message).not.toContain(badValue);  // does not echo the value
+    expect(message).not.toContain('tok_abc'); // no credential fragment
+  });
+
+  // ── Production constant smoke tests ──────────────────────────────────────
+  //
+  // Confirm each production env var name and its documented default are
+  // accepted as-is (i.e. unset → default, default within its own bounds).
+
+  it.each([
+    ['RPC_FAILOVER_COOLDOWN_MS',   60_000,    1_000,    3_600_000],
+    ['RPC_STALE_LEDGER_THRESHOLD',     50,        1,       10_000],
+    ['RPC_RECOVERY_PROBE_MS',      30_000,    1_000,    3_600_000],
+    ['RPC_MAX_CONSECUTIVE_ERRORS',      5,        1,        1_000],
+  ] as const)(
+    '%s: unset returns documented default %d',
+    (varName, defaultVal, min, max) => {
+      const orig = process.env[varName as string];
+      delete process.env[varName as string];
+
+      expect(parsePositiveIntEnv(varName as string, defaultVal, min, max)).toBe(defaultVal);
+
+      if (orig === undefined) {
+        delete process.env[varName as string];
+      } else {
+        process.env[varName as string] = orig;
+      }
+    },
+  );
+
+  it.each([
+    ['RPC_FAILOVER_COOLDOWN_MS',   '5000',   5_000,    1_000,    3_600_000],
+    ['RPC_STALE_LEDGER_THRESHOLD', '100',      100,        1,       10_000],
+    ['RPC_RECOVERY_PROBE_MS',      '15000', 15_000,    1_000,    3_600_000],
+    ['RPC_MAX_CONSECUTIVE_ERRORS', '3',          3,        1,        1_000],
+  ] as const)(
+    '%s: valid override "%s" is accepted',
+    (varName, rawValue, expected, min, max) => {
+      const orig = process.env[varName as string];
+      process.env[varName as string] = rawValue;
+
+      expect(parsePositiveIntEnv(varName as string, 0, min, max)).toBe(expected);
+
+      if (orig === undefined) {
+        delete process.env[varName as string];
+      } else {
+        process.env[varName as string] = orig;
+      }
+    },
+  );
 });
