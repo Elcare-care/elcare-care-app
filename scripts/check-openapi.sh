@@ -5,7 +5,9 @@ set -euo pipefail
 # Fails if the generated spec differs from what is in git.
 
 echo "==> Generating OpenAPI spec..."
-npx tsx indexer/src/generate-openapi.ts
+# Run from the indexer package so the generator resolves the indexer's own tsx
+# and writes openapi.json next to indexer/package.json.
+(cd indexer && npx tsx src/generate-openapi.ts)
 
 echo "==> Diffing against committed openapi.json..."
 if git diff --quiet -- indexer/openapi.json; then
