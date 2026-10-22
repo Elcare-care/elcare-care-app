@@ -222,6 +222,25 @@ If an event's `schema_version` is ever bumped in a way that turns out **not** to
 
 See also the **CI/fixture requirement** follow-up noted in `CONTRIBUTING.md`'s Documentation Review Policy: contract event changes and indexer event-schema changes should not be mergeable independently without updated fixtures covering both shapes, but wiring that up as an enforced CI gate is out of scope for this change and tracked as follow-up work.
 
+### 7.1 Event-Fixture Review Requirement
+
+When a versioned event schema changes (e.g. adding a field and bumping `schema_version`), the PR must include **two** fixture variants in `indexer/src/__tests__/parser.test.ts` so that the per-event-type fixture table exercises both historical and current shapes:
+
+1. **Pre-versioned fixture** — the payload shape that predates the `schema_version` field (no `schema_version` key, treated as implicit v0 by the decoder). This ensures events emitted before the version field was introduced continue to decode without error.
+2. **Current-version fixture** — the payload shape with the current supported `schema_version` value and all fields populated, including any newly added optional fields.
+
+> **What CI enforces vs. what reviewers check.**
+> The **static schema gate** — CI job `contract-error-coverage` running `scripts/contract-errors/validate-error-coverage.mjs` — is the automated enforcement; it checks that the schema registry and error coverage are in parity. **Fixture coverage for both shapes (pre-versioned and current-version) is a reviewer responsibility** — CI does not assert that both fixture variants exist in the test file. A reviewer must verify both fixtures are present before approving a versioned event change.
+
+**Checklist for a versioned event schema change:**
+
+- [ ] Pre-versioned fixture (no `schema_version`, implicit v0) added or confirmed present for the changed event type.
+- [ ] Current-version fixture (with the current `schema_version` and new fields) added for the changed event type.
+- [ ] Out-of-range version test case (from §7) still passes — an unsupported future `schema_version` must throw `UnsupportedSchemaVersionError`, not `SchemaDecodeError`.
+- [ ] `npm run test:indexer` passes from the repository root.
+
+> A future unsupported version (e.g. `schema_version: 3` when the indexer supports `1`) should continue to use the existing versioning tests described in §7 — no new fixture type is needed for that case.
+
 ---
 
 ## 8. Safe Redaction Guidance
