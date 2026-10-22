@@ -345,7 +345,7 @@ export function CheckoutModal({
           )}
 
           {/* Typed transaction error — distinguishes wallet rejection from chain failure */}
-          {txState.state === "error" && txState.error && (
+          {(txState.state === "error" || txState.state === "indexer_delay") && txState.error && (
             <TxErrorPanel
               error={txState.error}
               txHash={txState.txHash}

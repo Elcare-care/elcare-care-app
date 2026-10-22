@@ -1142,7 +1142,7 @@ export function ListingWizard({ onSuccess, onCancel }: ListingWizardProps) {
               </div>
             )}
 
-            {listingTxState.state === "error" && listingTxState.error && (
+            {(listingTxState.state === "error" || listingTxState.state === "indexer_delay") && listingTxState.error && (
               <TxErrorPanel
                 error={listingTxState.error}
                 txHash={listingTxState.txHash}

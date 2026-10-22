@@ -899,7 +899,7 @@ export function ListingForm({ listing, onSuccess, onCancel }: ListingFormProps) 
 
           {/* Typed transaction error — distinguishes wallet rejection, simulation
               failure, and chain failure with per-category recovery instructions */}
-          {listingTxState.state === "error" && listingTxState.error && (
+          {(listingTxState.state === "error" || listingTxState.state === "indexer_delay") && listingTxState.error && (
             <TxErrorPanel
               error={listingTxState.error}
               txHash={listingTxState.txHash}

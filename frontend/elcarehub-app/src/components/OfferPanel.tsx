@@ -388,7 +388,7 @@ function OwnerOfferList({
   return (
     <div className="space-y-3" data-testid="owner-offer-list">
       {/* Typed transaction error panel */}
-      {offerTxState.state === "error" && offerTxState.error && (
+      {(offerTxState.state === "error" || offerTxState.state === "indexer_delay") && offerTxState.error && (
         <TxErrorPanel
           error={offerTxState.error}
           txHash={offerTxState.txHash}
