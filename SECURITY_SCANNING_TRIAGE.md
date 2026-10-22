@@ -70,12 +70,29 @@ This project runs dependency and secret scans on every PR to protect the supply 
     mode, `--redact`) against `indexer/` — the Docker build context for
     `indexer/Dockerfile` — so a secret baked into the generated image can't
     slip past a source-only scan. This is a pre-build filesystem scan
-    rather than a scan of the built image's layers; a full built-image
-    layer scan (e.g. `docker save` + scan the exported tarball) is a
-    heavier follow-up, not implemented yet.
+    rather than a scan of the built image's layers.
+  - `gitleaks-docker-image` job (#998) — every pull request and the weekly
+    schedule. Builds the indexer image with Docker BuildKit (`--load`/never
+    pushed), exports it via `docker save`, extracts each `layer.tar` blob
+    into a temporary directory, and scans the unpacked filesystem tree with
+    `gitleaks detect --no-git --redact --exit-code 1`. This catches secrets
+    NOT present in checked-out source that could still end up baked into a
+    layer — e.g. a secret written during a `RUN` step via an uncleared build
+    `ARG`, an intermediate file left behind by a script, or a base-image
+    layer change. The image is never pushed; BuildKit GHA cache keeps build
+    time low. Image artefacts are cleaned up after scanning regardless of
+    outcome.
+    - **Gate verification**: `indexer/src/__tests__/image-layer-scan-gate.fixture.ts`
+      contains a clearly-labelled synthetic Stellar-shaped key
+      (`SIMAGEL4YERSCANGATE000000000000000000000000000000000000X`) that is
+      allowlisted in `.gitleaks.toml`. Remove the allowlist entry to confirm
+      the gate fires and redacts (not prints) the value on non-allowlisted
+      findings.
 - **Allowlist**: `.gitleaks.toml`'s `[allowlist]` covers only clearly
   synthetic fixtures — specific fake values (a repeated-`A` Stellar test key
-  in `indexer/src/__tests__/keeper-unit.test.ts`, `pj_test_secret` /
+  in `indexer/src/__tests__/keeper-unit.test.ts`, the image-layer scan gate
+  key `SIMAGEL4YERSCANGATE...` in
+  `indexer/src/__tests__/image-layer-scan-gate.fixture.ts`, `pj_test_secret` /
   `e2e-test-pinata-jwt` Pinata placeholders in frontend tests, the fixed
   local-only `postgres:postgres@`/`ltuser:ltpass@` docker-compose creds) plus
   a small set of template/vendored paths (`.env.example` files, the vendored

@@ -9,16 +9,40 @@ ever contacted, and no secrets are required. CI wiring:
 `.github/workflows/e2e-wallet-failure-matrix.yml`, run via
 `npm run test:e2e:wallet-matrix`.
 
+Extended in Issues #999 / #1000 / #1001 to cover listing creation, auction
+bids, and offer submission write surfaces. New tests live in
+`tests/e2e/listing-auction-offer-failure-matrix.spec.ts`.
+
 ## How failures are injected
 
 `src/lib/e2e-chain-mock.ts` exposes `window.__E2E_SET_FAILURE_MODE__`,
 registered on first paint by `E2eMockChainInit`. Setting a mode makes the
-next mock `buy_artwork` call throw an error worded the way a real
-Freighter / Soroban RPC / Horizon failure would word it, so the suite
-exercises the app's real `classifyTxError` → `TxErrorPanel` code path —
-the mock only decides *when* to fail, never how the app reacts.
+next mock write call throw an error worded the way a real Freighter / Soroban
+RPC / Horizon failure would word it, so the suite exercises the app's real
+`classifyTxError` → `TxErrorPanel` code path — the mock only decides *when*
+to fail, never how the app reacts.
+
+The failure mode is **global**: setting it once affects the very next mock
+write call, regardless of which write surface (purchase, listing creation,
+bid, or offer) is exercised. After a failure fires the mode is automatically
+reset by `resetE2eMockListings()` in `beforeEach`.
+
+## Write surfaces and mock entry points
+
+| Write surface | Mock entry point | Added |
+|---|---|---|
+| Purchase (`buy_artwork`) | `e2eMockBuyArtwork` | Issue #525 |
+| Listing creation | `e2eMockCreateListingWithFailure` | Issue #999 |
+| Auction bid | `e2eMockPlaceBid` | Issue #1000 |
+| Offer submission | `e2eMockSubmitOffer` | Issue #1001 |
+
+All entry points inject the failure **before** state mutation, mirroring how
+a real wallet rejection or RPC error aborts before the action reaches the
+contract.
 
 ## Scenario coverage
+
+### Purchase write surface (`wallet-failure-matrix.spec.ts`)
 
 | # | Scenario | How it's forced | What's asserted |
 |---|----------|------------------|------------------|
@@ -32,16 +56,37 @@ the mock only decides *when* to fail, never how the app reacts.
 | 8 | Indexer lag | Normal success path | Transient "Waiting for indexer confirmation…" button label is reachable |
 | 9 | Reorg reset | Indexer briefly reports the sold listing as `Active` again, then reconciles | No crash, no `tx-error-panel`, and the UI ends up consistent with the latest indexer response |
 
+### Listing creation write surface (`listing-auction-offer-failure-matrix.spec.ts`, Issue #999)
+
+| # | Scenario | How it's forced | What's asserted |
+|---|----------|------------------|------------------|
+| 10 | Wallet rejection | `wallet_rejection` failure mode | `tx-error-panel` visible, "declined" messaging, retry button visible, no full public key in error surface |
+| 11 | RPC timeout | `submission_timeout` failure mode | Network-error panel with retry button |
+
+### Auction-bid write surface (`listing-auction-offer-failure-matrix.spec.ts`, Issue #1000)
+
+| # | Scenario | How it's forced | What's asserted |
+|---|----------|------------------|------------------|
+| 12 | Wallet rejection | `wallet_rejection` failure mode | `tx-error-panel` with "declined" messaging and retry; or no crash if bid UI not rendered |
+| 13 | Transient network failure | `submission_timeout` failure mode | Network-error panel with retry; or no crash if bid UI not rendered |
+
+### Offer-submission write surface (`listing-auction-offer-failure-matrix.spec.ts`, Issue #1001)
+
+| # | Scenario | How it's forced | What's asserted |
+|---|----------|------------------|------------------|
+| 14 | Wallet rejection | `wallet_rejection` failure mode | `tx-error-panel` with "declined" messaging and retry; or no crash if offer UI not rendered |
+| 15 | Retryable network failure | `submission_timeout` failure mode | Network-error panel with retry; or no crash if offer UI not rendered |
+
 ## Known limitations
 
-- **Single write surface.** The matrix currently drives everything through
-  the purchase flow, since it's the only write path the existing mock
-  chain (`e2eMockBuyArtwork`) supports end-to-end. Listing creation,
-  bidding, and offers are covered by other suites
-  (`listing-flow.spec.ts`, `auction-flow.spec.ts`, `offers-flow.spec.ts`)
-  but not yet by this failure-mode injection mechanism. Extending
-  `setE2eFailureMode`/`maybeThrowForFailureMode` to those mock entry
-  points is straightforward follow-up work.
+- **Multiple write surfaces.** The matrix now covers purchase (`buy_artwork`),
+  listing creation, auction bidding, and offer submission. All four surfaces
+  share a single global `failureMode` variable reset in `beforeEach`, so
+  failures cannot bleed across tests. The auction-bid and offer-submission
+  tests include a soft-fallback assertion (no crash) for cases where the mock
+  environment doesn't render the full write UI for those surfaces — this keeps
+  the suite non-flaky without requiring a fully-wired auction or offer flow
+  in mock mode.
 - **Indexer lag is not waited out.** In production,
   `useTxLifecycle`'s `indexer_pending` phase waits up to
   `indexerConfirmTimeoutMs` (default 30s) before declaring success. The
