@@ -76,3 +76,34 @@ jobs:
           bash scripts/migrations/lint-migration.sh \
             indexer/prisma/migrations/20260827000000_example_expand_contract/migration.sql
 
+      # ── Rollback annotation gate (Issue #1009) ─────────────────────────────
+      # Ensures every newly added migration SQL file includes a non-empty
+      # `-- rollback:` annotation as required by docs/MIGRATION_GUIDE.md.
+      # Scoped to files added in the PR diff — historical migrations are
+      # not affected.
+      - name: Verify rollback annotations on new migrations
+        run: |
+          chmod +x scripts/migrations/check-rollback-annotation.sh
+          BASE="${{ github.event.pull_request.base.ref || 'main' }}"
+          CHANGED=$(git diff --name-only "origin/${BASE}...HEAD" -- '*.sql' \
+            | grep "indexer/prisma/migrations/" || true)
+          if [[ -n "$CHANGED" ]]; then
+            bash scripts/migrations/check-rollback-annotation.sh $CHANGED
+          else
+            echo "No new migration SQL files to check."
+          fi
+
+      - name: Validate rollback annotation checker with fixtures
+        run: |
+          # Positive fixture should pass
+          bash scripts/migrations/check-rollback-annotation.sh \
+            scripts/migrations/fixtures/rollback-positive.sql
+          # Negative fixture should fail (expected)
+          if bash scripts/migrations/check-rollback-annotation.sh \
+            scripts/migrations/fixtures/rollback-negative.sql 2>/dev/null; then
+            echo "ERROR: Negative fixture should have failed but did not."
+            exit 1
+          else
+            echo "OK: Negative fixture correctly rejected."
+          fi
+
