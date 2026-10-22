@@ -418,3 +418,91 @@ describe('Secret redaction regression — GET /health must not leak env secrets'
     expect(body).not.toContain('SECRET789');
   });
 });
+
+// ── Dependency-down vs liveness distinguishability ───────────────────────────
+//
+// Operators and load balancers need to tell apart:
+//   - A dependency outage  (process is alive; a backing service is unreachable)
+//   - A liveness failure   (process is dead / its event loop is stuck)
+//
+// The /health response uses probeType: "dependency_status" to make this
+// contract machine-readable.  When status is "down", the version and
+// probeType fields must still be present so consumers know the process
+// itself produced the response.
+
+describe('Dependency-down vs liveness distinguishability — /health', () => {
+  let app: express.Application;
+
+  function buildApp() {
+    const a = express();
+    a.get('/health', async (_req, res) => {
+      const { runAllChecks: rac } = await import('../health');
+      const result = await rac();
+      const httpStatus = result.status === 'down' ? 503 : 200;
+      res.status(httpStatus).json(result);
+    });
+    return a;
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    // Healthy defaults
+    mockPrisma.$queryRaw.mockResolvedValue([1]);
+    mockRedis.isReady = true;
+    mockRedis.ping.mockResolvedValue('PONG');
+    mockRpcServer.getLatestLedger.mockResolvedValue({ sequence: 5010 });
+    mockPrisma.syncState.findUnique.mockResolvedValue({ id: 1, lastLedger: 5005 });
+    app = buildApp();
+  });
+
+  it('healthy response carries probeType "dependency_status"', async () => {
+    const res = await request(app).get('/health');
+    expect(res.status).toBe(200);
+    expect(res.body.probeType).toBe('dependency_status');
+  });
+
+  it('dependency-down response (503) still carries probeType "dependency_status"', async () => {
+    // Simulate a Redis outage — process is alive, Redis is not
+    mockRedis.isReady = false;
+    const res = await request(app).get('/health');
+    expect(res.status).toBe(503);
+    // probeType must survive the failure so the consumer knows who produced the response
+    expect(res.body.probeType).toBe('dependency_status');
+  });
+
+  it('dependency-down response still includes version metadata', async () => {
+    // A liveness failure would produce no structured body at all.
+    // Confirming version is present proves the process generated this 503.
+    mockPrisma.$queryRaw.mockRejectedValue(new Error('DB down'));
+    const res = await request(app).get('/health');
+    expect(res.status).toBe(503);
+    expect(res.body).toHaveProperty('version');
+    expect(res.body.version).toHaveProperty('app');
+  });
+
+  it('dependency-down status is "down", not "not_ready" or a liveness signal', async () => {
+    mockPrisma.$queryRaw.mockRejectedValue(new Error('DB down'));
+    const res = await request(app).get('/health');
+    // "down" = dependency unreachable; never "dead" or "not_ready"
+    expect(res.body.status).toBe('down');
+    // The individual check must pinpoint which dependency failed
+    expect(res.body.checks.database.status).toBe('down');
+    // Redis and RPC are separate dependencies — they must not inherit the DB failure
+    expect(res.body.checks.redis.status).toBe('ok');
+    expect(res.body.checks.stellar_rpc.status).toBe('ok');
+  });
+
+  it('process-level fields (timestamp, version) are present even when all deps are down', async () => {
+    mockPrisma.$queryRaw.mockRejectedValue(new Error('DB down'));
+    mockRedis.isReady = false;
+    mockRpcServer.getLatestLedger.mockRejectedValue(new Error('RPC down'));
+
+    const res = await request(app).get('/health');
+    expect(res.status).toBe(503);
+    expect(res.body).toHaveProperty('timestamp');
+    expect(res.body).toHaveProperty('version');
+    expect(res.body).toHaveProperty('probeType');
+    // The process is alive: it produced a structured JSON body
+    expect(res.body.probeType).toBe('dependency_status');
+  });
+});

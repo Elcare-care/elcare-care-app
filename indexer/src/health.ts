@@ -1,8 +1,32 @@
 /**
  * health.ts — Dependency health checks for /health, /readyz, and /health/details.
  *
+ * ## Probe semantics
+ *
+ * This module distinguishes three layers of health:
+ *
+ *   Liveness  (/livez or process-level signals)
+ *     The process is running and its event loop is not stuck.
+ *     Liveness failure → restart the container.
+ *     This module does NOT own liveness; the process being able to serve HTTP
+ *     at all is the liveness signal.
+ *
+ *   Readiness (/readyz)
+ *     The process is ready to accept traffic: the database is reachable and
+ *     sync lag has not exceeded the hard threshold.  Readiness failure →
+ *     remove from the load-balancer pool; do NOT restart.
+ *     Implemented by `runReadinessChecks()`.
+ *
+ *   Dependency status (/health)
+ *     A full snapshot of every external dependency (DB, Redis, Stellar RPC,
+ *     sync lag, confirmation depth, lease state).  A `status: "down"` here
+ *     means one or more dependencies are unreachable — it does NOT mean the
+ *     process is dead.  Operators should use this for alerting dashboards, not
+ *     as a Kubernetes liveness probe target.
+ *     Implemented by `runAllChecks()`.
+ *
  * Each check function returns a HealthCheckResult with:
- *   status  : "ok" | "degraded" | "down"
+ *   status   : "ok" | "degraded" | "down"
  *   latencyMs: round-trip time in milliseconds
  *   message  : optional human-readable detail
  */
@@ -14,6 +38,7 @@ import { logger } from './logger.js';
 import { VERSION } from './config.js';
 import { getLeaseStatus } from './coordination/lease.js';
 import { getCurrentFencedLease } from './fenced-lease.js';
+import { getConfirmationHealthSummary } from './reorg.js';
 
 // ── Last-poll timestamp (Issue #926) ─────────────────────────────────────────
 //
@@ -66,8 +91,25 @@ export interface HealthCheckResult {
 }
 
 export interface AggregateHealth {
-  /** Overall system status — worst of all individual checks. */
+  /**
+   * Overall dependency status — worst of all individual checks.
+   *
+   * IMPORTANT: this reflects dependency reachability, NOT process liveness.
+   * A value of "down" means one or more external dependencies (DB, Redis,
+   * Stellar RPC, etc.) are unreachable.  The process itself is alive and
+   * serving HTTP.  Do NOT use this field to drive a Kubernetes liveness probe;
+   * use /readyz for readiness and rely on HTTP 200 from any endpoint for
+   * liveness.
+   */
   status: CheckStatus;
+  /**
+   * Identifies what this response represents so consumers can distinguish it
+   * from a liveness or readiness probe response programmatically.
+   *
+   * Always "dependency_status" for /health responses.
+   * Always "readiness"         for /readyz responses.
+   */
+  probeType: 'dependency_status' | 'readiness';
   checks: Record<string, HealthCheckResult>;
   /** Unix timestamp (ms) when this snapshot was taken. */
   timestamp: number;
@@ -273,11 +315,24 @@ export async function checkConfirmationDepth(): Promise<HealthCheckResult & {
 // ── Aggregate health ──────────────────────────────────────────────────────────
 
 /**
- * Run all checks in parallel and aggregate into a single result.
- * Overall status is:
- *   "ok"       — all checks ok
- *   "degraded" — at least one check degraded, none down
- *   "down"     — at least one check down
+ * Run all dependency checks in parallel and aggregate into a single result.
+ *
+ * ## Probe semantics — IMPORTANT
+ *
+ * This function backs the `/health` endpoint which is a **dependency status**
+ * probe, NOT a liveness probe.
+ *
+ * - `status: "ok"`       — all dependencies reachable
+ * - `status: "degraded"` — at least one dependency is slow/warning; process ok
+ * - `status: "down"`     — at least one dependency is unreachable; **the
+ *                           process is still alive**.  Restarting the container
+ *                           will not fix an unreachable database.
+ *
+ * The `probeType: "dependency_status"` field in the response makes this
+ * contract machine-readable for consumers who need to distinguish it from a
+ * `/readyz` (readiness) response.
+ *
+ * For load-balancer readiness gating use `runReadinessChecks()` (/readyz).
  */
 export async function runAllChecks(): Promise<AggregateHealth> {
   const [db, redisCheck, stellarRpc, syncLag, confirmationDepth] = await Promise.all([
@@ -306,6 +361,7 @@ export async function runAllChecks(): Promise<AggregateHealth> {
 
   return {
     status: overall,
+    probeType: 'dependency_status',
     checks,
     timestamp: Date.now(),
     lastSuccessfulPoll: getLastSuccessfulPollIso(),
@@ -322,7 +378,20 @@ export async function runAllChecks(): Promise<AggregateHealth> {
 
 /**
  * Lightweight readiness check — only database + sync lag.
- * Returns 503 if the DB is down or sync lag is "down".
+ *
+ * ## Probe semantics
+ *
+ * This function backs the `/readyz` endpoint, which is the correct target for
+ * Kubernetes readinessProbe and load-balancer health checks.
+ *
+ * - `ready: true`  → 200 — process is ready to accept traffic
+ * - `ready: false` → 503 — process is NOT ready (DB unreachable or sync lag
+ *                           exceeds the hard threshold).  Remove from the pool
+ *                           but do NOT restart the container; the process is
+ *                           alive and will recover when the dependency returns.
+ *
+ * Intentionally omits Redis, Stellar RPC, confirmation depth, and lease state
+ * to keep the readiness decision focused on what blocks request handling.
  */
 export async function runReadinessChecks(): Promise<{
   ready: boolean;
