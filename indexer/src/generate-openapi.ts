@@ -1,6 +1,6 @@
 /**
  * CLI script: generates openapi.json from the Zod-based registry and writes it
- * to the project root.
+ * next to the indexer package.json.
  *
  * Usage:
  *   npx tsx src/generate-openapi.ts
@@ -9,12 +9,14 @@
  * committed openapi.json, failing if they differ.
  */
 import { writeFileSync } from 'fs';
-import { resolve } from 'path';
+import { fileURLToPath } from 'url';
 import { buildOpenApiDocument } from './api/openapi.js';
 
 const doc = buildOpenApiDocument();
-// Always write next to package.json (one level above src/)
-const outPath = resolve(process.cwd(), 'openapi.json');
+// Always write next to package.json (one level above src/). Resolving the path
+// from this module rather than from process.cwd() keeps the output stable no
+// matter which directory the script is invoked from.
+const outPath = fileURLToPath(new URL('../openapi.json', import.meta.url));
 
 writeFileSync(outPath, JSON.stringify(doc, null, 2) + '\n', 'utf8');
 console.log(`✓ OpenAPI spec written to ${outPath}`);

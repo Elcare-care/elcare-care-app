@@ -239,6 +239,109 @@ export const ErrorResponseSchema = registry.register(
   }).openapi('ErrorResponse'),
 );
 
+// ── Rate-limit response headers ───────────────────────────────────────────────
+//
+// The indexer mounts two global limiters (`globalRateLimiter` and
+// `rateLimiter`) plus per-route cost-class limiters (light / medium / heavy /
+// operational). All of them are configured with `standardHeaders: 'draft-6'`
+// and `legacyHeaders: false`, so every response that passes a limiter carries
+// the IETF draft-6 header set.
+//
+// express-rate-limit emits draft-6 as four *separate* headers — not the
+// combined `RateLimit` header introduced by draft-7:
+//
+//   RateLimit-Policy:    <limit>;w=<windowSeconds>
+//   RateLimit-Limit:     <limit>
+//   RateLimit-Remaining: <remaining>
+//   RateLimit-Reset:     <seconds until the window resets>
+//
+// The values describe the budget of the *most specific* limiter that matched
+// the request, because each limiter overwrites the headers set by the one
+// before it.
+//
+// When a request is throttled the limiter also sets `Retry-After` (the number
+// of seconds to wait). The same header is returned by the SSE concurrency
+// guard (503) and by the error envelope for retryable failures.
+
+/** Paths the limiters explicitly skip — these responses carry no rate-limit headers. */
+const RATE_LIMIT_SKIPPED_PATHS = new Set(['/health', '/readyz']);
+
+/**
+ * Paths whose `503` is produced by the SSE concurrency guard. That guard is a
+ * throttle, so it answers with the same retry guidance as a `429`.
+ */
+const SSE_CONCURRENCY_503_PATHS = new Set(['/events', '/notifications/stream']);
+
+/** Reusable `components.headers` entries for the rate-limit headers. */
+const RATE_LIMIT_HEADER_COMPONENTS = {
+  RateLimitPolicy: {
+    description:
+      'Rate-limit policy of the budget that was applied to this request, formatted as `<limit>;w=<windowSeconds>`.',
+    schema: { type: 'string', example: '100;w=60' },
+  },
+  RateLimitLimit: {
+    description: 'Maximum number of requests allowed in the current rate-limit window.',
+    schema: { type: 'integer', example: 100 },
+  },
+  RateLimitRemaining: {
+    description: 'Number of requests still allowed in the current rate-limit window.',
+    schema: { type: 'integer', example: 99 },
+  },
+  RateLimitReset: {
+    description: 'Number of seconds until the current rate-limit window resets.',
+    schema: { type: 'integer', example: 60 },
+  },
+  RetryAfter: {
+    description:
+      'Number of seconds the client should wait before retrying the request (RFC 9110 `delay-seconds`).',
+    schema: { type: 'integer', example: 60 },
+  },
+};
+
+/** The draft-6 headers attached to every response served by a rate-limited route. */
+const RATE_LIMIT_HEADER_REFS = {
+  'RateLimit-Policy':   { $ref: '#/components/headers/RateLimitPolicy' },
+  'RateLimit-Limit':    { $ref: '#/components/headers/RateLimitLimit' },
+  'RateLimit-Remaining': { $ref: '#/components/headers/RateLimitRemaining' },
+  'RateLimit-Reset':    { $ref: '#/components/headers/RateLimitReset' },
+};
+
+/** Retry guidance attached to throttled responses. */
+const RETRY_AFTER_HEADER_REF = { 'Retry-After': { $ref: '#/components/headers/RetryAfter' } };
+
+/**
+ * Body of a `429 Too Many Requests` response.
+ *
+ * The rate-limit middleware answers with a flat payload, while abuse detection
+ * reuses the standard error envelope — both are accepted here.
+ */
+export const RateLimitedResponseSchema = registry.register(
+  'RateLimitedResponse',
+  z.object({
+    error: z.union([
+      z.string().openapi({
+        description: 'Human-readable reason returned by the rate-limit middleware.',
+        example: 'Too many requests, please slow down.',
+      }),
+      ErrorResponseSchema.shape.error.openapi({
+        description: 'Standard error envelope used by abuse detection.',
+      }),
+    ]),
+    retryAfter: z.string().optional().openapi({
+      description: 'Human-readable retry hint, e.g. `1 minute`.',
+      example: '1 minute',
+    }),
+    limit: z.number().int().optional().openapi({
+      description: 'Maximum number of requests allowed in the exceeded window.',
+      example: 100,
+    }),
+    windowMs: z.number().int().optional().openapi({
+      description: 'Length of the exceeded rate-limit window in milliseconds.',
+      example: 60000,
+    }),
+  }).openapi('RateLimitedResponse'),
+);
+
 // ── Shared parameter helpers ──────────────────────────────────────────────────
 
 function pathParam(name: string, description: string) {
@@ -1101,6 +1204,56 @@ const securitySchemes = {
 
 const generator = new OpenApiGeneratorV3(registry.definitions);
 
+const HTTP_METHODS = new Set(['get', 'post', 'put', 'patch', 'delete', 'head', 'options', 'trace']);
+
+/**
+ * Attach the rate-limit response headers to every documented response and
+ * document the throttled (`429`) response for every rate-limited route.
+ *
+ * The headers are attached programmatically rather than repeated in each
+ * `registerPath` call because the runtime applies them uniformly: every route
+ * is mounted behind the global limiters, so every response it produces carries
+ * the draft-6 header set. The only exceptions are the two paths the limiters
+ * explicitly skip (`/health`, `/readyz`).
+ */
+function applyRateLimitHeaders(doc: any): void {
+  const components = (doc.components ??= {});
+  components.headers = { ...RATE_LIMIT_HEADER_COMPONENTS, ...(components.headers ?? {}) };
+
+  for (const [path, pathItem] of Object.entries<any>(doc.paths ?? {})) {
+    const rateLimited = !RATE_LIMIT_SKIPPED_PATHS.has(path);
+
+    for (const [method, operation] of Object.entries<any>(pathItem ?? {})) {
+      if (!HTTP_METHODS.has(method)) continue;
+
+      const responses = (operation.responses ??= {});
+
+      // Document the throttled response for every rate-limited route.
+      if (rateLimited && !responses['429']) {
+        responses['429'] = {
+          description:
+            'Too many requests. The request was rejected by the rate limiter; `Retry-After` gives the number of seconds to wait before retrying.',
+          headers: { ...RATE_LIMIT_HEADER_REFS, ...RETRY_AFTER_HEADER_REF },
+          content: {
+            'application/json': { schema: { $ref: '#/components/schemas/RateLimitedResponse' } },
+          },
+        };
+      }
+
+      for (const [status, response] of Object.entries<any>(responses)) {
+        const headers = (response.headers ??= {});
+        if (rateLimited) Object.assign(headers, RATE_LIMIT_HEADER_REFS);
+        // A throttled response always carries its retry guidance.
+        if (status === '429') Object.assign(headers, RETRY_AFTER_HEADER_REF);
+        // The SSE concurrency guard throttles with 503 and sets `Retry-After`.
+        if (status === '503' && SSE_CONCURRENCY_503_PATHS.has(path)) {
+          Object.assign(headers, RETRY_AFTER_HEADER_REF);
+        }
+      }
+    }
+  }
+}
+
 export function buildOpenApiDocument() {
   // Cast to `any` to accommodate the version difference between
   // OpenAPIObjectConfig types across @asteasolutions/zod-to-openapi versions.
@@ -1124,6 +1277,9 @@ export function buildOpenApiDocument() {
   if (!doc.components) (doc as any).components = {};
   (doc as any).components.securitySchemes = securitySchemes;
   (doc as any).security = [{ operatorToken: [] }];
+
+  // Document the rate-limit headers the runtime actually returns.
+  applyRateLimitHeaders(doc);
 
   return doc;
 }

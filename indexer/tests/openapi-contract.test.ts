@@ -77,6 +77,28 @@ describe('OpenAPI contract — representative responses', () => {
     const historyPath = doc.paths['/listings/{id}/history'];
     expect(historyPath).toBeDefined();
     expect(historyPath.get.responses['200']).toBeDefined();
+
+    const headers = (historyPath.get.responses['200'] as any).headers ?? {};
+    expect(Object.keys(headers).sort()).toEqual([
+      'RateLimit-Limit',
+      'RateLimit-Policy',
+      'RateLimit-Remaining',
+      'RateLimit-Reset',
+    ]);
+  });
+
+  it('documents the throttled response with its retry guidance', () => {
+    const historyPath = doc.paths['/listings/{id}/history'];
+    const throttled = (historyPath.get.responses as any)['429'];
+    expect(throttled, 'missing 429 on a rate-limited route').toBeDefined();
+    expect(Object.keys(throttled.headers ?? {})).toContain('Retry-After');
+  });
+
+  it('documents rate-limit headers as reusable components', () => {
+    const headers = (doc.components as any)?.headers;
+    expect(headers).toBeDefined();
+    expect(headers.RateLimitPolicy).toBeDefined();
+    expect(headers.RetryAfter).toBeDefined();
   });
 
   it('documents pagination cursor headers for listing endpoints', () => {
