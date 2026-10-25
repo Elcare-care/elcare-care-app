@@ -58,7 +58,7 @@ attestation store, cryptographically tying each file's digest to:
 Verify it with the `gh` CLI (no token needed for a public repo):
 
 ```bash
-gh attestation verify ./collection_nft_erc721.wasm --repo your-org/elcarehub
+gh attestation verify ./collection_nft_erc721.wasm --repo Elcare-care/elcare-care-app
 ```
 
 ### 2. cosign keyless signature over SHA256SUMS
@@ -77,7 +77,7 @@ workflow identity:
 ```bash
 cosign verify-blob \
   --bundle SHA256SUMS.bundle \
-  --certificate-identity-regexp '^https://github.com/your-org/elcarehub/\.github/workflows/release\.yml@refs/tags/.*$' \
+  --certificate-identity-regexp '^https://github.com/Elcare-care/elcare-care-app/\.github/workflows/release\.yml@refs/tags/.*$' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   SHA256SUMS
 ```
@@ -89,10 +89,10 @@ Prerequisites: `cosign` ([install](https://docs.sigstore.dev/cosign/system_confi
 
 ```bash
 # 1. Download every asset from the GitHub Release for the tag you're promoting.
-gh release download v1.2.3 --repo your-org/elcarehub --dir ./release-assets
+gh release download v1.2.3 --repo Elcare-care/elcare-care-app --dir ./release-assets
 
 # 2. Run the bundled verification script.
-./scripts/release/verify-artifact.sh --dir ./release-assets --repo your-org/elcarehub --tag v1.2.3
+./scripts/release/verify-artifact.sh --dir ./release-assets --repo Elcare-care/elcare-care-app --tag v1.2.3
 ```
 
 `verify-artifact.sh` runs, in order, and prints a clear `PASS`/`FAIL` per
@@ -116,7 +116,7 @@ documented in comments at the top of `verify-artifact.sh` too:
 
 ```bash
 # 1. Verify a real, unmodified release directory first — confirm it PASSes.
-./scripts/release/verify-artifact.sh --dir ./release-assets --repo your-org/elcarehub
+./scripts/release/verify-artifact.sh --dir ./release-assets --repo Elcare-care/elcare-care-app
 
 # 2. Flip one byte in any artifact.
 printf '\x00' | dd of=./release-assets/abi.json bs=1 seek=4 count=1 conv=notrunc
@@ -124,7 +124,7 @@ printf '\x00' | dd of=./release-assets/abi.json bs=1 seek=4 count=1 conv=notrunc
 # 3. Re-run. It MUST fail — either at the checksum step (the common case), or
 #    at the cosign/attestation step if the tamper also touched SHA256SUMS
 #    without a valid re-signature. Either failure path proves detection works.
-./scripts/release/verify-artifact.sh --dir ./release-assets --repo your-org/elcarehub
+./scripts/release/verify-artifact.sh --dir ./release-assets --repo Elcare-care/elcare-care-app
 ```
 
 ## What `PROVENANCE.json` contains
@@ -135,7 +135,7 @@ covered by `SHA256SUMS`):
 ```jsonc
 {
   "source": {
-    "repository": "your-org/elcarehub",
+    "repository": "Elcare-care/elcare-care-app",
     "ref": "refs/tags/v1.2.3",
     "tag": "v1.2.3",
     "commit": "<full sha>",
@@ -145,7 +145,7 @@ covered by `SHA256SUMS`):
     "workflow": "Release",
     "run_id": "...",
     "run_attempt": "...",
-    "run_url": "https://github.com/your-org/elcarehub/actions/runs/...",
+    "run_url": "https://github.com/Elcare-care/elcare-care-app/actions/runs/...",
     "triggered_by": "push",
     "actor": "...",
     "runner_os": "Linux",
@@ -176,7 +176,7 @@ gates on release verification when an operator is promoting a specific,
 downloaded release rather than building fresh from a working tree:
 
 - Set `RELEASE_ARTIFACTS_DIR=/path/to/downloaded/release` (and optionally
-  `RELEASE_REPO=owner/repo`, defaults to `your-org/elcarehub`) and the script
+  `RELEASE_REPO=owner/repo`, defaults to `Elcare-care/elcare-care-app`) and the script
   runs `verify-artifact.sh` against that directory **before** building or
   deploying anything. A failed verification aborts the deployment
   (non-zero exit) with no on-chain changes made.
