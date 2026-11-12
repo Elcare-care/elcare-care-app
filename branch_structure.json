@@ -1,0 +1,18 @@
+{
+  "default_branch": "main",
+  "branches": [
+    "fix/issue-916-include-request-ids-in-client-visible-api-errors",
+    "main",
+    "origin"
+  ],
+  "parent": {
+    "fix/issue-916-include-request-ids-in-client-visible-api-errors": "main",
+    "main": null,
+    "origin": "main"
+  },
+  "order": [
+    "main",
+    "fix/issue-916-include-request-ids-in-client-visible-api-errors",
+    "origin"
+  ]
+}

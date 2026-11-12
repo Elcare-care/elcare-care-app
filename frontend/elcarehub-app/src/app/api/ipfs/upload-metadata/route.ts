@@ -49,6 +49,7 @@ interface UploadErrorResponse {
   error: string;
   category: UploadErrorCategory;
   uploadId?: string;
+  requestId?: string;
 }
 
 // ── Helpers ───────────────────────────────────────────────────
@@ -57,6 +58,18 @@ function getPinataJwt(): string {
   const jwt = process.env.PINATA_JWT;
   if (!jwt) throw new Error("PINATA_JWT not configured");
   return jwt;
+}
+
+/**
+ * Extract the request ID assigned by the correlation/logging middleware.
+ * Returns undefined when no ID has been assigned so the response shape
+ * remains valid for requests without one.
+ */
+function getRequestId(req: Request): string | undefined {
+  const id =
+    req.headers.get("x-request-id") ??
+    req.headers.get("x-correlation-id");
+  return id && id.trim() ? id.trim() : undefined;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -181,13 +194,17 @@ async function pinataMetadataUploadWithRetry(
 
 export async function POST(req: Request) {
   const uploadId = `meta_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+  const requestId = getRequestId(req);
 
   const errorResponse = (
     message: string,
     category: UploadErrorCategory,
     status: number
   ): NextResponse<UploadErrorResponse> =>
-    NextResponse.json({ error: message, category, uploadId }, { status });
+    NextResponse.json(
+      { error: message, category, uploadId, ...(requestId ? { requestId } : {}) },
+      { status }
+    );
 
   try {
     const body = await req.json() as { metadata?: unknown; name?: string };

@@ -1,11 +1,20 @@
-import { NextResponse } from 'next/server';
+import { NextRequest, NextResponse } from 'next/server';
 
 /**
  * Health check endpoint for container orchestration and monitoring.
  * Returns a simple JSON response indicating the service is healthy.
- * 
+ *
  * This endpoint is used by Docker health checks and Kubernetes liveness probes.
  */
+
+const REQUEST_ID_HEADER = 'x-request-id';
+
+function resolveRequestId(request: NextRequest): string | undefined {
+  const headerValue = request.headers.get(REQUEST_ID_HEADER)?? request.headers.get('request-id');
+  const trimmed = headerValue?.trim();
+  return trimmed ? trimmed : undefined;
+}
+
 export async function GET() {
   return NextResponse.json(
     {

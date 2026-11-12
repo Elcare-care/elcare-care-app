@@ -18,6 +18,7 @@
 import { NextRequest, NextResponse } from "next/server";
 
 const MAX_BUFFER = 200;
+const REQUEST_ID_HEADER = "x-request-id";
 const reports: unknown[] = [];
 
 export async function POST(req: NextRequest) {
@@ -25,7 +26,7 @@ export async function POST(req: NextRequest) {
   try {
     body = await req.json();
   } catch {
-    return new NextResponse(null, { status: 400 });
+    return errorResponse(req, 400, "invalid_json", "Request body is not valid JSON.");
   }
 
   const safe = sanitizeReport(body);
@@ -42,6 +43,23 @@ export async function POST(req: NextRequest) {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+function getRequestId(req: NextRequest): string | undefined {
+  const id = req.headers.get(REQUEST_ID_HEADER);
+  return id && id.trim().length > 0 ? id.trim() : undefined;
+}
+
+function errorResponse(
+  req: NextRequest,
+  status: number,
+  code: string,
+  message: string,
+): NextResponse {
+  const requestId = getRequestId(req);
+  const payload: Record<string, unknown> = { error: { code, message } };
+  if (requestId) (payload.error as Record<string, unknown>).requestId = requestId;
+  return NextResponse.json(payload, { status });
+}
 
 function sanitizeReport(body: unknown): Record<string, unknown> {
   if (!body || typeof body !== "object") return {};

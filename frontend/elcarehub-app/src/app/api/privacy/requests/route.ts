@@ -30,28 +30,50 @@ function walletHeader(req: NextRequest): string | null {
   return req.headers.get("x-wallet-address");
 }
 
+// Issue 053 — surface a request ID in client-visible errors when the
+// correlation middleware assigned one. We accept the common header names
+// used by request-ID middleware and never echo internal error details.
+function requestIdFrom(req: NextRequest): string | null {
+  const id =
+    req.headers.get("x-request-id") ??
+    req.headers.get("x-correlation-id") ??
+    req.headers.get("request-id");
+  return id && id.trim() ? id.trim() : null;
+}
+
+function errorResponse(
+  req: NextRequest,
+  message: string,
+  status: number
+): NextResponse {
+  const requestId = requestIdFrom(req);
+  const body: { error: string; requestId?: string } = { error: message };
+  if (requestId) {
+    body.requestId = requestId;
+  }
+  const res = NextResponse.json(body, { status });
+  if (requestId) {
+    res.headers.set("x-request-id", requestId);
+  }
+  return res;
+}
+
 export async function POST(req: NextRequest) {
   const wallet = walletHeader(req);
   if (!wallet) {
-    return NextResponse.json(
-      { error: "X-Wallet-Address header is required." },
-      { status: 401 }
-    );
+    return errorResponse(req, "X-Wallet-Address header is required.", 401);
   }
 
   let body: unknown;
   try {
     body = await req.json();
   } catch {
-    return NextResponse.json({ error: "Invalid JSON body." }, { status: 400 });
+    return errorResponse(req, "Invalid JSON body.", 400);
   }
 
   const type = (body as { type?: unknown })?.type;
   if (type !== "EXPORT" && type !== "DELETION") {
-    return NextResponse.json(
-      { error: "Field 'type' must be 'EXPORT' or 'DELETION'." },
-      { status: 422 }
-    );
+    return errorResponse(req, "Field 'type' must be 'EXPORT' or 'DELETION'.", 422);
   }
 
   try {
@@ -69,17 +91,14 @@ export async function POST(req: NextRequest) {
     return NextResponse.json(data, { status: upstream.status });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Upstream request failed";
-    return NextResponse.json({ error: message }, { status: 502 });
+    return errorResponse(req, message, 502);
   }
 }
 
 export async function GET(req: NextRequest) {
   const wallet = walletHeader(req);
   if (!wallet) {
-    return NextResponse.json(
-      { error: "X-Wallet-Address header is required." },
-      { status: 401 }
-    );
+    return errorResponse(req, "X-Wallet-Address header is required.", 401);
   }
 
   try {
@@ -95,6 +114,6 @@ export async function GET(req: NextRequest) {
     return NextResponse.json(data, { status: upstream.status });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Upstream request failed";
-    return NextResponse.json({ error: message }, { status: 502 });
+    return errorResponse(req, message, 502);
   }
 }
