@@ -57,6 +57,9 @@ OIDC_ISSUER="https://token.actions.githubusercontent.com"
 # Scoped to this repo's release workflow so a signature from an unrelated
 # workflow/repo cannot be substituted.
 CERT_IDENTITY_REGEXP_TEMPLATE='^https://github.com/%s/\.github/workflows/release\.yml@refs/tags/.*$'
+# When a specific tag is requested the identity must name that exact tag so a
+# signature produced by a different release run cannot satisfy the check.
+CERT_IDENTITY_REGEXP_TAG_TEMPLATE='^https://github.com/%s/\.github/workflows/release\.yml@refs/tags/%s$'
 
 usage() {
   grep '^#' "$0" | grep -v '^#!/' | sed 's/^# \{0,1\}//'
@@ -87,7 +90,14 @@ if [[ ! -d "$ARTIFACT_DIR" ]]; then
   exit 2
 fi
 
-CERT_IDENTITY_REGEXP="$(printf "$CERT_IDENTITY_REGEXP_TEMPLATE" "$REPO")"
+if [[ -n "$TAG" ]]; then
+  # Escape every regex metacharacter in the tag so a tag like "v1.2.3" does not
+  # allow a tag named "v1X2Y3" to satisfy the identity check.
+  TAG_ESCAPED="$(printf '%s' "$TAG" | sed 's/[.^$*+?{}|()[\]\\]/\\&/g')"
+  CERT_IDENTITY_REGEXP="$(printf "$CERT_IDENTITY_REGEXP_TAG_TEMPLATE" "$REPO" "$TAG_ESCAPED")"
+else
+  CERT_IDENTITY_REGEXP="$(printf "$CERT_IDENTITY_REGEXP_TEMPLATE" "$REPO")"
+fi
 
 CHECKS_PASSED=0
 CHECKS_FAILED=0
