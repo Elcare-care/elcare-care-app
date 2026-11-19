@@ -38,5 +38,21 @@
   "sort": "Panga",
   "empty_state_no_items": "Hakuna vitu vilivyopatikana",
   "view_details": "Angalia Maelezo",
-  "back": "Rudi"
+  "back": "Rudi",
+  "explore_empty_filtered_title": "Hakuna kazi zinazolingana",
+  "explore_empty_filtered_description": "Hakuna matangazo yanayolingana na vichujio au maneno ya utafutaji wako. Jaribu kufuta au kupumzisha vichujio kugundua kazi zaidi.",
+  "explore_empty_filtered_action": "Futa vichujio vyote",
+  "explore_empty_unfiltered_title": "Bado hakuna kazi",
+  "explore_empty_unfiltered_description": "Soko bado halijapata matangazo. Rudi hivi karibuni kwa kazi mpya kutoka kwa wabunifu.",
+  "auctions_empty_filtered_title": "Hakuna minada ya {status}",
+  "auctions_empty_filtered_description": "Hakuna minada ya {status} kwa sasa.",
+  "auctions_empty_filtered_action": "Angalia minada yote",
+  "auctions_empty_unfiltered_title": "Hakuna minada iliyopatikana",
+  "auctions_empty_unfiltered_description": "Bado hakuna minada iliyoundwa. Rudi hivi karibuni!",
+  "filter_reset_all": "Weka upya vichujio vyote",
+  "filter_no_results_title": "Hakuna matokeo",
+  "filter_no_results_description": "Hakuna vitu vinavyolingana na vichujio vya sasa. Jaribu kurekebisha utafutaji wako au kufuta baadhi ya vichujio.",
+  "filter_clear_all": "Futa vichujio vyote",
+  "loading_artworks": "Inapakia kazi…",
+  "loading_auctions": "Inapakia minada…"
 }

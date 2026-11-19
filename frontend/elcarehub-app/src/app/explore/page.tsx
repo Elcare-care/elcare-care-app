@@ -10,7 +10,7 @@
 import { useState, useCallback, useEffect, useRef, useReducer } from "react";
 import { Listing } from "@/lib/contract";
 import { ListingCard } from "@/components/ListingCard";
-import { ListingCardSkeleton } from "@/components/Skeletons";
+import { ListingCardGridSkeleton } from "@/components/Skeletons";
 import { ChevronLeft, ChevronRight, Search, SlidersHorizontal, ArrowUpDown, Info } from "lucide-react";
 import { FilterSidebar, filterReducer, SortOption } from "@/components/FilterSidebar";
 import { ActiveFilterChips } from "@/components/ActiveFilterChips";
@@ -324,10 +324,7 @@ export default function ExplorePage() {
           )}
 
           {isLoading && (
-            <div role="status" aria-live="polite" className="grid gap-6 sm:grid-cols-2 lg:grid-cols-3">
-              <span className="sr-only">Loading artworks…</span>
-              {Array.from({ length: PAGE_SIZE }).map((_, i) => <ListingCardSkeleton key={i} />)}
-            </div>
+            <ListingCardGridSkeleton count={PAGE_SIZE} label="Loading artworks…" />
           )}
 
           {!isLoading && !error && listings.length === 0 && (
