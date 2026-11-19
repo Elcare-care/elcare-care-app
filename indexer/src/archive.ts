@@ -62,7 +62,7 @@ export const ARCHIVE_TABLES: ArchiveTable[] = [
     hot: 'MarketplaceEvent',
     archive: 'ArchivedMarketplaceEvent',
     retentionDays: 90,
-    where: { ledgerSequence: { lt: BigInt(Date.now() / 1000 - 90 * 24 * 60 * 60) } },
+    where: { ledgerSequence: { lt: BigInt(Math.floor(Date.now() / 1000 - 90 * 24 * 60 * 60)) } },
   },
   {
     hot: 'PriceHistory',
@@ -268,7 +268,12 @@ async function main() {
   logger.info('[archive] All tables processed');
 }
 
-main().catch((err) => {
-  logger.error('[archive] Fatal error', err);
-  process.exit(1);
-});
+// Only self-execute when run directly (not when imported by tests).
+// import.meta.url matches file:// on direct execution; Node's require cache
+// path is undefined in ESM, so this guard is reliable across both contexts.
+if (import.meta.url === `file://${process.argv[1]?.replace(/\\/g, '/')}`) {
+  main().catch((err) => {
+    logger.error('[archive] Fatal error', err);
+    process.exit(1);
+  });
+}
