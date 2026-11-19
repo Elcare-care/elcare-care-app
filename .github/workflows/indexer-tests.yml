@@ -66,6 +66,27 @@ jobs:
       - name: Run all unit tests
         run: npm test
 
+      # ── Unit test coverage gate ───────────────────────────────────────────
+      # Runs the same unit-only suite (excludes integration tests via
+      # vitest.config.mts) with v8 coverage enabled.  Vitest evaluates the
+      # thresholds configured in vitest.config.mts and fails the job when any
+      # metric drops below the baseline.  The HTML + lcov reports are uploaded
+      # as a workflow artifact so maintainers can inspect them without running
+      # locally.
+      - name: Run unit tests with coverage
+        run: npx vitest run --coverage
+        # COLLECT_COVERAGE is not needed here — coverage is requested via the
+        # --coverage flag, which causes Vitest to honour the thresholds defined
+        # under coverage.thresholds in vitest.config.mts.
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: indexer-coverage
+          path: indexer/coverage/
+          if-no-files-found: warn
+
       # ── TypeScript type check ─────────────────────────────────────────────
       - name: Type check
         run: npx tsc --noEmit

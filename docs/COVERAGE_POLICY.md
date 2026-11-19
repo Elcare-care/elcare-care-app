@@ -30,11 +30,12 @@ Thresholds are defined in `frontend/elcarehub-app/jest.config.js` under `coverag
 
 | Scope | Statements | Branches | Functions | Lines |
 |-------|-----------|---------|----------|-------|
-| Global | 60% | 50% | 55% | 60% |
+| Global | 65% | 55% | 60% | 65% |
 | `src/components/CheckoutModal.tsx` | 90% | 75% | 85% | 90% |
 | `src/components/ListingCard.tsx` | 90% | 75% | 85% | 90% |
 | `src/hooks/useMarketplace.ts` | 55% | 45% | 50% | 55% |
 | `src/lib/contract.ts` | 15% | 10% | 10% | 15% |
+| `src/lib/ipfs.ts` | 80% | 65% | 80% | 80% |
 | `src/lib/disclosures.ts` | 80% | 70% | 75% | 80% |
 | `src/lib/support.ts` | 80% | 70% | 75% | 80% |
 
@@ -42,16 +43,27 @@ Thresholds are defined in `frontend/elcarehub-app/jest.config.js` under `coverag
 
 ### Indexer (Vitest)
 
-Thresholds are not yet enforced by CI for the indexer unit suite but will be added once a baseline report is committed. The target is:
+Thresholds are enforced in CI via the `Run unit tests with coverage` step in
+`.github/workflows/indexer-tests.yml`.  Vitest evaluates the values below
+(configured in `indexer/vitest.config.mts`) on every push and pull-request
+that touches the `indexer/` tree.  A coverage result below any threshold fails
+the job.  The HTML and lcov reports are uploaded as the `indexer-coverage`
+workflow artifact.
 
-| Scope | Statements | Branches |
-|-------|-----------|---------|
+| Scope | Statements | Branches | Functions | Lines |
+|-------|-----------|---------|----------|-------|
+| Global | 60% | 50% | 55% | 60% |
+
+> Per-file thresholds for `src/parser.ts`, `src/event-schemas.ts`, and
+> `src/keeper/**` are listed as aspirational targets below and will be added to
+> `vitest.config.mts` incrementally once confirmed as reachable by the baseline
+> report.
+
+| Path (aspirational) | Statements | Branches |
+|---------------------|-----------|---------|
 | `src/parser.ts` | 80% | 70% |
 | `src/event-schemas.ts` | 85% | 80% |
 | `src/keeper/**` | 70% | 60% |
-| Global | 65% | 55% |
-
-Add these to `vitest.config.mts` under `coverage.thresholds` once baseline reports confirm they are reachable.
 
 ### Rust Contracts
 
@@ -114,8 +126,8 @@ These paths require dedicated tests regardless of global percentage:
 | Path | Risk | Current Test Location |
 |------|------|-----------------------|
 | `soroban-marketplace` overflow checks | Financial arithmetic; overflow = fund loss | `contracts/soroban-marketplace/src/invariant_tests.rs` |
-| `src/lib/disclosures.ts` | Disclosure gates block signing; bugs bypass user consent | `src/__tests__/disclosures.test.ts` (to be added) |
-| `src/lib/support.ts` `containsSecret()` | Incorrectly passing a secret to support would be a severe data exposure | `src/__tests__/support.test.ts` (to be added) |
+| `src/lib/disclosures.ts` | Disclosure gates block signing; bugs bypass user consent | `src/__tests__/disclosures.test.ts` — covers `DISCLOSURES` catalog, `isAcknowledged`, `recordAcknowledgement`, `clearAcknowledgement`, and version isolation |
+| `src/lib/support.ts` `containsSecret()` | Incorrectly passing a secret to support would be a severe data exposure | `src/__tests__/support.test.ts` — covers `containsSecret` (Stellar secret keys, mnemonics, hex keys, public-key false-positive), `validateSupportForm`, and `SUPPORT_CATEGORIES` catalog |
 | `indexer/src/parser.ts` | Misparse = wrong financial state stored | `indexer/src/__tests__/parser.test.ts` |
 | `indexer/src/event-schemas.ts` | Schema mismatch = silent data loss | `indexer/src/__tests__/event-catalog.test.ts` |
 | `indexer/src/keeper/tx-pipeline.ts` | Keeper double-execution = duplicate settlement | `indexer/src/__tests__/keeper-unit.test.ts` |

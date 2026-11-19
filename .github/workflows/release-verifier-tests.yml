@@ -1,0 +1,48 @@
+name: Release Verifier Tests
+
+# Runs the offline test suites for scripts/release/verify-artifact.sh on every
+# push or PR that touches the verifier or its tests.  No network access, no
+# external secrets, no real cosign or gh invocations — all external tools are
+# replaced by in-test stub executables.
+
+on:
+  push:
+    paths:
+      - 'scripts/release/verify-artifact.sh'
+      - 'scripts/release/verify-artifact.test.sh'
+      - 'scripts/release/verify-artifact-tamper.test.sh'
+      - '.github/workflows/release-verifier-tests.yml'
+  pull_request:
+    paths:
+      - 'scripts/release/verify-artifact.sh'
+      - 'scripts/release/verify-artifact.test.sh'
+      - 'scripts/release/verify-artifact-tamper.test.sh'
+      - '.github/workflows/release-verifier-tests.yml'
+
+jobs:
+  verifier-tests:
+    name: Offline verifier tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Mark test scripts executable
+        run: |
+          chmod +x scripts/release/verify-artifact.sh
+          chmod +x scripts/release/verify-artifact.test.sh
+          chmod +x scripts/release/verify-artifact-tamper.test.sh
+
+      # ── Identity-regexp tests (Issue #995) ───────────────────────────────
+      # Verifies that --tag binds the cosign identity to the exact supplied tag,
+      # that regex metacharacters in tags are escaped, and that tagless mode
+      # still accepts any release tag.
+      - name: Run identity-regexp tests
+        run: bash scripts/release/verify-artifact.test.sh
+
+      # ── Tamper-detection tests (Issue #996) ──────────────────────────────
+      # Verifies that modified artifacts, corrupted checksums, missing
+      # signatures, and failed attestations all cause verify-artifact.sh to
+      # exit non-zero (fail closed).  Entirely offline via stub executables.
+      - name: Run tamper-detection tests
+        run: bash scripts/release/verify-artifact-tamper.test.sh
