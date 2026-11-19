@@ -9,6 +9,7 @@ import { useWallet } from "@/hooks/useWallet";
 import { useLaunchpadAdminCheck, useLaunchpadAdminStats, useLaunchpadAdminActions } from "@/hooks/useLaunchpadAdmin";
 import { useLaunchpadCollections } from "@/hooks/useLaunchpad";
 import { useAdminSession } from "@/hooks/useAdminSession";
+import { t } from "@/lib/i18n";
 import { AdminConfirmationModal } from "@/components/AdminConfirmationModal";
 import {
   Shield,
@@ -553,6 +554,17 @@ export default function LaunchpadAdminPage() {
             )}
           </div>
         </div>
+
+        {/* Pending action status */}
+        {isProcessing && (
+          <div
+            role="status"
+            className="mt-6 flex items-center gap-3 rounded-xl border border-brand-200 bg-brand-50 px-4 py-3"
+          >
+            <Loader2 size={18} className="animate-spin text-brand-600" aria-hidden="true" />
+            <p className="text-sm font-medium text-brand-800">{t("launchpad_admin_pending")}</p>
+          </div>
+        )}
 
         {/* Error Display */}
         {actionError && (

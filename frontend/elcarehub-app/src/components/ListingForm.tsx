@@ -19,7 +19,8 @@ import { validateAmountInput, baseToDisplay } from "@/lib/amount";
 import posthog from "posthog-js";
 import { isValidStellarAddress } from "@/lib/validation";
 import { config } from "@/lib/config";
-import { useTxLifecycle, txStateLabel } from "@/hooks/useTxLifecycle";
+import { useTxLifecycle, txStatusMessage } from "@/hooks/useTxLifecycle";
+import { t } from "@/lib/i18n";
 import { TxErrorPanel } from "@/components/TxErrorPanel";
 import Link from "next/link";
 import { RoyaltySplitEditor, validateRecipients } from "@/components/RoyaltySplitEditor";
@@ -553,7 +554,7 @@ export function ListingForm({ listing, onSuccess, onCancel }: ListingFormProps) 
   /** True when any async operation is in flight (including approval). */
   const isAnyLoading = isLoading || isCheckingApproval || isApprovingMarketplace;
   const progress = isListingTxActive
-    ? txStateLabel(listingTxState.state)
+    ? txStatusMessage(listingTxState)
     : isEdit
     ? updateProgress
     : createProgress;
@@ -575,6 +576,7 @@ export function ListingForm({ listing, onSuccess, onCancel }: ListingFormProps) 
           <p className="text-gray-500 font-inter">
             Your artwork is now live and available for purchase on the ELCARE-HUB marketplace.
           </p>
+          <p className="text-brand-600 font-inter font-semibold">{t("tx_guidance_listing")}</p>
         </div>
         <div className="flex flex-col sm:flex-row gap-4 w-full mt-4">
           {!isEdit && (

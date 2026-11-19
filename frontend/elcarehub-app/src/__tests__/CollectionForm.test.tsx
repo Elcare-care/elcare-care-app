@@ -346,7 +346,7 @@ describe("CollectionForm wizard", () => {
       await user.click(screen.getByRole("button", { name: /deploy collection/i }));
       await waitFor(() =>
         expect(mockPushToast).toHaveBeenCalledWith(
-          "Collection deployed successfully!",
+          expect.stringContaining("Collection deployed"),
           "success"
         )
       );

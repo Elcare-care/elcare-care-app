@@ -30,6 +30,7 @@ import {
   type ConfirmedSnapshot,
 } from "./useReconciliation";
 import { useTxToast } from "./useTxToast";
+import { t } from "@/lib/i18n";
 
 // ── useFreshOffer ─────────────────────────────────────────────
 
@@ -248,7 +249,7 @@ export function useWithdrawOffer(publicKey: string | null) {
         },
         {
           action: "Withdrawing offer",
-          successMessage: () => "Offer withdrawn successfully",
+          successMessage: () => t("offer_withdrawn_success"),
         }
       );
       if (result === null) {
@@ -294,7 +295,7 @@ export function useReclaimOffer(publicKey: string | null) {
         },
         {
           action: "Reclaiming offer funds",
-          successMessage: () => "Offer funds reclaimed successfully",
+          successMessage: () => t("offer_reclaimed_success"),
         }
       );
       if (result === null) {
@@ -342,7 +343,7 @@ export function useAcceptOffer(publicKey: string | null) {
         },
         {
           action: "Accepting offer",
-          successMessage: () => "Offer accepted successfully",
+          successMessage: () => t("offer_accepted_success"),
         }
       );
       if (result === null) {
@@ -388,7 +389,7 @@ export function useRejectOffer(publicKey: string | null) {
         },
         {
           action: "Rejecting offer",
-          successMessage: () => "Offer rejected successfully",
+          successMessage: () => t("offer_rejected_success"),
         }
       );
       if (result === null) {
@@ -426,7 +427,7 @@ export function useMakeOffer(publicKey: string | null) {
         },
         {
           action: "Placing offer",
-          successMessage: () => "Offer placed successfully",
+          successMessage: () => t("offer_success_status"),
         }
       );
       if (result === null) {

@@ -22,6 +22,7 @@ import {
   RefreshCw,
 } from "lucide-react";
 import { getReadableErrorMessage } from "@/lib/errors";
+import { t } from "@/lib/i18n";
 
 type TxPhase =
   | "idle"
@@ -58,6 +59,7 @@ export default function CollectionMintClient({ address }: { address: string }) {
   const [txPhase, setTxPhase] = useState<TxPhase>("idle");
   const [txMessage, setTxMessage] = useState<string | null>(null);
   const [resultDetail, setResultDetail] = useState<string | null>(null);
+  const [pendingOp, setPendingOp] = useState<"mint" | "redeem" | null>(null);
 
   const isLazy = useMemo(
     () =>
@@ -105,6 +107,7 @@ export default function CollectionMintClient({ address }: { address: string }) {
     setTxPhase("idle");
     setTxMessage(null);
     setResultDetail(null);
+    setPendingOp(null);
   }, []);
 
   const runMintNormal721 = useCallback(async () => {
@@ -131,6 +134,7 @@ export default function CollectionMintClient({ address }: { address: string }) {
       return;
     }
     setTxPhase("signing");
+    setPendingOp("mint");
     setTxMessage(null);
     try {
       const id = await mint721(publicKey, address, to, uri);
@@ -177,6 +181,7 @@ export default function CollectionMintClient({ address }: { address: string }) {
       return;
     }
     setTxPhase("signing");
+    setPendingOp("mint");
     setTxMessage(null);
     try {
       const tid = await mint1155New(publicKey, address, to, amt, uri);
@@ -212,6 +217,7 @@ export default function CollectionMintClient({ address }: { address: string }) {
       return;
     }
     setTxPhase("signing");
+    setPendingOp("redeem");
     try {
       const tokenId = await redeemLazy721(
         publicKey,
@@ -261,6 +267,7 @@ export default function CollectionMintClient({ address }: { address: string }) {
       return;
     }
     setTxPhase("signing");
+    setPendingOp("redeem");
     try {
       await redeemLazy1155(
         publicKey,
@@ -280,6 +287,14 @@ export default function CollectionMintClient({ address }: { address: string }) {
   }, [publicKey, lazyTokenId, lazyBuyerQuota, lazyPrice, lazyCurrency, lazyUri, lazyUriHash, lazyValidUntil, signatureHex, redeemAmount, address]);
 
   const isBusy = txPhase === "signing" || txPhase === "validating";
+  const pendingButtonLabel =
+    txPhase === "validating"
+      ? t("launchpad_pending_checking")
+      : t("launchpad_pending_signing");
+  const pendingStatus =
+    pendingOp === "redeem"
+      ? t("launchpad_redeem_pending")
+      : t("launchpad_mint_pending");
 
   const derived721VoucherJson = useMemo(() => JSON.stringify({
     token_id: lazyTokenId,
@@ -406,6 +421,18 @@ export default function CollectionMintClient({ address }: { address: string }) {
                 </div>
               )}
 
+              {isBusy && (
+                <div
+                  role="status"
+                  className="rounded-2xl border border-brand-200 bg-brand-50 p-5 flex gap-3 items-center"
+                >
+                  <Loader2 className="animate-spin text-brand-500 shrink-0" size={22} />
+                  <p className="text-sm font-semibold text-brand-800 font-inter">
+                    {pendingStatus}
+                  </p>
+                </div>
+              )}
+
               {record && !isLazy && record.kind === "Normal721" && (
                 <div className="bg-white rounded-3xl border border-gray-100 p-8 shadow-sm space-y-4">
                   <h2 className="text-xl font-display font-bold text-gray-900">
@@ -440,7 +467,7 @@ export default function CollectionMintClient({ address }: { address: string }) {
                     {isBusy ? (
                       <span className="inline-flex items-center justify-center gap-2">
                         <Loader2 className="animate-spin" size={20} />
-                        {txPhase === "validating" ? "Checking…" : "Sign in Freighter…"}
+                        {pendingButtonLabel}
                       </span>
                     ) : (
                       "Mint NFT"
@@ -491,7 +518,7 @@ export default function CollectionMintClient({ address }: { address: string }) {
                     onClick={runMintNormal1155}
                     className="w-full rounded-2xl bg-brand-500 py-4 text-white font-bold hover:bg-brand-600 disabled:opacity-50"
                   >
-                    {isBusy ? "Sign in Freighter…" : "Mint"}
+                    {isBusy ? pendingButtonLabel : "Mint"}
                   </button>
                 </div>
               )}
@@ -562,7 +589,7 @@ export default function CollectionMintClient({ address }: { address: string }) {
                     onClick={runRedeem721}
                     className="w-full rounded-2xl bg-brand-500 py-4 text-white font-bold hover:bg-brand-600 disabled:opacity-50 mt-2"
                   >
-                    {isBusy ? "Sign in Freighter…" : "Redeem & mint"}
+                    {isBusy ? pendingButtonLabel : "Redeem & mint"}
                   </button>
                 </div>
               )}
@@ -654,7 +681,7 @@ export default function CollectionMintClient({ address }: { address: string }) {
                     onClick={runRedeem1155}
                     className="w-full rounded-2xl bg-brand-500 py-4 text-white font-bold hover:bg-brand-600 disabled:opacity-50 mt-2"
                   >
-                    {isBusy ? "Sign in Freighter…" : "Redeem"}
+                    {isBusy ? pendingButtonLabel : "Redeem"}
                   </button>
                 </div>
               )}

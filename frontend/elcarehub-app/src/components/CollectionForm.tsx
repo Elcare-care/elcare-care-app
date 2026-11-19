@@ -281,10 +281,10 @@ export function CollectionForm() {
       }
     }
 
-    pushToast("Deploying your collection…", "info");
+    pushToast(t("launchpad_deploy_pending_button"), "info");
     const addr = await deploy(input);
     if (addr) {
-      pushToast("Collection deployed successfully!", "success");
+      pushToast(t("launchpad_deploy_success"), "success");
       setSuccessAddress(addr);
       // Draft fulfilled — clear it so the next collection starts fresh
       if (publicKey) clearDraft(publicKey);
@@ -819,6 +819,16 @@ export function CollectionForm() {
               </p>
             )}
 
+            {isDeploying && (
+              <div
+                role="status"
+                className="mb-4 flex items-center gap-3 rounded-2xl bg-brand-50 px-6 py-4 text-sm font-semibold text-brand-700"
+              >
+                <Loader2 size={20} className="animate-spin" aria-hidden="true" />
+                {t("launchpad_deploy_pending_status")}
+              </div>
+            )}
+
             <GuardButton
               type="button"
               disabled={isDeploying || !hasSupportedTokens || isPreflighting || preflightBlocked}
@@ -829,7 +839,7 @@ export function CollectionForm() {
               {isDeploying ? (
                 <>
                   <Loader2 size={24} className="animate-spin" />
-                  Deploying to Stellar…
+                  {t("launchpad_deploy_pending_button")}
                 </>
               ) : (
                 <>

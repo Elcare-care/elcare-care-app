@@ -22,6 +22,7 @@ import { getReadableErrorMessage } from "@/lib/errors";
 import { config } from "@/lib/config";
 import { useTransientErrorToast } from "./useTransientErrorToast";
 import { useTxToast } from "./useTxToast";
+import { t } from "@/lib/i18n";
 import { assertSupportedTokenAddress } from "@/lib/token-support";
 import { DEFAULT_TOKEN } from "@/config/tokens";
 import {
@@ -185,7 +186,7 @@ export function useCreateAuction(creatorPublicKey: string | null) {
 
         if (!metadataCid) {
           // Step 1: Upload image to IPFS.
-          setProgress("Uploading image to IPFS…");
+          setProgress(t("progress_uploading_image"));
           const imageResult = await uploadImageToIPFS(input.imageFile, input.title);
 
           // Step 2: Build metadata JSON.
@@ -199,19 +200,19 @@ export function useCreateAuction(creatorPublicKey: string | null) {
           };
 
           // Step 3: Upload metadata to IPFS.
-          setProgress("Uploading metadata to IPFS…");
+          setProgress(t("progress_uploading_metadata"));
           const metadataResult = await uploadMetadataToIPFS(metadata, input.title);
           metadataCid = metadataResult.cid;
         }
 
         // Step 4: Validate token and call the Soroban contract via useTxToast.
-        setProgress("Creating on-chain auction…");
+        setProgress(t("progress_creating_auction"));
         const token = await assertSupportedTokenAddress(
           input.tokenAddress ?? DEFAULT_TOKEN.address,
           "auction"
         );
 
-        setProgress("Creating on-chain auction…");
+        setProgress(t("progress_creating_auction"));
         const auctionId = await run(
           () =>
             createAuction(
@@ -227,7 +228,7 @@ export function useCreateAuction(creatorPublicKey: string | null) {
 
         if (auctionId === null) return null;
 
-        setProgress("Auction created successfully!");
+        setProgress(t("progress_auction_created"));
         return auctionId;
       } catch (err: unknown) {
         setError(getReadableErrorMessage(err, "Failed to create auction"));

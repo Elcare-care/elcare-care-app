@@ -18,6 +18,7 @@
 
 import { Loader2, RotateCcw, AlertTriangle } from "lucide-react";
 import type { RecordState } from "@/hooks/useReconciliation";
+import { t } from "@/lib/i18n";
 
 interface ProvisionalBadgeProps {
   recordState: RecordState;
@@ -26,30 +27,28 @@ interface ProvisionalBadgeProps {
 
 const CONFIG: Record<
   Exclude<RecordState, "confirmed">,
-  { label: string; icon: React.ElementType; classes: string; spin: boolean; title: string }
+  { labelKey: Parameters<typeof t>[0]; icon: React.ElementType; classes: string; spin: boolean; titleKey: Parameters<typeof t>[0] }
 > = {
   pending: {
-    label: "Pending confirmation",
+    labelKey: "provisional_pending_label",
     icon: Loader2,
     classes: "bg-brand-500/20 text-brand-300 border-brand-500/30",
     spin: true,
-    title:
-      "This transaction was just submitted and is shown optimistically. It has not yet been confirmed by the indexer.",
+    titleKey: "provisional_pending_title",
   },
   stale: {
-    label: "Confirmation delayed",
+    labelKey: "provisional_stale_label",
     icon: AlertTriangle,
     classes: "bg-amber-500/20 text-amber-300 border-amber-500/30",
     spin: false,
-    title:
-      "This transaction is taking longer than expected to confirm. The value shown may not reflect the latest on-chain state.",
+    titleKey: "provisional_stale_title",
   },
   rejected: {
-    label: "Update reverted",
+    labelKey: "provisional_rejected_label",
     icon: RotateCcw,
     classes: "bg-terracotta-500/20 text-terracotta-300 border-terracotta-500/30",
     spin: false,
-    title: "This transaction failed or was rolled back — showing the last confirmed value.",
+    titleKey: "provisional_rejected_title",
   },
 };
 
@@ -61,7 +60,9 @@ const CONFIG: Record<
 export function ProvisionalBadge({ recordState, className = "" }: ProvisionalBadgeProps) {
   if (recordState === "confirmed") return null;
 
-  const { label, icon: Icon, classes, spin, title } = CONFIG[recordState];
+  const { labelKey, icon: Icon, classes, spin, titleKey } = CONFIG[recordState];
+  const label = t(labelKey);
+  const title = t(titleKey);
 
   return (
     <span
