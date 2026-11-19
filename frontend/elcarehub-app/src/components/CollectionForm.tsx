@@ -12,12 +12,13 @@ import { useWalletContext } from "@/context/WalletContext";
 import { useToast } from "@/components/ToastProvider";
 import { Loader2, Rocket, CheckCircle, ArrowRight, ArrowLeft, Check, AlertTriangle, Info, ExternalLink, Save, X } from "lucide-react";
 import { GuardButton } from "./WalletGuard";
-import { CollectionKind } from "@/lib/launchpad";
+import { CollectionKind, getCollectionKindLabel } from "@/lib/launchpad";
 import { DEFAULT_TOKEN } from "@/config/tokens";
 import { useSupportedTokens } from "@/hooks/useSupportedTokens";
 import { getDefaultSupportedToken } from "@/lib/token-support";
 import { config } from "@/lib/config";
 import { validateCollectionName } from "@/lib/validation";
+import { t } from "@/lib/i18n";
 
 function isValidStellarAddress(addr: string): boolean {
   try {
@@ -68,6 +69,23 @@ const KIND_OPTIONS = [
   { id: "LazyMint721", label: "Lazy 721", desc: "Mint only when sold (Gasless)" },
   { id: "LazyMint1155", label: "Lazy 1155", desc: "Multi-edition lazy minting" },
 ] as const;
+
+// ── Presentation helpers ─────────────────────────────────────────────────────
+
+/** Format a value for display, hiding empty/undefined with a placeholder. */
+function formatDisplayValue(value: string | number | null | undefined, placeholder = "—"): string {
+  if (value === null || value === undefined || String(value).trim() === "") {
+    return placeholder;
+  }
+  return String(value);
+}
+
+/** Truncate address for display while keeping it readable. */
+function formatAddressDisplay(address: string | null | undefined, maxLength = 20): string {
+  if (!address || address.trim() === "") return "—";
+  if (address.length <= maxLength) return address;
+  return `${address.slice(0, 10)}…${address.slice(-8)}`;
+}
 
 export function CollectionForm() {
   const { publicKey } = useWalletContext();
@@ -177,6 +195,15 @@ export function CollectionForm() {
   useEffect(() => {
     setNextAttempted(false);
   }, [step]);
+
+  // Announce step changes to screen readers
+  const [stepAnnouncement, setStepAnnouncement] = useState("");
+  useEffect(() => {
+    const remaining = step < STEPS.length - 1 ? `${t('wizard_step_remaining')}: ${STEPS.length - step - 1}` : '';
+    setStepAnnouncement(
+      `${t('wizard_current_step')}: ${STEPS[step]}. ${t('wizard_step')} ${step + 1} ${t('wizard_of')} ${STEPS.length}. ${remaining}`
+    );
+  }, [step, t]);
 
   const fieldErrors = useMemo(() => {
     const errors: Record<string, string> = {};
@@ -422,41 +449,59 @@ export function CollectionForm() {
       )}
 
       {/* Step indicator */}
-      <div className="flex items-center justify-between mb-10">
-        {STEPS.map((label, i) => (
-          <div key={label} className="flex items-center flex-1">
-            <div className="flex flex-col items-center">
-              <div
-                className={`w-9 h-9 rounded-full flex items-center justify-center font-bold text-sm border-2 transition-all ${
-                  i < step
-                    ? "bg-brand-500 border-brand-500 text-white"
-                    : i === step
-                    ? "border-brand-500 text-brand-600 bg-brand-50"
-                    : "border-gray-200 text-gray-400 bg-white"
-                }`}
-              >
-                {i < step ? <Check size={16} /> : i + 1}
+      <div className="mb-10">
+        <div
+          aria-live="polite"
+          aria-atomic="true"
+          className="text-sm font-semibold text-gray-600 mb-4 text-center"
+        >
+          {t('wizard_step')} {step + 1} {t('wizard_of')} {STEPS.length} — {STEPS[step]}
+        </div>
+        <div className="flex items-center justify-between">
+          {STEPS.map((label, i) => (
+            <div key={label} className="flex items-center flex-1">
+              <div className="flex flex-col items-center">
+                <div
+                  className={`w-9 h-9 rounded-full flex items-center justify-center font-bold text-sm border-2 transition-all ${
+                    i < step
+                      ? "bg-brand-500 border-brand-500 text-white"
+                      : i === step
+                      ? "border-brand-500 text-brand-600 bg-brand-50"
+                      : "border-gray-200 text-gray-400 bg-white"
+                  }`}
+                  aria-current={i === step ? "step" : undefined}
+                >
+                  {i < step ? <Check size={16} /> : i + 1}
+                </div>
+                <span
+                  className={`mt-1.5 text-xs font-bold hidden sm:block ${
+                    i <= step ? "text-brand-600" : "text-gray-400"
+                  }`}
+                >
+                  {label}
+                </span>
               </div>
-              <span
-                className={`mt-1.5 text-xs font-bold hidden sm:block ${
-                  i <= step ? "text-brand-600" : "text-gray-400"
-                }`}
-              >
-                {label}
-              </span>
+              {i < STEPS.length - 1 && (
+                <div
+                  className={`flex-1 h-0.5 mx-2 transition-all ${
+                    i < step ? "bg-brand-500" : "bg-gray-200"
+                  }`}
+                />
+              )}
             </div>
-            {i < STEPS.length - 1 && (
-              <div
-                className={`flex-1 h-0.5 mx-2 transition-all ${
-                  i < step ? "bg-brand-500" : "bg-gray-200"
-                }`}
-              />
-            )}
-          </div>
-        ))}
+          ))}
+        </div>
       </div>
 
       <div className="bg-white rounded-3xl shadow-2xl shadow-brand-900/5 border border-brand-100/50 p-6 md:p-10">
+        {/* Live region for step change announcements */}
+        <div
+          aria-live="polite"
+          aria-atomic="true"
+          className="sr-only"
+        >
+          {stepAnnouncement}
+        </div>
         {/* Step 0: Kind Selection */}
         {step === 0 && (
           <div>
@@ -677,11 +722,11 @@ export function CollectionForm() {
 
             <div className="space-y-3 mb-8 rounded-2xl border border-gray-100 bg-gray-50/50 p-6">
               {[
-                { label: "Collection Type", value: form.kind },
-                { label: "Name", value: form.name || "—" },
+                { label: "Collection Type", value: getCollectionKindLabel(form.kind) },
+                { label: "Name", value: formatDisplayValue(form.name) },
                 ...(is721
                   ? [
-                      { label: "Symbol", value: form.symbol || "—" },
+                      { label: "Symbol", value: formatDisplayValue(form.symbol) },
                       { label: "Max Supply", value: form.maxSupply.toLocaleString() },
                     ]
                   : []),
@@ -693,11 +738,11 @@ export function CollectionForm() {
                   label: "Fee Token",
                   value:
                     supportedTokens.find((t) => t.address === form.currencyAddress)
-                      ?.symbol ?? form.currencyAddress,
+                      ?.symbol ?? formatDisplayValue(form.currencyAddress, "Unknown token"),
                 },
                 {
                   label: "Royalty Receiver",
-                  value: form.royaltyReceiver || publicKey || "—",
+                  value: formatAddressDisplay(form.royaltyReceiver || publicKey),
                   mono: true,
                 },
               ].map(({ label, value, mono }) => (

@@ -70,6 +70,14 @@ export const translations = {
     empty_state_no_items: 'No items found',
     view_details: 'View Details',
     back: 'Back',
+
+    // wizard
+    wizard_step: 'Step',
+    wizard_of: 'of',
+    wizard_current_step: 'Current step',
+    wizard_step_complete: 'completed',
+    wizard_step_current: 'current',
+    wizard_step_remaining: 'remaining',
   },
   sw: {
     // navigation — Swahili
@@ -123,6 +131,14 @@ export const translations = {
     empty_state_no_items: 'Hakuna vitu vilivyopatikana',
     view_details: 'Angalia Maelezo',
     back: 'Rudi',
+
+    // wizard
+    wizard_step: 'Hatua',
+    wizard_of: 'ya',
+    wizard_current_step: 'Hatua ya sasa',
+    wizard_step_complete: 'imekamilika',
+    wizard_step_current: 'ya sasa',
+    wizard_step_remaining: 'zinazobaki',
   },
 } as const;
 

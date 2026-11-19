@@ -288,7 +288,7 @@ describe("CollectionForm wizard", () => {
     it("displays collection type in review summary", async () => {
       const user = userEvent.setup();
       await goToStep3(user);
-      expect(screen.getByText("Normal721")).toBeInTheDocument();
+      expect(screen.getByText("Standard 721")).toBeInTheDocument();
     });
 
     it("displays collection name in review summary", async () => {

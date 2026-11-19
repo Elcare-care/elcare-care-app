@@ -66,6 +66,7 @@ import {
   clearListingWizardDraft,
 } from "@/lib/listingWizardDraft";
 import { MAX_RECIPIENTS } from "@/components/ListingForm";
+import { t } from "@/lib/i18n";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -576,6 +577,15 @@ export function ListingWizard({ onSuccess, onCancel }: ListingWizardProps) {
     setStep((s) => Math.max(s - 1, 0));
   }
 
+  // Announce step changes to screen readers
+  const [stepAnnouncement, setStepAnnouncement] = useState("");
+  useEffect(() => {
+    const remaining = step < STEPS.length - 1 ? `${t('wizard_step_remaining')}: ${STEPS.length - step - 1}` : '';
+    setStepAnnouncement(
+      `${t('wizard_current_step')}: ${STEPS[step]}. ${t('wizard_step')} ${step + 1} ${t('wizard_of')} ${STEPS.length}. ${remaining}`
+    );
+  }, [step, t]);
+
   // ── Success screen ────────────────────────────────────────────────────────
 
   if (successId !== null) {
@@ -666,33 +676,51 @@ export function ListingWizard({ onSuccess, onCancel }: ListingWizardProps) {
       </div>
 
       {/* Step indicator */}
-      <div className="flex items-center justify-between mb-10">
-        {STEPS.map((label, i) => (
-          <div key={label} className="flex items-center flex-1">
-            <div className="flex flex-col items-center">
-              <div
-                className={`w-9 h-9 rounded-full flex items-center justify-center font-bold text-sm border-2 transition-all ${
-                  i < step
-                    ? "bg-brand-500 border-brand-500 text-white"
-                    : i === step
-                    ? "border-brand-500 text-brand-600 bg-brand-50"
-                    : "border-gray-200 text-gray-400 bg-white"
-                }`}
-              >
-                {i < step ? <Check size={16} /> : i + 1}
+      <div className="mb-10">
+        <div
+          aria-live="polite"
+          aria-atomic="true"
+          className="text-sm font-semibold text-gray-600 mb-4 text-center"
+        >
+          {t('wizard_step')} {step + 1} {t('wizard_of')} {STEPS.length} — {STEPS[step]}
+        </div>
+        <div className="flex items-center justify-between">
+          {STEPS.map((label, i) => (
+            <div key={label} className="flex items-center flex-1">
+              <div className="flex flex-col items-center">
+                <div
+                  className={`w-9 h-9 rounded-full flex items-center justify-center font-bold text-sm border-2 transition-all ${
+                    i < step
+                      ? "bg-brand-500 border-brand-500 text-white"
+                      : i === step
+                      ? "border-brand-500 text-brand-600 bg-brand-50"
+                      : "border-gray-200 text-gray-400 bg-white"
+                  }`}
+                  aria-current={i === step ? "step" : undefined}
+                >
+                  {i < step ? <Check size={16} /> : i + 1}
+                </div>
+                <span className={`mt-1.5 text-xs font-bold hidden sm:block ${i <= step ? "text-brand-600" : "text-gray-400"}`}>
+                  {label}
+                </span>
               </div>
-              <span className={`mt-1.5 text-xs font-bold hidden sm:block ${i <= step ? "text-brand-600" : "text-gray-400"}`}>
-                {label}
-              </span>
+              {i < STEPS.length - 1 && (
+                <div className={`flex-1 h-0.5 mx-2 transition-all ${i < step ? "bg-brand-500" : "bg-gray-200"}`} />
+              )}
             </div>
-            {i < STEPS.length - 1 && (
-              <div className={`flex-1 h-0.5 mx-2 transition-all ${i < step ? "bg-brand-500" : "bg-gray-200"}`} />
-            )}
-          </div>
-        ))}
+          ))}
+        </div>
       </div>
 
       <div className="bg-white rounded-3xl shadow-2xl shadow-brand-900/5 border border-brand-100/50 p-6 md:p-10">
+        {/* Live region for step change announcements */}
+        <div
+          aria-live="polite"
+          aria-atomic="true"
+          className="sr-only"
+        >
+          {stepAnnouncement}
+        </div>
         {/* ── Step 0: Collection ── */}
         {step === 0 && (
           <div>
