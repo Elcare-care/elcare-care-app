@@ -7,6 +7,7 @@ import { useCollectionDetail } from "@/hooks/useLaunchpad";
 import { useWalletContext } from "@/context/WalletContext";
 import { Loader2, ShieldCheck, User, Percent, Database, Package, ArrowLeft, Plus, Lock, Unlock, Ticket, CheckCircle, XCircle, Clock, AlertTriangle } from "lucide-react";
 import { useState, useEffect } from "react";
+import { getCollectionKindLabel } from "@/lib/launchpad";
 
 interface Voucher {
   id: number;

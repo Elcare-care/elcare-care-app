@@ -6,6 +6,7 @@ import { Navbar } from "@/components/Navbar";
 import { useCreatorCollections } from "@/hooks/useLaunchpad";
 import { useWalletContext } from "@/context/WalletContext";
 import { Loader2, Search, Filter, ExternalLink, Plus, Palette, Crown, AlertCircle } from "lucide-react";
+import { getCollectionKindLabel } from "@/lib/launchpad";
 
 export default function MyCollectionsPage() {
   const { publicKey, isConnected } = useWalletContext();
@@ -139,8 +140,8 @@ export default function MyCollectionsPage() {
                 className="appearance-none pl-4 pr-10 py-4 rounded-2xl border border-gray-200 bg-white focus:border-brand-500 focus:outline-none transition-all shadow-sm font-inter font-semibold text-gray-700"
               >
                 <option value="All">All Types</option>
-                <option value="Normal721">Normal 721</option>
-                <option value="Normal1155">Normal 1155</option>
+                <option value="Normal721">Standard 721</option>
+                <option value="Normal1155">Standard 1155</option>
                 <option value="LazyMint721">Lazy 721</option>
                 <option value="LazyMint1155">Lazy 1155</option>
               </select>
@@ -201,7 +202,7 @@ export default function MyCollectionsPage() {
                     <span className={`px-3 py-1 rounded-full text-xs font-bold tracking-wider uppercase ${
                       c.kind.startsWith('Lazy') ? 'bg-amber-100 text-amber-700' : 'bg-brand-100 text-brand-700'
                     }`}>
-                      {c.kind}
+                      {getCollectionKindLabel(c.kind)}
                     </span>
                     <Link
                       href={`/launchpad/collections/${c.address}`}
@@ -217,7 +218,7 @@ export default function MyCollectionsPage() {
                     <div className="flex justify-between text-sm">
                       <span className="text-gray-400 font-inter">Type</span>
                       <span className="text-gray-700 font-medium">
-                        {c.kind.replace('Mint', ' Mint')}
+                        {getCollectionKindLabel(c.kind)}
                       </span>
                     </div>
                     <div className="flex justify-between text-sm">

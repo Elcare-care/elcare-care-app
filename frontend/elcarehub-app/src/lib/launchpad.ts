@@ -16,6 +16,17 @@ export type CollectionKind =
   | "LazyMint721"
   | "LazyMint1155";
 
+/** Get human-readable label for a collection kind. */
+export function getCollectionKindLabel(kind: CollectionKind): string {
+  const labels: Record<CollectionKind, string> = {
+    Normal721: "Standard 721",
+    Normal1155: "Standard 1155",
+    LazyMint721: "Lazy 721",
+    LazyMint1155: "Lazy 1155",
+  };
+  return labels[kind] || kind;
+}
+
 export interface CollectionRecord {
   address: string;
   kind: CollectionKind;
