@@ -39,7 +39,17 @@ vi.mock('../prisma-write',  () => ({ default: mockPrisma }));
 vi.mock('../redis.js',      () => ({ default: mockRedis  }));
 
 import { isValidStellarAddress } from '../stellar-address';
-import { listingsQuerySchema, collectionsQuerySchema } from '../api/query-schemas';
+import {
+  listingsQuerySchema,
+  auctionsQuerySchema,
+  offersQuerySchema,
+  walletActivityQuerySchema,
+  collectionsQuerySchema,
+  searchQuerySchema,
+  eventsQuerySchema,
+  syncGapsQuerySchema,
+  royaltyBreakdownQuerySchema,
+} from '../api/query-schemas';
 import router from '../api/routes';
 import { errorHandler } from '../api/errors';
 
@@ -369,5 +379,128 @@ describe('Error envelope shape', () => {
   it('does not include a top-level "stack" property', async () => {
     const res = await request(app).get('/listings?limit=9999');
     expect(res.body).not.toHaveProperty('stack');
+  });
+});
+
+
+// ── 6. Indexer 400 param matrix — missing / negative / too-large / wrong-type / unknown ──
+//
+// Table-driven matrix that walks every exported route schema and asserts each
+// malformed parameter category (missing required, negative, too-large,
+// wrong-type, unknown enum) is rejected by the schema. The HTTP block below
+// then confirms the rejection surfaces as a consistent 400 BAD_REQUEST
+// envelope through the real router + errorHandler, so clients always see the
+// same error shape regardless of which route produced it.
+
+type MatrixCase = {
+  name: string;
+  category: 'missing' | 'negative' | 'too-large' | 'wrong-type' | 'unknown';
+  schema: { safeParse: (v: unknown) => { success: boolean } };
+  input: Record<string, unknown>;
+};
+
+const paramMatrix: MatrixCase[] = [
+  // ── listingsQuerySchema ────────────────────────────────────────────────────
+  { name: 'listings.limit too-large',       category: 'too-large',  schema: listingsQuerySchema,      input: { limit: 101 } },
+  { name: 'listings.limit wrong-type',      category: 'wrong-type', schema: listingsQuerySchema,      input: { limit: 'abc' } },
+  { name: 'listings.offset too-large',      category: 'too-large',  schema: listingsQuerySchema,      input: { offset: 10001 } },
+  { name: 'listings.offset negative',       category: 'negative',   schema: listingsQuerySchema,      input: { offset: -1 } },
+  { name: 'listings.minPrice negative',     category: 'negative',   schema: listingsQuerySchema,      input: { minPrice: -5 } },
+  { name: 'listings.maxPrice wrong-type',   category: 'wrong-type', schema: listingsQuerySchema,      input: { maxPrice: 'xyz' } },
+  { name: 'listings.status unknown',        category: 'unknown',    schema: listingsQuerySchema,      input: { status: 'INVALID' } },
+  { name: 'listings.sort unknown',          category: 'unknown',    schema: listingsQuerySchema,      input: { sort: 'bogus' } },
+  { name: 'listings.cursor_direction unknown', category: 'unknown', schema: listingsQuerySchema,      input: { cursor_direction: 'sideways' } },
+
+  // ── auctionsQuerySchema ────────────────────────────────────────────────────
+  { name: 'auctions.limit too-large',       category: 'too-large',  schema: auctionsQuerySchema,      input: { limit: 101 } },
+  { name: 'auctions.offset too-large',      category: 'too-large',  schema: auctionsQuerySchema,      input: { offset: 10001 } },
+  { name: 'auctions.offset negative',       category: 'negative',   schema: auctionsQuerySchema,      input: { offset: -1 } },
+  { name: 'auctions.status unknown',        category: 'unknown',    schema: auctionsQuerySchema,      input: { status: 'INVALID' } },
+  { name: 'auctions.creator wrong-type',   category: 'wrong-type', schema: auctionsQuerySchema,      input: { creator: 'bad' } },
+  { name: 'auctions.cursor_direction unknown', category: 'unknown', schema: auctionsQuerySchema,     input: { cursor_direction: 'sideways' } },
+
+  // ── offersQuerySchema ───────────────────────────────────────────────────────
+  { name: 'offers.listing_id negative',     category: 'negative',   schema: offersQuerySchema,        input: { listing_id: '-1' } },
+  { name: 'offers.listing_id wrong-type',   category: 'wrong-type', schema: offersQuerySchema,        input: { listing_id: 'abc' } },
+  { name: 'offers.offerer wrong-type',      category: 'wrong-type', schema: offersQuerySchema,        input: { offerer: 'bad' } },
+  { name: 'offers.limit too-large',         category: 'too-large',  schema: offersQuerySchema,        input: { limit: 101 } },
+  { name: 'offers.offset too-large',       category: 'too-large',  schema: offersQuerySchema,        input: { offset: 10001 } },
+
+  // ── walletActivityQuerySchema ──────────────────────────────────────────────
+  { name: 'walletActivity.limit too-large',  category: 'too-large',  schema: walletActivityQuerySchema, input: { limit: 201 } },
+  { name: 'walletActivity.limit wrong-type', category: 'wrong-type', schema: walletActivityQuerySchema, input: { limit: 'abc' } },
+  { name: 'walletActivity.offset too-large', category: 'too-large',  schema: walletActivityQuerySchema, input: { offset: 10001 } },
+  { name: 'walletActivity.offset negative',  category: 'negative',   schema: walletActivityQuerySchema, input: { offset: -1 } },
+
+  // ── collectionsQuerySchema ─────────────────────────────────────────────────
+  { name: 'collections.kind unknown',       category: 'unknown',    schema: collectionsQuerySchema,   input: { kind: 'erc20' } },
+  { name: 'collections.limit too-large',    category: 'too-large',  schema: collectionsQuerySchema,   input: { limit: 101 } },
+  { name: 'collections.offset too-large',   category: 'too-large',  schema: collectionsQuerySchema,   input: { offset: 10001 } },
+
+  // ── searchQuerySchema (q is required) ───────────────────────────────────────
+  { name: 'search.q missing',               category: 'missing',    schema: searchQuerySchema,        input: {} },
+  { name: 'search.q empty',                 category: 'missing',    schema: searchQuerySchema,        input: { q: '' } },
+  { name: 'search.limit too-large',         category: 'too-large',  schema: searchQuerySchema,        input: { q: 'ok', limit: 51 } },
+  { name: 'search.types unknown',           category: 'unknown',    schema: searchQuerySchema,        input: { q: 'ok', types: 'bogus' } },
+
+  // ── eventsQuerySchema ───────────────────────────────────────────────────────
+  { name: 'events.lastEventId wrong-type',  category: 'wrong-type', schema: eventsQuerySchema,        input: { lastEventId: 'abc' } },
+  { name: 'events.lastEventId malformed',   category: 'wrong-type', schema: eventsQuerySchema,       input: { lastEventId: 'x-y-z' } },
+  { name: 'events.listingId wrong-type',     category: 'wrong-type', schema: eventsQuerySchema,        input: { listingId: 'abc' } },
+  { name: 'events.listingId negative',      category: 'negative',   schema: eventsQuerySchema,        input: { listingId: '-1' } },
+  { name: 'events.types wrong-type',        category: 'wrong-type', schema: eventsQuerySchema,        input: { types: 'a,b!' } },
+
+  // ── syncGapsQuerySchema ─────────────────────────────────────────────────────
+  { name: 'syncGaps.status unknown',        category: 'unknown',    schema: syncGapsQuerySchema,      input: { status: 'Unknown' } },
+  { name: 'syncGaps.source unknown',         category: 'unknown',    schema: syncGapsQuerySchema,      input: { source: 'bogus' } },
+  { name: 'syncGaps.limit too-large',        category: 'too-large',  schema: syncGapsQuerySchema,      input: { limit: 501 } },
+  { name: 'syncGaps.offset too-large',       category: 'too-large',  schema: syncGapsQuerySchema,      input: { offset: 10001 } },
+
+  // ── royaltyBreakdownQuerySchema ─────────────────────────────────────────────
+  { name: 'royaltyBreakdown.from negative',  category: 'negative',   schema: royaltyBreakdownQuerySchema, input: { from: -1 } },
+  { name: 'royaltyBreakdown.to wrong-type',  category: 'wrong-type', schema: royaltyBreakdownQuerySchema, input: { to: 'abc' } },
+  { name: 'royaltyBreakdown.limit too-large', category: 'too-large', schema: royaltyBreakdownQuerySchema, input: { limit: 1001 } },
+  { name: 'royaltyBreakdown.offset too-large', category: 'too-large', schema: royaltyBreakdownQuerySchema, input: { offset: 10001 } },
+];
+
+describe('Indexer 400 param matrix — missing / negative / too-large / wrong-type / unknown', () => {
+  it.each(paramMatrix)('rejects $name ($category)', ({ schema, input }) => {
+    expect(schema.safeParse(input).success).toBe(false);
+  });
+
+  it('the matrix exercises every required category at least once', () => {
+    const categories = new Set(paramMatrix.map((c) => c.category));
+    for (const required of ['missing', 'negative', 'too-large', 'wrong-type', 'unknown'] as const) {
+      expect(categories.has(required)).toBe(true);
+    }
+  });
+
+  // ── HTTP consistency: malformed params surface as a uniform 400 envelope ──
+  // (uses /collections, whose middleware stack mirrors /listings — the bad
+  //  input is rejected by validateQuery before the route handler runs.)
+
+  it('GET /collections returns 400 BAD_REQUEST envelope for an unknown kind', async () => {
+    const res = await request(app).get('/collections?kind=erc20');
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatchObject({ code: 'BAD_REQUEST' });
+    expect(typeof res.body.error.message).toBe('string');
+  });
+
+  it('GET /collections returns 400 for a too-large limit', async () => {
+    const res = await request(app).get('/collections?limit=9999');
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe('BAD_REQUEST');
+  });
+
+  it('GET /collections returns 400 for a negative offset', async () => {
+    const res = await request(app).get('/collections?offset=-1');
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe('BAD_REQUEST');
+  });
+
+  it('the 400 envelope is consistent and does not leak a stack trace', async () => {
+    const res = await request(app).get('/collections?kind=erc20');
+    expect(JSON.stringify(res.body)).not.toContain('.ts:');
+    expect(JSON.stringify(res.body)).not.toContain(' at ');
   });
 });
