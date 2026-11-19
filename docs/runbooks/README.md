@@ -11,6 +11,10 @@ Each runbook covers: detection, containment, diagnosis, recovery, and post-incid
 |---|---|---|
 | [admin-read-only-diagnostic.md](./admin-read-only-diagnostic.md) | First-step read-only sync/health check for support | LOW |
 | [stalled-ingestion.md](./stalled-ingestion.md) | Indexer stops processing new ledgers | HIGH |
+| [poller-health-checklist.md](./poller-health-checklist.md) | Classify poller as healthy / degraded / stalled / re-org (read-only) | LOW |
+| [stale-cache-diagnostic.md](./stale-cache-diagnostic.md) | Compare a Redis-cached listing/auction with PostgreSQL (read-only) | LOW |
+| [redis-key-registry.md](./redis-key-registry.md) | Redis key prefixes, TTLs, and review checklist | — |
+| [cache-ttl-reference.md](./cache-ttl-reference.md) | Source-of-truth table for response-cache TTLs | — |
 | [reorganization.md](./reorganization.md) | Stellar chain reorg detected | MEDIUM–HIGH |
 | [database-outage.md](./database-outage.md) | PostgreSQL unavailable | CRITICAL |
 | [redis-outage.md](./redis-outage.md) | Redis cache unavailable | MEDIUM |
