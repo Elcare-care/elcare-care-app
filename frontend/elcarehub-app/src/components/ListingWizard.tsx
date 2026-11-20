@@ -42,7 +42,7 @@ import { useWalletContext } from "@/context/WalletContext";
 import { GuardButton } from "@/components/WalletGuard";
 import { TxErrorPanel } from "@/components/TxErrorPanel";
 import { useCreateListing } from "@/hooks/useMarketplace";
-import { useTxLifecycle, txStateLabel } from "@/hooks/useTxLifecycle";
+import { useTxLifecycle, txStatusMessage } from "@/hooks/useTxLifecycle";
 import { useSupportedTokens } from "@/hooks/useSupportedTokens";
 import { getDefaultSupportedToken } from "@/lib/token-support";
 import { DEFAULT_TOKEN, TokenConfig } from "@/config/tokens";
@@ -601,6 +601,7 @@ export function ListingWizard({ onSuccess, onCancel }: ListingWizardProps) {
             <span className="font-mono">{truncateAddress(form.collectionAddress)}</span>, token #{form.nftTokenId} —
             {" "}is now live on the ELCARE-HUB marketplace.
           </p>
+          <p className="text-brand-600 font-inter font-semibold">{t("tx_guidance_listing")}</p>
         </div>
         <div className="w-full rounded-2xl border border-gray-100 bg-gray-50/50 p-5 text-left text-sm space-y-2">
           <div className="flex justify-between"><span className="text-gray-500">Price</span><span className="font-bold">{form.price} {selectedToken.symbol}</span></div>
@@ -1166,7 +1167,7 @@ export function ListingWizard({ onSuccess, onCancel }: ListingWizardProps) {
 
             {isBusy && (
               <div className="mb-4 flex items-center gap-3 rounded-2xl bg-brand-50 px-6 py-4 text-sm font-semibold text-brand-700 animate-pulse">
-                <Loader2 size={20} className="animate-spin" /> {txStateLabel(listingTxState.state)}
+                <Loader2 size={20} className="animate-spin" /> {txStatusMessage(listingTxState)}
               </div>
             )}
 
@@ -1201,7 +1202,7 @@ export function ListingWizard({ onSuccess, onCancel }: ListingWizardProps) {
             >
               {isBusy ? (
                 <>
-                  <Loader2 size={24} className="animate-spin" /> {txStateLabel(listingTxState.state)}
+                  <Loader2 size={24} className="animate-spin" /> {txStatusMessage(listingTxState, { short: true })}
                 </>
               ) : (
                 <>

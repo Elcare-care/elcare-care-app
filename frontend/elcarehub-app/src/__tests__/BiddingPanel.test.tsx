@@ -34,7 +34,7 @@ jest.mock('@/hooks/useTxLifecycle', () => ({
     run: async (action: () => Promise<boolean>) => action(),
     reset: jest.fn(),
   }),
-  txStateLabel: () => '',
+  txStatusMessage: () => '',
   isTxActive: () => false,
 }));
 

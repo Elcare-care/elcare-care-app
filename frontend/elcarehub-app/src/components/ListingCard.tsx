@@ -20,6 +20,7 @@ import {
 import { GuardButton } from "./WalletGuard";
 import posthog from "posthog-js";
 import { CheckoutModal } from "./CheckoutModal";
+import { t } from "@/lib/i18n";
 
 interface ListingCardProps {
   listing: Listing;
@@ -154,7 +155,7 @@ export function ListingCard({ listing, onPurchased }: ListingCardProps) {
           role="status"
           className="sr-only"
         >
-          Purchase successful
+          {t("purchase_success_status")}
         </p>
       )}
       <div

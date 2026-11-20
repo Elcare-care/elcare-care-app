@@ -42,6 +42,7 @@ import { useDisclosure } from "@/hooks/useDisclosure";
 import { buildExpectedBuyArtworkIntent } from "@/lib/tx-intent";
 import { getNetworkLabel } from "@/lib/preflight";
 import { config } from "@/lib/config";
+import { useTxLifecycle, txStatusMessage } from "@/hooks/useTxLifecycle";
 
 interface CheckoutModalProps {
   isOpen: boolean;
@@ -261,7 +262,7 @@ export function CheckoutModal({
     : isPreflighting
     ? "Verifying listing is still available…"
     : isBuying
-    ? txStateLabel(txState.state) || "Processing your purchase. Please check your wallet for a signature request."
+    ? txStatusMessage(txState)
     : "";
   const statusPoliteness =
     (conflictMessage || txState.state === "error" || previewError) && !isPreflighting
@@ -269,7 +270,7 @@ export function CheckoutModal({
       : "polite";
 
   const buttonLabel = () => {
-    if (isBuying) return txStateLabel(txState.state) || "Processing…";
+    if (isBuying) return txStatusMessage(txState, { short: true });
     if (step === "confirm") return `Confirm & Pay ${preview?.buyerTotalDisplay ?? ""} ${selectedToken.symbol}`;
     return `Review & Pay ${preview?.itemPriceDisplay ?? ""} ${selectedToken.symbol}`;
   };
@@ -592,7 +593,7 @@ export function CheckoutModal({
               {isBuying ? (
                 <>
                   <Loader2 className="animate-spin" size={18} aria-hidden="true" />
-                  {txStateLabel(txState.state) || "Processing…"}
+                  {txStatusMessage(txState, { short: true })}
                 </>
               ) : (
                 buttonLabel()

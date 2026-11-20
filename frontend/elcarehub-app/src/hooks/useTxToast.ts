@@ -24,12 +24,13 @@ import { getReadableErrorMessage, isUserRejectionError } from "@/lib/errors";
 import { config } from "@/lib/config";
 import {
   useTxLifecycle,
-  txStateLabel,
+  txActionLabel,
   TxState,
   extractTxHash,
   classifyTxError,
 } from "./useTxLifecycle";
 import { isValidTxHash } from "@/lib/txLookup";
+import { t, type TranslationKey } from "@/lib/i18n";
 
 // ── Types ─────────────────────────────────────────────────────
 
@@ -108,6 +109,64 @@ export function getTxExplorerUrl(txHash: string | null | undefined): string | nu
   return `https://stellar.expert/explorer/${network}/tx/${txHash}`;
 }
 
+// ── Success guidance ─────────────────────────────────────────
+//
+// Maps the same free-form action labels used for lifecycle copy onto the
+// tx_guidance_* locale entries, so every success notification ends with a
+// concise, outcome-specific next action instead of a bare "Success".
+
+const TX_GUIDANCE_KEYS: Record<string, TranslationKey> = {
+  "purchase": "tx_guidance_purchase",
+  "bid": "tx_guidance_bid",
+  "create listing": "tx_guidance_listing",
+  "listing": "tx_guidance_listing",
+  "update listing": "tx_guidance_listing",
+  "create auction": "tx_guidance_auction_create",
+  "auction": "tx_guidance_auction_create",
+  "place offer": "tx_guidance_offer",
+  "placing offer": "tx_guidance_offer",
+  "offer": "tx_guidance_offer",
+  "accept offer": "tx_guidance_offer_response",
+  "accepting offer": "tx_guidance_offer_response",
+  "reject offer": "tx_guidance_offer_response",
+  "rejecting offer": "tx_guidance_offer_response",
+  "finalize auction": "tx_guidance_finalize",
+  "cancel auction": "tx_guidance_cancel",
+  "cancel listing": "tx_guidance_cancel",
+  "cancel listings": "tx_guidance_cancel",
+  "claim refund": "tx_guidance_refund",
+};
+
+function txSuccessGuidance(action: string): string {
+  const key = TX_GUIDANCE_KEYS[action.trim().toLowerCase()];
+  return t(key ?? "tx_guidance_generic");
+}
+
+function capitalizeFirst(s: string): string {
+  return s.length === 0 ? s : s[0].toUpperCase() + s.slice(1);
+}
+
+/**
+ * Builds the localized success toast: "<Action> confirmed!" followed by
+ * outcome-specific next-action guidance and, when a transaction hash is
+ * available, an explorer link (the hash itself stays available via the URL).
+ */
+export function buildTxSuccessMessage(
+  action: string,
+  txHash: string | null,
+  customMessage?: (txHash: string | null) => string
+): string {
+  if (customMessage) return customMessage(txHash);
+
+  const actionLabel = capitalizeFirst(txActionLabel(action));
+  const base = t("tx_state_success").replace(/\{action\}/g, actionLabel);
+  const explorerUrl = getTxExplorerUrl(txHash);
+  const suffix = explorerUrl
+    ? ` ${t("tx_success_view_explorer")}: ${explorerUrl}`
+    : "";
+  return `${base} ${txSuccessGuidance(action)}${suffix}`;
+}
+
 // ── Map TxState → legacy TxLifecyclePhase ────────────────────
 
 function toPhase(state: TxState): TxLifecyclePhase {
@@ -177,20 +236,13 @@ export function useTxToast(): UseTxToastResult {
         return null;
       }
 
-      // Toast: broadcasting
-      pushToast(`${action}: broadcasting to the network…`, "info");
+      // Toast: broadcasting — note that the UI updates after ledger confirmation
+      pushToast(`${action}: broadcasting to the network — this page will update once the ledger confirms…`, "info");
 
-      // Build success message
+      // Build success message — localized, outcome-specific next action,
+      // explorer link preserved when a tx hash is available.
       const txHash = extractTxHash(result);
-      let successMsg: string;
-      if (successMessage) {
-        successMsg = successMessage(txHash);
-      } else {
-        const explorerUrl = getTxExplorerUrl(txHash);
-        successMsg = explorerUrl
-          ? `${action} confirmed! View on explorer: ${explorerUrl}`
-          : `${action} confirmed successfully!`;
-      }
+      const successMsg = buildTxSuccessMessage(action, txHash, successMessage);
       pushToast(successMsg, "success", successDurationMs);
 
       return result;

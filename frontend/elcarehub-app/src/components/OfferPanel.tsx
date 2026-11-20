@@ -43,8 +43,9 @@ import { useAcceptOffer, useRejectOffer } from "@/hooks/useOffers";
 import { useModalA11y } from "@/hooks/useModalA11y";
 import { StatusAnnouncer } from "@/components/a11y/StatusAnnouncer";
 import { TxErrorPanel } from "@/components/TxErrorPanel";
-import { useTxLifecycle, txStateLabel } from "@/hooks/useTxLifecycle";
+import { useTxLifecycle, txStatusMessage } from "@/hooks/useTxLifecycle";
 import { config } from "@/lib/config";
+import { t } from "@/lib/i18n";
 import Link from "next/link";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -102,9 +103,9 @@ function MakeOfferModal({
   const amountErrorId = `${titleId}-amount-error`;
 
   const statusMessage = isSubmitting
-    ? "Placing your offer. Please check your wallet for a signature request."
+    ? t("offer_pending_status")
     : success
-    ? "Offer placed successfully."
+    ? t("offer_success_status")
     : localError || error
     ? `Error: ${localError || error}`
     : "";
@@ -307,7 +308,7 @@ function MakeOfferModal({
               data-testid="offer-modal-success"
             >
               <CheckCircle size={14} aria-hidden="true" />
-              Offer placed successfully!
+              {t("offer_success_status")}
             </div>
           )}
 
@@ -321,12 +322,12 @@ function MakeOfferModal({
             {isSubmitting ? (
               <>
                 <Loader2 size={16} className="animate-spin" />
-                Placing offer…
+                {t("offer_pending_button")}
               </>
             ) : success ? (
               <>
                 <CheckCircle size={16} />
-                Offer placed!
+                {t("offer_placed_button")}
               </>
             ) : (
               <>
@@ -404,7 +405,7 @@ function OwnerOfferList({
           className="flex items-center gap-2 rounded-xl border border-brand-500/20 bg-brand-500/10 px-4 py-3 text-xs text-brand-400"
         >
           <Loader2 size={13} className="animate-spin" aria-hidden="true" />
-          {txStateLabel(offerTxState.state)}
+          {txStatusMessage(offerTxState)}
         </div>
       )}
 
