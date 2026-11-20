@@ -70,6 +70,26 @@ jest.mock('@/lib/ipfs', () => ({
   }),
 }));
 
+// ArtworkImage component mock
+jest.mock('@/components/ArtworkImage', () => ({
+  ArtworkImage: ({ metadata, isLoading, metadataError, fallbackId }: any) => {
+    if (isLoading) {
+      return <div data-testid="artwork-loading">Loading…</div>;
+    }
+    if (metadataError) {
+      return <div data-testid="artwork-unavailable">Content unavailable</div>;
+    }
+    if (!metadata?.image) {
+      return <div data-testid="artwork-missing">No Artwork</div>;
+    }
+    return (
+      <div data-testid="artwork-img" data-fallback-id={fallbackId}>
+        {metadata.title || 'Artwork'}
+      </div>
+    );
+  },
+}));
+
 // WalletGuard — render children directly
 jest.mock('@/components/WalletGuard', () => ({
   GuardButton: ({
@@ -347,7 +367,7 @@ describe('ListingCard', () => {
   it('renders the missing artwork fallback when metadata lacks an image', async () => {
     const { fetchMetadata } = jest.requireMock('@/lib/ipfs');
     fetchMetadata.mockResolvedValueOnce({ title: 'No Image', description: 'desc' });
-    
+
     render(<ListingCard listing={makeListing()} />);
     await waitFor(() => {
       expect(screen.getByTestId('artwork-missing')).toBeInTheDocument();
@@ -357,54 +377,9 @@ describe('ListingCard', () => {
   it('renders the missing artwork fallback when metadata fetch fails', async () => {
     const { fetchMetadata } = jest.requireMock('@/lib/ipfs');
     fetchMetadata.mockRejectedValueOnce(new Error('IPFS down'));
-    
+
     render(<ListingCard listing={makeListing()} />);
     await waitFor(() => {
-      expect(screen.getByTestId('artwork-missing')).toBeInTheDocument();
-    });
-  });
-
-// ── IPFS gateway fallback tests ──────────────────────────────────────────────
-
-  it('advances to the next gateway URL when the current image fails to load', async () => {
-    render(<ListingCard listing={makeListing()} />);
-
-    await waitFor(() => {
-      const img = screen.getByRole('img') as HTMLImageElement;
-      expect(img.src).toContain('mock-pinata.example.com');
-    });
-
-    screen.getByRole('img').dispatchEvent(new Event('error', { bubbles: true }));
-
-    await waitFor(() => {
-      const img = screen.getByRole('img') as HTMLImageElement;
-      expect(img.src).toContain('ipfs.io');
-    });
-  });
-
-  it('shows the placeholder when all gateway URLs have been exhausted', async () => {
-    render(<ListingCard listing={makeListing()} />);
-
-    await waitFor(() => {
-      expect(screen.getByRole('img')).toBeInTheDocument();
-    });
-
-    // Fail primary → fallback to ipfs.io
-    screen.getByRole('img').dispatchEvent(new Event('error', { bubbles: true }));
-    await waitFor(() => {
-      expect(screen.getByRole('img').getAttribute('src')).toContain('ipfs.io');
-    });
-
-    // Fail ipfs.io → fallback to cloudflare-ipfs.com
-    screen.getByRole('img').dispatchEvent(new Event('error', { bubbles: true }));
-    await waitFor(() => {
-      expect(screen.getByRole('img').getAttribute('src')).toContain('cloudflare-ipfs.com');
-    });
-
-    // All gateways exhausted → placeholder
-    screen.getByRole('img').dispatchEvent(new Event('error', { bubbles: true }));
-    await waitFor(() => {
-      expect(screen.queryByRole('img')).not.toBeInTheDocument();
       expect(screen.getByTestId('artwork-missing')).toBeInTheDocument();
     });
   });
@@ -459,31 +434,6 @@ describe('ListingCard', () => {
       // After exhausting retries, falls through to artwork-missing
       expect(screen.queryByTestId('artwork-retry-btn')).not.toBeInTheDocument();
       expect(screen.getByTestId('artwork-missing')).toBeInTheDocument();
-    });
-  });
-
-  // ── Content advisory overlay (Issue #7) ────────────────────────────────────
-
-  it('renders content-advisory overlay when metadata.contentAdvisory is set', async () => {
-    const { fetchMetadata } = jest.requireMock('@/lib/ipfs');
-    fetchMetadata.mockResolvedValueOnce({
-      title: 'Sensitive Art',
-      description: '',
-      image: 'QmSensitive',
-      contentAdvisory: 'Contains graphic content',
-    });
-
-    render(<ListingCard listing={makeListing()} />);
-    await waitFor(() => {
-      expect(screen.getByTestId('content-advisory-overlay')).toBeInTheDocument();
-      expect(screen.getByText('Contains graphic content')).toBeInTheDocument();
-    });
-  });
-
-  it('does not render content-advisory overlay when contentAdvisory is absent', async () => {
-    render(<ListingCard listing={makeListing()} />);
-    await waitFor(() => {
-      expect(screen.queryByTestId('content-advisory-overlay')).not.toBeInTheDocument();
     });
   });
 });

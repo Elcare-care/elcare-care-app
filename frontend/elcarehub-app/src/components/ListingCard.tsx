@@ -10,16 +10,16 @@ import Link from "next/link";
 import { Listing, stroopsToXlm } from "@/lib/contract";
 import { getTokenConfigByAddress, DEFAULT_TOKEN, baseUnitsToDisplay } from "@/config/tokens";
 import { buildExpectedBuyArtworkIntent } from "@/lib/tx-intent";
-import { ArtworkMetadata, fetchMetadata, getGatewayUrls } from "@/lib/ipfs";
+import { ArtworkMetadata, fetchMetadata } from "@/lib/ipfs";
 import { useWalletContext } from "@/context/WalletContext";
 import { useBuyArtwork } from "@/hooks/useMarketplace";
 import {
   ShoppingCart, User, Calendar, Tag, ShieldAlert, Clock, Hourglass,
-  RefreshCw, WifiOff,
 } from "lucide-react";
 import { GuardButton } from "./WalletGuard";
 import posthog from "posthog-js";
 import { CheckoutModal } from "./CheckoutModal";
+import { ArtworkImage } from "./ArtworkImage";
 
 interface ListingCardProps {
   listing: Listing;
@@ -40,7 +40,6 @@ export function ListingCard({ listing, onPurchased }: ListingCardProps) {
   const { buy, isBuying, error: buyError } = useBuyArtwork(publicKey);
 
   const [metadata, setMetadata] = useState<ArtworkMetadata | null>(null);
-  const [gatewayIndex, setGatewayIndex] = useState(0);
   const [isLoading, setIsLoading] = useState(true);
   const [metadataError, setMetadataError] = useState(false);
   const [metadataRetries, setMetadataRetries] = useState(0);
@@ -71,30 +70,18 @@ export function ListingCard({ listing, onPurchased }: ListingCardProps) {
     void loadMetadata();
   }, [loadMetadata]);
 
-  // Reset gateway index when metadata changes (new image to load).
-  useEffect(() => {
-    setGatewayIndex(0);
-  }, [metadata?.image]);
-
   const handleRetry = () => {
     if (metadataRetries >= MAX_METADATA_RETRIES) return;
     setMetadataRetries((n) => n + 1);
-    setGatewayIndex(0);
     void loadMetadata();
   };
-
-  const imageUrls: string[] | null = metadata?.image
-    ? getGatewayUrls(metadata.image)
-    : null;
-
-  const currentImageUrl = imageUrls?.[gatewayIndex] ?? null;
-  const allGatewaysExhausted = imageUrls !== null && gatewayIndex >= imageUrls.length;
 
   const isOwn = publicKey === listing.artist;
   const isExpired =
     listing.status === "Cancelled" &&
     !!listing.expires_at &&
     listing.expires_at < Date.now() / 1000;
+  const hasRetriesRemaining = metadataRetries < MAX_METADATA_RETRIES;
 
   // Countdown for active listings with an expiry deadline
   const [countdown, setCountdown] = useState<string | null>(null);
@@ -168,78 +155,16 @@ export function ListingCard({ listing, onPurchased }: ListingCardProps) {
         className="block focus:outline-none focus:ring-2 focus:ring-brand-500 focus:ring-inset"
       >
         <div className="relative aspect-square overflow-hidden bg-brand-50">
-          {isLoading ? (
-            /* Loading skeleton */
-            <div
-              className="flex h-full w-full items-center justify-center bg-gray-100 animate-pulse"
-              aria-label="Loading artwork"
-              data-testid="artwork-loading"
-            >
-              <span className="sr-only">Loading artwork…</span>
-            </div>
-          ) : metadataError && metadataRetries < MAX_METADATA_RETRIES ? (
-            /* Recoverable error: offer a retry */
-            <div
-              className="flex h-full w-full flex-col items-center justify-center gap-3 bg-gray-50 text-gray-400"
-              aria-label="Artwork unavailable"
-              data-testid="artwork-unavailable"
-            >
-              <WifiOff size={28} />
-              <span className="text-xs font-medium">Content unavailable</span>
-              <button
-                type="button"
-                onClick={(e) => { e.preventDefault(); handleRetry(); }}
-                className="flex items-center gap-1.5 rounded-lg bg-brand-50 px-3 py-1.5 text-xs font-semibold text-brand-600 hover:bg-brand-100 focus:outline-none focus:ring-2 focus:ring-brand-500 focus:ring-offset-1 transition-colors"
-                data-testid="artwork-retry-btn"
-                aria-label={`Retry loading artwork: ${metadata?.title ?? `Artwork #${listing.listing_id}`}`}
-              >
-                <RefreshCw size={11} />
-                Retry
-              </button>
-            </div>
-          ) : currentImageUrl && !allGatewaysExhausted ? (
-            <Image
-              key={currentImageUrl}
-              src={currentImageUrl}
-              alt={
-                metadata?.isDecorativeImage
-                  ? ""
-                  : (metadata?.altText ?? metadata?.title ?? `Listing #${listing.listing_id}`)
-              }
-              fill
-              className="object-cover transition-transform duration-300 group-hover:scale-105"
-              onError={() => setGatewayIndex((i) => i + 1)}
-              unoptimized
-            />
-          ) : (
-            /* All gateways exhausted or no image field */
-            <div
-              className="flex h-full w-full flex-col items-center justify-center bg-gray-50 text-gray-400"
-              aria-label="Artwork missing"
-              data-testid="artwork-missing"
-            >
-              <span className="text-4xl mb-2">🖼️</span>
-              <span className="text-xs font-medium uppercase tracking-wider">No Artwork</span>
-            </div>
-          )}
-
-          {/* Content advisory overlay (Issue #7) */}
-          {!isLoading && metadata?.contentAdvisory && (
-            <div
-              className="absolute inset-0 flex items-center justify-center bg-black/60 backdrop-blur-sm opacity-0 group-hover:opacity-100 transition-opacity duration-200"
-              data-testid="content-advisory-overlay"
-              aria-live="polite"
-            >
-              <div className="mx-3 rounded-xl bg-midnight-900/90 px-3 py-2 text-center">
-                <p className="text-[10px] font-bold text-amber-400 uppercase tracking-widest mb-1">
-                  Content Advisory
-                </p>
-                <p className="text-[11px] text-white/80 leading-snug">
-                  {metadata.contentAdvisory}
-                </p>
-              </div>
-            </div>
-          )}
+          <ArtworkImage
+            metadata={metadata}
+            isLoading={isLoading}
+            metadataError={metadataError}
+            onRetry={hasRetriesRemaining ? handleRetry : undefined}
+            retryCount={metadataRetries}
+            maxRetries={MAX_METADATA_RETRIES}
+            fallbackId={listing.listing_id}
+            imageClassName="group-hover:scale-105"
+          />
 
           {/* Status badge */}
           <span

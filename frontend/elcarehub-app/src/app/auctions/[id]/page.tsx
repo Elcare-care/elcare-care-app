@@ -6,7 +6,6 @@
 
 import { useState, useEffect, useCallback } from "react";
 import { useParams, useRouter } from "next/navigation";
-import Image from "next/image";
 import Link from "next/link";
 import {
   getAuction,
@@ -19,7 +18,7 @@ import {
   refundLosingBid,
 } from "@/lib/contract";
 import { StrKey } from "@stellar/stellar-sdk";
-import { fetchMetadata, cidToGatewayUrl, ArtworkMetadata } from "@/lib/ipfs";
+import { fetchMetadata, ArtworkMetadata } from "@/lib/ipfs";
 import {
   subscribeToMarketplaceEvents,
   getAuctionBidHistory,
@@ -36,6 +35,7 @@ import { useServerClock } from "@/hooks/useServerClock";
 import { GuardButton } from "@/components/WalletGuard";
 import { ResourceState } from "@/components/PageStates";
 import { AuctionManagementPanel } from "@/components/AuctionManagementPanel";
+import { ArtworkImage } from "@/components/ArtworkImage";
 import { config } from "@/lib/config";
 import { getTokenConfigByAddress, getNativeTokenConfig } from "@/config/tokens";
 import {
@@ -47,7 +47,6 @@ import { formatLedgerTime } from "@/lib/format";
 import {
   ArrowLeft,
   Clock,
-  Gavel,
   Trophy,
   History,
   RefreshCw,
@@ -634,6 +633,7 @@ export default function AuctionDetailPage() {
   const [auction, setAuction] = useState<Auction | null>(null);
   const [metadata, setMetadata] = useState<ArtworkMetadata | null>(null);
   const [isLoading, setIsLoading] = useState(true);
+  const [metadataError, setMetadataError] = useState(false);
   const [pageError, setPageError] = useState<PageStateError | null>(null);
   const [activeTab, setActiveTab] = useState<"details" | "bids">("details");
   const [bidAmountXlm, setBidAmountXlm] = useState("");
@@ -673,6 +673,7 @@ export default function AuctionDetailPage() {
   const loadData = useCallback(async () => {
     if (!id) return;
     setIsLoading(true);
+    setMetadataError(false);
     setPageError(null);
     try {
       const auctionData = await getAuction(Number(id));
@@ -680,7 +681,10 @@ export default function AuctionDetailPage() {
       setLiveEndTime(auctionData.end_time);
       setLastLoadedAt(Date.now());
 
-      const meta = await fetchMetadata(auctionData.metadata_cid).catch(() => null);
+      const meta = await fetchMetadata(auctionData.metadata_cid).catch(() => {
+        setMetadataError(true);
+        return null;
+      });
       setMetadata(meta);
     } catch (err) {
       // Distinguishes "this auction id doesn't exist" from "the indexer/RPC
@@ -869,7 +873,6 @@ export default function AuctionDetailPage() {
   const hasNoBids = auction ? auction.highest_bid === 0n : true;
   const canEditReserve = isActive && !isExpired && isCreator && hasNoBids;
 
-  const imageUrl = metadata?.image ? cidToGatewayUrl(metadata.image) : null;
   const highestBidXlm = auction ? stroopsToXlm(auction.highest_bid) : "0";
   const reserveXlm = auction ? stroopsToXlm(auction.reserve_price) : "0";
   const minimumNextBidBase = auction
@@ -960,19 +963,13 @@ export default function AuctionDetailPage() {
         <div className="grid gap-10 lg:grid-cols-[1fr_420px]">
           {/* Artwork image */}
           <div className="relative aspect-square overflow-hidden rounded-3xl bg-brand-50 shadow-md">
-            {imageUrl ? (
-              <Image
-                src={imageUrl}
-                alt={metadata?.title ?? `Auction #${auction.auction_id}`}
-                fill
-                className="object-cover"
-                unoptimized
-              />
-            ) : (
-              <div className="flex h-full items-center justify-center">
-                <Gavel size={64} className="text-brand-200" />
-              </div>
-            )}
+            <ArtworkImage
+              metadata={metadata}
+              isLoading={isLoading}
+              metadataError={metadataError}
+              fallbackId={auction.auction_id}
+              showContentAdvisory={false}
+            />
 
             {/* Status badge */}
             <span

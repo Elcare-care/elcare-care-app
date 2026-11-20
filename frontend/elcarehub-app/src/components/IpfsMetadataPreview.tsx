@@ -12,8 +12,9 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { AlertTriangle, CheckCircle2, ImageOff, Loader2 } from "lucide-react";
-import { ArtworkMetadata, cidToGatewayUrl, fetchMetadata } from "@/lib/ipfs";
+import { AlertTriangle, CheckCircle2, Loader2 } from "lucide-react";
+import { ArtworkMetadata, fetchMetadata } from "@/lib/ipfs";
+import { ArtworkImage } from "./ArtworkImage";
 
 interface IpfsMetadataPreviewProps {
   /** Metadata CID (raw or "ipfs://CID") returned from a completed, verified upload. */
@@ -87,7 +88,6 @@ export function IpfsMetadataPreview({ cid, metadata: providedMetadata }: IpfsMet
     (field) => !metadata[field] || String(metadata[field]).trim() === ""
   );
   const schemaValid = missingFields.length === 0;
-  const imageUrl = metadata.image ? cidToGatewayUrl(metadata.image) : null;
 
   return (
     <div className="rounded-2xl border border-gray-200 bg-white p-5 space-y-4">
@@ -115,13 +115,14 @@ export function IpfsMetadataPreview({ cid, metadata: providedMetadata }: IpfsMet
       )}
 
       <div className="flex gap-4">
-        <div className="h-24 w-24 shrink-0 overflow-hidden rounded-xl bg-gray-100 flex items-center justify-center">
-          {imageUrl ? (
-            // eslint-disable-next-line @next/next/no-img-element
-            <img src={imageUrl} alt={metadata.altText || metadata.title || "Artwork preview"} className="h-full w-full object-cover" />
-          ) : (
-            <ImageOff size={24} className="text-gray-300" />
-          )}
+        <div className="h-24 w-24 shrink-0 overflow-hidden rounded-xl bg-gray-100">
+          <ArtworkImage
+            metadata={metadata}
+            isLoading={false}
+            aspectRatio="aspect-square"
+            bgColor="bg-gray-100"
+            showContentAdvisory={false}
+          />
         </div>
         <dl className="flex-1 min-w-0 space-y-1.5 text-sm">
           <div>

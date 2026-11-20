@@ -118,6 +118,7 @@ export function FilterSidebar({ filters, dispatch, isOpen, setIsOpen, recentArti
             <button
               onClick={() => setIsOpen(false)}
               className="rounded-lg p-2 text-gray-400 hover:bg-gray-100 lg:hidden"
+              aria-label="Close filters"
             >
               <X size={20} />
             </button>
