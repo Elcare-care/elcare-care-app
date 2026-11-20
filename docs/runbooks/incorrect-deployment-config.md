@@ -122,9 +122,9 @@ echo "Expected: $MARKETPLACE_CONTRACT_ID"
 
 **Option 1: Update env and restart (preferred for new deployments)**
 ```bash
-# Update indexer .env with correct contract IDs
-# MARKETPLACE_CONTRACT_ID=C...correct...
-# LAUNCHPAD_CONTRACT_ID=C...correct...
+# Update indexer .env with correct contract IDs for the targeted network (testnet vs. mainnet)
+# MARKETPLACE_CONTRACT_ID=C<CORRECT_NETWORK_SPECIFIC_ID_56_CHARS>
+# LAUNCHPAD_CONTRACT_ID=C<CORRECT_NETWORK_SPECIFIC_ID_56_CHARS>
 
 # Wipe and re-seed TrackedContract rows
 psql "$DATABASE_URL" -c "
@@ -302,6 +302,31 @@ grep -E 'NEXT_PUBLIC_.*=(S[0-9A-Z]{55}|eyJ)' frontend/elcarehub-app/.env* 2>/dev
 cd indexer && npx prisma migrate status
 # Expected: "All migrations have been applied"
 ```
+
+---
+
+### Operator Review & Revert Procedures for Contract ID Updates
+
+#### Review Procedure
+1. Confirm that `STELLAR_NETWORK` (`testnet` vs `mainnet`) matches the RPC endpoint and target deployment.
+2. Cross-check `NEXT_PUBLIC_CONTRACT_ID` (frontend) and `MARKETPLACE_CONTRACT_ID` (indexer) are identical.
+3. Execute read-only contract version verification:
+   ```bash
+   # [READ-ONLY] Verify deployed contract responds
+   stellar contract invoke --id "$MARKETPLACE_CONTRACT_ID" --rpc-url "$STELLAR_RPC_URL" --network "$STELLAR_NETWORK" -- version
+   ```
+4. Verify that no testnet placeholder (`CB74...`, `CA4R...`) is accidentally configured in a mainnet environment.
+
+#### Revert Procedure
+If a contract ID was misconfigured:
+1. Immediately restore the previous verified contract ID in `.env` / environment secrets.
+2. Restart indexer and frontend services.
+3. If the indexer ingested events from an incorrect contract:
+   ```bash
+   # [REVERT] Clear corrupted indexer cursor for that contract
+   psql "$DATABASE_URL" -c "DELETE FROM \"TrackedContract\" WHERE \"contractId\" = '<MISCONFIGURED_CID>';"
+   # Re-sync from the last verified checkpoint
+   ```
 
 ---
 

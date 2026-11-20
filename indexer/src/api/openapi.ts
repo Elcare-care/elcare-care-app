@@ -28,9 +28,9 @@ export const ListingSchema = registry.register(
     price:           z.string().openapi({ example: '100000000', description: 'RAW on-chain price in the token\'s base units (i128, unscaled — e.g. stroops for a 7-decimal token). The contract never scales this value; see `priceDecimal` for the human-readable form.' }),
     priceDecimal:    z.string().openapi({ example: '10.0000000', description: 'Human-readable price, computed as price / 10^decimals using the payment token\'s known decimal precision (see docs/guides/payment-tokens.md). Safe to display directly.' }),
     currency:        z.string().openapi({ example: 'XLM' }),
-    collection:      z.string().openapi({ example: 'CABC...DEF', description: 'Collection contract address' }),
+    collection:      z.string().openapi({ example: 'CABC...DEF', description: 'Collection contract address (network-specific Soroban contract ID: testnet vs mainnet)' }),
     nftTokenId:      bigIntString.openapi({ description: 'NFT token ID within the collection' }),
-    token:           z.string().openapi({ example: 'CABC...DEF', description: 'Payment token contract address' }),
+    token:           z.string().openapi({ example: 'CABC...DEF', description: 'Payment token contract address (network-specific SAC contract ID: testnet vs mainnet)' }),
     status:          z.enum(['Active', 'Sold', 'Cancelled', 'Auction']).openapi({ example: 'Active' }),
     recipients:      z.unknown().nullable().openapi({ description: 'Royalty recipients (JSON)' }),
     createdAtLedger: z.number().int().openapi({ example: 50000000, description: 'Ledger sequence when the listing was created' }),
@@ -45,9 +45,9 @@ export const AuctionSchema = registry.register(
   z.object({
     auctionId:       bigIntString.openapi({ description: 'Unique auction ID' }),
     creator:         z.string().openapi({ example: 'GABC...XYZ', description: 'Auction creator Stellar address' }),
-    collection:      z.string().openapi({ example: 'CABC...DEF' }),
+    collection:      z.string().openapi({ example: 'CABC...DEF', description: 'Collection contract address (network-specific)' }),
     nftTokenId:      bigIntString,
-    token:           z.string().openapi({ example: 'CABC...DEF', description: 'Payment token contract address' }),
+    token:           z.string().openapi({ example: 'CABC...DEF', description: 'Payment token contract address (network-specific SAC address)' }),
     reservePrice:    z.string().openapi({ example: '50000000', description: 'RAW minimum acceptable bid in the token\'s base units (unscaled i128). See `reservePriceDecimal` for the human-readable form.' }),
     reservePriceDecimal: z.string().openapi({ example: '5.0000000', description: 'Human-readable reserve price (reservePrice / 10^decimals).' }),
     highestBid:      z.string().openapi({ example: '75000000', description: 'RAW current highest bid in the token\'s base units (unscaled i128). See `highestBidDecimal` for the human-readable form.' }),
@@ -71,7 +71,7 @@ export const OfferSchema = registry.register(
     offerer:         z.string().openapi({ example: 'GABC...XYZ', description: 'Address that placed the offer' }),
     amount:          z.string().openapi({ example: '80000000', description: 'RAW offered amount in the token\'s base units (unscaled i128). See `amountDecimal` for the human-readable form.' }),
     amountDecimal:   z.string().openapi({ example: '8.0000000', description: 'Human-readable offer amount (amount / 10^decimals).' }),
-    token:           z.string().openapi({ example: 'CABC...DEF', description: 'Payment token contract address' }),
+    token:           z.string().openapi({ example: 'CABC...DEF', description: 'Payment token contract address (network-specific SAC address)' }),
     status:          z.enum(['Pending', 'Accepted', 'Rejected', 'Withdrawn']).openapi({ example: 'Pending' }),
     expiresAt:       bigIntString.optional().openapi({ description: 'Ledger timestamp after which the offer can be reclaimed; absent when it never expires', example: '1735689600' }),
     createdAtLedger: z.number().int().openapi({ example: 50000000 }),
@@ -98,7 +98,7 @@ export const CollectionSchema = registry.register(
   'Collection',
   z.object({
     id:               z.number().int().openapi({ example: 1 }),
-    contractAddress:  z.string().openapi({ example: 'CABC...DEF', description: 'Deployed collection contract address' }),
+    contractAddress:  z.string().openapi({ example: 'CABC...DEF', description: 'Deployed collection contract address (network-specific Soroban contract ID)' }),
     kind:             z.string().openapi({
       example: 'normal_721',
       description: 'Collection type: normal_721 | normal_1155 | lazy_721 | lazy_1155',
@@ -1110,7 +1110,8 @@ export function buildOpenApiDocument() {
       title: 'ElcareHub Indexer API',
       description:
         'Off-chain event indexer and REST API for the ElcareHub NFT marketplace on Stellar Soroban. ' +
-        'All BigInt values (IDs, endTime) are serialised as decimal strings.',
+        'All BigInt values (IDs, endTime) are serialised as decimal strings. ' +
+        'Note: Contract addresses are network-specific (testnet vs. mainnet); never reuse testnet contract IDs in mainnet environments.',
       version: '1.0.0',
       contact: { name: 'ElcareHub', url: 'https://elcarehub.io' },
     },

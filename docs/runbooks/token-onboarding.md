@@ -66,8 +66,10 @@ For a token with non-7 decimals:
 ### Pre-flight
 
 ```bash
+# Network-specific token contract address (56 characters starting with C)
+# Ensure --network matches the environment target (testnet vs. mainnet)
 bash scripts/preflight/token-onboarding.sh \
-  --address CXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX \
+  --address C<TOKEN_CONTRACT_ADDRESS_56_CHARS> \
   --symbol USDC \
   --decimals 7 \
   --network testnet
