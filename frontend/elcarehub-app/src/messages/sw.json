@@ -38,5 +38,11 @@
   "sort": "Panga",
   "empty_state_no_items": "Hakuna vitu vilivyopatikana",
   "view_details": "Angalia Maelezo",
-  "back": "Rudi"
+  "back": "Rudi",
+  "activity_empty_no_events_title": "Bado hakuna shughuli",
+  "activity_empty_no_events_description": "Soko bado halijarekodiwa matukio yoyote. Shughuli itaonekana hapa matangazo, zabuni, na mauzo yanapotokea kwenye mnyororo.",
+  "activity_empty_no_events_action": "Angalia tena",
+  "activity_empty_filter_title": "Hakuna shughuli ya {filter}",
+  "activity_empty_filter_description": "Hakuna matukio yanayolingana na kichujio cha {filter} kwa sasa. Shughuli nyingine bado zinafanyika kwenye jukwaa.",
+  "activity_empty_filter_action": "Onyesha shughuli zote"
 }

@@ -13,16 +13,18 @@ import {
   Layers,
   Wifi,
   WifiOff,
-  TrendingUp,
   AlertCircle,
   ArrowUp,
   Loader2,
+  FilterX,
+  Inbox,
 } from "lucide-react";
 import { Breadcrumb } from "@/components/Breadcrumb";
 import { useActivityFeed } from "@/hooks/useActivityFeed";
 import { ActivityFeedEvent, activityEventKey } from "@/lib/indexer";
 import { formatRelativeTime } from "@/lib/format";
 import { StaleBanner } from "@/components/StaleBanner";
+import { useIndexerFreshness } from "@/hooks/useIndexerFreshness";
 
 // ── Event type icon mapping ───────────────────────────────────────────────────
 
@@ -139,6 +141,77 @@ function ActivityRow({ event }: { event: ActivityFeedEvent }) {
           )}
         </div>
       </div>
+    </div>
+  );
+}
+
+// ── Activity-specific empty states ───────────────────────────────────────────
+//
+// Two distinct variants so the user knows whether the feed is genuinely
+// empty (no events on this chain at all) or whether the current filter just
+// has no matches.  Each provides a focused action instead of a dead end.
+
+/** Rendered when every loaded event was filtered out by the domain selector. */
+function NoFilterResults({
+  filter,
+  onClearFilter,
+}: {
+  filter: string;
+  onClearFilter: () => void;
+}) {
+  return (
+    <div
+      role="status"
+      aria-live="polite"
+      className="flex flex-col items-center gap-2 py-12 text-center px-4"
+      data-testid="activity-empty-filter"
+    >
+      <FilterX size={36} className="text-gray-600" aria-hidden="true" />
+      <p className="text-sm font-medium text-gray-300">
+        No {filter.toLowerCase()} activity
+      </p>
+      <p className="text-xs text-gray-500 max-w-xs">
+        There are no events matching the{" "}
+        <span className="text-brand-400">{filter}</span> filter right now.
+        Other activity is still happening on the platform.
+      </p>
+      <button
+        type="button"
+        onClick={onClearFilter}
+        className="mt-3 inline-flex items-center gap-1.5 rounded-lg bg-white/5 px-4 py-2 text-xs font-medium text-gray-300 hover:bg-white/10 hover:text-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-400/60"
+        data-testid="activity-clear-filter-btn"
+      >
+        <FilterX size={12} aria-hidden="true" />
+        Show all activity
+      </button>
+    </div>
+  );
+}
+
+/** Rendered when the feed loaded successfully but has zero events at all. */
+function NoActivityYet({ onRefresh }: { onRefresh: () => void }) {
+  return (
+    <div
+      role="status"
+      aria-live="polite"
+      className="flex flex-col items-center gap-2 py-12 text-center px-4"
+      data-testid="activity-empty-no-events"
+    >
+      <Inbox size={36} className="text-gray-600" aria-hidden="true" />
+      <p className="text-sm font-medium text-gray-300">No activity yet</p>
+      <p className="text-xs text-gray-500 max-w-xs">
+        The marketplace hasn&apos;t recorded any events yet. Activity will
+        appear here as listings, bids, and sales happen on-chain.
+      </p>
+      <button
+        type="button"
+        onClick={onRefresh}
+        className="mt-3 inline-flex items-center gap-1.5 rounded-lg bg-white/5 px-4 py-2 text-xs font-medium text-gray-300 hover:bg-white/10 hover:text-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-400/60"
+        data-testid="activity-check-again-btn"
+      >
+        <RefreshCw size={12} aria-hidden="true" />
+        Check again
+      </button>
     </div>
   );
 }
@@ -344,10 +417,18 @@ export default function ActivityPage() {
     commitPending,
   } = useActivityFeed(50);
 
+  const freshness = useIndexerFreshness({ onRefresh: refresh });
+
   const visible = useMemo(
     () => events.filter((e) => matchesDomainFilter(e, domainFilter)),
     [events, domainFilter]
   );
+
+  // Determine which empty-state variant to show:
+  //   - events loaded but zero total  → genuinely no activity yet
+  //   - events loaded but filter hides them → no matches for this filter
+  const isFilterEmpty = !isLoading && events.length > 0 && visible.length === 0;
+  const isTotallyEmpty = !isLoading && events.length === 0 && !error;
 
   return (
     <div className="min-h-screen bg-midnight-950 pt-20">
@@ -408,7 +489,7 @@ export default function ActivityPage() {
               freshness={freshness.freshness}
               status={freshness.status}
               reorg={freshness.reorg}
-              onRefresh={freshness.refresh}
+              onRefresh={() => void freshness.refresh()}
               isRefreshing={freshness.isRefreshing}
             />
           </div>
@@ -476,15 +557,13 @@ export default function ActivityPage() {
                 Try again
               </button>
             </div>
-          ) : visible.length === 0 ? (
-            <div className="flex flex-col items-center gap-2 py-12 text-center">
-              <TrendingUp size={36} className="text-gray-600" />
-              <p className="text-sm font-medium text-gray-500">
-                {domainFilter === "all"
-                  ? "No activity yet"
-                  : `No ${FILTER_LABELS[domainFilter].toLowerCase()} activity yet`}
-              </p>
-            </div>
+          ) : isFilterEmpty ? (
+            <NoFilterResults
+              filter={FILTER_LABELS[domainFilter]}
+              onClearFilter={() => setDomainFilter("all")}
+            />
+          ) : isTotallyEmpty ? (
+            <NoActivityYet onRefresh={() => void refresh()} />
           ) : (
             <ActivityList
               visible={visible}

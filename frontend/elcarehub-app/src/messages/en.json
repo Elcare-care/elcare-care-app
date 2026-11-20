@@ -38,5 +38,11 @@
   "sort": "Sort",
   "empty_state_no_items": "No items found",
   "view_details": "View Details",
-  "back": "Back"
+  "back": "Back",
+  "activity_empty_no_events_title": "No activity yet",
+  "activity_empty_no_events_description": "The marketplace hasn't recorded any events yet. Activity will appear here as listings, bids, and sales happen on-chain.",
+  "activity_empty_no_events_action": "Check again",
+  "activity_empty_filter_title": "No {filter} activity",
+  "activity_empty_filter_description": "There are no events matching the {filter} filter right now. Other activity is still happening on the platform.",
+  "activity_empty_filter_action": "Show all activity"
 }
