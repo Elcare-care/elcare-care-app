@@ -255,6 +255,168 @@ stellar contract invoke \
 
 ---
 
+## Re-org Recovery Verification Worksheet
+
+This worksheet provides a repeatable, step-by-step checklist for on-call operators during and after a chain reorganization.
+All pre- and post-recovery queries are strictly **read-only** (`[READ-ONLY]`) to avoid mutating database state during verification.
+
+### Pre-Rollback Impact Assessment [READ-ONLY]
+
+1. **Verify Sync Tip and Chain Head [READ-ONLY]:**
+   ```bash
+   # Check current database sync cursor
+   psql "$DATABASE_URL" -c "
+     SELECT \"lastLedger\", \"lastLedgerHash\", \"updatedAt\"
+     FROM \"SyncState\" LIMIT 1;
+   "
+
+   # Query Stellar RPC latest ledger sequence
+   curl -s -X POST "$STELLAR_RPC_URL" \
+     -H "Content-Type: application/json" \
+     -d '{"jsonrpc":"2.0","id":1,"method":"getLatestLedger"}' | jq '.result.sequence'
+   ```
+
+2. **Audit Unconfirmed Events in Invalidation Window [READ-ONLY]:**
+   ```bash
+   # Count unconfirmed and provisional events above safe ledger checkpoint ($SAFE_LEDGER)
+   psql "$DATABASE_URL" -c "
+     SELECT \"ledgerSequence\", count(*), confirmed
+     FROM \"MarketplaceEvent\"
+     WHERE \"ledgerSequence\" > $SAFE_LEDGER
+     GROUP BY \"ledgerSequence\", confirmed
+     ORDER BY \"ledgerSequence\" DESC;
+   "
+   ```
+
+3. **Check Open Ledger Gaps and Dead-Letter Backlog [READ-ONLY]:**
+   ```bash
+   # Verify ledger gaps flagged by reorg
+   psql "$DATABASE_URL" -c "
+     SELECT id, \"fromLedger\", \"toLedger\", source, status, \"createdAt\"
+     FROM \"LedgerGap\"
+     WHERE source = 'reorg'
+     ORDER BY \"createdAt\" DESC LIMIT 10;
+   "
+
+   # Check if any dead letters occurred during the reorg event
+   psql "$DATABASE_URL" -c "
+     SELECT count(*), status
+     FROM \"DeadLetterEvent\"
+     WHERE \"ledgerSequence\" > $SAFE_LEDGER
+     GROUP BY status;
+   "
+   ```
+
+---
+
+### Post-Rollback & Cache Invalidation Verification [READ-ONLY]
+
+1. **Verify Ledger Cursor Rollback [READ-ONLY]:**
+   ```bash
+   # Verify lastLedger has rolled back to <= $SAFE_LEDGER
+   psql "$DATABASE_URL" -c "
+     SELECT \"lastLedger\", \"lastLedgerHash\", \"updatedAt\"
+     FROM \"SyncState\" LIMIT 1;
+   "
+   ```
+
+2. **Verify Purge of Invalidated Provisional Rows [READ-ONLY]:**
+   ```bash
+   # Ensure zero unconfirmed rows remain above the safe ledger
+   psql "$DATABASE_URL" -c "
+     SELECT count(*) AS orphaned_events
+     FROM \"MarketplaceEvent\"
+     WHERE \"ledgerSequence\" > $SAFE_LEDGER
+       AND confirmed = false;
+   "
+   # Expected result: 0
+   ```
+
+3. **Verify Redis Cache Invalidation [READ-ONLY]:**
+   ```bash
+   # Inspect Redis keys for listings invalidated in the rollback window
+   redis-cli -u "$REDIS_URL" KEYS "listing:*" | head -n 20
+
+   # Verify TTL or check that cached records reflect current on-chain state
+   redis-cli -u "$REDIS_URL" GET "listing:$LISTING_ID"
+   ```
+
+---
+
+### Sync Resumption & Health Verification [READ-ONLY]
+
+1. **Monitor Monotonic Sync Resumption [READ-ONLY]:**
+   ```bash
+   # Run twice with a 10s gap to verify lastLedger is advancing
+   psql "$DATABASE_URL" -c "SELECT \"lastLedger\", \"updatedAt\" FROM \"SyncState\";"
+   sleep 10
+   psql "$DATABASE_URL" -c "SELECT \"lastLedger\", \"updatedAt\" FROM \"SyncState\";"
+   ```
+
+2. **Verify Prometheus Reorg & Stalled Metrics [READ-ONLY]:**
+   ```bash
+   curl -s http://localhost:4000/metrics | grep -E 'indexer_stalled|indexer_open_ledger_gaps|indexer_last_ledger_sequence'
+   # Expected:
+   # indexer_stalled 0
+   # indexer_open_ledger_gaps{source="reorg"} 0
+   ```
+
+3. **Verify Indexer Health & Readiness [READ-ONLY]:**
+   ```bash
+   curl -s http://localhost:4000/health
+   # Expected: {"status":"healthy"}
+
+   curl -s http://localhost:4000/readyz
+   # Expected: {"ready":true}
+   ```
+
+---
+
+### Operator Verification Worksheet Table
+
+| Check # | Verification Item | Target Command / Metric | Expected Outcome | Operator Sign-Off |
+|---|---|---|---|---|
+| **1** | Safe Ledger Boundary | `SyncState.lastLedger` vs Network Tip | `lastLedger <= $SAFE_LEDGER` | `[  ]` Passed |
+| **2** | Orphan Event Cleanup | `SELECT count(*) WHERE ledger > safe AND confirmed = false` | Exactly `0` | `[  ]` Passed |
+| **3** | Ledger Gap Status | `SELECT count(*) FROM "LedgerGap" WHERE status != 'Repaired'` | Exactly `0` | `[  ]` Passed |
+| **4** | Redis Cache Invalidation | `redis-cli GET "listing:$ID"` | Cache purged or re-warmed | `[  ]` Passed |
+| **5** | Poller Resumption | Check successive `SyncState.lastLedger` | Advancing monotonically | `[  ]` Passed |
+| **6** | Metrics Normalization | `indexer_stalled` gauge | Equals `0` | `[  ]` Passed |
+| **7** | Service Readiness | `GET /readyz` | HTTP 200 `{"ready":true}` | `[  ]` Passed |
+
+---
+
+### Operator Notes: Review and Revert Procedures
+
+#### Review Procedure
+1. Confirm that all 7 items in the Verification Worksheet Table have been verified and signed off.
+2. Confirm no raw credentials, private keys, or PII are logged in the incident record.
+3. Attach the read-only command output to the incident post-mortem ticket.
+
+#### Revert Procedure
+If post-rollback sync fails or points to an invalid fork:
+1. Stop the indexer poller:
+   ```bash
+   docker compose stop indexer
+   ```
+2. Reset `SyncState` back to an earlier verified checkpoint:
+   ```sql
+   UPDATE "SyncState"
+   SET "lastLedger" = $CHECKPOINT_LEDGER,
+       "lastLedgerHash" = '$CHECKPOINT_HASH',
+       "updatedAt" = NOW();
+   ```
+3. Flush transient Redis read caches:
+   ```bash
+   redis-cli -u "$REDIS_URL" FLUSHDB
+   ```
+4. Restart indexer in read-only audit mode or resume poller:
+   ```bash
+   docker compose start indexer
+   ```
+
+---
+
 ## Communication
 
 ### During Recovery
