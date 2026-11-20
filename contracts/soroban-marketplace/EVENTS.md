@@ -314,3 +314,38 @@ Emitted when a qualifying bid is accepted within the active `extension_trigger` 
   * Callable with or without active bids.
   * When bids exist: refunds 100% of the leading bid to `highest_bidder`, marks `mark_bid_refunded` (blocking double refund), emits `AUCTION_BID_REFUNDED`, emits `AUCTION_CANCELLED` with `reason: Admin` or `Emergency` and `escrow_amount = refunded_amount`, and emits `AUCTION_ADMIN_CANCELLED`.
   * In both paths, NFT custody is returned to creator, leaving zero residual escrow in the contract.
+
+### 5. Offer Lifecycle State Matrix & Event Flow — Issue #1088
+
+The contract implements a formal state machine for offers via `OfferStatus` (`types.rs`) and entry points in `contract.rs`. Escrowed payment tokens are held by the marketplace contract until terminal resolution.
+
+#### Offer State Fields
+* `offer_id`: Unique monotonic identifier (`u64`).
+* `listing_id`: Target marketplace listing (`u64`).
+* `offerer`: Address of the prospective buyer (`Address`).
+* `amount`: Escrowed payment token amount in base units (`i128`).
+* `token`: Whitelisted SAC payment token address (`Address`).
+* `status`: Current state (`OfferStatus`: `Pending`, `Accepted`, `Rejected`, `Withdrawn`, `Expired`).
+* `created_at`: Ledger sequence number when created (`u32`).
+* `expires_at`: Optional expiration timestamp in seconds (`Option<u64>`).
+
+#### State Transition Matrix
+
+| Initial State | Transition Action | Entry Point | Required Auth | Preconditions & Guard Checks | Target State | Escrow & Custody Action | Emitted Event(s) |
+|:---|:---|:---|:---|:---|:---|:---|:---|
+| *(None)* | **Create** | `make_offer` | `offerer` | Listing Active, `offerer != artist`, `amount > 0`, token whitelisted, pending count $< 30$ | `Pending` | Transfers `amount` from `offerer` to contract escrow | `OFFER_MADE` (`offer_made`) |
+| `Pending` | **Accept** | `accept_offer` | `artist` | Listing Active, `now < expires_at`, `now < listing.expires_at`, token active in policy engine | `Accepted` | 1. Payout split to royalty, treasury, seller<br>2. NFT transferred to `offerer`<br>3. Siblings refunded | `OFFER_ACCEPTED` (`offer_accepted`), `OFFER_REJECTED` (`offer_rejected`) for siblings, `PROTOCOL_FEE_COLLECTED`, `ROYALTY_SETTLEMENT` |
+| `Pending` | **Reject** | `reject_offer` | `artist` | Listing exists, `artist == caller`, offer is `Pending` | `Rejected` | Full `amount` refunded from contract to `offerer` | `OFFER_REJECTED` (`offer_rejected`) |
+| `Pending` | **Withdraw** | `withdraw_offer` | `offerer` | `offerer == caller`, offer is `Pending` | `Withdrawn` | Full `amount` refunded from contract to `offerer` | `OFFER_WITHDRAWN` (`offer_withdrawn`) |
+| `Pending` | **Reclaim** | `reclaim_offer` | None (Public) | Offer is `Pending`, `expires_at.is_some()`, `now >= expires_at` | `Withdrawn` | Full `amount` refunded from contract to `offerer` | `OFFER_RECLAIMED` (`offer_reclaimed`) |
+| `Pending` | **Sweep** | `sweep_expired_offers` | None (Batch) | Batch size $\le 20$, offer is `Pending`, `now >= expires_at` | `Expired` | Full `amount` refunded from contract to `offerer` | `OFFER_EXPIRED_SWEEP` (`offer_expired_sweep`) |
+| `Pending` | **Counter** | `counter_offer` | `artist` | `artist == caller`, offer is `Pending`, `amount > 0` | `Rejected` (parent) | Parent escrow refunded to `offerer`; new counter-offer created | `OFFER_COUNTERED` (`offer_countered`), `OFFER_MADE` (`offer_made`) |
+| `Accepted` | *(Any)* | `*` | Any | None | *(Terminal)* | None | Reverts with `InvalidOfferState` (`#33`) |
+| `Rejected` | *(Any)* | `*` | Any | None | *(Terminal)* | None | Reverts with `InvalidOfferState` (`#33`) |
+| `Withdrawn` | *(Any)* | `*` | Any | None | *(Terminal)* | None | Reverts with `InvalidOfferState` (`#33`) |
+| `Expired` | *(Any)* | `*` | Any | None | *(Terminal)* | None | Reverts with `InvalidOfferState` (`#33`) |
+
+#### Reentrancy & Pause Safety
+* **Reentrancy**: `accept_offer` acquires `ListingLock(listing_id)` via RAII guard `ListingReentrancyScope` before modifying state or performing token/NFT transfers. Reentrant callbacks revert with `ReentrancyGuard` (`#22`).
+* **Emergency Pause Bypass**: User fund recovery entry points (`withdraw_offer`, `reject_offer`, `reclaim_offer`) bypass all pause controls (global, per-collection, per-function), guaranteeing buyers and artists can always retrieve escrowed funds during an incident.
+* **Checks-Effects-Interactions (CEI)**: Every transition updates and commits `offer.status` in persistent storage before invoking `TokenClient::transfer`.
