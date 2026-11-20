@@ -38,5 +38,21 @@
   "sort": "Sort",
   "empty_state_no_items": "No items found",
   "view_details": "View Details",
-  "back": "Back"
+  "back": "Back",
+  "explore_empty_filtered_title": "No matching artworks",
+  "explore_empty_filtered_description": "No listings match your current filters or search terms. Try clearing or relaxing your filters to discover more works.",
+  "explore_empty_filtered_action": "Clear all filters",
+  "explore_empty_unfiltered_title": "No artworks yet",
+  "explore_empty_unfiltered_description": "The marketplace doesn't have any listings yet. Check back soon for new artworks from creators.",
+  "auctions_empty_filtered_title": "No {status} auctions",
+  "auctions_empty_filtered_description": "No {status} auctions at the moment.",
+  "auctions_empty_filtered_action": "View all auctions",
+  "auctions_empty_unfiltered_title": "No auctions found",
+  "auctions_empty_unfiltered_description": "No auctions have been created yet. Check back soon!",
+  "filter_reset_all": "Reset all filters",
+  "filter_no_results_title": "No results found",
+  "filter_no_results_description": "No items match the current filters. Try adjusting your search or clearing some filters.",
+  "filter_clear_all": "Clear all filters",
+  "loading_artworks": "Loading artworks…",
+  "loading_auctions": "Loading auctions…"
 }
