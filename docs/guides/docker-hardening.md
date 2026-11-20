@@ -174,14 +174,15 @@ DATABASE_URL=postgresql://user:pass@host:5432/db
 # Redis (use secrets manager in production)
 REDIS_URL=redis://host:6379
 
-# Stellar configuration (public)
+# Stellar configuration (public - testnet defaults shown; adjust for mainnet)
 STELLAR_NETWORK=testnet
 STELLAR_RPC_URL=https://soroban-testnet.stellar.org
 STELLAR_HORIZON_URL=https://horizon-testnet.stellar.org
 
-# Contract IDs (public)
-MARKETPLACE_CONTRACT_ID=GD...
-LAUNCHPAD_CONTRACT_ID=GD...
+# Contract IDs (public - 56-char C... address; network-specific placeholder)
+# Testnet example: CB74XQOHEVOL2NQ376JLVW5IGVM6I5VFDSHG66YKSHDQKRNTYGGXW25E
+MARKETPLACE_CONTRACT_ID=C<TESTNET_OR_MAINNET_MARKETPLACE_CONTRACT_ID>
+LAUNCHPAD_CONTRACT_ID=C<TESTNET_OR_MAINNET_LAUNCHPAD_CONTRACT_ID>
 
 # Security tokens (use secrets manager)
 HEALTH_DETAILS_TOKEN=random-secret-token
@@ -189,8 +190,8 @@ HEALTH_DETAILS_TOKEN=random-secret-token
 
 #### Frontend
 ```bash
-# Public configuration (baked into build)
-NEXT_PUBLIC_CONTRACT_ID=GD...
+# Public configuration (baked into build - 56-char C... address matching targeted network)
+NEXT_PUBLIC_CONTRACT_ID=C<TESTNET_OR_MAINNET_MARKETPLACE_CONTRACT_ID>
 NEXT_PUBLIC_STELLAR_NETWORK=testnet
 NEXT_PUBLIC_INDEXER_URL=https://api.elcarehub.xyz
 

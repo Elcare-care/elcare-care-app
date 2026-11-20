@@ -108,6 +108,9 @@ rows are never updated or deleted after insertion.
 | `Discrepancy` | `ArchivedDiscrepancy` | `detectedAt < now() - INTERVAL '90 days'` |
 | `KeeperAction` | `ArchivedKeeperAction` | `updatedAt < now() - INTERVAL '30 days'` |
 
+> **Note on Storage-Level Partition Maintenance:**
+> In addition to application-level archival tables, storage-level range partitions for `MarketplaceEvent`, `Bid`, and `RoyaltyPayment` must follow the [Partition Maintenance Checklist](../indexer/docs/partitioning-operations.md#partition-maintenance-checklist-pre-destructive-action) before any partition is detached or dropped.
+
 ## Archival job
 
 The archival job (`src/archive.ts`) runs as a bounded, resumable batch process:

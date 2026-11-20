@@ -148,6 +148,8 @@ const LAUNCHPAD_ERRORS: ContractErrorDefinition[] = [
   { code: 18, name: "NameTooLong", message: "The collection name exceeds the maximum allowed length of 64 characters.", retryable: false, action: "adjust_input" },
   { code: 19, name: "SymbolTooLong", message: "The collection symbol exceeds the maximum allowed length of 16 characters.", retryable: false, action: "adjust_input" },
   { code: 20, name: "MaxSupplyTooLarge", message: "Max supply cannot exceed 1,000,000,000.", retryable: false, action: "adjust_input" },
+  { code: 21, name: "MarketplaceNotConfigured", message: "The launchpad marketplace contract has not been configured yet.", retryable: false, action: "contact_support" },
+  { code: 22, name: "CollectionNotOurs", message: "This collection was not deployed by this launchpad instance.", retryable: false, action: "adjust_input" },
 ];
 
 const COLLECTION_NFT_ERC721_ERRORS: ContractErrorDefinition[] = [
@@ -207,6 +209,8 @@ const COLLECTION_NFT_ERC1155_ERRORS: ContractErrorDefinition[] = [
   { code: 24, name: "NoPendingCreator", message: "There is no pending creator-succession proposal to accept or cancel.", retryable: false, action: "refresh_and_retry" },
   { code: 25, name: "NotPendingCreator", message: "You are not the proposed successor for this creator transfer.", retryable: false, action: "reconnect_wallet" },
   { code: 26, name: "ProposalExpired", message: "The creator-succession proposal has expired and must be re-issued.", retryable: false, action: "refresh_and_retry" },
+  { code: 27, name: "InvalidMaxSupply", message: "Max supply must be greater than zero and within platform limits.", retryable: false, action: "adjust_input" },
+  { code: 28, name: "InvalidUri", message: "The token URI uses an invalid scheme.", retryable: false, action: "adjust_input" },
 ];
 
 const LAZY_MINT_ERC721_ERRORS: ContractErrorDefinition[] = [

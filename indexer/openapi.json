@@ -2,7 +2,7 @@
   "openapi": "3.0.0",
   "info": {
     "title": "ElcareHub Indexer API",
-    "description": "Off-chain event indexer and REST API for the ElcareHub NFT marketplace on Stellar Soroban. All BigInt values (IDs, endTime) are serialised as decimal strings.",
+    "description": "Off-chain event indexer and REST API for the ElcareHub NFT marketplace on Stellar Soroban. All BigInt values (IDs, endTime) are serialised as decimal strings. Note: Contract addresses are network-specific (testnet vs. mainnet); never reuse testnet contract IDs in mainnet environments.",
     "version": "1.0.0",
     "contact": {
       "name": "ElcareHub",
@@ -52,7 +52,7 @@
           "collection": {
             "type": "string",
             "example": "CABC...DEF",
-            "description": "Collection contract address"
+            "description": "Collection contract address (network-specific Soroban contract ID: testnet vs mainnet)"
           },
           "nftTokenId": {
             "type": "string",
@@ -62,7 +62,7 @@
           "token": {
             "type": "string",
             "example": "CABC...DEF",
-            "description": "Payment token contract address"
+            "description": "Payment token contract address (network-specific SAC contract ID: testnet vs mainnet)"
           },
           "status": {
             "type": "string",
@@ -350,7 +350,7 @@
           "contractAddress": {
             "type": "string",
             "example": "CABC...DEF",
-            "description": "Deployed collection contract address"
+            "description": "Deployed collection contract address (network-specific Soroban contract ID)"
           },
           "kind": {
             "type": "string",

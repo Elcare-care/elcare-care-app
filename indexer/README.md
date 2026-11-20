@@ -20,8 +20,9 @@
 - [How It Works](#how-it-works)
 - [Getting Started](#getting-started)
 - [Environment Variables](#environment-variables)
-- [API Reference](#api-reference)
 - [API Documentation (Swagger UI)](#api-documentation-swagger-ui)
+- [OpenAPI Route Changelog](#openapi-route-changelog)
+- [API Reference](#api-reference)
 - [Database Schema](#database-schema)
 - [Re-org Handling](#re-org-handling)
 - [Redis Caching](#redis-caching)
@@ -128,8 +129,8 @@ npm run backfill -- --start=123456 --end=124999 --rpc=https://your-archival-rpc
 | `DB_STATEMENT_TIMEOUT` | ⬜ | `30000` | Max query execution time (ms). Recommended: 30000 for typical queries, 10000 for strict SLA |
 | `DB_IDLE_TIMEOUT` | ⬜ | `30000` | Connection idle timeout (ms). Recommended: 30000 |
 | `DB_ACQUIRE_TIMEOUT` | ⬜ | `10000` | Max time to acquire connection from pool (ms). Increase if seeing "too many clients" errors under peak load |
-| `MARKETPLACE_CONTRACT_ID` | ✅ | — | Soroban marketplace contract address |
-| `LAUNCHPAD_CONTRACT_ID` | ✅ | — | Launchpad factory contract address |
+| `MARKETPLACE_CONTRACT_ID` | ✅ | — | Soroban marketplace contract address (56 characters starting with `C`; network-specific placeholder `C<MARKETPLACE_CONTRACT_ID>`) |
+| `LAUNCHPAD_CONTRACT_ID` | ✅ | — | Launchpad factory contract address (56 characters starting with `C`; network-specific placeholder `C<LAUNCHPAD_CONTRACT_ID>`) |
 | `REDIS_URL` | ✅ | `redis://localhost:6379` | Redis connection string |
 | `STELLAR_RPC_URL` | ✅ | `https://soroban-testnet.stellar.org` | Soroban RPC endpoint |
 | `STELLAR_NETWORK` | ✅ | `testnet` | **Target network: `testnet` or `mainnet`.** Local development uses `testnet` by default. Mainnet requires intentional deployment configuration. |
@@ -213,6 +214,108 @@ To update the spec locally after changing routes:
 npm run generate-openapi
 # then commit the updated openapi.json
 ```
+
+---
+
+## OpenAPI Route Changelog
+
+This changelog records public and operator route interface evolutions, authentication policy adjustments, payload additions, and deprecation schedules across the indexer route families.
+
+### Route Evolution Guidelines
+1. **Additive Schema Updates:** New response properties must be additive and optional/nullable for existing consumers.
+2. **Deprecation Window:** Deprecated fields or routes must maintain backwards-compatibility for at least one minor release cycle with documented transition paths.
+3. **Authentication Transparency:** Any addition of authentication gates (`X-Operator-Token`, JWT, or session) must be documented with explicit status code expectations (`401 Unauthorized` vs `403 Forbidden`).
+4. **Reversibility:** Every route change must have an operator revert strategy preserving previous client contracts if downstream errors emerge.
+
+---
+
+### Seeded Route Families Changelog
+
+#### 1. Listings Route Family (`/listings`, `/listings/:id`, `/listings/:id/history`)
+- **Category:** Marketplace Core
+- **Authentication:** Public (None).
+- **Responses:**
+  - Added `priceDecimal` (7-decimal formatted string) alongside raw integer `price` (stroops in i128) to eliminate client-side float division rounding errors.
+  - Standardized response list envelope: `{ data: Listing[], total: number, limit: number, offset: number }`.
+- **Deprecation Notice:** The use of raw unscaled `price` for direct frontend display is deprecated; clients should adopt `priceDecimal`. Unpaginated listing array responses are deprecated.
+
+#### 2. Auctions Route Family (`/auctions`, `/auctions/:id`, `/auctions/:id/bids`)
+- **Category:** Marketplace Auctions
+- **Authentication:** Public (None).
+- **Responses:**
+  - Added `reservePriceDecimal` and `highestBidDecimal` human-readable representations.
+  - Added bid timeline cursor pagination support for high-frequency auction listings.
+- **Deprecation Notice:** Client reliance on client-side math for `reservePrice` scaling is deprecated in favor of `reservePriceDecimal`.
+
+#### 3. Offers Route Family (`/offers`, `/offers/:id`)
+- **Category:** Marketplace Offers
+- **Authentication:** Public (None).
+- **Responses:**
+  - Added `amountDecimal` human-readable representation.
+  - Added `expiresAt` optional ledger timestamp field for time-limited offers.
+- **Deprecation Notice:** Unfiltered offer queries without a `listing_id` target parameter are deprecated to prevent query cost escalation.
+
+#### 4. Collections Route Family (`/collections`, `/collections/:id`, `/collections/:id/tokens`)
+- **Category:** Launchpad & Collections
+- **Authentication:** Public (None).
+- **Responses:**
+  - Standardized collection contract responses (`contractAddress`, `kind`, `creator`, `name`, `symbol`, `deployedAtLedger`).
+  - Added support for both `normal_721` and `normal_1155` collection variants.
+- **Deprecation Notice:** Legacy non-standard collection kind identifiers are deprecated.
+
+#### 5. Analytics & Royalties Route Family (`/stats`, `/stats/overview`, `/royalties`)
+- **Category:** Telemetry & Accounting
+- **Authentication:** Public (None); rate-limited.
+- **Responses:**
+  - Added `totalVolume` and `floorPrice` as exact decimal strings.
+  - Added `conversionRate` (0 – 1) and unique user metrics.
+- **Deprecation Notice:** Millisecond integer timestamps in stats filters are deprecated in favor of ISO-8601 UTC date strings (`YYYY-MM-DD`).
+
+#### 6. Operational & Audit Route Family (`/audit/logs`, `/audit/export`)
+- **Category:** Operator Tools & Security
+- **Authentication:** **Protected** — requires `X-Operator-Token` header.
+- **Responses:**
+  - Structured audit trail JSON and CSV exports.
+  - Automatic pseudonymization of wallet addresses (`GCAT…ZXAB`) and redaction of request IDs in compliance with logging policy.
+- **Deprecation Notice:** Deprecated unauthenticated diagnostic inspection endpoints.
+
+#### 7. Wallet Notifications Route Family (`/wallets/:address/notifications`)
+- **Category:** User Activity Feeds
+- **Authentication:** Public wallet address path parameter; rate-limited (20 req/min).
+- **Responses:**
+  - Paginated notification events categorized by `domain` (`marketplace`, `auction`, `admin`) and `priority` (`HIGH`, `MEDIUM`, `LOW`).
+- **Deprecation Notice:** Deprecated polling without domain/priority filters on mobile clients.
+
+---
+
+### Operator & Developer Notes: Route Change Review & Revert
+
+#### Developer Review Procedure
+1. Edit Zod schema and route definitions in `indexer/src/api/openapi.ts` and `indexer/src/api/routes.ts`.
+2. Regenerate the OpenAPI JSON spec:
+   ```bash
+   # [DEVELOPER] Regenerate specification
+   npm run generate-openapi --prefix indexer
+   ```
+3. Validate OpenAPI consistency against git:
+   ```bash
+   # [READ-ONLY] Validate schema parity
+   bash scripts/check-openapi.sh
+   ```
+4. Append a changelog entry in this section specifying: route path, auth requirements, payload delta, and deprecation details.
+
+#### Revert Procedure
+If a route modification breaks frontend clients or external indexer consumers:
+1. Revert the route code and schema commit:
+   ```bash
+   git revert <commit-sha>
+   ```
+2. Re-run spec generation and validation:
+   ```bash
+   npm run generate-openapi --prefix indexer
+   bash scripts/check-openapi.sh
+   ```
+3. Deploy the rolled-back indexer container.
 
 ---
 
