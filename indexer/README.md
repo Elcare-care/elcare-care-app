@@ -430,10 +430,13 @@ High-traffic read endpoints are cached with a short TTL to protect the database 
 
 | Endpoint | TTL | Notes |
 |----------|-----|-------|
-| `/listings` | 30 s | Invalidated on new events |
-| `/auctions` | 30 s | Invalidated on new events |
+| `/listings` | 10 s | Invalidated on new events |
+| `/listings/:id` | 60 s | Invalidated on listing events |
+| `/auctions` | 10 s | Invalidated on new events |
+| `/auctions/:id` | 5 s | Invalidated on auction events |
 | `/collections` | 60 s | Rarely changes |
-| `/wallets/:address/activity` | 15 s | Per-address key |
+
+The full per-route table is in [docs/runbooks/cache-ttl-reference.md](../docs/runbooks/cache-ttl-reference.md). That page is the source of truth and is checked by `src/__tests__/redis-ops-docs.test.ts`. Key prefixes are listed in [docs/runbooks/redis-key-registry.md](../docs/runbooks/redis-key-registry.md). `REDIS_CACHE_TTL_SECONDS` is currently not read by any route.
 
 If Redis is unavailable, the API falls back to direct PostgreSQL reads automatically. Cache errors are logged but never surface as 500s to clients.
 
