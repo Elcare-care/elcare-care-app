@@ -49,6 +49,26 @@ function renderConsumer() {
   return { api: () => api, onHook };
 }
 
+// ── Helpers ─────────────────────────────────────────────────────────────────
+
+/** The full set of URL query keys the hook ever intentionally writes. */
+const ALLOWED_URL_KEYS = new Set([
+  "q", "status", "collection", "minPrice", "maxPrice", "artist", "sort", "page",
+]);
+
+/** The URL string passed to router.replace on the most recent call. */
+function lastReplaceUrl(): string {
+  const calls = mockReplace.mock.calls;
+  return (calls[calls.length - 1]?.[0] as string) ?? "";
+}
+
+/** Asserts every query key the hook wrote is one it intends to manage. */
+function expectOnlyIntendedKeys(): void {
+  const qs = lastReplaceUrl().split("?")[1] ?? "";
+  const keys = qs ? [...new URLSearchParams(qs).keys()] : [];
+  expect(keys.every((k) => ALLOWED_URL_KEYS.has(k))).toBe(true);
+}
+
 // ── Tests ──────────────────────────────────────────────────
 
 describe("useFilterUrlSync", () => {
@@ -257,5 +277,95 @@ describe("useFilterUrlSync", () => {
       "/explore?q=african+pattern&status=Active&collection=Origins&minPrice=10&maxPrice=500&artist=GARTIST2&sort=price-high&page=3",
       { scroll: false }
     );
+  });
+
+  // ── Valid, unknown, and duplicate values — only intended URL keys remain ──
+
+  it("syncToUrl with all valid values leaves only the intended URL keys", () => {
+    const { api } = renderConsumer();
+    const filters: Filters = {
+      search: "bronze",
+      status: "Active",
+      collection: ["Benin"],
+      minPrice: "5",
+      maxPrice: "50",
+      artist: "GART",
+      sort: "price-low",
+    };
+    api().syncToUrl(filters, 3);
+    expect(mockReplace).toHaveBeenCalledWith(
+      "/explore?q=bronze&status=Active&collection=Benin&minPrice=5&maxPrice=50&artist=GART&sort=price-low&page=3",
+      { scroll: false }
+    );
+    expectOnlyIntendedKeys();
+  });
+
+  it("syncToUrl drops unknown URL params, leaving only the intended keys", () => {
+    mockSearchParams = new URLSearchParams("q=test&foo=unknown&bar=baz&page=2");
+    const { api } = renderConsumer();
+
+    // Unknown params are not read into Filters…
+    expect(api().initialFilters.search).toBe("test");
+    // …and are dropped when the filters are pushed back to the URL.
+    api().syncToUrl(
+      {
+        search: "test",
+        status: "All",
+        collection: [],
+        minPrice: "",
+        maxPrice: "",
+        artist: "",
+        sort: "newest",
+      },
+      2,
+    );
+    expect(mockReplace).toHaveBeenCalledWith("/explore?q=test&page=2", {
+      scroll: false,
+    });
+    expectOnlyIntendedKeys();
+  });
+
+  it("duplicate single-value params collapse to one on read and on sync", () => {
+    mockSearchParams = new URLSearchParams(
+      "q=a&q=b&page=1&page=2&sort=price-low&sort=price-high",
+    );
+    const { api } = renderConsumer();
+
+    // Reading takes the first value of each duplicated single-value param.
+    expect(api().initialFilters.search).toBe("a");
+    expect(api().initialPage).toBe(1);
+    expect(api().initialFilters.sort).toBe("price-low");
+
+    // Syncing writes each single-value key at most once (page=1 is default → omitted).
+    api().syncToUrl(api().initialFilters, api().initialPage);
+    expect(mockReplace).toHaveBeenCalledWith("/explore?q=a&sort=price-low", {
+      scroll: false,
+    });
+    expectOnlyIntendedKeys();
+  });
+
+  it("duplicate collection values are preserved as the intended multi-value key", () => {
+    mockSearchParams = new URLSearchParams("collection=C1&collection=C2&collection=C1&foo=drop");
+    const { api } = renderConsumer();
+
+    expect(api().initialFilters.collection).toEqual(["C1", "C2", "C1"]);
+    api().syncToUrl(
+      {
+        search: "",
+        status: "All",
+        collection: ["C1", "C2", "C1"],
+        minPrice: "",
+        maxPrice: "",
+        artist: "",
+        sort: "newest",
+      },
+      1,
+    );
+    expect(mockReplace).toHaveBeenCalledWith(
+      "/explore?collection=C1&collection=C2&collection=C1",
+      { scroll: false },
+    );
+    // `collection` is an intended key even when repeated; the unknown `foo` is gone.
+    expectOnlyIntendedKeys();
   });
 });

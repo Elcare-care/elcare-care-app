@@ -627,6 +627,59 @@ describe('[#443] SSE HTTP — headers, resume, dedup, reorg', () => {
       expect(data.type).toBe('CONNECTED');
     }
   });
+
+  // ── disconnect + reorg: reconnectable headers, event shape, dedupe by id ────
+  //
+  // These extend the resume/reorg coverage above with the specific edge state:
+  // a client that disconnects and reconnects must (a) still see stream headers
+  // that allow reconnection, (b) receive a reorg-correction event in the named
+  // `event: reorg` frame shape (with an id so it can be deduped), and (c) never
+  // have an already-seen event id redelivered. The shared beforeEach/afterEach
+  // in this block start and stop the test server cleanly between each case.
+
+  it('a reorg event is delivered as a named `event: reorg` frame with an id and data payload', async () => {
+    emitSSEEvent({ eventType: 'REORG', fromLedger: 100, toLedger: 105 }); // id 1
+
+    const frames = await collectSseFrames(`${baseUrl}/events`, { 'Last-Event-ID': '0' }, 1);
+    const reorgFrame = frames.find((f) => f.includes('event: reorg'));
+
+    expect(reorgFrame).toBeDefined();
+    expect(reorgFrame as string).toContain('id: 1');
+    expect(reorgFrame as string).toContain('event: reorg');
+
+    const dataLine = (reorgFrame as string)
+      .split('\n')
+      .find((l) => l.startsWith('data: ')) as string;
+    const payload = JSON.parse(dataLine.slice('data: '.length));
+    expect(payload.eventType).toBe('REORG');
+    expect(payload.fromLedger).toBe(100);
+    expect(payload.toLedger).toBe(105);
+  });
+
+  it('every delivered event frame carries an id line so clients can resume by Last-Event-ID', async () => {
+    emitSSEEvent({ type: 'one' }); // id 1
+    emitSSEEvent({ type: 'two' }); // id 2
+
+    const frames = await collectSseFrames(`${baseUrl}/events`, { 'Last-Event-ID': '0' }, 2);
+
+    expect(frames).toHaveLength(2);
+    // Each event frame begins with `id:` so a reconnecting client can resume
+    // from the exact point it disconnected (reconnectable).
+    expect(frames.every((f) => f.startsWith('id: '))).toBe(true);
+  });
+
+  it('reconnecting at the last seen event id does not redeliver already-seen events (dedupe by event id)', async () => {
+    emitSSEEvent({ type: 'seen-1' }); // id 1 — already received by the client
+    emitSSEEvent({ type: 'seen-2' }); // id 2 — client disconnects here
+
+    // Reconnect with Last-Event-ID pointing at the last event it actually saw.
+    const frames = await collectSseFrames(`${baseUrl}/events`, { 'Last-Event-ID': '2' }, 2, 400);
+    const redelivered = frames.filter((f) => f.startsWith('id: '));
+
+    // No previously-seen event id is sent again across the disconnect+reconnect.
+    expect(redelivered).not.toContain('id: 1');
+    expect(redelivered).not.toContain('id: 2');
+  });
 });
 
 // =============================================================================
