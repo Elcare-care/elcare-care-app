@@ -406,6 +406,9 @@ All settlement (`buy_artwork`, `accept_offer`, `finalize_auction`) routes throug
 | High basis points | `amount=1_000_000`, `royalty_bps=1_000` (10%), `fee_bps=500` (5%), 1 recipient at 9 500 bps | `royalty = 100_000`; `remaining = 900_000`; `fee = 45_000`; `remaining = 855_000`; recipient (last) gets `855_000`. Total = `100_000+45_000+855_000 = 1_000_000`. |
 | Multiple recipients | `amount=100`, `fee_bps=0`, no royalty, 3 recipients at 3 334 / 3 333 / 3 333 bps | Recipient 0 = `33`, recipient 1 = `33`, recipient 2 (last) = `100-33-33 = 34` (absorbs remainder). Total = `100`. |
 
+> For comprehensive worked examples, multi-recipient split fixtures (0, 1, and many recipients), and offer precision fixture notes (dust, exact, and overflow-risk amounts), see [MATH.md](MATH.md).
+> For the complete Offer Lifecycle State Matrix with allowed transitions and emitted events, see [EVENTS.md §5](EVENTS.md#5-offer-lifecycle-state-matrix--event-flow--issue-1088).
+
 ### Overflow and validity guarantees
 
 - Every multiplication/division/addition/subtraction in the payout path uses `checked_*` arithmetic and reverts with `ArithmeticOverflow` (#40) instead of silently wrapping — this includes the protocol-fee computation, which previously used unchecked `*`/`/` and has been hardened to match the royalty/recipient paths.
