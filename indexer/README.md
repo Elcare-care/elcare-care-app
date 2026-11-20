@@ -561,3 +561,44 @@ For deeper indexer troubleshooting, schema changes, and ingestion diagnostics, r
 - 🚀 **[Deployment Guide](../docs/guides/deployment.md)**
 - 🛡️ **[Security Triage Guide](../docs/guides/security-triage.md)**
 
+---
+
+## Graceful Shutdown
+
+The indexer handles graceful shutdown gracefully when Kubernetes sends `SIGTERM` or Docker runs `docker stop`. This ensures:
+
+- **No stale polling** — The poller completes its current batch and saves cursor state
+- **No open HTTP handlers** — The server drains in-flight requests before closing
+- **No incomplete Prisma transactions** — All database transactions commit or rollback cleanly
+- **No stale SSE connections** — Connected clients receive a `server-shutdown` event before disconnection
+
+See **[Graceful Shutdown Handling](docs/graceful-shutdown.md)** for:
+- Full shutdown sequence documentation
+- Kubernetes/Docker timing configuration
+- Verification scripts for production operators
+- Smoke checks to validate health during termination
+
+---
+
+## Configuration
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `DATABASE_URL` | ✅ | — | PostgreSQL connection string |
+| `DB_CONNECTION_LIMIT` | ⬜ | `10` | Max connections in pool. Recommended: 10-20 for single instance, up to 50 for high-traffic production |
+| `DB_STATEMENT_TIMEOUT` | ⬜ | `30000` | Max query execution time (ms). Recommended: 30000 for typical queries, 10000 for strict SLA |
+| `DB_IDLE_TIMEOUT` | ⬜ | `30000` | Connection idle timeout (ms). Recommended: 30000 |
+| `DB_ACQUIRE_TIMEOUT` | ⬜ | `10000` | Max time to acquire connection from pool (ms). Increase if seeing "too many clients" errors under peak load |
+| `MARKETPLACE_CONTRACT_ID` | ✅ | — | Soroban marketplace contract address |
+| `LAUNCHPAD_CONTRACT_ID` | ✅ | — | Launchpad factory contract address |
+| `REDIS_URL` | ✅ | `redis://localhost:6379` | Redis connection string |
+| `STELLAR_RPC_URL` | ✅ | `https://soroban-testnet.stellar.org` | Soroban RPC endpoint |
+| `STELLAR_NETWORK` | ✅ | `testnet` | **Target network: `testnet` or `mainnet`.** Local development uses `testnet` by default. Mainnet requires intentional deployment configuration. |
+| `STELLAR_HORIZON_URL` | ⬜ | `https://horizon-testnet.stellar.org` | Horizon REST API |
+| `PORT` | ⬜ | `4000` | HTTP server port |
+| `POLL_INTERVAL_MS` | ⬜ | `5000` | Polling interval in milliseconds |
+| `CORS_ORIGIN` | ⬜ | — | Comma-separated list of allowed origins (see CORS section) |
+| `LOG_LEVEL` | ⬜ | `info` | Minimum log level emitted: `debug` \| `info` \| `warn` \| `error` (see [Logging](#logging)) |
+| `LOG_FORMAT` | ⬜ | `json` | `json` for machine-readable logs, `pretty` for colorized human-readable local dev output |
+| `SHUTDOWN_TIMEOUT_MS` | ⬜ | `30000` | Seconds to wait for HTTP requests to drain before force-closing. Keep ≥30s in production to allow full drain |
+
