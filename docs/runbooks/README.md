@@ -25,6 +25,10 @@ Each runbook covers: detection, containment, diagnosis, recovery, and post-incid
 | [wallet-incompatibility.md](./wallet-incompatibility.md) | Freighter or Magic.link failures | HIGH |
 | [incorrect-deployment-config.md](./incorrect-deployment-config.md) | Wrong contract ID, network, or secrets | HIGH |
 | [tabletop-exercises.md](./tabletop-exercises.md) | Exercise records and scenarios | — |
+| [rpc-fallback-activation.md](./rpc-fallback-activation.md) | Switch to a fallback RPC endpoint during an outage | HIGH |
+| [contract-deploy-dry-run.md](./contract-deploy-dry-run.md) | Pre-confirmation checklist for contract deployments | HIGH |
+| [wasm-reproducibility-checklist.md](./wasm-reproducibility-checklist.md) | Verify WASM artifact hashes against source and build provenance | HIGH |
+| [workflow-manual-dispatch-safety-guide.md](./workflow-manual-dispatch-safety-guide.md) | Safe use of `workflow_dispatch` inputs in CI workflows | MEDIUM |
 
 **Secret inventory:** [../secret-inventory.md](../secret-inventory.md)  
 **Reliability reviews & backlog:** [../reliability/README.md](../reliability/README.md)  
