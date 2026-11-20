@@ -236,3 +236,29 @@ Each contract only supports sequential upgrades (n → n+1). Attempting to jump 
 | `collection_nft_erc1155` | creator address | (none — initial version baseline) |
 | `lazy_mint_erc721` | creator address | (none — initial version baseline) |
 | `lazy_mint_erc1155` | creator address | (none — initial version baseline) |
+
+---
+
+## Contract Version & Migration Marker Compatibility Checklist (Issue #1100)
+
+Before and after invoking `stellar contract install` or `migrate` / `migrate_step`, operators must verify binary version and on-chain migration marker parity using the checklist below:
+
+### Pre-Upgrade Compatibility Checklist
+- [ ] **1. Record pre-upgrade on-chain versions (Read-Only):**
+  ```bash
+  stellar contract invoke --id <CONTRACT_ID> --network <network> -- version
+  stellar contract invoke --id <CONTRACT_ID> --network <network> -- contract_version
+  ```
+  Confirm `version()` equals `contract_version()` prior to uploading the new WASM, and verify no incomplete `MigrationCursor` is stranded from an earlier run.
+- [ ] **2. Verify `MigrationDone(target_version)` idempotency guard:**
+  Confirm in `contracts/soroban-marketplace/src/contract.rs` that the new binary's `version()` string matches the `MigrationDone(version)` key written by `migrate()` / `migrate_step()`. Invoking `migrate()` twice on an already-migrated version must deterministically return `ContractError::AlreadyMigrated`.
+- [ ] **3. Verify role & pause authority before installation:**
+  Confirm the operator holds the `Upgrade` role (or `Admin` fallback via `get_role_inventory`) and that `cargo test -p soroban-marketplace` passes cleanly.
+
+### Post-Upgrade Verification & Rollback Checklist
+- [ ] **4. Confirm `version() == contract_version()` after `migrate` / `migrate_step`:**
+  Once `migrate_step` returns `0` (or `migrate` succeeds), re-query both `version()` and `contract_version()` and confirm the `("migrated", version_string)` event was emitted.
+- [ ] **5. Verify re-invocation guard:**
+  A dry-run simulation of `migrate` against the upgraded contract must return `ContractError::AlreadyMigrated` (confirming the `MigrationDone` marker is persisted).
+- [ ] **6. Rollback / Escalation Path:**
+  If `version()` and `contract_version()` diverge or `migrate_step` halts with an unexpected error, immediately pause state-mutating entry points via `set_paused(true)` (`docs/runbooks/contract-pause.md`), re-install the previous verified WASM hash via `stellar contract install --wasm-hash <PREVIOUS_WASM_HASH>`, and escalate to the Contract Lead.

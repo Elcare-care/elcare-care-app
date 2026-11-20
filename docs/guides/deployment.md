@@ -243,3 +243,9 @@ See [COMPATIBILITY.md](../../COMPATIBILITY.md) for the full matrix of tested and
 - **NEVER print `STELLAR_SECRET_KEY`** in CI logs or terminal recordings.
 - Store production secrets in encrypted secrets managers (Kubernetes Secrets, HashiCorp Vault, Vercel Environment Variables).
 - Verify deployment scripts sanitize output before printing environment details.
+
+---
+
+## Upgrade & Version Compatibility Reference
+
+Before upgrading any deployed marketplace or launchpad contract WASM, complete the [Contract Version & Migration Marker Compatibility Checklist](./contract-upgrade-runbook.md#contract-version--migration-marker-compatibility-checklist-issue-1100) in `docs/guides/contract-upgrade-runbook.md`.

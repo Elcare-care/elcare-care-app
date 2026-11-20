@@ -158,3 +158,25 @@ escalation path as dependency findings below:
 - Cargo Audit: https://docs.rs/cargo-audit/
 - npm Audit: https://docs.npmjs.com/auditing-package-dependencies-for-security-vulnerabilities
 - Gitleaks: https://github.com/gitleaks/gitleaks
+
+---
+
+## Gitleaks False-Positive Triage Record Template (Issue #1112)
+
+When secret scanning (`.github/workflows/secret-scan.yml` / `.gitleaks.toml`) flags synthetic test fixtures or historical non-secret data, record the disposition using the standardized template below before adding any narrow value allowlist entry. Scanner rules in `.gitleaks.toml` must not be weakened or disabled.
+
+```markdown
+### Gitleaks Triage Record — [YYYY-MM-DD]
+
+- **Finding:** [Rule ID, e.g., `stellar-secret-key` / `generic-api-key`, file path, line number, and commit SHA (REDACTED match snippet only — never paste raw secrets)]
+- **Context:** [Where the value appears (unit test fixture, E2E mock, documentation placeholder, vendored upstream test) and why it triggered the pattern]
+- **Validation:** [Proof that the value is non-sensitive: e.g., deterministic repeated-character test key, zero on-chain balance/history on Mainnet & Testnet, or offline-only local container credential]
+- **Disposition:** [`FALSE_POSITIVE_ALLOWLIST_VALUE` | `ROTATE_AND_PURGE` | `REPLACE_WITH_SYNTHETIC_FIXTURE`]
+- **Expiry / Review Date:** [YYYY-MM-DD (maximum 90 days for temporary allowlist entries, or `PERMANENT_SYNTHETIC_FIXTURE` for deterministic test constants)]
+- **Reviewer & Owner:** [Security / Backend Reviewer GitHub handle, PR link, and rollback action if the fixture is no longer required]
+```
+
+### Triage Governance & Rollback
+- **Owner:** Security & DevOps Maintainers (`SECURITY.md`).
+- **Trigger:** Any non-zero exit from the `gitleaks` or `gitleaks-docker-context` CI job on a pull request or weekly history scan.
+- **Rollback / Escalation:** If a triaged entry is later found to correspond to a live or reused credential, immediately revoke/rotate the credential in the provider console, remove the allowlist regex from `.gitleaks.toml`, and escalate via the compromised-key runbook (`docs/runbooks/compromised-admin-key.md`).

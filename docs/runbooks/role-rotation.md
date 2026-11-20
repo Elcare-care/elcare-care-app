@@ -219,3 +219,22 @@ See also:
 - [contract-upgrade-runbook.md](contract-upgrade-runbook.md) — post-upgrade role verification
 - [compromised-admin-key.md](../runbooks/compromised-admin-key.md) — key compromise emergency procedure
 - `scripts/preflight/role-rotation-preflight.sh` — dry-run preflight script
+
+---
+
+## Role-Transfer Operator Verification & Test Checklist (Issue #1097)
+
+Use this checklist to verify all six role-transfer lifecycle scenarios against the contract test suite (`cargo test -p soroban-marketplace`) and during staging/testnet rehearsals:
+
+| Scenario | Entry Point / Mechanism | Expected Invariant & Error Code | Verification Command / Test Check |
+|---|---|---|---|
+| **1. Propose transfer** | `propose_role_transfer(current_authority, role, candidate)` | Requires auth from current role holder (or `Admin` if role uses fallback); records `pending_candidate` with 7-day (`604_800`s) expiry and emits `RoleTransferProposed`. Unauthorized caller fails with `Unauthorized`. | `stellar contract invoke ... -- get_role_inventory` shows `pending_candidate == candidate` and `pending_expires_at == now + 604800`. |
+| **2. Accept transfer** | `accept_role_transfer(role, candidate)` | Requires `candidate.require_auth()`; promotes `candidate` to active role holder, clears pending proposal, and emits `RoleTransferAccepted`. Wrong caller fails with `Unauthorized` / `NoPendingRoleTransfer`. | `get_role_inventory` shows `holder == candidate` and `pending_candidate == null`. |
+| **3. Cancel proposal** | `cancel_role_proposal(authority, role)` | Current role holder or `Admin` cancels an active proposal before acceptance; clears `pending_candidate` and emits `RoleProposalCancelled`. | Subsequent `accept_role_transfer` by the former candidate fails with `NoPendingRoleTransfer`. |
+| **4. Proposal expiry** | Ledger timestamp advances past `pending_expires_at` (`> 604_800`s) | Expired proposal cannot be accepted; calling `accept_role_transfer` after expiry fails with `RoleProposalExpired` and preserves existing holder. | Advance ledger timestamp > 7 days in unit test; assert `RoleProposalExpired`. |
+| **5. Admin fallback** | No explicit holder assigned for `ProtocolConfig`, `EmergencyPause`, `CollectionAdmin`, or `Upgrade` | `Admin` address is authoritative for the axis until an explicit holder accepts a transfer. | `get_role_inventory` reports `Admin` as effective authority when explicit role slot is unset. |
+| **6. Legacy role migration** | `migrate_roles(admin)` | Idempotently initializes/migrates role storage slots under `Admin` authority during schema upgrades without revoking active holders. | Run `cargo test -p soroban-marketplace role` and confirm all role lifecycle tests pass. |
+
+### Ownership & Rollback
+- **Owner:** Contract & Security Operations (`ops@elcarehub.xyz`).
+- **Rollback Path:** If a wrong `candidate` address is proposed, immediately invoke `cancel_role_proposal` using the current role holder or `Admin` key before the candidate can accept.
