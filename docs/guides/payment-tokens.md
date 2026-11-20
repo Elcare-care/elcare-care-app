@@ -84,10 +84,15 @@ Example — `GET /listings/42` for a 10 XLM listing:
   "price": "100000000",
   "priceDecimal": "10.0000000",
   "currency": "XLM",
-  "token": "CDLZ...CYSC",
+  "token": "C<TOKEN_SAC_ADDRESS>",
   "status": "Active"
 }
 ```
+
+> **Network Note on `token` addresses:** In testnet environments, the native XLM SAC address is
+> `CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC` (often abbreviated `CDLZ...CYSC` in examples).
+> On mainnet, the native XLM SAC address is `CAS3J7GYLGXGR6AK3VTQBDG2YZQOEFV2TKEBKH6A76EABR76W3G6AB7C`.
+> Always verify the token contract address matches the active network (`STELLAR_NETWORK`).
 
 `price` is the raw stroop amount emitted by the contract (an `i128`, serialized as a JSON string to
 avoid the double-precision-float truncation that plain JSON numbers would suffer for large i128

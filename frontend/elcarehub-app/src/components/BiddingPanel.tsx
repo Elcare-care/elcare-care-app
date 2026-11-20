@@ -12,7 +12,8 @@ import { useFinalizeAuction, useMinBidIncrement } from "@/hooks/useAuctions";
 import { useServerClock } from "@/hooks/useServerClock";
 import { GuardButton } from "@/components/WalletGuard";
 import { TxErrorPanel } from "@/components/TxErrorPanel";
-import { useTxLifecycle, txStateLabel, isTxActive } from "@/hooks/useTxLifecycle";
+import { useTxLifecycle, txStatusMessage, isTxActive } from "@/hooks/useTxLifecycle";
+import { t } from "@/lib/i18n";
 import { getTokenConfigByAddress, getNativeTokenConfig } from "@/config/tokens";
 import { config } from "@/lib/config";
 import {
@@ -285,7 +286,7 @@ export function BiddingPanel({
       {bidSuccess && (
         <div role="status" className="flex items-center gap-2 rounded-lg bg-green-100 px-3 py-2 text-sm font-medium text-green-700">
           <CheckCircle size={16} aria-hidden="true" />
-          Bid placed successfully!
+          {t("bid_success_status")}
         </div>
       )}
 
@@ -293,7 +294,7 @@ export function BiddingPanel({
       {isActive && (
         <div role="status" className="flex items-center gap-2 rounded-lg bg-brand-50 px-3 py-2 text-sm text-brand-700">
           <Loader2 size={14} className="animate-spin" aria-hidden="true" />
-          {txStateLabel(txState.state)}
+          {txStatusMessage(txState)}
         </div>
       )}
 
@@ -310,7 +311,7 @@ export function BiddingPanel({
       {/* sr-only live region for assistive technologies */}
       {isActive && (
         <div role="status" className="sr-only">
-          {txStateLabel(txState.state)}
+          {txStatusMessage(txState)}
         </div>
       )}
 

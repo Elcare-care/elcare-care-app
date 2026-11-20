@@ -62,6 +62,7 @@ const CATALOG_TS_PATH = join(
   REPO_ROOT,
   "frontend/elcarehub-app/src/lib/contractErrors/catalog.ts"
 );
+const ERROR_CATALOG_JSON_PATH = join(REPO_ROOT, "error-catalog.json");
 
 /**
  * Extracts { name, code } pairs from the `#[contracterror]`-annotated enum
@@ -151,8 +152,16 @@ function extractCatalogEntries(catalogSource, constName) {
 
 function main() {
   const catalogSource = readFileSync(CATALOG_TS_PATH, "utf8");
+  let errorCatalogJson = null;
+  try {
+    errorCatalogJson = JSON.parse(readFileSync(ERROR_CATALOG_JSON_PATH, "utf8"));
+  } catch (err) {
+    console.warn(`! Warning: could not read error-catalog.json: ${err.message}`);
+  }
+
   let hasFailure = false;
   const report = [];
+  const coverageSummary = [];
 
   for (const contract of CONTRACTS) {
     const rustPath = join(REPO_ROOT, contract.rustFile);
@@ -191,8 +200,39 @@ function main() {
     const rustCodes = new Set(rustVariants.map((v) => v.code));
     const stale = catalogEntries.filter((e) => !rustCodes.has(e.code));
 
+    // Verify parity against error-catalog.json if present
+    if (errorCatalogJson && errorCatalogJson.contracts) {
+      const jsonKey = Object.keys(errorCatalogJson.contracts).find(
+        (k) =>
+          k === contract.key ||
+          k.replace(/-/g, "_") === contract.key.replace(/-/g, "_") ||
+          (contract.key === "marketplace" && k === "soroban-marketplace")
+      );
+      if (jsonKey) {
+        const jsonErrors = errorCatalogJson.contracts[jsonKey].errors || {};
+        const jsonMissing = rustVariants.filter((v) => jsonErrors[v.name] === undefined);
+        const jsonMismatched = rustVariants.filter(
+          (v) => jsonErrors[v.name] !== undefined && jsonErrors[v.name] !== v.code
+        );
+        if (jsonMissing.length > 0 || jsonMismatched.length > 0) {
+          hasFailure = true;
+          report.push(
+            `✗ ${contract.key}: error-catalog.json discrepancy (missing: ${jsonMissing.length}, mismatched: ${jsonMismatched.length})`
+          );
+        }
+      }
+    }
+
+    coverageSummary.push({
+      contract: contract.key,
+      totalVariants: rustVariants.length,
+      mappedClient: catalogEntries.length,
+      unmapped: missing.length,
+      stale: stale.length,
+    });
+
     if (missing.length === 0 && mismatched.length === 0) {
-      report.push(`✓ ${contract.key}: ${rustVariants.length} contract errors, all mapped`);
+      report.push(`✓ ${contract.key}: ${rustVariants.length} contract errors, all mapped (100% coverage)`);
     } else {
       hasFailure = true;
       report.push(`✗ ${contract.key}: coverage gap found`);
@@ -236,7 +276,10 @@ function main() {
     }
   }
 
+  console.log("=== API & Contract Error Catalog Coverage Report ===");
   console.log(report.join("\n"));
+  console.log("\nSummary:");
+  console.table(coverageSummary);
 
   if (hasFailure) {
     console.error(

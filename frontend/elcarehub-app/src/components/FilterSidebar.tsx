@@ -107,6 +107,7 @@ export function FilterSidebar({ filters, dispatch, isOpen, setIsOpen, recentArti
 
       {/* Sidebar */}
       <div
+        data-testid="filter-sidebar"
         className={`fixed inset-y-0 left-0 z-50 w-80 transform bg-white shadow-xl transition-transform duration-300 ease-in-out lg:static lg:block lg:translate-x-0 ${
           isOpen ? "translate-x-0" : "-translate-x-full"
         }`}
@@ -216,15 +217,44 @@ export function FilterSidebar({ filters, dispatch, isOpen, setIsOpen, recentArti
                 ))}
               </datalist>
             </div>
+
+            {/* Sort */}
+            <div className="space-y-4">
+              <h3 className="text-sm font-medium text-gray-900">Sort by</h3>
+              <select
+                value={filters.sort}
+                onChange={(e) =>
+                  dispatch({ type: "SET_SORT", payload: e.target.value as SortOption })
+                }
+                aria-label="Sort listings"
+                className="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm focus:border-brand-500 focus:outline-none focus:ring-1 focus:ring-brand-500"
+              >
+                <option value="newest">Newest First</option>
+                <option value="oldest">Oldest First</option>
+                <option value="price-low">Price: Low to High</option>
+                <option value="price-high">Price: High to Low</option>
+                <option value="recently-sold">Recently Sold</option>
+              </select>
+            </div>
           </div>
 
           {/* Footer */}
-          <div className="border-t p-4">
+          <div className="border-t p-4 space-y-2">
             <button
-              onClick={() => dispatch({ type: "CLEAR_ALL" })}
-              className="w-full rounded-lg border border-gray-300 px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50"
+              data-testid="filter-reset-all"
+              onClick={() => {
+                dispatch({ type: "CLEAR_ALL" });
+                setIsOpen(false);
+              }}
+              className="w-full rounded-lg bg-brand-500 px-4 py-2.5 text-sm font-semibold text-white hover:bg-brand-600 transition-colors"
             >
-              Clear All Filters
+              Reset all filters
+            </button>
+            <button
+              onClick={() => setIsOpen(false)}
+              className="w-full rounded-lg border border-gray-300 px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50 transition-colors lg:hidden"
+            >
+              Close
             </button>
           </div>
         </div>

@@ -264,3 +264,88 @@ The JSON block below defines the exact topics and data schemas for all events. I
   }
 }
 ```
+
+---
+
+## Detailed Event Semantics & Edge Cases
+
+### 1. Auction Extension (`AUCTION_EXTENDED`) — Issue #1085
+Emitted when a qualifying bid is accepted within the active `extension_trigger` window and neither `max_extensions` nor `MAX_TOTAL_AUCTION_DURATION` (30 days) is exceeded.
+* **Topic**: `auction_extended`
+* **Payload Fields**:
+  * `auction_id`: Target auction identifier (`u64`).
+  * `prev_end_time`: Expiration timestamp prior to this extension (`u64`).
+  * `new_end_time`: New extended timestamp (`now + extension_window`) (`u64`).
+  * `extension_count`: Monotonically increasing counter (1-based) indicating total extensions applied (`u32`).
+* **Suppression Semantics**:
+  * If a bid arrives inside the trigger window but `extension_count >= max_extensions` (when `max_extensions > 0`), the bid is accepted, but no `auction_extended` event is emitted.
+  * If the proposed end time exceeds `original_end_time + 2_592_000`, the bid is accepted, but extension is suppressed and no `auction_extended` event is emitted.
+  * If `now >= end_time`, the transaction reverts with `AuctionExpired` (#9) before reaching event emission.
+
+### 2. Bid History Retention & Event Stream (`BID_PLACED`) — Issue #1084
+* **Topic**: `bid_placed`
+* **Payload Fields**:
+  * `auction_id`: Target auction identifier (`u64`).
+  * `bidder`: Address of the successful bidder (`Address`).
+  * `bid_amount`: Amount placed in the payment token (`i128`).
+  * `effective_end_time`: The active end time of the auction after this bid (`u64`).
+* **On-Chain Storage vs. Event Stream**:
+  * Every valid bid emits a `bid_placed` event to the ledger stream.
+  * On-chain state retains at most `bid_history_cap` records (default 50, range 1–200, commonly configured to 20 in UI fixtures) in a FIFO ring buffer.
+  * When capacity is reached, the oldest record at index 0 is evicted. The on-chain list queryable via `get_auction_bids(auction_id)` maintains strict chronological monotonicity (oldest retained to newest).
+
+### 3. Reserve Price & Finalization Distinction — Issue #1086
+* **Outcome A: Reserve Met / Winning Settlement**:
+  * Emits `AUCTION_RESOLVED` (`auction_resolved`): carries `winner: Some(winner_address)` and `amount: winning_bid`.
+  * Emits `PROTOCOL_FEE_COLLECTED`, `ROYALTY_SETTLEMENT`, and royalty breakdown.
+  * NFT custody transferred to winner.
+* **Outcome B: Reserve Not Met / Zero Bids**:
+  * When an auction expires without receiving any bids meeting `reserve_price`:
+  * Emits `AUCTION_RESOLVED` (`auction_resolved`) with `winner: None` and `amount: 0`.
+  * Emits `AUCTION_CANCELLED` (`auction_cancelled`) with `reason: AuctionCancelReason::Owner` and `escrow_amount: 0`.
+  * No fee or payout events are emitted.
+  * NFT custody safely returned to creator.
+
+### 4. Auction Cancellation & Custody Cleanup — Issue #1087
+* **Creator Cancel (`cancel_auction`)**:
+  * Callable only on Active auctions with zero bids.
+  * Emits `AUCTION_CANCELLED` with `reason: AuctionCancelReason::Owner`, `escrow_amount: 0`.
+* **Admin / Emergency Cancel (`admin_cancel_auction`)**:
+  * Callable with or without active bids.
+  * When bids exist: refunds 100% of the leading bid to `highest_bidder`, marks `mark_bid_refunded` (blocking double refund), emits `AUCTION_BID_REFUNDED`, emits `AUCTION_CANCELLED` with `reason: Admin` or `Emergency` and `escrow_amount = refunded_amount`, and emits `AUCTION_ADMIN_CANCELLED`.
+  * In both paths, NFT custody is returned to creator, leaving zero residual escrow in the contract.
+
+### 5. Offer Lifecycle State Matrix & Event Flow — Issue #1088
+
+The contract implements a formal state machine for offers via `OfferStatus` (`types.rs`) and entry points in `contract.rs`. Escrowed payment tokens are held by the marketplace contract until terminal resolution.
+
+#### Offer State Fields
+* `offer_id`: Unique monotonic identifier (`u64`).
+* `listing_id`: Target marketplace listing (`u64`).
+* `offerer`: Address of the prospective buyer (`Address`).
+* `amount`: Escrowed payment token amount in base units (`i128`).
+* `token`: Whitelisted SAC payment token address (`Address`).
+* `status`: Current state (`OfferStatus`: `Pending`, `Accepted`, `Rejected`, `Withdrawn`, `Expired`).
+* `created_at`: Ledger sequence number when created (`u32`).
+* `expires_at`: Optional expiration timestamp in seconds (`Option<u64>`).
+
+#### State Transition Matrix
+
+| Initial State | Transition Action | Entry Point | Required Auth | Preconditions & Guard Checks | Target State | Escrow & Custody Action | Emitted Event(s) |
+|:---|:---|:---|:---|:---|:---|:---|:---|
+| *(None)* | **Create** | `make_offer` | `offerer` | Listing Active, `offerer != artist`, `amount > 0`, token whitelisted, pending count $< 30$ | `Pending` | Transfers `amount` from `offerer` to contract escrow | `OFFER_MADE` (`offer_made`) |
+| `Pending` | **Accept** | `accept_offer` | `artist` | Listing Active, `now < expires_at`, `now < listing.expires_at`, token active in policy engine | `Accepted` | 1. Payout split to royalty, treasury, seller<br>2. NFT transferred to `offerer`<br>3. Siblings refunded | `OFFER_ACCEPTED` (`offer_accepted`), `OFFER_REJECTED` (`offer_rejected`) for siblings, `PROTOCOL_FEE_COLLECTED`, `ROYALTY_SETTLEMENT` |
+| `Pending` | **Reject** | `reject_offer` | `artist` | Listing exists, `artist == caller`, offer is `Pending` | `Rejected` | Full `amount` refunded from contract to `offerer` | `OFFER_REJECTED` (`offer_rejected`) |
+| `Pending` | **Withdraw** | `withdraw_offer` | `offerer` | `offerer == caller`, offer is `Pending` | `Withdrawn` | Full `amount` refunded from contract to `offerer` | `OFFER_WITHDRAWN` (`offer_withdrawn`) |
+| `Pending` | **Reclaim** | `reclaim_offer` | None (Public) | Offer is `Pending`, `expires_at.is_some()`, `now >= expires_at` | `Withdrawn` | Full `amount` refunded from contract to `offerer` | `OFFER_RECLAIMED` (`offer_reclaimed`) |
+| `Pending` | **Sweep** | `sweep_expired_offers` | None (Batch) | Batch size $\le 20$, offer is `Pending`, `now >= expires_at` | `Expired` | Full `amount` refunded from contract to `offerer` | `OFFER_EXPIRED_SWEEP` (`offer_expired_sweep`) |
+| `Pending` | **Counter** | `counter_offer` | `artist` | `artist == caller`, offer is `Pending`, `amount > 0` | `Rejected` (parent) | Parent escrow refunded to `offerer`; new counter-offer created | `OFFER_COUNTERED` (`offer_countered`), `OFFER_MADE` (`offer_made`) |
+| `Accepted` | *(Any)* | `*` | Any | None | *(Terminal)* | None | Reverts with `InvalidOfferState` (`#33`) |
+| `Rejected` | *(Any)* | `*` | Any | None | *(Terminal)* | None | Reverts with `InvalidOfferState` (`#33`) |
+| `Withdrawn` | *(Any)* | `*` | Any | None | *(Terminal)* | None | Reverts with `InvalidOfferState` (`#33`) |
+| `Expired` | *(Any)* | `*` | Any | None | *(Terminal)* | None | Reverts with `InvalidOfferState` (`#33`) |
+
+#### Reentrancy & Pause Safety
+* **Reentrancy**: `accept_offer` acquires `ListingLock(listing_id)` via RAII guard `ListingReentrancyScope` before modifying state or performing token/NFT transfers. Reentrant callbacks revert with `ReentrancyGuard` (`#22`).
+* **Emergency Pause Bypass**: User fund recovery entry points (`withdraw_offer`, `reject_offer`, `reclaim_offer`) bypass all pause controls (global, per-collection, per-function), guaranteeing buyers and artists can always retrieve escrowed funds during an incident.
+* **Checks-Effects-Interactions (CEI)**: Every transition updates and commits `offer.status` in persistent storage before invoking `TokenClient::transfer`.

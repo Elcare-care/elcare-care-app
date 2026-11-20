@@ -32,6 +32,19 @@ const mockRedis = vi.hoisted(() => {
   // any other module-level code, including function declarations below it.
   const store = new Map<string, { value: string; expiresAt: number | null }>();
   let ready = true;
+  // Simulates a mid-request Redis failure (after the readiness check passes):
+  // when set, the quota INCR rejects, exercising the fail-open try/catch path.
+  let failure: 'none' | 'connection-refused' | 'timeout' = 'none';
+  function failureError(): Error {
+    if (failure === 'connection-refused') {
+      const e = new Error('connect ECONNREFUSED 127.0.0.1:6379');
+      (e as any).code = 'ECONNREFUSED';
+      return e;
+    }
+    const e = new Error('Redis command timed out');
+    (e as any).code = 'ETIMEDOUT';
+    return e;
+  }
   const nowSec = () => Math.floor(Date.now() / 1000);
   const isLive = (e: any) => !!e && (e.expiresAt === null || e.expiresAt > nowSec());
   return {
@@ -42,7 +55,11 @@ const mockRedis = vi.hoisted(() => {
     setReady(v: boolean) {
       ready = v;
     },
+    setFailure(m: 'none' | 'connection-refused' | 'timeout') {
+      failure = m;
+    },
     async incr(key: string) {
+      if (failure !== 'none') throw failureError();
       const existing = store.get(key);
       const current = isLive(existing) ? parseInt(existing!.value, 10) : 0;
       const next = current + 1;
@@ -114,6 +131,7 @@ function buildApp(family: keyof typeof FAMILY_BUDGETS) {
 beforeEach(() => {
   mockRedis._store.clear();
   mockRedis.setReady(true);
+  mockRedis.setFailure('none');
 });
 
 describe('abuse-detection: key derivation', () => {
@@ -194,6 +212,42 @@ describe('abuse-detection: Redis failure fails open', () => {
     mockRedis.setReady(false);
     const result = await isBlocked('wallet:GABC123');
     expect(result.blocked).toBe(false);
+  });
+});
+
+describe('abuse-detection: Redis operation failures (connection refused / timeout) fail open', () => {
+  // A connection drop or a command timeout that happens *mid-request* — after
+  // the readiness check passes — must not turn into a blanket 429/500 for
+  // legitimate traffic. The abuseDetection middleware wraps the Redis calls in
+  // a try/catch that records exactly one fail-open metric increment and lets
+  // the request proceed. We simulate the failure at the INCR (quota write)
+  // step; the earlier TTL read (isBlocked) still succeeds and reports "not
+  // blocked", so only the quota_check fail-open fires — one increment.
+
+  it('connection refused: allows the request and records exactly one fail-open increment', async () => {
+    mockRedis.setReady(true);
+    mockRedis.setFailure('connection-refused');
+    const before = (await abuseDetectionRedisFailureTotal.get()).values.reduce((s, v) => s + v.value, 0);
+
+    const app = buildApp('search');
+    const res = await request(app).get('/probe');
+
+    expect(res.status).toBe(200);
+    const after = (await abuseDetectionRedisFailureTotal.get()).values.reduce((s, v) => s + v.value, 0);
+    expect(after - before).toBe(1);
+  });
+
+  it('timeout: allows the request and records exactly one fail-open increment', async () => {
+    mockRedis.setReady(true);
+    mockRedis.setFailure('timeout');
+    const before = (await abuseDetectionRedisFailureTotal.get()).values.reduce((s, v) => s + v.value, 0);
+
+    const app = buildApp('search');
+    const res = await request(app).get('/probe');
+
+    expect(res.status).toBe(200);
+    const after = (await abuseDetectionRedisFailureTotal.get()).values.reduce((s, v) => s + v.value, 0);
+    expect(after - before).toBe(1);
   });
 });
 

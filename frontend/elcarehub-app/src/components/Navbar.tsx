@@ -211,26 +211,27 @@ export function Navbar() {
             : "bg-transparent"
         }`}
       >
-        <div className="mx-auto flex max-w-7xl items-center justify-between px-4 sm:px-6 py-4">
+        <div className="mx-auto flex max-w-7xl items-center justify-between px-3 sm:px-6 py-3 sm:py-4 gap-2 sm:gap-0">
 
           {/* Logo */}
           <Link
             href="/"
             aria-label="ElcareHub home"
-            className="flex items-center gap-2.5 group shrink-0"
+            className="flex items-center gap-2 group shrink-0"
           >
             <span
               aria-hidden="true"
-              className="flex items-center justify-center w-10 h-10 rounded-xl bg-brand-500 shadow-lg shadow-brand-500/30 group-hover:shadow-brand-500/50 transition-all duration-300 group-hover:scale-105"
+              className="flex items-center justify-center w-8 h-8 sm:w-10 sm:h-10 rounded-xl bg-brand-500 shadow-lg shadow-brand-500/30 group-hover:shadow-brand-500/50 transition-all duration-300 group-hover:scale-105 shrink-0"
             >
-              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
                 <rect x="9" y="2" width="6" height="20" rx="2" fill="white"/>
                 <rect x="2" y="9" width="20" height="6" rx="2" fill="white"/>
                 <circle cx="12" cy="12" r="2.5" fill="#E27D60"/>
               </svg>
             </span>
-            <span className="text-xl font-display font-bold text-white tracking-tight">
-              Elcare<span className="text-brand-400">Hub</span>
+            {/* Hide "Hub" suffix at ≤320px to prevent overflow while keeping brand identity */}
+            <span className="text-base sm:text-xl font-display font-bold text-white tracking-tight">
+              Elcare<span className="text-brand-400 hidden xs:inline">Hub</span>
             </span>
           </Link>
 
@@ -273,7 +274,7 @@ export function Navbar() {
                     aria-haspopup="true"
                     aria-expanded={showWalletMenu}
                     aria-label={`Wallet ${shortKey} — click to open wallet menu`}
-                    className="flex items-center gap-2 pl-3 pr-2 py-1.5 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10 transition-colors cursor-pointer"
+                    className="flex items-center gap-2 pl-3 pr-2 py-1.5 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10 transition-colors cursor-pointer min-w-0"
                   >
                     <div className="flex flex-col items-end">
                       <span className="text-[10px] font-bold text-white/40 uppercase tracking-tighter">Wallet</span>
@@ -344,9 +345,9 @@ export function Navbar() {
             aria-expanded={mobileOpen}
             aria-controls="mobile-menu"
             aria-label={mobileOpen ? "Close navigation menu" : "Open navigation menu"}
-            className="md:hidden flex items-center justify-center w-10 h-10 rounded-xl bg-white/5 text-white/70 hover:bg-white/10 border border-white/10 transition-all"
+            className="md:hidden flex items-center justify-center w-9 h-9 sm:w-10 sm:h-10 rounded-xl bg-white/5 text-white/70 hover:bg-white/10 border border-white/10 transition-all shrink-0"
           >
-            {mobileOpen ? <X size={20} aria-hidden="true" /> : <Menu size={20} aria-hidden="true" />}
+            {mobileOpen ? <X size={18} aria-hidden="true" /> : <Menu size={18} aria-hidden="true" />}
           </button>
         </div>
 
@@ -362,7 +363,7 @@ export function Navbar() {
             mobileOpen ? "max-h-[calc(100vh-5rem)] opacity-100" : "max-h-0 opacity-0 pointer-events-none"
           }`}
         >
-          <div className="bg-midnight-950/98 backdrop-blur-xl border-t border-white/5 px-4 py-6 overflow-y-auto max-h-[calc(100vh-5rem)]">
+          <div className="bg-midnight-950/98 backdrop-blur-xl border-t border-white/5 px-3 sm:px-4 py-6 overflow-y-auto max-h-[calc(100vh-5rem)]">
 
             {/* Public links */}
             <div className="space-y-1 mb-6">
@@ -437,10 +438,10 @@ export function Navbar() {
                       closeMobile();
                     }}
                     disabled={isConnecting}
-                    className="w-full flex items-center justify-center gap-2.5 rounded-xl bg-brand-500 py-4 text-base font-bold text-white shadow-xl shadow-brand-500/20 disabled:opacity-60"
+                    className="w-full flex items-center justify-center gap-2 rounded-xl bg-brand-500 py-4 text-sm sm:text-base font-bold text-white shadow-xl shadow-brand-500/20 disabled:opacity-60 truncate"
                   >
-                    <Wallet size={20} aria-hidden="true" />
-                    {isConnecting ? "Connecting…" : "Connect Wallet"}
+                    <Wallet size={18} aria-hidden="true" className="shrink-0" />
+                    <span className="truncate">{isConnecting ? "Connecting…" : "Connect Wallet"}</span>
                   </button>
                 </div>
               )}

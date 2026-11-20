@@ -293,3 +293,75 @@ psql "$DATABASE_URL" -c "
 
 - [Stalled Ingestion](./stalled-ingestion.md)
 - [Redis Outage](./redis-outage.md)
+
+---
+
+## Database Connection Pool Sizing Matrix & Failure Validation
+
+### Sizing Principles & Pool Separation
+The indexer divides PostgreSQL connections into two dedicated pools:
+1. **Read Pool (`indexer/src/db.ts`):** Serves API read traffic (`/listings`, `/auctions`, `/stats`). Controlled by `DB_CONNECTION_LIMIT`.
+2. **Write Pool (`indexer/src/prisma-write.ts`):** Dedicated to poller event ingestion, batch parser transactions, and backfill. Controlled by `DB_WRITE_CONNECTION_LIMIT`.
+
+Dedicated separation ensures high API traffic never blocks on-chain event ingestion, and heavy event backfills never starve API clients.
+
+### Environment Sizing Matrix
+
+| Environment | Topology / Instances | Read Pool (`DB_CONNECTION_LIMIT`) | Write Pool (`DB_WRITE_CONNECTION_LIMIT`) | Total / Instance | Total Indexer Conns | PostgreSQL `max_connections` | Reserved Headroom |
+|---|---|---|---|---|---|---|---|
+| **Local Dev** (Docker) | 1 instance | 10 | 3 | 13 | 13 | 50 | 37 (74%) |
+| **Staging** (Single Host) | 2 replicas | 15 | 5 | 20 | 40 | 100 | 60 (60%) |
+| **Production (Standard)** | 4 replicas | 25 | 5 | 30 | 120 | 200 | 80 (40%) |
+| **Production (High-Load)** | 8 replicas (with PgBouncer) | 30 (to pooler) | 5 (direct) | 35 | pooled | 300 | 100 (33%) |
+
+**Sizing Rule of Thumb:**
+$$\text{Total Connections} = \sum (\text{Replicas} \times (\text{ReadLimit} + \text{WriteLimit})) + \text{Headroom (15--20\%)}$$
+Always verify that total connection allocation does not exceed `80%` of PostgreSQL's `max_connections`.
+
+---
+
+### Pool Acquisition Failure Diagnostics & Validation [READ-ONLY]
+
+#### Diagnostic Step 1: Inspect Active vs Idle Connections [READ-ONLY]
+```sql
+-- [READ-ONLY] Check connection state distribution in PostgreSQL
+SELECT state, count(*), max(now() - state_change) AS max_duration
+FROM pg_stat_activity
+WHERE datname = current_database()
+GROUP BY state
+ORDER BY count(*) DESC;
+```
+
+#### Diagnostic Step 2: Identify Blocked or Long-Running Queries [READ-ONLY]
+```sql
+-- [READ-ONLY] Locate transactions holding connections > 10 seconds
+SELECT pid, usename, client_addr, state, now() - query_start AS duration, query
+FROM pg_stat_activity
+WHERE state != 'idle'
+  AND (now() - query_start) > INTERVAL '10 seconds'
+ORDER BY duration DESC;
+```
+
+#### Diagnostic Step 3: Validate Pool Health Metric [READ-ONLY]
+```bash
+# Check indexer DB health probe latency
+curl -s http://localhost:4000/metrics | grep -E 'indexer_db_health|db_pool'
+```
+
+#### Common Error Codes & Remediation
+
+| Symptom / Log Output | Root Cause | Operator Action |
+|---|---|---|
+| `Timed out fetching a new connection from the connection pool` (`P2024` / `P1001`) | Read pool exhausted under spike load | Increase `DB_CONNECTION_LIMIT` by 5; check for unindexed slow queries |
+| `P1008: Operations timed out after 30000ms` | Slow statement holding connection | Inspect `pg_stat_activity`; reduce query complexity or increase `DB_STATEMENT_TIMEOUT` |
+| `FATAL: remaining connection slots are reserved for non-replication superuser connections` | Total connections exceeded `max_connections` | Reduce per-instance pool limit or scale down unused replicas |
+
+#### Revert Procedure
+If pool adjustments cause database memory exhaustion or instability:
+1. Revert `DB_CONNECTION_LIMIT` and `DB_WRITE_CONNECTION_LIMIT` in `.env` to default values (`10` and `3`).
+2. Restart indexer containers: `docker compose restart indexer`.
+3. Terminate stuck connections if necessary:
+   ```sql
+   SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = current_database() AND state = 'idle in transaction';
+   ```
+

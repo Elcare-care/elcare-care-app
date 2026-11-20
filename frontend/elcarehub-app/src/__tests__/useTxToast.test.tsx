@@ -177,11 +177,11 @@ describe('useTxToast — success lifecycle', () => {
       expect(screen.getByRole('status', { hidden: true })).toBeInTheDocument();
     });
 
-    // The success toast message should contain the action label
+    // The success toast message should name the action and its outcome
     await waitFor(() => {
       const statuses = screen.getAllByRole('status', { hidden: true });
       const messages = statuses.map((el) => el.textContent ?? '');
-      expect(messages.some((m) => m.includes('Purchase') && m.includes('confirmed'))).toBe(true);
+      expect(messages.some((m) => m.includes('purchase') && m.includes('confirmed'))).toBe(true);
     });
   });
 
@@ -229,7 +229,7 @@ describe('useTxToast — success lifecycle', () => {
       const statuses = screen.getAllByRole('status', { hidden: true });
       const messages = statuses.map((el) => el.textContent ?? '');
       expect(
-        messages.some((m) => m.includes('Listing') && m.includes('confirmed'))
+        messages.some((m) => m.includes('listing') && m.includes('confirmed'))
       ).toBe(true);
     });
   });
@@ -266,6 +266,62 @@ describe('useTxToast — success lifecycle', () => {
     await waitFor(() =>
       expect(screen.getByTestId('running').textContent).toBe('false')
     );
+  });
+
+  // ── Outcome-specific next-action guidance ────────────────────────────────
+  //
+  // Every success toast must end with concise guidance for what to do next,
+  // tailored to the action family (purchase / listing / bid / offer).
+
+  it.each([
+    { action: 'Purchase', guidance: 'Profile' },
+    { action: 'Create listing', guidance: 'listing link' },
+    { action: 'Bid', guidance: 'highest bid' },
+    { action: 'Offer', guidance: 'Offers' },
+  ])('appends next-action guidance for "$action"', async ({ action, guidance }) => {
+    const user = userEvent.setup();
+    const successFn = jest.fn().mockResolvedValue(undefined);
+
+    renderHarness(successFn, { action });
+    await user.click(screen.getByTestId('trigger'));
+
+    await waitFor(() => {
+      const statuses = screen.getAllByRole('status', { hidden: true });
+      const messages = statuses.map((el) => el.textContent ?? '');
+      expect(messages.some((m) => m.includes('Next:') && m.includes(guidance))).toBe(true);
+    });
+  });
+
+  it('keeps the transaction hash available via the explorer link', async () => {
+    const user = userEvent.setup();
+    const txHash = 'b'.repeat(64);
+    const successFn = jest.fn().mockResolvedValue({ hash: txHash });
+
+    renderHarness(successFn, { action: 'Purchase' });
+    await user.click(screen.getByTestId('trigger'));
+
+    await waitFor(() => {
+      const statuses = screen.getAllByRole('status', { hidden: true });
+      const messages = statuses.map((el) => el.textContent ?? '');
+      const msg = messages.find((m) => m.includes('stellar.expert'));
+      expect(msg).toBeDefined();
+      expect(msg).toContain(txHash);
+      expect(msg).toContain('Next:');
+    });
+  });
+
+  it('uses generic guidance for unmapped actions', async () => {
+    const user = userEvent.setup();
+    const successFn = jest.fn().mockResolvedValue(undefined);
+
+    renderHarness(successFn, { action: 'My Custom Action' });
+    await user.click(screen.getByTestId('trigger'));
+
+    await waitFor(() => {
+      const statuses = screen.getAllByRole('status', { hidden: true });
+      const messages = statuses.map((el) => el.textContent ?? '');
+      expect(messages.some((m) => m.includes('on-chain state'))).toBe(true);
+    });
   });
 
   it('uses a custom action label in toasts', async () => {
