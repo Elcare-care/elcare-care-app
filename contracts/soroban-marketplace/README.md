@@ -63,11 +63,95 @@ This contract manages the complete lifecycle of on-chain marketplace listings, a
 | Function | Auth | Description |
 |----------|------|-------------|
 | `create_auction(creator, token, collection, token_id, reserve_price, duration, recipients)` | creator | Creates an auction. `duration` must be ≥ `MIN_AUCTION_DURATION` (3 600 s / 1 hour); rejects with `InvalidAuctionDuration` otherwise. |
-| `place_bid(bidder, auction_id, bid_amount)` | bidder | Places a bid above the current highest. Appends a `BidRecord` to the bounded on-chain history (capped to `BID_HISTORY_CAP = 20`). |
-| `finalize_auction(caller, auction_id)` | anyone | Finalizes after `end_time` — transfers NFT to winner and distributes funds. |
+| `place_bid(bidder, auction_id, bid_amount)` | bidder | Places a bid above the current highest. Appends a `BidRecord` to the bounded on-chain history (capped to `BID_HISTORY_CAP`). |
+| `finalize_auction(caller, auction_id)` | anyone | Finalizes after `end_time` — transfers NFT to winner and distributes funds if reserve met; cancels and returns NFT if no bids. |
 | `cancel_auction(creator, auction_id)` | creator | Cancels a no-bid auction before it ends. |
+| `admin_cancel_auction(admin, auction_id)` | admin (ProtocolConfig / EmergencyPause) | Administrative/emergency cancellation; refunds active bidder 100% and returns NFT to creator. |
 | `get_auction(auction_id)` | — | Returns full `Auction` struct. |
-| `get_auction_bids(auction_id)` | — | Returns the bounded bid history (`Vec<BidRecord>`) in chronological order (oldest → newest). At most `BID_HISTORY_CAP` (20) entries are retained; older bids are evicted. Returns an empty vec when no bids have been placed. |
+| `get_auction_bids(auction_id)` | — | Returns the bounded bid history (`Vec<BidRecord>`) in chronological order (oldest → newest). At most `bid_history_cap` (1–200, default 50) entries are retained; older bids are evicted. |
+
+#### Anti-Sniping & Auction Extension Boundaries (Issue #1085)
+
+Auctions incorporate an anti-sniping dynamic time-extension engine ("soft close") to protect participants against last-second automated sniping.
+
+##### Configuration Inventory
+
+| Setting / Constant | Type | Default | Scope | Description |
+|---|---|---|---|---|
+| `extension_window` | `u64` (seconds) | `600` (10 min) | Per-auction snapshot | Duration added to the current timestamp (`now + extension_window`) when an extension triggers. Configured via `set_auction_extension_window(secs)`. |
+| `extension_trigger` | `u64` (seconds) | `0` (disabled) | Per-auction snapshot | Threshold before `end_time`. If remaining time `< extension_trigger`, the anti-sniping extension fires. Configured via `set_auction_extension_trigger(secs)`. |
+| `max_extensions` | `u32` (count) | `0` (unlimited) | Per-auction snapshot | Hard cap on total extensions allowed per auction. Configured via `set_auction_max_extensions(max)`. `0` denotes unlimited extensions up to the duration cap. |
+| `MAX_TOTAL_AUCTION_DURATION` | `u64` (seconds) | `2_592_000` (30 days) | Global contract constant | Absolute ceiling for auction lifespan. An extension can never set `end_time > original_end_time + MAX_TOTAL_AUCTION_DURATION`. |
+| `MIN_AUCTION_DURATION` | `u64` (seconds) | `3_600` (1 hour) | Global contract constant | Minimum initial auction duration enforced at creation time. |
+
+*Note: All auction settings are snapshotted into the `Auction` struct at creation time (`create_auction`). Subsequent changes by protocol governance do not retroactively alter in-flight auctions.*
+
+##### Boundary & Edge-Case Behavior Matrix
+
+| Scenario | Condition | Last Permitted Bid Timestamp | Extension Triggered? | Final `end_time` Behavior | Event Emitted | Error / Result |
+|---|---|---|---|---|---|---|
+| **Expired Auction** | `now >= end_time` | `end_time - 1` | No | Unchanged | None | Reverts with `AuctionExpired` (Error #12) |
+| **Normal Bid Outside Trigger** | `end_time - now >= extension_trigger` | `end_time - 1` | No | Unchanged (`end_time`) | `BidPlacedEvent` | Bid accepted; no extension |
+| **Qualifying Bid Inside Trigger** | `end_time - now < extension_trigger` and caps not met | `end_time - 1` | **Yes** | Extended to `now + extension_window`; `extension_count += 1` | `BidPlacedEvent`, `AuctionExtendedEvent` | Bid accepted; auction extended |
+| **Max Extensions Cap Hit** | `end_time - now < extension_trigger` and `max_extensions > 0` and `extension_count >= max_extensions` | `end_time - 1` | **Suppressed** | Unchanged (`end_time`); `extension_count` unchanged | `BidPlacedEvent` | Bid accepted; extension suppressed |
+| **Max Duration Cap Exceeded** | `end_time - now < extension_trigger` and `now + extension_window > original_end_time + 2_592_000` | `end_time - 1` | **Suppressed** | Unchanged (`end_time`); `extension_count` unchanged | `BidPlacedEvent` | Bid accepted; extension suppressed |
+| **Zero Extension Window** | `extension_trigger > 0` and `extension_window == 0` | `end_time - 1` | **Suppressed** | Unchanged (`end_time`) | `BidPlacedEvent` | Bid accepted; extension suppressed (misconfiguration guard) |
+| **Finalization After End** | `now >= end_time` | N/A | N/A | Sells or Cancels | `AuctionFinalizedEvent` | Succeeded (CEI execution) |
+
+#### Bid History Eviction & Chronological Retention (Issue #1084)
+
+The marketplace records a bounded on-chain audit trail of bids for each auction via `append_bid_record`.
+
+* **Ring-Buffer Mechanism**: Managed through a persistent FIFO storage queue.
+* **Capacity Constraints**: Configurable globally by the `ProtocolConfig` role via `set_bid_history_cap(cap)` within `[1, 200]` stroop-safe bounds (`DEFAULT_BID_HISTORY_CAP = 50`, commonly `20` in UI configurations). Snapshotted per auction as `auction.bid_history_cap`.
+* **FIFO Eviction Invariant**: When `history.len() >= cap`, the oldest entry at index 0 is dropped, remaining entries are shifted left, and the newly accepted bid is appended at the tail.
+* **Chronological Monotonicity**: Index 0 always contains the oldest retained bid; index `len - 1` contains the newest bid. Relative chronological ordering is strictly preserved with zero index inversion across both `cap-plus-one` and `cap-plus-many` eviction cycles.
+* **Complexity**:
+  * **Time Complexity**: $O(C)$ where $C \le 200$ is the auction's cap. A bounded slice copy in WASM linear memory ensures predictable execution cost well under Soroban CPU limits.
+  * **Space Complexity**: $O(C)$ per auction in persistent storage (`DataKey::AuctionBids(auction_id)`).
+
+#### Reserve Price & Distinguishable Finalization Outcomes (Issue #1086)
+
+Auctions enforce reserve prices at bidding time and differentiate settlement outcomes at finalization:
+
+* **Reserve Enforcement**: The creator sets `reserve_price >= min_increment`. The first bid must satisfy `amount >= reserve_price`.
+  * **Below-Reserve Attempt** (`amount < reserve_price`): Rejected with `MarketplaceError::BidTooLow` (Error #11). The contract state remains untouched (`highest_bid = 0`, `highest_bidder = None`).
+  * **Exact-Reserve Bid** (`amount == reserve_price`): Accepted as the leading bid.
+* **Finalization Outcomes**:
+  * **Winning-Bid Settlement (Reserve Met)**: `highest_bidder` is `Some(winner)`.
+    * Status: Transitions to `AuctionStatus::Finalized`.
+    * Events: Emits `AuctionFinalizedEvent { winner: Some(winner), amount: winning_bid }`, `ProtocolFeeCollectedEvent`, `RoyaltySettlementEvent`, and per-recipient royalty breakdown.
+    * Custody: Escrowed NFT is transferred to `winner`. Winning funds distributed to creator and royalty recipients.
+  * **Reserve Not Met / No-Bid Finalization**: `highest_bidder` is `None`.
+    * Status: Transitions to `AuctionStatus::Cancelled` (distinguishable status).
+    * Events: Emits `AuctionFinalizedEvent { winner: None, amount: 0 }` and `AuctionCancelledEvent { reason: AuctionCancelReason::Owner, escrow_amount: 0 }`.
+    * Custody: Escrowed NFT is safely returned to `creator`. Zero funds moved; no protocol fees collected.
+
+#### Auction Cancellation & Custody Cleanup (Issue #1087)
+
+The marketplace guarantees complete asset and fund cleanup upon cancellation:
+
+* **Creator Cancellation (`cancel_auction`)**:
+  * Authorized only for the auction `creator` on `Active` auctions with **zero bids**.
+  * Transitions status to `AuctionStatus::Cancelled`.
+  * Releases escrowed NFT back to `creator`.
+  * Emits `AuctionCancelledEvent` with `reason: AuctionCancelReason::Owner` and `escrow_amount = 0`.
+* **Admin / Emergency Cancellation (`admin_cancel_auction`)**:
+  * Authorized for `ProtocolConfig` role (`AuctionCancelReason::Admin`) or `EmergencyPause` role (`AuctionCancelReason::Emergency`).
+  * Reentrancy-guarded via temporary storage lock.
+  * **With Active Bids**:
+    * 100% of the highest bidder's escrowed funds are returned atomically (`TokenClient::transfer`).
+    * CEI defense: Marked in storage (`mark_bid_refunded`) prior to transfer to prevent duplicate refunds via `refund_losing_bid`.
+    * Emits `AuctionBidRefundedEvent { reason: "admin_cancel" }`, `AuctionCancelledEvent { escrow_amount: refunded_amount }`, and `AuctionAdminCancelledEvent`.
+    * Escrowed NFT is returned to the `creator` (never to the bidder).
+    * Contract holds zero stranded escrow tokens.
+  * **Without Bids**:
+    * Transitions status to `AuctionStatus::Cancelled`.
+    * Emits `AuctionCancelledEvent` with `escrow_amount = 0` and `AuctionAdminCancelledEvent` with `refunded_amount = 0`.
+    * Escrowed NFT is returned to `creator`.
+* **Post-Cancellation Invariants**:
+  * Cancelled auctions cannot receive new bids (`MarketplaceError::AuctionNotActive` / Error #10).
+  * Cancelled auctions cannot be finalized or re-cancelled (`MarketplaceError::InvalidAuctionState` / Error #45).
 
 ### Offers
 

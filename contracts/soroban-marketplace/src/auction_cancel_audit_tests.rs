@@ -304,3 +304,119 @@ fn test_creator_cannot_cancel_auction_with_bids() {
     // AuctionHasBids = 30
     client.cancel_auction(&creator, &auction_id);
 }
+
+// ── §6 Cancellation Cleanup Coverage (Issue #1087) ───────────────────────────
+
+#[test]
+fn test_creator_cancel_nft_custody_released_to_creator() {
+    let (env, client, _, creator, _, payment_token, collection) = auction_setup();
+    let auction_id = make_auction(&env, &client, &creator, &payment_token, &collection, 3_601);
+    let nft = MockNftClient::new(&env, &collection);
+
+    // Initial escrow state: contract holds NFT
+    assert_eq!(nft.owner_of(&1u64), client.address, "NFT must be in contract custody upon creation");
+
+    client.cancel_auction(&creator, &auction_id);
+
+    // Post-cancel state: custody released back to creator
+    assert_eq!(nft.owner_of(&1u64), creator, "NFT custody must be returned to creator");
+    assert_eq!(client.get_auction(&auction_id).status, AuctionStatus::Cancelled);
+}
+
+#[test]
+fn test_admin_cancel_no_bids_nft_custody_released_to_creator() {
+    let (env, client, admin, creator, _, payment_token, collection) = auction_setup();
+    let auction_id = make_auction(&env, &client, &creator, &payment_token, &collection, 3_601);
+    let nft = MockNftClient::new(&env, &collection);
+    let token = soroban_sdk::token::TokenClient::new(&env, &payment_token);
+
+    let contract_balance_before = token.balance(&client.address);
+    client.admin_cancel_auction(&admin, &auction_id);
+
+    // NFT returned to creator
+    assert_eq!(nft.owner_of(&1u64), creator, "NFT must be released to creator on admin cancel");
+    // Token balance completely untouched
+    assert_eq!(token.balance(&client.address), contract_balance_before, "contract token balance must be unaffected");
+    assert_eq!(client.get_auction(&auction_id).status, AuctionStatus::Cancelled);
+}
+
+#[test]
+fn test_admin_cancel_with_bid_full_cleanup_escrow_and_nft() {
+    let (env, client, admin, creator, bidder, payment_token, collection) = auction_setup();
+    let auction_id = make_auction(&env, &client, &creator, &payment_token, &collection, 3_601);
+    let nft = MockNftClient::new(&env, &collection);
+    let token = soroban_sdk::token::TokenClient::new(&env, &payment_token);
+
+    let bidder_initial_balance = token.balance(&bidder);
+    let bid_amount = 2_500_000_i128;
+    client.place_bid(&bidder, &auction_id, &bid_amount);
+
+    assert_eq!(token.balance(&bidder), bidder_initial_balance - bid_amount);
+    assert_eq!(nft.owner_of(&1u64), client.address);
+
+    client.admin_cancel_auction(&admin, &auction_id);
+
+    // NFT returned to creator (not highest bidder)
+    assert_eq!(nft.owner_of(&1u64), creator, "NFT must return to creator on admin cancel with bids");
+    // Bidder refunded 100% of escrowed bid
+    assert_eq!(token.balance(&bidder), bidder_initial_balance, "bidder must receive 100% refund of escrow");
+    // Auction status terminal Cancelled
+    assert_eq!(client.get_auction(&auction_id).status, AuctionStatus::Cancelled);
+
+    // Defense-in-depth: bidder cannot re-claim refund via refund_losing_bid
+    let refund_res = client.try_refund_losing_bid(&bidder, &auction_id);
+    assert!(refund_res.is_err(), "already-refunded bidder must not be eligible for double refund");
+}
+
+#[test]
+fn test_admin_cancel_multi_bid_cascade_cleanup() {
+    let (env, client, admin, creator, bidder1, payment_token, collection) = auction_setup();
+    let auction_id = make_auction(&env, &client, &creator, &payment_token, &collection, 3_601);
+    let nft = MockNftClient::new(&env, &collection);
+    let token = soroban_sdk::token::TokenClient::new(&env, &payment_token);
+
+    let bidder2 = Address::generate(&env);
+    soroban_sdk::token::StellarAssetClient::new(&env, &payment_token).mint(&bidder2, &100_000_000_000_i128);
+
+    let b1_init = token.balance(&bidder1);
+    let b2_init = token.balance(&bidder2);
+    let contract_init = token.balance(&client.address);
+
+    // Bidder 1 bids 1_500_000
+    client.place_bid(&bidder1, &auction_id, &1_500_000_i128);
+    assert_eq!(token.balance(&bidder1), b1_init - 1_500_000_i128);
+
+    // Bidder 2 outbids with 3_000_000 -> Bidder 1 is immediately refunded on outbid
+    client.place_bid(&bidder2, &auction_id, &3_000_000_i128);
+    assert_eq!(token.balance(&bidder1), b1_init, "bidder 1 must be refunded immediately when outbid");
+    assert_eq!(token.balance(&bidder2), b2_init - 3_000_000_i128);
+
+    // Admin cancels auction -> Bidder 2 is refunded
+    client.admin_cancel_auction(&admin, &auction_id);
+
+    assert_eq!(token.balance(&bidder2), b2_init, "bidder 2 must be refunded upon admin cancellation");
+    assert_eq!(token.balance(&client.address), contract_init, "contract escrow balance must return to baseline");
+    assert_eq!(nft.owner_of(&1u64), creator, "NFT must be restored to creator");
+}
+
+#[test]
+fn test_cancelled_auction_terminal_state_invariants() {
+    let (env, client, admin, creator, bidder, payment_token, collection) = auction_setup();
+    let auction_id = make_auction(&env, &client, &creator, &payment_token, &collection, 3_601);
+    client.admin_cancel_auction(&admin, &auction_id);
+
+    // 1. Cannot place bid on cancelled auction (AuctionNotActive = #10)
+    let bid_res = client.try_place_bid(&bidder, &auction_id, &1_500_000_i128);
+    assert!(bid_res.is_err(), "placing bid on cancelled auction must be rejected");
+
+    // 2. Cannot finalize cancelled auction (InvalidAuctionState = #45)
+    env.ledger().set_timestamp(env.ledger().timestamp() + 4000);
+    let finalize_res = client.try_finalize_auction(&creator, &auction_id);
+    assert!(finalize_res.is_err(), "finalizing cancelled auction must be rejected");
+
+    // 3. Cannot cancel an already cancelled auction (InvalidAuctionState = #45)
+    let recancel_owner = client.try_cancel_auction(&creator, &auction_id);
+    assert!(recancel_owner.is_err(), "owner cancel on cancelled auction must be rejected");
+    let recancel_admin = client.try_admin_cancel_auction(&admin, &auction_id);
+    assert!(recancel_admin.is_err(), "admin cancel on cancelled auction must be rejected");
+}
