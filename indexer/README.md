@@ -140,6 +140,26 @@ npm run backfill -- --start=123456 --end=124999 --rpc=https://your-archival-rpc
 | `LOG_LEVEL` | ⬜ | `info` | Minimum log level emitted: `debug` \| `info` \| `warn` \| `error` (see [Logging](#logging)) |
 | `LOG_FORMAT` | ⬜ | `json` | `json` for machine-readable logs, `pretty` for colorized human-readable local dev output |
 
+### Connection Pool Sizing Matrix
+
+The indexer manages two isolated connection pools to prevent write spikes from impacting API reads:
+- **API Read Pool (`db.ts`):** `DB_CONNECTION_LIMIT` (default: 10)
+- **Poller Write Pool (`prisma-write.ts`):** `DB_WRITE_CONNECTION_LIMIT` (default: 3)
+
+| Environment | Topology / Instances | Read Pool (`DB_CONNECTION_LIMIT`) | Write Pool (`DB_WRITE_CONNECTION_LIMIT`) | Total / Instance | PostgreSQL `max_connections` | Headroom |
+|---|---|---|---|---|---|---|
+| **Local Dev** (Docker) | 1 instance | 10 | 3 | 13 | 50 | 37 (74%) |
+| **Staging** (Single Host) | 2 replicas | 15 | 5 | 20 | 100 | 60 (60%) |
+| **Production (Standard)** | 4 replicas | 25 | 5 | 30 | 200 | 80 (40%) |
+| **Production (High-Load)** | 8 replicas (with PgBouncer) | 30 (to pooler) | 5 (direct) | 35 | 300 | 100 (33%) |
+
+**Pool Acquisition Failure Validation:**
+If logs output `Timed out fetching a new connection from the connection pool` (`P2024` / `P1001`), verify active connections with:
+```sql
+SELECT state, count(*) FROM pg_stat_activity WHERE datname = current_database() GROUP BY state;
+```
+See the [Database Outage Runbook](../docs/runbooks/database-outage.md#database-connection-pool-sizing-matrix--failure-validation) for triage details.
+
 ---
 
 ## CORS Configuration
