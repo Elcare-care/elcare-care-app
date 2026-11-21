@@ -130,3 +130,34 @@ jobs:
           REDIS_URL: redis://localhost:6379
           PINATA_GATEWAY: https://gateway.pinata.cloud
         run: node scripts/validate-config.js
+
+  # ── Advisory exceptions register gate (Reliability, Security & Operations) ──
+  # Fails when an exception in docs/advisory-exceptions.md is expired, lacks an
+  # owner, or when a .cargo/audit.toml ignore has no documented exception row.
+  # Read-only: parses files only — no network, no secrets, no deployments.
+  advisory-exceptions:
+    name: Advisory Exceptions Register
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Validate advisory exceptions register
+        run: node scripts/check-advisory-exceptions.mjs
+
+  # ── Contract ID / network settings consistency gate (Reliability, Security ──
+  # & Operations) — fails when contract IDs or Stellar network settings disagree
+  # across frontend, indexer, shared config, or the deploy scripts' hardcoded
+  # --network-passphrase. Read-only: parses committed templates + deploy scripts
+  # only — no network, no secrets, no deployments.
+  contract-network-consistency:
+    name: Contract / Network Config Consistency
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Check contract IDs & network settings consistency
+        run: node scripts/check-contract-network-consistency.mjs
