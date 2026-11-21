@@ -100,15 +100,7 @@ const TOPIC_MAP: Record<string, string> = {
   // resolveEventType() therefore returned null for these topics and the events
   // were dropped before any schema ran — verified with a real ScVal payload (see
   // the Issue #846 PR description). The short forms stay for historical
-  // backfills; these entries cover what the contract emits today, for every
-  // event type that carries a `schema_version`.
-  //
-  // The remaining topic constants in events.rs still have no entry here (52 of
-  // them at the time of writing: governance, role, treasury, escrow, pause and
-  // claim events). That is the same defect for those types and is deliberately
-  // left as a separate change: it would switch ~45 further event types from
-  // silently-dropped to decoded, which deserves its own review (and, for the 31
-  // of them without a schema entry, their own schema work).
+  // backfills; these entries cover what the contract emits today.
   'artwork_sold': 'ARTWORK_SOLD',
   'auction_admin_cancelled': 'AUCTION_ADMIN_CANCELLED',
   'auction_bid_refunded': 'AUCTION_BID_REFUNDED',
@@ -116,10 +108,43 @@ const TOPIC_MAP: Record<string, string> = {
   'auction_created': 'AUCTION_CREATED',
   'auction_resolved': 'AUCTION_RESOLVED',
   'listing_created': 'LISTING_CREATED',
+  'listing_updated': 'LISTING_UPDATED',
+  'listing_cancelled': 'LISTING_CANCELLED',
   'offer_accepted': 'OFFER_ACCEPTED',
   'offer_made': 'OFFER_MADE',
+  'offer_rejected': 'OFFER_REJECTED',
+  'offer_withdrawn': 'OFFER_WITHDRAWN',
+  'bid_placed': 'BID_PLACED',
   'protocol_fee_collected': 'PROTOCOL_FEE_COLLECTED',
   'royalty_settlement': 'ROYALTY_SETTLEMENT',
+  'royalty_paid': 'ROYALTY_PAID',
+  'fee_attribution': 'FEE_ATTRIBUTION',
+  // ── Role events (Issue #267) — long-form topics emitted by the contract ──
+  // These were silently dropped before this fix because TOPIC_MAP had no entry
+  // for the full string constants used in events.rs.
+  'role_transfer_proposed': 'ROLE_TRANSFER_PROPOSED',
+  'role_transferred': 'ROLE_TRANSFERRED',
+  'role_proposal_cancelled': 'ROLE_PROPOSAL_CANCELLED',
+  'role_migrated': 'ROLE_MIGRATED',
+  'role_proposal_overwritten': 'ROLE_PROPOSAL_OVERWRITTEN',
+  // ── Granular pause long-form topics ─────────────────────────────────────
+  'function_paused': 'FUNCTION_PAUSED',
+  'function_unpaused': 'FUNCTION_UNPAUSED',
+  'contract_paused': 'CONTRACT_PAUSED',
+  'contract_unpaused': 'CONTRACT_UNPAUSED',
+  // ── Other long-form topics ───────────────────────────────────────────────
+  'admin_proposal_cancelled': 'ADMIN_PROPOSAL_CANCELLED',
+  'admin_transfer_proposed': 'ADMIN_TRANSFER_PROPOSED',
+  'admin_transferred': 'ADMIN_TRANSFERRED',
+  'artist_revoked': 'ARTIST_REVOKED',
+  'artist_reinstated': 'ARTIST_REINSTATED',
+  'token_whitelisted': 'TOKEN_WHITELISTED',
+  'token_removed': 'TOKEN_REMOVED',
+  'auction_extended': 'AUCTION_EXTENDED',
+  'listing_expired': 'LISTING_EXPIRED',
+  'offer_reclaimed': 'OFFER_RECLAIMED',
+  'auction_reserve_updated': 'AUCTION_RESERVE_UPDATED',
+  'listing_ownership_reconciled': 'LISTING_OWNERSHIP_RECONCILED',
 };
 
 /** All event type names this parser can produce (exported for tests/UI). */

@@ -69,6 +69,9 @@ mod offer_unknown_id_tests;
 #[cfg(test)]
 mod royalty_boundary_tests;
 
+#[cfg(test)]
+mod role_fallback_tests;
+
 pub use contract::MarketplaceContract;
 pub use types::{
     Auction, AuctionCancelReason, AuctionStatus, BatchItemError, BidRecord, CancelReason,
