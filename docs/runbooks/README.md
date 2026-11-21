@@ -11,6 +11,9 @@ Each runbook covers: detection, containment, diagnosis, recovery, and post-incid
 |---|---|---|
 | [admin-read-only-diagnostic.md](./admin-read-only-diagnostic.md) | First-step read-only sync/health check for support | LOW |
 | [stalled-ingestion.md](./stalled-ingestion.md) | Indexer stops processing new ledgers | HIGH |
+| [gap-repair.md](./gap-repair.md) | Ledger gap repair: dry review (READ-ONLY) vs. repair execution (MUTATING), reconciliation | HIGH |
+| [backfill-job-status.md](./backfill-job-status.md) | BackfillJob states, safe restart, stuck-job ownership, read-only diagnostics | MEDIUM |
+| [dead-letter-review.md](./dead-letter-review.md) | Parser dead letters: view → classify → redact → resolve → replay | MEDIUM |
 | [poller-health-checklist.md](./poller-health-checklist.md) | Classify poller as healthy / degraded / stalled / re-org (read-only) | LOW |
 | [stale-cache-diagnostic.md](./stale-cache-diagnostic.md) | Compare a Redis-cached listing/auction with PostgreSQL (read-only) | LOW |
 | [redis-key-registry.md](./redis-key-registry.md) | Redis key prefixes, TTLs, and review checklist | — |
@@ -25,6 +28,7 @@ Each runbook covers: detection, containment, diagnosis, recovery, and post-incid
 | [pinata-outage.md](./pinata-outage.md) | Pinata/IPFS unavailable | MEDIUM |
 | [wallet-incompatibility.md](./wallet-incompatibility.md) | Freighter or Magic.link failures | HIGH |
 | [incorrect-deployment-config.md](./incorrect-deployment-config.md) | Wrong contract ID, network, or secrets | HIGH |
+| [startup-config-report.md](./startup-config-report.md) | Read the non-secret startup configuration report and its testnet/mainnet warnings | LOW |
 | [observability-alerts.md](./observability-alerts.md) | Prometheus alert interpretations and responses | MEDIUM |
 | [game-day-scenario-combined-failure.md](./game-day-scenario-combined-failure.md) | Quarterly "Perfect Storm" combined-failure game day | — |
 | [tabletop-exercises.md](./tabletop-exercises.md) | Exercise records and individual scenarios | — |

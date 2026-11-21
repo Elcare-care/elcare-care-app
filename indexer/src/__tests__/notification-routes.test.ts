@@ -42,6 +42,7 @@ vi.mock('../logger.js', () => ({
 vi.mock('../api/auth-middleware.js', () => ({
   authMiddleware: () => (_req: any, _res: any, next: any) => next(),
   classifyRoute: () => 'public',
+  operatorActorLabel: () => 'operator:test',
 }));
 
 import notificationRouter from '../api/notification-routes.js';

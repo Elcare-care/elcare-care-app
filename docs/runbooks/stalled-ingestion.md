@@ -290,6 +290,8 @@ STELLAR_RPC_REQUEST_TIMEOUT_MS=10000
 # Increase poll interval under rate limiting
 POLL_INTERVAL_MS=7000
 
+# MUTATING once enabled: the worker repairs every Open gap automatically.
+# Run the READ-ONLY dry review in docs/runbooks/gap-repair.md (Part A) before enabling.
 # Enable gap repair worker for unattended recovery from RPC window skips
 GAP_REPAIR_ENABLED=true
 ARCHIVAL_STELLAR_RPC_URL=https://mainnet.sorobanrpc.com

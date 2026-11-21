@@ -87,6 +87,7 @@ vi.mock('../metrics.js', () => ({
 vi.mock('../api/auth-middleware.js', () => ({
   authMiddleware: () => (_: any, __: any, next: any) => next(),
   classifyRoute: () => 'public',
+  operatorActorLabel: () => 'operator:test',
 }));
 vi.mock('../api/versioning.js', () => ({
   versioningMiddleware: (_: any, __: any, next: any) => next(),

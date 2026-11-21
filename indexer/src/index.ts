@@ -18,6 +18,7 @@ import { authMiddleware, setPrismaClient } from './api/auth-middleware.js';
 import { errorHandler } from './api/errors.js';
 import { startReconciler } from './reconciler.js';
 import { validateRequiredEnv, loadKeeperConfig, loadConfig } from './config.js';
+import { buildStartupConfigReport, logStartupConfigReport } from './startup-report.js';
 import { parseCorsOrigins, buildCorsOptions } from './cors.js';
 import { startKeeper } from './keeper/index.js';
 import { startGapRepairWorker } from './gap-repair.js';
@@ -48,6 +49,12 @@ try {
 }
 
 const cfg  = loadConfig();
+
+// Issue #1067: log a non-secret startup configuration report (network,
+// contracts, RPC/DB/Redis targets as host:port only, poll settings) plus one
+// WARN per detected testnet/mainnet misconfiguration. Never throws.
+logStartupConfigReport(buildStartupConfigReport(process.env));
+
 const app  = express();
 const PORT = process.env.PORT || 4000;
 

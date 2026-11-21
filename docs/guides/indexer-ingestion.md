@@ -67,15 +67,24 @@ npm run test:integration
 
 ### Backfill Missed Ledger Ranges
 If the indexer was offline and missed ledgers past the RPC retention window:
+
+> 🔴 **MUTATING.** Writes events and projections, and creates a `BackfillJob`. Do the 🟢 READ-ONLY
+> dry review in [Gap Repair Part A](../runbooks/gap-repair.md#part-a--dry-review--read-only) first.
+> See [BackfillJob status](../runbooks/backfill-job-status.md) for resume and stuck-job handling.
+
 ```bash
 cd indexer
 npm run backfill -- --start=123400 --end=123900 --rpc=https://soroban-testnet.stellar.org
 ```
-*Expected output:*
+*Expected log lines (structured logger):*
 ```text
-[info] Starting backfill from ledger 123400 to 123900...
-[info] Processed 500 ledgers. Ingested 14 events. Backfill complete.
+backfill: created new job {jobId, startLedger: 123400, endLedger: 123900, concurrency: 5}
+backfill: cursor interaction {cursorInteraction: "below", liveCursor}
+backfill: job completed {jobId, totalInserted: 14, endLedger: 123900}
 ```
+Any `backfill: batch failed (will retry on resume)` line means the range was **not** fully
+covered, even though the job reports `Completed`. See
+[Gap Repair C4](../runbooks/gap-repair.md#c4-partial-repair-batch-failures--mutating).
 
 ---
 
