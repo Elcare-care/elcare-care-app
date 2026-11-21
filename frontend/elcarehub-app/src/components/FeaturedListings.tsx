@@ -19,6 +19,8 @@ interface EnrichedItem {
   imageUrl: string;
 }
 
+const IMAGE_FALLBACK_SRC = "/placeholder-art.svg";
+
 function getDesktopCardWidthClass(itemCount: number): string {
   if (itemCount <= 1) {
     return "md:min-w-full md:max-w-full";
@@ -35,6 +37,19 @@ export function FeaturedListings() {
   const { listings, isLoading } = useMarketplace();
   const [enriched, setEnriched] = useState<EnrichedItem[]>([]);
   const [scrollIdx, setScrollIdx] = useState(0);
+  const [failedImages, setFailedImages] = useState<Record<string, boolean>>({});
+
+  const handleImageError = useCallback((listingId: string) => {
+    setFailedImages((prev) =>
+      prev[listingId] ? prev : { ...prev, [listingId]: true }
+    );
+  }, []);
+
+  const resolveImageUrl = useCallback(
+    (item: EnrichedItem): string =>
+      failedImages[item.listing.listing_id] ? IMAGE_FALLBACK_SRC : item.imageUrl,
+    [failedImages]
+  );
 
   const activeListings = listings
     .filter((listing: Listing) => listing.status === "Active")
@@ -48,6 +63,7 @@ export function FeaturedListings() {
 
     setEnriched([]);
     setScrollIdx(0);
+    setFailedImages({});
 
     if (active.length === 0) {
       return () => {
@@ -62,13 +78,13 @@ export function FeaturedListings() {
           return {
             listing,
             metadata: meta,
-            imageUrl: meta?.image ? cidToGatewayUrl(meta.image) : "/placeholder-art.svg",
+            imageUrl: meta?.image ? cidToGatewayUrl(meta.image) : IMAGE_FALLBACK_SRC,
           };
         } catch {
           return {
             listing,
             metadata: null,
-            imageUrl: "/placeholder-art.svg",
+            imageUrl: IMAGE_FALLBACK_SRC,
           };
         }
       })
@@ -86,7 +102,7 @@ export function FeaturedListings() {
   const liveFallbackItems: EnrichedItem[] = activeListings.map((listing) => ({
     listing,
     metadata: null,
-    imageUrl: "/placeholder-art.svg",
+    imageUrl: IMAGE_FALLBACK_SRC,
   }));
   const displayItems = enriched.length > 0 ? enriched : liveFallbackItems;
   const hasListings = activeListings.length > 0;
@@ -191,11 +207,12 @@ export function FeaturedListings() {
                     <Link href={`/listings/${item.listing.listing_id}`}>
                       <div className="relative aspect-[4/5] overflow-hidden rounded-2xl corner-accent">
                         <Image
-                          src={item.imageUrl}
+                          src={resolveImageUrl(item)}
                           alt={item.metadata?.title ?? `Artwork #${item.listing.listing_id}`}
                           fill
                           className="object-cover transition-transform duration-700 group-hover:scale-110"
                           unoptimized
+                          onError={() => handleImageError(item.listing.listing_id)}
                         />
                         <div className="absolute inset-0 bg-card-gradient opacity-0 transition-opacity duration-500 group-hover:opacity-100" />
 
@@ -238,11 +255,12 @@ export function FeaturedListings() {
                   className="group relative aspect-[4/5] overflow-hidden rounded-2xl"
                 >
                   <Image
-                    src={item.imageUrl}
+                    src={resolveImageUrl(item)}
                     alt={item.metadata?.title ?? `Artwork #${item.listing.listing_id}`}
                     fill
                     className="object-cover"
                     unoptimized
+                    onError={() => handleImageError(item.listing.listing_id)}
                   />
                   <div className="absolute inset-0 bg-card-gradient" />
                   <div className="absolute bottom-0 left-0 right-0 p-4">

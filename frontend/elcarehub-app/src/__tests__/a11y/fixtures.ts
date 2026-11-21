@@ -86,6 +86,47 @@ export const a11yFixtures = {
   },
 
   /**
+   * Focus ring contrast test cases (#1148)
+   * Interactive controls must remain visible in all supported themes/states.
+   * Assertions read computed styles via CSS variables — no hard-coded exceptions.
+   */
+  focusRing: {
+    description:
+      "Focusable controls expose a visible focus ring in every supported theme",
+    minRatio: 3, // WCAG 2.2 non-text contrast for focus indicators
+    cssVariables: {
+      color: "--focus-ring-color",
+      offset: "--focus-ring-offset",
+      width: "--focus-ring-width",
+      backgroundTokens: [
+        "--color-bg",
+        "--color-surface",
+        "--color-bg-elevated",
+      ],
+    },
+    themes: ["light", "dark", "high-contrast"],
+    states: ["default", "hover", "focus-visible", "active", "disabled"],
+    focusableSelectors: [
+      "a[href]",
+      "button:not([disabled])",
+      "input:not([disabled])",
+      "select:not([disabled])",
+      "textarea:not([disabled])",
+      "[tabindex]:not([tabindex='-1'])",
+      "[role='button']:not([aria-disabled='true'])",
+    ],
+    representativeControls: [
+      { name: "Connect Wallet button", selector: "button[data-testid='connect-wallet']" },
+      { name: "Buy Now button", selector: "button[data-testid='buy-now']" },
+      { name: "Filter chip", selector: "[data-testid='filter-chip']" },
+      { name: "Checkout confirm", selector: "button[data-testid='checkout-confirm']" },
+      { name: "Admin table sort header", selector: "th[aria-sort] button" },
+    ],
+    verification:
+      "getComputedStyle(control).outlineColor matches resolved --focus-ring-color and outlineWidth > 0 on :focus-visible",
+  },
+
+  /**
    * Motion & animation test cases
    */
   motion: {
@@ -107,6 +148,79 @@ export const a11yFixtures = {
       implementation: "useReducedMotion hook",
       verification: "Static text visible; animation optional",
     },
+  },
+
+  /**
+   * Reduced-motion E2E coverage (#1147)
+   * Decorative animation must stop under prefers-reduced-motion while
+   * transaction feedback remains visible.
+   */
+  reducedMotion: {
+    mediaQuery: "(prefers-reduced-motion: reduce)",
+    description:
+      "Decorative animation stops under reduced motion; transaction feedback stays visible",
+    decorativeElements: [
+      {
+        name: "Stale banner slide-in",
+        selector: "[data-testid='stale-banner']",
+        assert: {
+          animationName: "none",
+          animationDuration: "0s",
+          transitionDuration: "0s",
+        },
+      },
+      {
+        name: "Loading spinner pulse",
+        selector: "[data-testid='loading-spinner']",
+        assert: {
+          animationName: "none",
+          animationDuration: "0s",
+        },
+      },
+      {
+        name: "Modal slide transition",
+        selector: "[data-testid='modal-panel']",
+        assert: {
+          transitionDuration: "0s",
+        },
+      },
+      {
+        name: "Auction countdown tick",
+        selector: "[data-testid='auction-countdown']",
+        assert: {
+          animationName: "none",
+          animationDuration: "0s",
+        },
+      },
+    ],
+    essentialFeedback: [
+      {
+        name: "Transaction submitted status",
+        selector: "[data-testid='tx-status']",
+        mustRemainVisible: true,
+        ariaLive: "polite",
+      },
+      {
+        name: "Transaction error message",
+        selector: "[data-testid='tx-error']",
+        mustRemainVisible: true,
+        ariaLive: "assertive",
+      },
+      {
+        name: "Reorg warning",
+        selector: "[data-testid='reorg-warning']",
+        mustRemainVisible: true,
+        ariaLive: "assertive",
+      },
+      {
+        name: "Focus ring on confirm button",
+        selector: "button[data-testid='checkout-confirm']",
+        mustRemainVisible: true,
+        assert: { outlineWidth: "not 0px" },
+      },
+    ],
+    verification:
+      "With reduced motion emulated, decorative elements report animation-name: none and transition-duration: 0s; essential feedback elements remain visible (not display:none / visibility:hidden / opacity:0)",
   },
 
   /**
@@ -241,6 +355,29 @@ export const a11yFixtures = {
       ],
       expectedResult: "Checkout completable; no motion-dependent info",
     },
+    reducedMotionFeedback: {
+      description:
+        "Reduced motion stops decorative animation but keeps transaction feedback visible (#1147)",
+      steps: [
+        "Emulate prefers-reduced-motion: reduce",
+        "Trigger a transaction and observe status region",
+        "Assert decorative elements have animation-name: none / transition-duration: 0s",
+        "Assert tx status and error regions remain visible",
+      ],
+      expectedResult:
+        "No decorative animation; transaction feedback remains visible",
+    },
+    focusRingContrast: {
+      description:
+        "Focus ring visible across themes using CSS variables (#1148)",
+      steps: [
+        "For each supported theme, Tab to representative controls",
+        "Read computed outlineColor/outlineWidth on :focus-visible",
+        "Assert outlineColor resolves to --focus-ring-color",
+        "Assert outlineWidth > 0 and contrast against background token >= 3:1",
+      ],
+      expectedResult: "Focus ring visible in all themes and states",
+    },
   },
 
   /**
@@ -298,5 +435,24 @@ export function verifyAriaLive(element: HTMLElement): {
   return {
     hasLive: !!live,
     level: (live as "polite" | "assertive") || null,
+  };
+}
+
+/**
+ * Helper: Verify a focus-ring CSS variable resolves on an element via
+ * computed styles (rather than hard-coded exceptions).
+ *
+ * @param element - The focusable control to inspect
+ * @param variable - CSS custom property name, e.g. "--focus-ring-color"
+ * @returns The resolved value (trimmed) and whether it is set
+ */
+export function verifyFocusRingVariable(
+  element: HTMLElement,
+  variable: string
+): { value: string; isSet: boolean } {
+  const raw = getComputedStyle(element).getPropertyValue(variable).trim();
+  return {
+    value: raw,
+    isSet: raw.length > 0,
   };
 }

@@ -15,6 +15,9 @@ import { useEffect, useState } from "react";
 import { AlertTriangle, CheckCircle2, ImageOff, Loader2 } from "lucide-react";
 import { ArtworkMetadata, cidToGatewayUrl, fetchMetadata } from "@/lib/ipfs";
 
+/** Timeout (ms) after which a pending metadata fetch is treated as failed. */
+export const METADATA_FETCH_TIMEOUT_MS = 10_000;
+
 interface IpfsMetadataPreviewProps {
   /** Metadata CID (raw or "ipfs://CID") returned from a completed, verified upload. */
   cid: string;
@@ -33,6 +36,7 @@ export function IpfsMetadataPreview({ cid, metadata: providedMetadata }: IpfsMet
   const [metadata, setMetadata] = useState<ArtworkMetadata | null>(providedMetadata ?? null);
   const [isLoading, setIsLoading] = useState(!providedMetadata);
   const [fetchError, setFetchError] = useState<string | null>(null);
+  const [imageFailed, setImageFailed] = useState(false);
 
   useEffect(() => {
     if (providedMetadata) {
@@ -42,8 +46,18 @@ export function IpfsMetadataPreview({ cid, metadata: providedMetadata }: IpfsMet
     }
     if (!cid) return;
     let cancelled = false;
+    let timeoutId: ReturnType<typeof setTimeout> | undefined;
     setIsLoading(true);
     setFetchError(null);
+    setImageFailed(false);
+    timeoutId = setTimeout(() => {
+      if (!cancelled) {
+        setFetchError(
+          "Timed out loading metadata from IPFS. The gateway may be temporarily unavailable."
+        );
+        setIsLoading(false);
+      }
+    }, METADATA_FETCH_TIMEOUT_MS);
     fetchMetadata(cid)
       .then((meta) => {
         if (!cancelled) setMetadata(meta);
@@ -56,10 +70,14 @@ export function IpfsMetadataPreview({ cid, metadata: providedMetadata }: IpfsMet
         }
       })
       .finally(() => {
-        if (!cancelled) setIsLoading(false);
+        if (!cancelled) {
+          if (timeoutId !== undefined) clearTimeout(timeoutId);
+          setIsLoading(false);
+        }
       });
     return () => {
       cancelled = true;
+      if (timeoutId !== undefined) clearTimeout(timeoutId);
     };
   }, [cid, providedMetadata]);
 
@@ -115,12 +133,20 @@ export function IpfsMetadataPreview({ cid, metadata: providedMetadata }: IpfsMet
       )}
 
       <div className="flex gap-4">
-        <div className="h-24 w-24 shrink-0 overflow-hidden rounded-xl bg-gray-100 flex items-center justify-center">
-          {imageUrl ? (
+        <div
+          className="h-24 w-24 shrink-0 overflow-hidden rounded-xl bg-gray-100 flex items-center justify-center"
+          data-testid="ipfs-preview-image"
+        >
+          {imageUrl && !imageFailed ? (
             // eslint-disable-next-line @next/next/no-img-element
-            <img src={imageUrl} alt={metadata.altText || metadata.title || "Artwork preview"} className="h-full w-full object-cover" />
+            <img
+              src={imageUrl}
+              alt={metadata.altText || metadata.title || "Artwork preview"}
+              className="h-full w-full object-cover"
+              onError={() => setImageFailed(true)}
+            />
           ) : (
-            <ImageOff size={24} className="text-gray-300" />
+            <ImageOff size={24} className="text-gray-300" aria-label="Artwork image unavailable" />
           )}
         </div>
         <dl className="flex-1 min-w-0 space-y-1.5 text-sm">

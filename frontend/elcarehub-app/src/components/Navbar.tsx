@@ -82,7 +82,7 @@ function DesktopNavLink({ item }: { item: NavItem }) {
     <Link
       href={item.href}
       aria-current={active ? "page" : undefined}
-      className={`flex items-center gap-1.5 text-sm font-medium transition-colors duration-200 ${
+      className={`flex items-center gap-1.5 text-sm font-medium transition-colors duration-200 rounded-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring-color)] focus-visible:ring-offset-2 focus-visible:ring-offset-midnight-950 ${
         active
           ? "text-brand-400 font-semibold"
           : "text-white/65 hover:text-white"
@@ -112,7 +112,7 @@ function MobileNavLink({
       href={item.href}
       onClick={onClick}
       aria-current={active ? "page" : undefined}
-      className={`flex items-center gap-3 rounded-xl px-3 py-2.5 text-base font-medium transition-colors ${
+      className={`flex items-center gap-3 rounded-xl px-3 py-2.5 text-base font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring-color)] focus-visible:ring-offset-2 focus-visible:ring-offset-midnight-950 ${
         active
           ? "bg-brand-500/15 text-brand-300"
           : "text-white/75 hover:bg-white/5 hover:text-white"
@@ -217,7 +217,7 @@ export function Navbar() {
           <Link
             href="/"
             aria-label="ElcareHub home"
-            className="flex items-center gap-2 group shrink-0"
+            className="flex items-center gap-2 group shrink-0 rounded-xl focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring-color)] focus-visible:ring-offset-2 focus-visible:ring-offset-midnight-950"
           >
             <span
               aria-hidden="true"
@@ -254,7 +254,7 @@ export function Navbar() {
                   <button
                     onClick={() => setIsModalOpen(true)}
                     aria-label="Wrong network — click to reconnect"
-                    className="flex items-center gap-2 rounded-full bg-terracotta-500/20 border border-terracotta-500/30 px-3 py-1.5 text-[10px] font-bold uppercase tracking-wider text-terracotta-400 hover:bg-terracotta-500/30 transition-all"
+                    className="flex items-center gap-2 rounded-full bg-terracotta-500/20 border border-terracotta-500/30 px-3 py-1.5 text-[10px] font-bold uppercase tracking-wider text-terracotta-400 hover:bg-terracotta-500/30 transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring-color)] focus-visible:ring-offset-2 focus-visible:ring-offset-midnight-950"
                   >
                     <AlertTriangle size={12} aria-hidden="true" />
                     Wrong Network
@@ -274,7 +274,7 @@ export function Navbar() {
                     aria-haspopup="true"
                     aria-expanded={showWalletMenu}
                     aria-label={`Wallet ${shortKey} — click to open wallet menu`}
-                    className="flex items-center gap-2 pl-3 pr-2 py-1.5 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10 transition-colors cursor-pointer min-w-0"
+                    className="flex items-center gap-2 pl-3 pr-2 py-1.5 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10 transition-colors cursor-pointer min-w-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring-color)] focus-visible:ring-offset-2 focus-visible:ring-offset-midnight-950"
                   >
                     <div className="flex flex-col items-end">
                       <span className="text-[10px] font-bold text-white/40 uppercase tracking-tighter">Wallet</span>
@@ -311,7 +311,7 @@ export function Navbar() {
               <button
                 onClick={() => setIsModalOpen(true)}
                 disabled={isConnecting}
-                className="flex items-center gap-2.5 rounded-xl bg-gradient-to-r from-brand-500 to-terracotta-500 px-6 py-2.5 text-sm font-bold text-white shadow-lg shadow-brand-500/25 hover:shadow-brand-500/40 hover:-translate-y-0.5 active:translate-y-0 transition-all duration-300 disabled:opacity-60"
+                className="flex items-center gap-2.5 rounded-xl bg-gradient-to-r from-brand-500 to-terracotta-500 px-6 py-2.5 text-sm font-bold text-white shadow-lg shadow-brand-500/25 hover:shadow-brand-500/40 hover:-translate-y-0.5 active:translate-y-0 transition-all duration-300 disabled:opacity-60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring-color)] focus-visible:ring-offset-2 focus-visible:ring-offset-midnight-950"
               >
                 <Wallet size={16} aria-hidden="true" />
                 {isConnecting ? "Connecting…" : "Connect Wallet"}
@@ -323,7 +323,7 @@ export function Navbar() {
             <Link
               href="/settings"
               aria-label="Settings"
-              className="flex items-center justify-center w-8 h-8 rounded-lg text-white/40 hover:text-white/80 hover:bg-white/5 transition-colors"
+              className="flex items-center justify-center w-8 h-8 rounded-lg text-white/40 hover:text-white/80 hover:bg-white/5 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring-color)] focus-visible:ring-offset-2 focus-visible:ring-offset-midnight-950"
             >
               <Settings size={16} aria-hidden="true" />
               <span className="sr-only">Settings</span>
@@ -331,7 +331,7 @@ export function Navbar() {
             <Link
               href="/help"
               aria-label="Help"
-              className="flex items-center justify-center w-8 h-8 rounded-lg text-white/40 hover:text-white/80 hover:bg-white/5 transition-colors"
+              className="flex items-center justify-center w-8 h-8 rounded-lg text-white/40 hover:text-white/80 hover:bg-white/5 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring-color)] focus-visible:ring-offset-2 focus-visible:ring-offset-midnight-950"
             >
               <HelpCircle size={16} aria-hidden="true" />
               <span className="sr-only">Help</span>
@@ -345,7 +345,7 @@ export function Navbar() {
             aria-expanded={mobileOpen}
             aria-controls="mobile-menu"
             aria-label={mobileOpen ? "Close navigation menu" : "Open navigation menu"}
-            className="md:hidden flex items-center justify-center w-9 h-9 sm:w-10 sm:h-10 rounded-xl bg-white/5 text-white/70 hover:bg-white/10 border border-white/10 transition-all shrink-0"
+            className="md:hidden flex items-center justify-center w-9 h-9 sm:w-10 sm:h-10 rounded-xl bg-white/5 text-white/70 hover:bg-white/10 border border-white/10 transition-all shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring-color)] focus-visible:ring-offset-2 focus-visible:ring-offset-midnight-950"
           >
             {mobileOpen ? <X size={18} aria-hidden="true" /> : <Menu size={18} aria-hidden="true" />}
           </button>
@@ -438,7 +438,7 @@ export function Navbar() {
                       closeMobile();
                     }}
                     disabled={isConnecting}
-                    className="w-full flex items-center justify-center gap-2 rounded-xl bg-brand-500 py-4 text-sm sm:text-base font-bold text-white shadow-xl shadow-brand-500/20 disabled:opacity-60 truncate"
+                    className="w-full flex items-center justify-center gap-2 rounded-xl bg-brand-500 py-4 text-sm sm:text-base font-bold text-white shadow-xl shadow-brand-500/20 disabled:opacity-60 truncate focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring-color)] focus-visible:ring-offset-2 focus-visible:ring-offset-midnight-950"
                   >
                     <Wallet size={18} aria-hidden="true" className="shrink-0" />
                     <span className="truncate">{isConnecting ? "Connecting…" : "Connect Wallet"}</span>

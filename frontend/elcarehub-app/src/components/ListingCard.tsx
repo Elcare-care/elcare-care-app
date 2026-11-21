@@ -36,6 +36,9 @@ const STATUS_BADGE: Record<string, string> = {
 /** How many times a listing card will attempt to reload stale/failed metadata before giving up. */
 const MAX_METADATA_RETRIES = 2;
 
+/** How long (ms) an image may stay pending before the card shows a fallback. */
+const IMAGE_LOAD_TIMEOUT_MS = 10_000;
+
 export function ListingCard({ listing, onPurchased }: ListingCardProps) {
   const { publicKey, status } = useWalletContext();
   const { buy, isBuying, error: buyError } = useBuyArtwork(publicKey);
@@ -45,6 +48,8 @@ export function ListingCard({ listing, onPurchased }: ListingCardProps) {
   const [isLoading, setIsLoading] = useState(true);
   const [metadataError, setMetadataError] = useState(false);
   const [metadataRetries, setMetadataRetries] = useState(0);
+  const [imageLoaded, setImageLoaded] = useState(false);
+  const [imageTimedOut, setImageTimedOut] = useState(false);
   const [showCheckout, setShowCheckout] = useState(false);
   const [purchaseSuccess, setPurchaseSuccess] = useState(false);
 
@@ -76,6 +81,19 @@ export function ListingCard({ listing, onPurchased }: ListingCardProps) {
   useEffect(() => {
     setGatewayIndex(0);
   }, [metadata?.image]);
+
+  // Reset image load state whenever the candidate URL changes.
+  useEffect(() => {
+    setImageLoaded(false);
+    setImageTimedOut(false);
+  }, [currentImageUrl]);
+
+  // Deterministic timeout: if the image never fires load/error, fall back.
+  useEffect(() => {
+    if (!currentImageUrl || imageLoaded || imageTimedOut) return;
+    const id = setTimeout(() => setImageTimedOut(true), IMAGE_LOAD_TIMEOUT_MS);
+    return () => clearTimeout(id);
+  }, [currentImageUrl, imageLoaded, imageTimedOut]);
 
   const handleRetry = () => {
     if (metadataRetries >= MAX_METADATA_RETRIES) return;
@@ -198,7 +216,7 @@ export function ListingCard({ listing, onPurchased }: ListingCardProps) {
                 Retry
               </button>
             </div>
-          ) : currentImageUrl && !allGatewaysExhausted ? (
+          ) : currentImageUrl && !allGatewaysExhausted && !imageTimedOut ? (
             <Image
               key={currentImageUrl}
               src={currentImageUrl}
@@ -209,6 +227,7 @@ export function ListingCard({ listing, onPurchased }: ListingCardProps) {
               }
               fill
               className="object-cover transition-transform duration-300 group-hover:scale-105"
+              onLoad={() => setImageLoaded(true)}
               onError={() => setGatewayIndex((i) => i + 1)}
               unoptimized
             />
@@ -218,9 +237,12 @@ export function ListingCard({ listing, onPurchased }: ListingCardProps) {
               className="flex h-full w-full flex-col items-center justify-center bg-gray-50 text-gray-400"
               aria-label="Artwork missing"
               data-testid="artwork-missing"
+              data-fallback-reason={imageTimedOut ? "timeout" : "missing"}
             >
               <span className="text-4xl mb-2">🖼️</span>
-              <span className="text-xs font-medium uppercase tracking-wider">No Artwork</span>
+              <span className="text-xs font-medium uppercase tracking-wider">
+                {imageTimedOut ? "Artwork timed out" : "No Artwork"}
+              </span>
             </div>
           )}
 
