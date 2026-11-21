@@ -183,9 +183,63 @@ kubectl rollout undo deployment/indexer -n elcarehub
 kubectl rollout status deployment/indexer -n elcarehub
 ```
 
+## Release Rollback Decision Template
+
+Use this template to decide between **full rollback**, **partial rollback**, and **forward-fix** based on the failure scope. It builds on the [deployment guide](docs/guides/deployment.md), the release workflow ([`.github/workflows/release.yml`](.github/workflows/release.yml)), and artifact verification ([`scripts/release/verify-artifact.sh`](scripts/release/verify-artifact.sh)).
+
+### Pre-Decision Evidence
+
+Before choosing a path, confirm the release artifact and current state:
+
+```bash
+# 1. Verify the promoted artifact (run before any promotion)
+./scripts/release/verify-artifact.sh <artifact-path>
+
+# 2. Confirm the release workflow run for the candidate version
+#    See .github/workflows/release.yml (run id / commit SHA)
+
+# 3. Capture current version and health
+kubectl describe deployment indexer -n elcarehub | grep Image:
+curl -s http://indexer:4000/health | jq .
+```
+
+### Decision Table
+
+| Scope | Trigger condition | Decision | Owner | Expected output | Escalation path |
+|-------|-------------------|----------|-------|-----------------|-----------------|
+| Frontend | Broken UI/API contract after release; error rate > 5% for > 10 min | **Partial rollback** (frontend only) | Frontend on-call | Previous frontend image restored; error rate back to baseline | Frontend lead → Release manager |
+| Indexer | `indexer_stalled == 1` for > 5 min, or `indexer_open_gaps_count > 20` for > 10 min | **Full rollback** | Indexer on-call | `kubectl rollout undo` complete; gaps draining; no duplicate polling | Indexer lead → Release manager → Incident commander |
+| Indexer | Sync lag elevated but reads healthy; no data loss | **Forward-fix** | Indexer on-call | Patch release with fix; lag trending down | Indexer lead → Release manager |
+| Contract | Contract address/ABI mismatch or failed artifact verification | **Full rollback** (halt promotion) | Release manager | Promotion halted; previous contract config restored | Release manager → Security lead |
+| Contract | Non-breaking config drift detected post-promotion | **Forward-fix** | Release manager | Corrected config deployed; verification re-run | Release manager → Contract owner |
+| Cross-cutting | Artifact verification fails (`verify-artifact.sh` non-zero) | **Full rollback** (block promotion) | Release manager | Promotion blocked; artifact rebuilt | Release manager → Security lead |
+
+### Rollback vs. Forward-Fix Rules
+
+- **Full rollback** when the indexer or contract scope is affected, or artifact verification fails.
+- **Partial rollback** when the failure is isolated to the frontend and the indexer/contract state is healthy.
+- **Forward-fix** only when reads remain available, no data loss occurred, and a patch can ship within the alert window.
+
+### Post-Decision Record
+
+Record the outcome in the issue file:
+
+- **Owner**: named on-call/lead from the table above
+- **Trigger**: the condition that fired
+- **Expected output**: restored version or patch release
+- **Rollback/escalation**: path taken and final state
+
+Credentials (operator token, registry auth) are referenced as placeholders only — never commit live values:
+
+```bash
+export OPERATOR_TOKEN="<operator-token>"
+export REGISTRY_AUTH="<registry-credentials>"
+```
+
 ## Configuration Changes
 
 ### Version Metadata
+=======
 
 Version metadata is embedded at build time and passed as environment variables:
 
