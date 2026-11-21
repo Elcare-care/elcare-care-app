@@ -124,6 +124,10 @@ The indexer exposes HTTP probes:
 - Liveness Probe: `GET http://localhost:4000/livez` (Returns HTTP 200)
 - Readiness Probe: `GET http://localhost:4000/readyz` (Checks DB connection & ingestion stall status)
 
+> **Readiness before migrations:** The readiness probe must remain **false** until all pending Prisma migrations have completed. Do not route traffic to a pod that reports ready while migrations are still running.
+
+> **Probe changes:** Before modifying any probe path, timing, or dependency, review the readiness probe review and release checklist in [DEPLOYMENT.md](../../DEPLOYMENT.md#kubernetes-readiness-probe-review).
+
 ---
 
 ## 4. Frontend Deployment Workflow (Next.js / Vercel)
