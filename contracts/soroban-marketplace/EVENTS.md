@@ -56,7 +56,8 @@ The JSON block below defines the exact topics and data schemas for all events. I
     "data_schema": {
       "auction_id": "u64",
       "bidder": "Address",
-      "bid_amount": "i128"
+      "bid_amount": "i128",
+      "effective_end_time": "u64"
     }
   },
   "AUCTION_RESOLVED": {
@@ -117,17 +118,21 @@ The JSON block below defines the exact topics and data schemas for all events. I
   "ROYALTY_PAID": {
     "topic": "royalty_paid",
     "data_schema": {
-      "listing_id": "u64",
-      "artist": "Address",
-      "amount": "i128",
-      "token": "Address"
+      "listing_id": "Option<u64>",
+      "auction_id": "Option<u64>",
+      "sale_price": "i128",
+      "protocol_fee_amount": "i128",
+      "token": "Address",
+      "recipients": "Vec<RecipientPayout>",
+      "ledger_sequence": "u32"
     }
   },
   "ADMIN_TRANSFER_PROPOSED": {
     "topic": "admin_transfer_proposed",
     "data_schema": {
       "current_admin": "Address",
-      "proposed_admin": "Address"
+      "proposed_admin": "Address",
+      "expires_at": "u64"
     }
   },
   "ADMIN_TRANSFERRED": {
@@ -151,11 +156,15 @@ The JSON block below defines the exact topics and data schemas for all events. I
   },
   "CONTRACT_PAUSED": {
     "topic": "contract_paused",
-    "data_schema": {}
+    "data_schema": {
+      "paused_by": "Option<Address>"
+    }
   },
   "CONTRACT_UNPAUSED": {
     "topic": "contract_unpaused",
-    "data_schema": {}
+    "data_schema": {
+      "unpaused_by": "Option<Address>"
+    }
   },
   "COLLECTION_PAUSED": {
     "topic": "collection_paused",
@@ -202,14 +211,21 @@ The JSON block below defines the exact topics and data schemas for all events. I
     "topic": "auction_extended",
     "data_schema": {
       "auction_id": "u64",
-      "new_end_time": "u64"
+      "prev_end_time": "u64",
+      "new_end_time": "u64",
+      "extension_count": "u32"
     }
   },
   "AUCTION_CANCELLED": {
     "topic": "auction_cancelled",
     "data_schema": {
       "auction_id": "u64",
-      "cancelled_by": "Address"
+      "cancelled_by": "Address",
+      "reason": "AuctionCancelReason",
+      "escrow_amount": "i128",
+      "token": "Address",
+      "ledger_sequence": "u32",
+      "schema_version": "u32"
     }
   },
   "PROTOCOL_FEE_COLLECTED": {
@@ -349,3 +365,55 @@ The contract implements a formal state machine for offers via `OfferStatus` (`ty
 * **Reentrancy**: `accept_offer` acquires `ListingLock(listing_id)` via RAII guard `ListingReentrancyScope` before modifying state or performing token/NFT transfers. Reentrant callbacks revert with `ReentrancyGuard` (`#22`).
 * **Emergency Pause Bypass**: User fund recovery entry points (`withdraw_offer`, `reject_offer`, `reclaim_offer`) bypass all pause controls (global, per-collection, per-function), guaranteeing buyers and artists can always retrieve escrowed funds during an incident.
 * **Checks-Effects-Interactions (CEI)**: Every transition updates and commits `offer.status` in persistent storage before invoking `TokenClient::transfer`.
+
+---
+
+## Event Schema Discrepancy Audit (Issue — Event Naming Drift)
+
+This section records every drift found between `events.rs`, this document, and
+the indexer's `event-schemas.ts` / `parser.ts`, and documents the resolution.
+
+### Changes made in this audit
+
+| Event | Location | Drift found | Resolution |
+|---|---|---|---|
+| `ROYALTY_PAID` | `EVENTS.md` JSON block | Schema showed `{listing_id, artist, amount, token}`. Rust struct is `RoyaltyPaidEvent {listing_id?, auction_id?, sale_price, protocol_fee_amount, token, recipients, ledger_sequence}`. | EVENTS.md updated to match Rust struct. |
+| `BID_PLACED` | `EVENTS.md` JSON block | Missing `effective_end_time: u64` field (added in Issue #468, present in Rust struct and indexer schema). | Field added to EVENTS.md schema. |
+| `AUCTION_EXTENDED` | `EVENTS.md` JSON block | Only listed `auction_id` and `new_end_time`. Rust struct also carries `prev_end_time: u64` and `extension_count: u32`. | Both fields added to EVENTS.md schema. |
+| `AUCTION_CANCELLED` | `EVENTS.md` JSON block | Only listed `auction_id` and `cancelled_by`. Rust struct `AuctionCancelledEvent` also carries `reason`, `escrow_amount`, `token`, `ledger_sequence`, `schema_version`. | Full schema added to EVENTS.md. |
+| `ADMIN_TRANSFER_PROPOSED` | `EVENTS.md` JSON block | Missing `expires_at: u64` field (added in Issue #202, present in Rust struct and indexer schema). | Field added to EVENTS.md schema. |
+| `CONTRACT_PAUSED` / `CONTRACT_UNPAUSED` | `EVENTS.md` JSON block | Showed empty `data_schema: {}`. Rust emits `paused_by: Option<Address>` and `unpaused_by: Option<Address>`. | Corrected to `Option<Address>` fields. |
+| Long-form topic strings | `parser.ts` TOPIC_MAP | 30+ topics emitted by the current contract build (listing_updated, listing_cancelled, bid_placed, offer_rejected, offer_withdrawn, royalty_paid, role_*, function_pause, admin events, etc.) had no TOPIC_MAP entry and were silently dropped by the indexer parser. | All missing long-form topic strings added to TOPIC_MAP in `parser.ts`. |
+| Role events | `event-schemas.ts` SCHEMA_REGISTRY | `ROLE_TRANSFER_PROPOSED`, `ROLE_TRANSFERRED`, `ROLE_PROPOSAL_CANCELLED`, `ROLE_MIGRATED`, `ROLE_PROPOSAL_OVERWRITTEN` had no schema and were not registered. | Schemas defined and registered in `event-schemas.ts`. |
+| `FUNCTION_PAUSED` / `FUNCTION_UNPAUSED` | `event-schemas.ts` SCHEMA_REGISTRY | Schemas were defined in `event-schemas.ts` but were not registered in `SCHEMA_REGISTRY`. | Added to registry. |
+| `LISTING_PRICE_UPDATED` | `event-schemas.ts` SCHEMA_REGISTRY | Schema was defined but not registered in `SCHEMA_REGISTRY`. | Added to registry. |
+
+### Field-name cross-reference (events.rs ↔ EVENTS.md ↔ indexer)
+
+The table below records the canonical field names from `events.rs` for the
+role events, which must be used consistently in `EVENTS.md`, `event-schemas.ts`,
+and any consumer of raw XDR.
+
+| Event struct (events.rs) | Field | Type |
+|---|---|---|
+| `RoleTransferProposedEvent` | `role` | `RoleType` (enum → string tag) |
+| | `current_authority` | `Address` |
+| | `proposed_authority` | `Address` |
+| | `expires_at` | `u64` |
+| `RoleTransferredEvent` | `role` | `RoleType` |
+| | `old_authority` | `Address` |
+| | `new_authority` | `Address` |
+| | `ledger_sequence` | `u32` |
+| `RoleProposalCancelledEvent` | `role` | `RoleType` |
+| | `current_authority` | `Address` |
+| | `cancelled_candidate` | `Address` |
+| | `ledger_sequence` | `u32` |
+| `RoleMigratedEvent` | `role` | `RoleType` |
+| | `authority` | `Address` |
+| `RoleProposalOverwrittenEvent` | `role` | `RoleType` |
+| | `current_authority` | `Address` |
+| | `old_candidate` | `Address` |
+| | `old_expires_at` | `u64` |
+| | `new_candidate` | `Address` |
+| | `new_expires_at` | `u64` |
+| | `ledger_sequence` | `u32` |

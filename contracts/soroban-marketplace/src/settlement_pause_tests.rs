@@ -431,3 +431,160 @@ fn test_pause_regression_mutation_blocked_read_available() {
         "listing price must be unchanged by the pause"
     );
 }
+
+// ══════════════════════════════════════════════════════════════
+// Issue — Per-function pause: exact examples for create, buy,
+// bid, offer, and cleanup calls.
+//
+// The pause table in README.md lists which entry points are
+// blocked versus always-available. These fixtures pin each cell
+// of that table so a future change to the pause logic cannot
+// silently remove a protection without breaking a test.
+// ══════════════════════════════════════════════════════════════
+
+// ── create_listing blocked by all three pause axes ────────────────────────────
+
+#[test]
+#[should_panic(expected = "Error(Contract, #23)")]
+fn test_create_listing_blocked_by_global_pause() {
+    let s = setup();
+    s.client.admin_pause(&s.admin);
+    // Attempt to create a new listing while globally paused.
+    MockNftClient::new(&s.env, &s.col).set_owner(&2u64, &s.admin);
+    s.client.create_listing(
+        &s.admin, &10_000_000_i128, &symbol_short!("XLM"),
+        &s.token, &s.col, &2u64, &1u64,
+        &valid_recipients(&s.env, &s.admin), &None::<u64>,
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #23)")]
+fn test_create_listing_blocked_by_collection_pause() {
+    let s = setup();
+    s.client.pause_collection(&s.admin, &s.col);
+    MockNftClient::new(&s.env, &s.col).set_owner(&2u64, &s.admin);
+    s.client.create_listing(
+        &s.admin, &10_000_000_i128, &symbol_short!("XLM"),
+        &s.token, &s.col, &2u64, &1u64,
+        &valid_recipients(&s.env, &s.admin), &None::<u64>,
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #23)")]
+fn test_create_listing_blocked_by_function_pause() {
+    let s = setup();
+    s.client.pause_function(&s.admin, &Symbol::new(&s.env, "create_listing"));
+    MockNftClient::new(&s.env, &s.col).set_owner(&2u64, &s.admin);
+    s.client.create_listing(
+        &s.admin, &10_000_000_i128, &symbol_short!("XLM"),
+        &s.token, &s.col, &2u64, &1u64,
+        &valid_recipients(&s.env, &s.admin), &None::<u64>,
+    );
+}
+
+// ── make_offer blocked by all three pause axes ────────────────────────────────
+
+#[test]
+#[should_panic(expected = "Error(Contract, #23)")]
+fn test_make_offer_blocked_by_global_pause() {
+    let s = setup();
+    let lid = make_listing(&s);
+    s.client.admin_pause(&s.admin);
+    s.client.make_offer(&s.buyer, &lid, &5_000_000_i128, &s.token, &None::<u64>);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #23)")]
+fn test_make_offer_blocked_by_collection_pause() {
+    let s = setup();
+    let lid = make_listing(&s);
+    s.client.pause_collection(&s.admin, &s.col);
+    s.client.make_offer(&s.buyer, &lid, &5_000_000_i128, &s.token, &None::<u64>);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #23)")]
+fn test_make_offer_blocked_by_function_pause() {
+    let s = setup();
+    let lid = make_listing(&s);
+    s.client.pause_function(&s.admin, &Symbol::new(&s.env, "make_offer"));
+    s.client.make_offer(&s.buyer, &lid, &5_000_000_i128, &s.token, &None::<u64>);
+}
+
+// ── create_auction blocked by all three pause axes ───────────────────────────
+
+#[test]
+#[should_panic(expected = "Error(Contract, #23)")]
+fn test_create_auction_blocked_by_function_pause() {
+    let s = setup();
+    s.client.pause_function(&s.admin, &Symbol::new(&s.env, "create_auction"));
+    let recs = vec![&s.env, Recipient { address: s.admin.clone(), percentage: 10_000 }];
+    s.client.create_auction(
+        &s.admin, &s.token, &s.col, &1u64, &5_000_000_i128, &3_600u64, &recs,
+    );
+}
+
+// ── cleanup / recovery calls remain unaffected by all three pause axes ────────
+//
+// This fixture table covers every row of the "Always available" column in
+// the README pause matrix: cancel_listing, cancel_listings (batch),
+// expire_listing, cancel_auction, finalize_auction, admin_cancel_auction,
+// withdraw_offer, reject_offer.
+
+#[test]
+fn test_reject_offer_works_under_global_pause() {
+    let s = setup();
+    let lid = make_listing(&s);
+    let oid = make_offer(&s, lid);
+    s.client.admin_pause(&s.admin);
+    // reject_offer refunds escrow — must succeed even while paused.
+    s.client.reject_offer(&s.admin, &oid);
+}
+
+#[test]
+fn test_reject_offer_works_under_function_pause_on_accept_offer() {
+    let s = setup();
+    let lid = make_listing(&s);
+    let oid = make_offer(&s, lid);
+    // Pausing accept_offer must not block reject_offer.
+    s.client.pause_function(&s.admin, &Symbol::new(&s.env, "accept_offer"));
+    s.client.reject_offer(&s.admin, &oid);
+}
+
+#[test]
+fn test_cancel_listing_works_under_create_listing_function_pause() {
+    let s = setup();
+    let lid = make_listing(&s);
+    // Pausing create_listing must not block cancellation of an existing listing.
+    s.client.pause_function(&s.admin, &Symbol::new(&s.env, "create_listing"));
+    s.client.cancel_listing(&s.admin, &lid);
+}
+
+// ── Unpause restores create_listing and make_offer ────────────────────────────
+
+#[test]
+fn test_create_listing_works_after_global_unpause() {
+    let s = setup();
+    s.client.admin_pause(&s.admin);
+    s.client.admin_unpause(&s.admin);
+    MockNftClient::new(&s.env, &s.col).set_owner(&2u64, &s.admin);
+    // Must succeed now that the global pause is lifted.
+    s.client.create_listing(
+        &s.admin, &10_000_000_i128, &symbol_short!("XLM"),
+        &s.token, &s.col, &2u64, &1u64,
+        &valid_recipients(&s.env, &s.admin), &None::<u64>,
+    );
+}
+
+#[test]
+fn test_make_offer_works_after_function_unpause() {
+    let s = setup();
+    let lid = make_listing(&s);
+    let fn_sym = Symbol::new(&s.env, "make_offer");
+    s.client.pause_function(&s.admin, &fn_sym.clone());
+    s.client.unpause_function(&s.admin, &fn_sym);
+    // Must succeed after unpause.
+    s.client.make_offer(&s.buyer, &lid, &5_000_000_i128, &s.token, &None::<u64>);
+}

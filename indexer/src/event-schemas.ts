@@ -860,6 +860,103 @@ export const LAUNCHPAD_COLLECTION_UPGRADED_SCHEMA: ContractEventSchema = {
   data: [],
 };
 
+// ── Role-based authorization events (Issue #267) ─────────────────────────────
+//
+// events.rs emits these under their full long-form topic strings
+// (e.g. "role_transfer_proposed"). They were silently dropped by the parser
+// before this fix because TOPIC_MAP had no entry and SCHEMA_REGISTRY had no
+// schema for them. All role fields that carry an enum (RoleType) decode via
+// scValToNative as a plain string tag, treated here as 'string'.
+
+export interface RoleTransferProposedData {
+  role: string;
+  current_authority: string;
+  proposed_authority: string;
+  expires_at: bigint;
+}
+
+export interface RoleTransferredData {
+  role: string;
+  old_authority: string;
+  new_authority: string;
+  ledger_sequence?: number;
+}
+
+export interface RoleProposalCancelledData {
+  role: string;
+  current_authority: string;
+  cancelled_candidate: string;
+  ledger_sequence?: number;
+}
+
+export interface RoleMigratedData {
+  role: string;
+  authority: string;
+}
+
+export interface RoleProposalOverwrittenData {
+  role: string;
+  current_authority: string;
+  old_candidate: string;
+  old_expires_at: bigint;
+  new_candidate: string;
+  new_expires_at: bigint;
+  ledger_sequence?: number;
+}
+
+export const ROLE_TRANSFER_PROPOSED_SCHEMA: ContractEventSchema = {
+  type: 'ROLE_TRANSFER_PROPOSED',
+  data: [
+    { name: 'role', type: 'string' },
+    { name: 'current_authority', type: 'string' },
+    // Field name in Rust struct: `proposed_authority`
+    { name: 'proposed_authority', type: 'string' },
+    { name: 'expires_at', type: 'bigint' },
+  ],
+};
+
+export const ROLE_TRANSFERRED_SCHEMA: ContractEventSchema = {
+  type: 'ROLE_TRANSFERRED',
+  data: [
+    { name: 'role', type: 'string' },
+    // Field names in Rust struct: `old_authority`, `new_authority`
+    { name: 'old_authority', type: 'string' },
+    { name: 'new_authority', type: 'string' },
+    { name: 'ledger_sequence', type: 'number', optional: true },
+  ],
+};
+
+export const ROLE_PROPOSAL_CANCELLED_SCHEMA: ContractEventSchema = {
+  type: 'ROLE_PROPOSAL_CANCELLED',
+  data: [
+    { name: 'role', type: 'string' },
+    { name: 'current_authority', type: 'string' },
+    { name: 'cancelled_candidate', type: 'string' },
+    { name: 'ledger_sequence', type: 'number', optional: true },
+  ],
+};
+
+export const ROLE_MIGRATED_SCHEMA: ContractEventSchema = {
+  type: 'ROLE_MIGRATED',
+  data: [
+    { name: 'role', type: 'string' },
+    { name: 'authority', type: 'string' },
+  ],
+};
+
+export const ROLE_PROPOSAL_OVERWRITTEN_SCHEMA: ContractEventSchema = {
+  type: 'ROLE_PROPOSAL_OVERWRITTEN',
+  data: [
+    { name: 'role', type: 'string' },
+    { name: 'current_authority', type: 'string' },
+    { name: 'old_candidate', type: 'string' },
+    { name: 'old_expires_at', type: 'bigint' },
+    { name: 'new_candidate', type: 'string' },
+    { name: 'new_expires_at', type: 'bigint' },
+    { name: 'ledger_sequence', type: 'number', optional: true },
+  ],
+};
+
 // ── Listing ownership reconciliation (Issue #456) ────────────────────────────
 
 /** Emitted when a CollectionAdmin reconciles an inconsistent listing owner. */
@@ -962,6 +1059,16 @@ export const SCHEMA_REGISTRY: Map<string, ContractEventSchema> = new Map([
   ['COLLECTION_UNPAUSED', COLLECTION_UNPAUSED_SCHEMA],
   // Issue #477: deployment idempotency
   ['DEPLOY_IDEMPOTENT', DEPLOY_IDEMPOTENT_SCHEMA],
+  // Issue #267: role-based authorization events (were silently dropped before)
+  ['ROLE_TRANSFER_PROPOSED', ROLE_TRANSFER_PROPOSED_SCHEMA],
+  ['ROLE_TRANSFERRED', ROLE_TRANSFERRED_SCHEMA],
+  ['ROLE_PROPOSAL_CANCELLED', ROLE_PROPOSAL_CANCELLED_SCHEMA],
+  ['ROLE_MIGRATED', ROLE_MIGRATED_SCHEMA],
+  ['ROLE_PROPOSAL_OVERWRITTEN', ROLE_PROPOSAL_OVERWRITTEN_SCHEMA],
+  // Granular pause events that were missing from the registry
+  ['FUNCTION_PAUSED', FUNCTION_PAUSED_SCHEMA],
+  ['FUNCTION_UNPAUSED', FUNCTION_UNPAUSED_SCHEMA],
+  ['LISTING_PRICE_UPDATED', LISTING_PRICE_UPDATED_SCHEMA],
 ]);
 
 // ── Schema-driven decoder ─────────────────────────────────────────────────────
