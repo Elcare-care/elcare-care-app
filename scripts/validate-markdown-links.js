@@ -24,6 +24,8 @@ const FILES_TO_CHECK = [
   'docs/financial-reconciliation-runbook.md',
   'docs/guides/contract-upgrade-runbook.md',
   'docs/guides/indexer-consumer-guide.md',
+  'docs/reliability/grafana-dashboard-ownership.md',
+  'docs/reliability/backup-retention-verification-report.md',
 ];
 
 // Regex for relative markdown links: [text](./path.md or path.md)

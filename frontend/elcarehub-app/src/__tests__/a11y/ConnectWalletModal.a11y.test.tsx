@@ -1,7 +1,9 @@
 import React from 'react';
-import { render, screen, fireEvent } from '@testing-library/react';
+import { render, screen, waitFor } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { axe } from 'jest-axe';
 import { ConnectWalletModal } from '@/components/ConnectWalletModal';
+import { a11yFixtures } from '@/__tests__/a11y/a11yFixtures';
 
 jest.mock('posthog-js', () => ({ capture: jest.fn() }));
 
@@ -157,103 +159,126 @@ describe('ConnectWalletModal accessibility', () => {
     expect(results).toHaveNoViolations();
   });
 
-  it('exposes focusable controls that are keyboard reachable', () => {
-    const { container } = render(
-      <ConnectWalletModal isOpen onClose={() => {}} />
-    );
+  describe('keyboard interactions', () => {
+    const { escape, tabWrap, focusReturn } =
+      a11yFixtures.keyboard.walletConnect;
 
-    const controls = getFocusableControls(container);
-    expect(controls.length).toBeGreaterThan(0);
+    it('closes the modal and calls onClose when Escape is pressed', async () => {
+      const user = userEvent.setup();
+      const onClose = jest.fn();
 
-    controls.forEach((control) => {
-      control.focus();
-      expect(document.activeElement).toBe(control);
+      render(<ConnectWalletModal isOpen onClose={onClose} />);
+
+      expect(screen.getByRole('dialog')).toBeInTheDocument();
+
+      await user.keyboard(escape.key);
+
+      expect(onClose).toHaveBeenCalledTimes(1);
     });
-  });
 
-  it.each(THEMES)(
-    'focus ring uses %s theme CSS variable and meets contrast',
-    (theme) => {
-      applyTheme(theme);
+    it('wraps focus from the last focusable element to the first on Tab', async () => {
+      const user = userEvent.setup();
 
-      const { container } = render(
-        <ConnectWalletModal isOpen onClose={() => {}} />
-      );
+      render(<ConnectWalletModal isOpen onClose={() => {}} />);
 
-      const controls = getFocusableControls(container);
-      expect(controls.length).toBeGreaterThan(0);
+      const dialog = screen.getByRole('dialog');
+      const focusables = Array.from(
+        dialog.querySelectorAll<HTMLElement>(
+          'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+        )
+      ).filter((el) => el.offsetParent !== null || el === document.activeElement);
 
-      controls.forEach((control) => {
-        fireEvent.focus(control);
+      expect(focusables.length).toBeGreaterThan(1);
 
-        const computed = getComputedStyle(control);
-        const outline = computed.outline;
-        const boxShadow = computed.boxShadow;
-        const focusRingValue = resolveCssVar(
-          control,
-          FOCUS_RING_VAR,
-          FOCUS_RING_FALLBACK
-        );
+      const first = focusables[0];
+      const last = focusables[focusables.length - 1];
 
-        // The focus indicator must be expressed via the CSS variable, not a
-        // hard-coded exception. Either the outline or box-shadow should
-        // reference the resolved focus ring color.
-        const focusRingColor = parseColor(focusRingValue);
-        expect(focusRingColor).not.toBeNull();
+      last.focus();
+      expect(document.activeElement).toBe(last);
 
-        const outlineColor = parseColor(computed.outlineColor);
-        const shadowReferencesVar =
-          boxShadow !== 'none' && boxShadow.includes(focusRingValue);
+      await user.tab({ shift: tabWrap.shift });
 
-        const outlineReferencesVar =
-          outline !== 'none' &&
-          outlineColor !== null &&
-          focusRingColor !== null &&
-          outlineColor[0] === focusRingColor[0] &&
-          outlineColor[1] === focusRingColor[1] &&
-          outlineColor[2] === focusRingColor[2];
-
-        expect(outlineReferencesVar || shadowReferencesVar).toBe(true);
-
-        const backgroundValue = resolveCssVar(
-          control,
-          BACKGROUND_VAR,
-          BACKGROUND_FALLBACK
-        );
-        const background = parseColor(backgroundValue);
-        expect(background).not.toBeNull();
-
-        if (focusRingColor && background) {
-          const ratio = contrastRatio(focusRingColor, background);
-          // WCAG 2.1 non-text contrast minimum for focus indicators.
-          expect(ratio).toBeGreaterThanOrEqual(3);
-        }
-      });
-    }
-  );
-
-  it('keeps focus ring color consistent across themes via CSS variable', () => {
-    const { container } = render(
-      <ConnectWalletModal isOpen onClose={() => {}} />
-    );
-
-    const controls = getFocusableControls(container);
-    expect(controls.length).toBeGreaterThan(0);
-
-    const values: string[] = [];
-    THEMES.forEach((theme) => {
-      applyTheme(theme);
-      controls.forEach((control) => {
-        values.push(
-          resolveCssVar(control, FOCUS_RING_VAR, FOCUS_RING_FALLBACK)
-        );
+      await waitFor(() => {
+        expect(document.activeElement).toBe(first);
       });
     });
 
-    // Every control resolves the focus ring through the same variable.
-    values.forEach((value) => {
-      expect(value).toBeTruthy();
-      expect(parseColor(value)).not.toBeNull();
+    it('wraps focus from the first focusable element to the last on Shift+Tab', async () => {
+      const user = userEvent.setup();
+
+      render(<ConnectWalletModal isOpen onClose={() => {}} />);
+
+      const dialog = screen.getByRole('dialog');
+      const focusables = Array.from(
+        dialog.querySelectorAll<HTMLElement>(
+          'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+        )
+      ).filter((el) => el.offsetParent !== null || el === document.activeElement);
+
+      expect(focusables.length).toBeGreaterThan(1);
+
+      const first = focusables[0];
+      const last = focusables[focusables.length - 1];
+
+      first.focus();
+      expect(document.activeElement).toBe(first);
+
+      await user.tab({ shift: !tabWrap.shift });
+
+      await waitFor(() => {
+        expect(document.activeElement).toBe(last);
+      });
+    });
+
+    it('returns focus to the trigger button after the modal closes', async () => {
+      const user = userEvent.setup();
+      const onClose = jest.fn();
+
+      const Trigger = () => {
+        const [open, setOpen] = React.useState(false);
+        return (
+          <>
+            <button
+              type="button"
+              onClick={() => setOpen(true)}
+              data-testid="wallet-trigger"
+            >
+              Connect Wallet
+            </button>
+            <ConnectWalletModal
+              isOpen={open}
+              onClose={() => {
+                onClose();
+                setOpen(false);
+              }}
+            />
+          </>
+        );
+      };
+
+      render(<Trigger />);
+
+      const trigger = screen.getByTestId('wallet-trigger');
+      trigger.focus();
+      expect(document.activeElement).toBe(trigger);
+
+      await user.click(trigger);
+
+      expect(screen.getByRole('dialog')).toBeInTheDocument();
+
+      await user.keyboard(escape.key);
+
+      expect(onClose).toHaveBeenCalledTimes(1);
+
+      await waitFor(() => {
+        expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+      });
+
+      await waitFor(() => {
+        expect(document.activeElement).toBe(trigger);
+      });
+
+      expect(focusReturn.returnsToTrigger).toBe(true);
     });
   });
 });

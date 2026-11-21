@@ -266,6 +266,8 @@ export function ListingCard({ listing, onPurchased }: ListingCardProps) {
 
           {/* Status badge */}
           <span
+            data-testid="listing-status-badge"
+            data-status={isExpired ? "Expired" : listing.status}
             className={`absolute right-3 top-3 rounded-full px-2.5 py-0.5 text-xs font-semibold ${
               isExpired
                 ? "bg-orange-100 text-orange-600"
@@ -361,6 +363,7 @@ export function ListingCard({ listing, onPurchased }: ListingCardProps) {
           {listing.status === "Active" && (
             <GuardButton
               data-testid="buy-now-button"
+              data-action="purchase"
               onAction={() => setShowCheckout(true)}
               disabled={isBuying || isOwn}
               actionName="To purchase this artwork"

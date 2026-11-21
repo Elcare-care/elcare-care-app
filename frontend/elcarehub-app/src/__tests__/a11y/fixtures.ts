@@ -17,6 +17,45 @@ export const a11yFixtures = {
         "Focus returns to button",
       ],
       expectedBehavior: "All steps completable without mouse",
+      escapeClose: {
+        description: "Escape closes the wallet connect dialog",
+        steps: [
+          "Open modal via Connect Wallet button",
+          "Press Escape",
+        ],
+        expectedBehavior:
+          "Dialog closes and is removed from the accessibility tree",
+      },
+      tabWrapForward: {
+        description: "Tab from last focusable wraps to first",
+        steps: [
+          "Open modal via Connect Wallet button",
+          "Tab to the last focusable element in the dialog",
+          "Press Tab",
+        ],
+        expectedBehavior:
+          "Focus moves to the first focusable element inside the dialog",
+      },
+      tabWrapBackward: {
+        description: "Shift+Tab from first focusable wraps to last",
+        steps: [
+          "Open modal via Connect Wallet button",
+          "Focus the first focusable element in the dialog",
+          "Press Shift+Tab",
+        ],
+        expectedBehavior:
+          "Focus moves to the last focusable element inside the dialog",
+      },
+      focusReturn: {
+        description: "Focus returns to trigger after modal close",
+        steps: [
+          "Focus the Connect Wallet button",
+          "Open modal via Enter",
+          "Close modal via Escape",
+        ],
+        expectedBehavior:
+          "Focus is restored to the Connect Wallet trigger button",
+      },
     },
     marketplaceFilters: {
       steps: [
