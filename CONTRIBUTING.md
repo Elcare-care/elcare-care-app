@@ -22,6 +22,7 @@ Thank you for contributing to ELCARE-HUB! This document explains how to work wit
   - [E2E tests](#e2e-tests)
 - [Test fixtures and helpers](#test-fixtures-and-helpers)
 - [Debugging failures](#debugging-failures)
+- [API and event-schema compatibility](#api-and-event-schema-compatibility)
 
 ---
 
@@ -287,7 +288,7 @@ fn test_my_new_behaviour_unauthorized() {
 
 Property-based tests go in `contracts/soroban-marketplace/src/invariant_tests.rs` using the `proptest!` macro.
 
-**Event schema changes**: If your PR modifies event payloads (contract event topics, struct fields, or indexer parsing), follow the procedure in `CONTRIBUTING-SCHEMA-CHANGES.md` first. This ensures backward compatibility and proper indexer integration.
+**Event schema changes**: If your PR modifies event payloads (contract event topics, struct fields, or indexer parsing), follow the procedure in `CONTRIBUTING-SCHEMA-CHANGES.md` first. This ensures backward compatibility and proper indexer integration. Classify the change and choose the `schema_version` bump using the [API & Event-Schema Versioning Policy](docs/api-versioning-policy.md).
 
 ### E2E tests
 
@@ -415,3 +416,17 @@ The template guides users to provide:
 **Security notice:** The template explicitly warns users NOT to share private keys, seed phrases, or credential-bearing URLs. Support engineers can investigate using public transaction hashes and error codes alone.
 
 For support response guidance, safe diagnostic collection, severity classification, and escalation paths, see **[Support Triage Guide](../docs/guides/support-triage.md)**.
+
+---
+
+## API and event-schema compatibility
+
+Changes to the indexer HTTP API (`indexer/src/api/**`, `indexer/openapi.*`), the SSE streams, or on-chain event schemas (`contracts/soroban-marketplace/src/events.rs`, `indexer/src/event-schemas.ts`) must follow the **[API & Event-Schema Versioning and Deprecation Policy](docs/api-versioning-policy.md)**. The policy defines what counts as breaking, how to version the change, the deprecation windows, and which owners must approve:
+
+| Surface | Approving owner |
+|---------|-----------------|
+| HTTP API and SSE | `@org/backend-lead-indexer` |
+| On-chain event schemas | `@org/backend-lead-contracts` |
+| Release matrix (`COMPATIBILITY.md`) | `@org/devops` |
+
+Related references: [SSE Protocol](docs/sse-protocol.md), [Event Deduplication Keys](docs/guides/event-deduplication.md), [CORS Configuration Validation](docs/guides/cors-validation.md).
