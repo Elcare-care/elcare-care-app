@@ -35,6 +35,50 @@ export function makeListing(overrides: Partial<Listing> = {}): Listing {
   };
 }
 
+export function makeSoldListing(overrides: Partial<Listing> = {}): Listing {
+  return makeListing({ status: "Sold", owner: null, ...overrides });
+}
+
+export function makeCancelledListing(overrides: Partial<Listing> = {}): Listing {
+  return makeListing({ status: "Cancelled", owner: null, ...overrides });
+}
+
+// ── Auction fixture ───────────────────────────────────────────────────────────
+
+export interface AuctionFixture {
+  auction_id: number;
+  listing_id: number;
+  seller: string;
+  token: string;
+  highest_bid: bigint;
+  reserve_price: bigint;
+  min_increment: bigint;
+  currency: string;
+  end_time: number;
+  status: "Active" | "Finalized" | "Cancelled";
+  highest_bidder: string | null;
+}
+
+let _auctionSeq = 1;
+
+export function makeAuction(overrides: Partial<AuctionFixture> = {}): AuctionFixture {
+  const id = _auctionSeq++;
+  return {
+    auction_id: id,
+    listing_id: id,
+    seller: `GARTIST${String(id).padStart(49, "0")}`,
+    token: `CTOKEN${String(id).padStart(50, "0")}`,
+    highest_bid: 10_000_000n,   // 1 XLM
+    reserve_price: 5_000_000n,  // 0.5 XLM
+    min_increment: 1_000_000n,  // 0.1 XLM
+    currency: "XLM",
+    end_time: 2_000,
+    status: "Active",
+    highest_bidder: null,
+    ...overrides,
+  };
+}
+
 // ── ArtworkMetadata fixture ───────────────────────────────────────────────────
 
 export function makeArtworkMetadata(
@@ -180,4 +224,5 @@ export function resetFixtureSequences(): void {
   _listingSeq = 1;
   _notifSeq = 1;
   _activitySeq = 1;
+  _auctionSeq = 1;
 }

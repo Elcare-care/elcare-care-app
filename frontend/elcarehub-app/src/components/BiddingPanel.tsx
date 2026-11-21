@@ -337,6 +337,7 @@ export function BiddingPanel({
                 placeholder={`Min ${minimumNextBidDisplay} ${bidToken.symbol}`}
                 aria-invalid={!!bidValidation}
                 aria-describedby={bidValidation ? bidErrorId : undefined}
+                data-testid="bid-amount-input"
                 className="w-full rounded-lg border border-gray-200 px-3 py-2.5 pr-14 text-sm focus:border-brand-500 focus:outline-none aria-[invalid=true]:border-red-400"
               />
               <span className="absolute right-3 top-1/2 -translate-y-1/2 text-sm font-medium text-gray-400">
@@ -344,7 +345,12 @@ export function BiddingPanel({
               </span>
             </div>
             {bidValidation && (
-              <p id={bidErrorId} role="alert" className="mt-1 flex items-center gap-1 text-xs text-red-500">
+              <p
+                id={bidErrorId}
+                role="alert"
+                data-testid="bid-validation-error"
+                className="mt-1 flex items-center gap-1 text-xs text-red-500"
+              >
                 <AlertCircle size={12} aria-hidden="true" />
                 {bidValidation}
               </p>
@@ -355,6 +361,7 @@ export function BiddingPanel({
             onAction={handleBid}
             disabled={isBidding || !bidAmount || !!bidValidation}
             actionName="To place a bid"
+            data-testid="place-bid-button"
             className="flex w-full items-center justify-center gap-2 rounded-xl bg-brand-500 py-3.5 font-bold text-white shadow-xl shadow-brand-500/20 hover:bg-brand-600 transition-all hover:scale-[1.02] active:scale-[0.98] disabled:opacity-50"
           >
             {isBidding ? (
