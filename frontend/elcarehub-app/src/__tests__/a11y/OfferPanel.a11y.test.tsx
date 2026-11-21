@@ -3,6 +3,11 @@ import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { axe } from 'jest-axe';
 import { OfferPanel, OfferPanelProps } from '@/components/OfferPanel';
+import {
+  makeIncomingOffer,
+  makeOutgoingOffer,
+  offerFixtures,
+} from '@/__tests__/helpers/fixtures';
 
 jest.mock('@/context/WalletContext', () => ({
   useWalletContext: () => ({ isConnected: true, isWrongNetwork: false }),
@@ -89,5 +94,107 @@ describe('OfferPanel — Make Offer modal accessibility', () => {
     const describedBy = input.getAttribute('aria-describedby');
     expect(describedBy).toBeTruthy();
     expect(document.getElementById(describedBy as string)).toHaveTextContent(/offer amount must be positive/i);
+  });
+});
+
+describe('OfferPanel — offer status fixture coverage', () => {
+  const ownerProps: OfferPanelProps = {
+    ...baseProps,
+    isOwner: true,
+    ownerPublicKey: 'GOWNER',
+  };
+
+  const buyerProps: OfferPanelProps = {
+    ...baseProps,
+    isOwner: false,
+    ownerPublicKey: 'GOWNER',
+  };
+
+  const statusCases: Array<{
+    status: string;
+    label: RegExp;
+    explanation: RegExp;
+    terminal: boolean;
+  }> = [
+    { status: 'pending', label: /pending/i, explanation: /awaiting|pending/i, terminal: false },
+    { status: 'accepted', label: /accepted/i, explanation: /accepted/i, terminal: true },
+    { status: 'rejected', label: /rejected/i, explanation: /rejected/i, terminal: true },
+    { status: 'withdrawn', label: /withdrawn/i, explanation: /withdrawn/i, terminal: true },
+    { status: 'expired', label: /expired/i, explanation: /expired/i, terminal: true },
+    { status: 'stale', label: /stale/i, explanation: /stale/i, terminal: true },
+  ];
+
+  it('inventories the offer fixtures for every status combination', () => {
+    expect(offerFixtures).toBeDefined();
+    for (const { status } of statusCases) {
+      expect(offerFixtures.incoming[status]).toBeDefined();
+      expect(offerFixtures.outgoing[status]).toBeDefined();
+    }
+  });
+
+  describe.each(statusCases)('incoming (owner) offer — $status', ({ status, label, explanation, terminal }) => {
+    it('renders the correct status badge label and explanation', () => {
+      const offer = makeIncomingOffer({ status });
+      render(<OfferPanel {...ownerProps} offers={[offer]} />);
+
+      const badge = screen.getByTestId(`offer-status-badge-${offer.id}`);
+      expect(badge).toHaveTextContent(label);
+      expect(badge).toHaveAttribute('title');
+      expect(badge.getAttribute('title')).toMatch(explanation);
+    });
+
+    it(`${terminal ? 'hides' : 'shows'} Accept/Reject actions`, () => {
+      const offer = makeIncomingOffer({ status });
+      render(<OfferPanel {...ownerProps} offers={[offer]} />);
+
+      const accept = screen.queryByTestId(`accept-offer-${offer.id}`);
+      const reject = screen.queryByTestId(`reject-offer-${offer.id}`);
+
+      if (terminal) {
+        expect(accept).not.toBeInTheDocument();
+        expect(reject).not.toBeInTheDocument();
+      } else {
+        expect(accept).toBeInTheDocument();
+        expect(reject).toBeInTheDocument();
+      }
+    });
+  });
+
+  describe.each(statusCases)('outgoing (buyer) offer — $status', ({ status, label, explanation, terminal }) => {
+    it('renders the correct status badge label and explanation', () => {
+      const offer = makeOutgoingOffer({ status });
+      render(<OfferPanel {...buyerProps} offers={[offer]} />);
+
+      const badge = screen.getByTestId(`offer-status-badge-${offer.id}`);
+      expect(badge).toHaveTextContent(label);
+      expect(badge).toHaveAttribute('title');
+      expect(badge.getAttribute('title')).toMatch(explanation);
+    });
+
+    it(`${terminal ? 'hides' : 'shows'} Accept/Reject actions`, () => {
+      const offer = makeOutgoingOffer({ status });
+      render(<OfferPanel {...buyerProps} offers={[offer]} />);
+
+      const accept = screen.queryByTestId(`accept-offer-${offer.id}`);
+      const reject = screen.queryByTestId(`reject-offer-${offer.id}`);
+
+      if (terminal) {
+        expect(accept).not.toBeInTheDocument();
+        expect(reject).not.toBeInTheDocument();
+      } else {
+        expect(accept).toBeInTheDocument();
+        expect(reject).toBeInTheDocument();
+      }
+    });
+  });
+
+  it('renders the empty-state copy when there are no offers', () => {
+    render(<OfferPanel {...ownerProps} offers={[]} />);
+    expect(screen.getByTestId('offers-empty-state')).toHaveTextContent(/no offers/i);
+  });
+
+  it('renders the empty-state copy for buyers when there are no offers', () => {
+    render(<OfferPanel {...buyerProps} offers={[]} />);
+    expect(screen.getByTestId('offers-empty-state')).toHaveTextContent(/no offers/i);
   });
 });

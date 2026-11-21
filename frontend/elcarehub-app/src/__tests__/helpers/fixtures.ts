@@ -6,7 +6,7 @@
  * the fields it cares about.
  */
 
-import type { Listing } from "@/lib/contract";
+import type { Listing, Offer } from "@/lib/contract";
 import type { ArtworkMetadata } from "@/lib/ipfs";
 import type { AppNotification } from "@/lib/watchlist";
 import type { FreshnessMetadata } from "@/lib/indexerFreshness";
