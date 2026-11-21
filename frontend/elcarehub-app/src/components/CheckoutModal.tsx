@@ -15,7 +15,7 @@
 //   • Stale listing triggers re-confirmation requirement
 // ─────────────────────────────────────────────────────────────
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import {
   X,
   CreditCard,
@@ -74,6 +74,16 @@ export function CheckoutModal({
 }: CheckoutModalProps) {
   const { dialogRef, titleId } = useModalA11y(isOpen, onClose);
 
+  // Issue #1141 — cancellation regression guard.
+  //
+  // Cancelling checkout (close button, backdrop click, Escape) must leave
+  // listing state unchanged and must never emit a success signal. If the
+  // user cancels while a purchase is still in flight, a late-resolving
+  // transaction must not call `onPurchased`/`onClose` (which would surface
+  // a success toast after the user already backed out).
+  const purchaseInFlightRef = useRef(false);
+  const cancelledRef = useRef(false);
+
   // Work item C: disclosure acknowledgement
   const { disclosure, acknowledged: disclosureAcknowledged, acknowledge: acknowledgeDisclosure, blocksAction } = useDisclosure('purchase');
 
@@ -121,11 +131,20 @@ export function CheckoutModal({
   // ── Reset on open/close ────────────────────────────────────
   useEffect(() => {
     if (!isOpen) {
+      // If the modal is dismissed while a purchase is still signing, mark
+      // the flow as cancelled so a late success cannot emit a toast.
+      if (purchaseInFlightRef.current) {
+        cancelledRef.current = true;
+      }
       setStep("preview");
       setConflictMessage(null);
       setPreviewError(null);
       resetTx();
       resetPreflight();
+    } else {
+      // Fresh open — clear any prior cancellation state.
+      cancelledRef.current = false;
+      purchaseInFlightRef.current = false;
     }
   }, [isOpen, resetPreflight, resetTx]);
 
@@ -217,6 +236,7 @@ export function CheckoutModal({
 
       setStep("processing");
       resetTx();
+      purchaseInFlightRef.current = true;
       const success = await runTx(() => onCryptoPurchase(), {
         action: "Purchase",
         // Issue #524 — fingerprint on the listing + buyer + price/token, so
@@ -234,7 +254,13 @@ export function CheckoutModal({
           },
         },
       });
+      purchaseInFlightRef.current = false;
       if (success) {
+        // Issue #1141 — if the user cancelled while signing, do not emit a
+        // success signal (no toast, no onPurchased, no forced close).
+        if (cancelledRef.current) {
+          return;
+        }
         posthog.capture("Purchase Successful", {
           listing_id: listing.listing_id,
           buyer_total_xlm: preview.buyerTotalDisplay,
@@ -246,6 +272,9 @@ export function CheckoutModal({
         setStep("preview");
       } else {
         // success is null — lifecycle transitioned to error; let TxErrorPanel render
+        if (cancelledRef.current) {
+          return;
+        }
         setStep("confirm");
       }
     }
