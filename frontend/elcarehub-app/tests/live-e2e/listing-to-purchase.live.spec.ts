@@ -111,7 +111,7 @@ test.describe('Live integration — listing, auction, offer, collection', () => 
     await bidInput.fill(amount);
     await page.getByRole('button', { name: /bid/i }).click();
 
-    await expect(page.getByText(/bid placed successfully/i)).toBeVisible({ timeout: 45_000 });
+    await expect(page.getByText(/bid placed/i)).toBeVisible({ timeout: 45_000 });
 
     await expect(async () => {
       const res = await page.request.get(`${INDEXER_URL}/auctions/${auctionId}`);

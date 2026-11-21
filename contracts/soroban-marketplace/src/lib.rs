@@ -61,6 +61,9 @@ mod batch_listing_tests;
 mod fee_governance_tests;
 
 #[cfg(test)]
+mod revoke_artist_cleanup_tests;
+
+#[cfg(test)]
 mod offer_unknown_id_tests;
 
 #[cfg(test)]

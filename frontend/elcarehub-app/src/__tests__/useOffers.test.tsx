@@ -433,7 +433,7 @@ describe('useWithdrawOffer (extended)', () => {
     await user.click(screen.getByRole('button'));
     await waitFor(() => {
       expect(mockPushToast).toHaveBeenCalledWith('Withdrawing offer\u2026', 'info');
-      expect(mockPushToast).toHaveBeenCalledWith('Offer withdrawn successfully', 'success');
+      expect(mockPushToast).toHaveBeenCalledWith(expect.stringContaining('Offer withdrawn'), 'success');
     });
   });
 });

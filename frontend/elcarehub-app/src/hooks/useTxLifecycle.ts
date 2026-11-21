@@ -25,6 +25,7 @@
 
 import { useCallback, useRef, useState, useEffect } from "react";
 import { lookupTxOnRpc } from "@/lib/txLookup";
+import { t, type TranslationKey } from "@/lib/i18n";
 import {
   beginIntent,
   updateIntentStatus,
@@ -77,6 +78,12 @@ export interface TxLifecycleState {
   error: TxError | null;
   /** Timestamp (ms) when the current state was entered. */
   stateEnteredAt: number;
+  /**
+   * Human-readable label of the operation currently in flight (e.g. "Bid",
+   * "Purchase"), captured from the run() options. Null when idle or when the
+   * state was restored from persistence without an associated action.
+   */
+  action: string | null;
 }
 
 // ── Options ───────────────────────────────────────────────────────────────────
@@ -380,6 +387,7 @@ const INITIAL_STATE: TxLifecycleState = {
   txHash: null,
   error: null,
   stateEnteredAt: 0,
+  action: null,
 };
 
 export function useTxLifecycle(
@@ -426,6 +434,7 @@ export function useTxLifecycle(
         txHash: savedHash,
         error: null,
         stateEnteredAt: Date.now(),
+        action: null,
       });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -559,6 +568,7 @@ export function useTxLifecycle(
             txHash: record.txHash,
             error: null,
             stateEnteredAt: Date.now(),
+            action,
           });
           watchDuplicateIntent(dedupe.network, dedupe.account, fingerprint);
           return null;
@@ -588,7 +598,7 @@ export function useTxLifecycle(
       };
 
       // ── Phase: simulating ──────────────────────────────────────────────────
-      transition({ state: "simulating", txHash: null, error: null });
+      transition({ state: "simulating", txHash: null, error: null, action });
 
       // Short yield so React can flush the state update before we block
       await new Promise((r) => setTimeout(r, 0));
@@ -775,6 +785,91 @@ export function txStateLabel(state: TxState): string {
     case "indexer_pending": return "Waiting for indexer confirmation…";
     case "success":         return "Confirmed!";
     case "error":           return "Failed";
+  }
+}
+
+// ── Localized, operation-specific status copy ─────────────────────────────────
+//
+// Maps the free-form `action` labels callers pass to run() onto the
+// tx_action_* entries in the locale catalog so pending states can name the
+// operation in the user's language. Unknown labels fall back to the raw
+// (already human-readable) action string.
+
+const TX_ACTION_KEYS: Record<string, TranslationKey> = {
+  "transaction": "tx_action_transaction",
+  "bid": "tx_action_bid",
+  "finalize auction": "tx_action_finalize_auction",
+  "create auction": "tx_action_create_auction",
+  "auction": "tx_action_create_auction",
+  "create listing": "tx_action_create_listing",
+  "purchase": "tx_action_purchase",
+  "listing": "tx_action_listing",
+  "offer": "tx_action_offer",
+  "place offer": "tx_action_place_offer",
+  "placing offer": "tx_action_place_offer",
+  "accept offer": "tx_action_accept_offer",
+  "accepting offer": "tx_action_accept_offer",
+  "reject offer": "tx_action_reject_offer",
+  "rejecting offer": "tx_action_reject_offer",
+  "withdraw offer": "tx_action_withdraw_offer",
+  "withdrawing offer": "tx_action_withdraw_offer",
+  "reclaim offer funds": "tx_action_reclaim_offer",
+  "reclaiming offer funds": "tx_action_reclaim_offer",
+  "cancel auction": "tx_action_cancel_auction",
+  "claim refund": "tx_action_claim_refund",
+  "cancel listing": "tx_action_cancel_listing",
+  "cancel listings": "tx_action_cancel_listings",
+  "update listing": "tx_action_update_listing",
+  "deploy collection": "tx_action_deploy_collection",
+  "mint": "tx_action_mint",
+  "redeem": "tx_action_redeem",
+  "transfer": "tx_action_transfer",
+};
+
+export function txActionLabel(action: string | null): string {
+  if (!action) return t("tx_action_transaction");
+  const key = TX_ACTION_KEYS[action.trim().toLowerCase()];
+  return key ? t(key) : action;
+}
+
+function fillTxTemplate(key: TranslationKey, actionLabel: string): string {
+  return t(key).replace(/\{action\}/g, actionLabel);
+}
+
+/**
+ * Localized, operation-specific label for the current lifecycle state.
+ *
+ * Pending (non-terminal) states name the in-flight operation and, once the
+ * transaction is submitted, note that the page updates after ledger
+ * confirmation. Use this for status regions and aria-live announcements;
+ * pass `{ short: true }` for space-constrained spots like button labels.
+ *
+ * The lifecycle state machine itself is unchanged — this is presentation only.
+ */
+export function txStatusMessage(
+  txState: TxLifecycleState,
+  opts: { short?: boolean } = {}
+): string {
+  const actionLabel = txActionLabel(txState.action);
+  const short = opts.short === true;
+
+  switch (txState.state) {
+    case "idle":
+      return t(short ? "tx_short_idle" : "tx_state_idle");
+    case "simulating":
+      return fillTxTemplate(short ? "tx_short_simulating" : "tx_state_simulating", actionLabel);
+    case "signing":
+      return fillTxTemplate(short ? "tx_short_signing" : "tx_state_signing", actionLabel);
+    case "broadcasting":
+      return fillTxTemplate(short ? "tx_short_broadcasting" : "tx_state_broadcasting", actionLabel);
+    case "confirming":
+      return fillTxTemplate(short ? "tx_short_confirming" : "tx_state_confirming", actionLabel);
+    case "indexer_pending":
+      return fillTxTemplate(short ? "tx_short_indexer_pending" : "tx_state_indexer_pending", actionLabel);
+    case "success":
+      return fillTxTemplate(short ? "tx_short_success" : "tx_state_success", actionLabel);
+    case "error":
+      return t(short ? "tx_short_failed" : "tx_state_failed");
   }
 }
 

@@ -28,6 +28,7 @@ import { getReadableErrorMessage } from "@/lib/errors";
 import { config } from "@/lib/config";
 import { useTransientErrorToast } from "./useTransientErrorToast";
 import { useTxToast } from "./useTxToast";
+import { t } from "@/lib/i18n";
 import { assertSupportedTokenAddress } from "@/lib/token-support";
 import { trackEvent } from "@/providers/PostHogProvider";
 import {
@@ -205,14 +206,14 @@ export function useCreateListing(artistPublicKey: string | null) {
       setError(null);
 
       try {
-        setProgress("Validating payment token…");
+        setProgress(t("progress_validating_token"));
         const token = await assertSupportedTokenAddress(
           input.tokenAddress,
           "listing",
         );
 
         // Step 1: Call the Soroban contract via useTxToast.
-        setProgress("Creating on-chain listing…");
+        setProgress(t("progress_creating_listing"));
         const listingId = await run(
           () =>
             createListing(
@@ -237,7 +238,7 @@ export function useCreateListing(artistPublicKey: string | null) {
           token.symbol || "XLM",
         );
 
-        setProgress("Listing created successfully!");
+        setProgress(t("progress_listing_created"));
         return listingId;
       } catch (err: unknown) {
         setError(getReadableErrorMessage(err, "Failed to create listing"));
@@ -371,7 +372,7 @@ export function useUpdateListing(artistPublicKey: string | null) {
           );
         }
 
-        setProgress("Validating payment token…");
+        setProgress(t("progress_validating_token"));
         const token = await assertSupportedTokenAddress(
           input.tokenAddress,
           "listing",
@@ -381,7 +382,7 @@ export function useUpdateListing(artistPublicKey: string | null) {
 
         // Step 1: Upload new image to IPFS if provided.
         if (input.imageFile) {
-          setProgress("Uploading new image to IPFS…");
+          setProgress(t("progress_uploading_new_image"));
           const imageResult = await uploadImageToIPFS(
             input.imageFile,
             input.title,
@@ -400,14 +401,14 @@ export function useUpdateListing(artistPublicKey: string | null) {
         };
 
         // Step 3: Upload metadata to IPFS.
-        setProgress("Uploading new metadata to IPFS…");
+        setProgress(t("progress_uploading_new_metadata"));
         const metadataResult = await uploadMetadataToIPFS(
           metadata,
           input.title,
         );
 
         // Step 4: Call the Soroban contract via useTxToast.
-        setProgress("Updating on-chain listing…");
+        setProgress(t("progress_updating_listing"));
         const success = await run(
           () =>
             updateListing(
@@ -422,7 +423,7 @@ export function useUpdateListing(artistPublicKey: string | null) {
 
         if (!success) return false;
 
-        setProgress("Listing updated successfully!");
+        setProgress(t("progress_listing_updated"));
         return true;
       } catch (err: unknown) {
         setError(getReadableErrorMessage(err, "Failed to update listing"));

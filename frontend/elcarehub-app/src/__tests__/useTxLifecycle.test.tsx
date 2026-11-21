@@ -13,8 +13,11 @@ import {
   buildTxErrorMessage,
   extractTxHash,
   txStateLabel,
+  txStatusMessage,
   isTxTerminal,
   isTxActive,
+  type TxState,
+  type TxLifecycleState,
 } from "../hooks/useTxLifecycle";
 
 // ── Mock lookupTxOnRpc ────────────────────────────────────────────────────────
@@ -183,6 +186,65 @@ describe("txStateLabel", () => {
   });
 });
 
+// ── txStatusMessage ───────────────────────────────────────────────────────────
+
+function makeTxState(state: TxState, action: string | null = null): TxLifecycleState {
+  return { state, txHash: null, error: null, stateEnteredAt: 0, action };
+}
+
+describe("txStatusMessage", () => {
+  beforeEach(() => {
+    localStorage.clear();
+  });
+
+  it("returns a non-empty string for every state", () => {
+    const states: TxState[] = [
+      "idle", "simulating", "signing", "broadcasting",
+      "confirming", "indexer_pending", "success", "error",
+    ];
+    for (const s of states) {
+      expect(txStatusMessage(makeTxState(s, "Bid")).length).toBeGreaterThan(0);
+    }
+  });
+
+  it("names the in-flight operation in pending states", () => {
+    const msg = txStatusMessage(makeTxState("signing", "Bid"));
+    expect(msg).toContain("your bid");
+    expect(msg).toContain("wallet signature");
+  });
+
+  it("mentions ledger confirmation once the transaction is submitted", () => {
+    for (const s of ["broadcasting", "confirming", "indexer_pending"] as TxState[]) {
+      const msg = txStatusMessage(makeTxState(s, "Purchase"));
+      expect(msg.toLowerCase()).toContain("ledger");
+    }
+  });
+
+  it("falls back to a generic operation label when no action is known", () => {
+    const msg = txStatusMessage(makeTxState("confirming", null));
+    expect(msg).toContain("transaction");
+    expect(msg).not.toContain("undefined");
+  });
+
+  it("passes unknown free-form actions through unchanged", () => {
+    const msg = txStatusMessage(makeTxState("signing", "Custom Admin Op"));
+    expect(msg).toContain("Custom Admin Op");
+  });
+
+  it("short variant stays concise and omits the ledger note", () => {
+    const msg = txStatusMessage(makeTxState("confirming", "Bid"), { short: true });
+    expect(msg).toContain("your bid");
+    expect(msg).not.toContain("ledger");
+  });
+
+  it("returns localized copy for the Swahili locale", () => {
+    localStorage.setItem("elcarehub_locale", "sw");
+    const msg = txStatusMessage(makeTxState("confirming", "Bid"));
+    expect(msg).toContain("zabuni yako");
+    expect(msg).toContain("ledger");
+  });
+});
+
 // ── isTxTerminal / isTxActive ─────────────────────────────────────────────────
 
 describe("isTxTerminal / isTxActive", () => {
@@ -232,6 +294,28 @@ describe("useTxLifecycle — happy path", () => {
     expect(result.current.txState.state).toBe("success");
     expect(result.current.txState.txHash).toBe("abc123");
     expect(result.current.isActive).toBe(false);
+  });
+
+  it("records the run action on txState for status copy", async () => {
+    localStorage.clear();
+    const { result } = renderHook(() => useTxLifecycle({ persistKey: null, indexerConfirmTimeoutMs: 10 }));
+
+    let runPromise: Promise<unknown>;
+    act(() => {
+      runPromise = result.current.run(successFn(), { action: "Bid" });
+    });
+
+    // While in flight, the action label is available to status components.
+    expect(result.current.txState.action).toBe("Bid");
+
+    await act(async () => {
+      jest.advanceTimersByTime(50);
+      await runPromise;
+    });
+
+    expect(result.current.txState.state).toBe("success");
+    expect(result.current.txState.action).toBe("Bid");
+    expect(txStatusMessage(result.current.txState)).toContain("your bid");
   });
 
   it("returns the result from fn on success", async () => {

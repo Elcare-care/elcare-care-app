@@ -44,6 +44,7 @@ import {
   baseToDisplay,
 } from "@/lib/amount";
 import { formatLedgerTime } from "@/lib/format";
+import { t } from "@/lib/i18n";
 import {
   ArrowLeft,
   Clock,
@@ -1144,7 +1145,7 @@ export default function AuctionDetailPage() {
                 </p>
                 {bidSuccess && (
                   <p className="flex items-center gap-1 text-xs text-green-600">
-                    <CheckCircle2 size={13} /> Bid placed successfully!
+                    <CheckCircle2 size={13} /> {t("bid_success_status")}
                   </p>
                 )}
               </div>
@@ -1185,7 +1186,7 @@ export default function AuctionDetailPage() {
             {finalizeSuccess && (
               <div className="flex items-center gap-2 rounded-xl bg-green-50 px-4 py-3 text-sm text-green-700">
                 <CheckCircle2 size={16} />
-                Auction finalized successfully!
+                {t("finalize_success_status")}
               </div>
             )}
 

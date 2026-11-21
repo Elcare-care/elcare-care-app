@@ -11,7 +11,8 @@ import { useSearchParams } from "next/navigation";
 import { useAuctions } from "@/hooks/useAuctions";
 import { Auction, stroopsToXlm } from "@/lib/contract";
 import { fetchMetadata, cidToGatewayUrl, ArtworkMetadata } from "@/lib/ipfs";
-import { AuctionCardSkeleton } from "@/components/Skeletons";
+import { AuctionCardGridSkeleton } from "@/components/Skeletons";
+import { EmptyState, ResourceState } from "@/components/PageStates";
 import { useFilterUrlSync } from "@/hooks/useFilterUrlSync";
 import { ArtworkImage } from "@/components/ArtworkImage";
 import {
@@ -295,18 +296,20 @@ export default function AuctionsPage() {
       {/* Content */}
       <div className="mx-auto max-w-7xl px-4 sm:px-6 py-8">
         {/* Error state */}
-        {error && <ErrorState title="Failed to load auctions" message={error} onRetry={refresh} />}
-
-        {/* Loading skeletons */}
-        {isLoading && !error && (
-          <div className="grid gap-6 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
-            {Array.from({ length: 8 }).map((_, i) => (
-              <AuctionCardSkeleton key={i} />
-            ))}
-          </div>
+        {error && (
+          <ResourceState
+            isLoading={false}
+            error={{ category: "unavailable", message: error, retryable: true }}
+            onRetry={refresh}
+          />
         )}
 
-        {/* Empty / No Results state */}
+        {/* Loading skeletons — grid matches the real auction grid so layout is stable */}
+        {isLoading && !error && (
+          <AuctionCardGridSkeleton count={8} label="Loading auctions…" />
+        )}
+
+        {/* Empty / No Results state — locale-keyed copy, never implies a network error */}
         {!isLoading && !error && filtered.length === 0 && (
           tab !== "all" ? (
             <EmptyState

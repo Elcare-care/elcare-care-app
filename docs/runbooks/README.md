@@ -11,16 +11,23 @@ Each runbook covers: detection, containment, diagnosis, recovery, and post-incid
 |---|---|---|
 | [admin-read-only-diagnostic.md](./admin-read-only-diagnostic.md) | First-step read-only sync/health check for support | LOW |
 | [stalled-ingestion.md](./stalled-ingestion.md) | Indexer stops processing new ledgers | HIGH |
+| [poller-health-checklist.md](./poller-health-checklist.md) | Classify poller as healthy / degraded / stalled / re-org (read-only) | LOW |
+| [stale-cache-diagnostic.md](./stale-cache-diagnostic.md) | Compare a Redis-cached listing/auction with PostgreSQL (read-only) | LOW |
+| [redis-key-registry.md](./redis-key-registry.md) | Redis key prefixes, TTLs, and review checklist | — |
+| [cache-ttl-reference.md](./cache-ttl-reference.md) | Source-of-truth table for response-cache TTLs | — |
 | [reorganization.md](./reorganization.md) | Stellar chain reorg detected | MEDIUM–HIGH |
 | [database-outage.md](./database-outage.md) | PostgreSQL unavailable | CRITICAL |
 | [redis-outage.md](./redis-outage.md) | Redis cache unavailable | MEDIUM |
 | [compromised-admin-key.md](./compromised-admin-key.md) | Admin Stellar key exposed or stolen | CRITICAL |
 | [role-rotation.md](./role-rotation.md) | Role-holder rotation procedure (Issue #473) | HIGH |
 | [contract-pause.md](./contract-pause.md) | Emergency pause / unpause procedure | CRITICAL |
+| [token-onboarding.md](./token-onboarding.md) | Add or remove a payment token from the whitelist | HIGH |
 | [pinata-outage.md](./pinata-outage.md) | Pinata/IPFS unavailable | MEDIUM |
 | [wallet-incompatibility.md](./wallet-incompatibility.md) | Freighter or Magic.link failures | HIGH |
 | [incorrect-deployment-config.md](./incorrect-deployment-config.md) | Wrong contract ID, network, or secrets | HIGH |
-| [tabletop-exercises.md](./tabletop-exercises.md) | Exercise records and scenarios | — |
+| [observability-alerts.md](./observability-alerts.md) | Prometheus alert interpretations and responses | MEDIUM |
+| [game-day-scenario-combined-failure.md](./game-day-scenario-combined-failure.md) | Quarterly "Perfect Storm" combined-failure game day | — |
+| [tabletop-exercises.md](./tabletop-exercises.md) | Exercise records and individual scenarios | — |
 
 **Secret inventory:** [../secret-inventory.md](../secret-inventory.md)  
 **Reliability reviews & backlog:** [../reliability/README.md](../reliability/README.md)  
@@ -62,6 +69,12 @@ Each runbook covers: detection, containment, diagnosis, recovery, and post-incid
 **Database returns 503?**  
 → [database-outage.md](./database-outage.md) — check container, pool, disk
 
+**Token whitelist change needed?**  
+→ [token-onboarding.md](./token-onboarding.md) — full two-operator sign-off checklist before mainnet
+
+**Prometheus alert firing?**  
+→ [observability-alerts.md](./observability-alerts.md) — per-alert triage steps
+
 ---
 
 ## Versioning
@@ -81,3 +94,17 @@ Each runbook includes a post-incident review template. Completed reviews are sto
 3. Use tabletop exercises to validate runbooks quarterly
 4. Feed exercise and incident outcomes into the [reliability backlog](../reliability/backlog.md)
 5. Update escalation contacts in [tabletop-exercises.md](./tabletop-exercises.md) when team changes
+
+---
+
+## Ownership
+
+| Domain | Runbook(s) | Primary Owner | Rollback / Escalation |
+|---|---|---|---|
+| Smart contracts | `contract-pause.md`, `role-rotation.md`, `compromised-admin-key.md`, `token-onboarding.md`, `incorrect-deployment-config.md` | Security Lead | CTO |
+| Indexer / ingestion | `stalled-ingestion.md`, `poller-health-checklist.md`, `reorganization.md`, `admin-read-only-diagnostic.md` | Backend Lead | On-call engineer |
+| Database | `database-outage.md` | Backend Lead | CTO — restore from last verified backup |
+| Cache / Redis | `redis-outage.md`, `redis-key-registry.md`, `cache-ttl-reference.md`, `stale-cache-diagnostic.md` | Backend Lead | Restart Redis, flush stale keys per registry |
+| Frontend / wallets | `wallet-incompatibility.md`, `pinata-outage.md` | Frontend Lead | Roll back frontend deploy; swap IPFS gateway |
+| Observability | `observability-alerts.md` | DevOps Engineer | Silence alert, open investigation ticket |
+| Game days | `tabletop-exercises.md`, `game-day-scenario-combined-failure.md` | Security Lead | No production impact — exercise only |

@@ -108,6 +108,9 @@ rows are never updated or deleted after insertion.
 | `Discrepancy` | `ArchivedDiscrepancy` | `detectedAt < now() - INTERVAL '90 days'` |
 | `KeeperAction` | `ArchivedKeeperAction` | `updatedAt < now() - INTERVAL '30 days'` |
 
+> **Note on Storage-Level Partition Maintenance:**
+> In addition to application-level archival tables, storage-level range partitions for `MarketplaceEvent`, `Bid`, and `RoyaltyPayment` must follow the [Partition Maintenance Checklist](../indexer/docs/partitioning-operations.md#partition-maintenance-checklist-pre-destructive-action) before any partition is detached or dropped.
+
 ## Archival job
 
 The archival job (`src/archive.ts`) runs as a bounded, resumable batch process:
@@ -130,19 +133,183 @@ The archival job (`src/archive.ts`) runs as a bounded, resumable batch process:
 
 ## Restore procedure
 
-To restore archived rows to the hot tables:
+To restore archived rows to the hot tables without data loss or downtime:
 
-1. Stop the indexer poller and API.
-2. For each archive table, run:
+1. Stop the indexer poller and API during the restore operation.
+2. Complete the [Archive Restore Proof Procedure](#archive-restore-proof-procedure) below.
+3. Restart the indexer once proof verification passes.
+
+---
+
+## Archive Restore Proof Procedure
+
+This procedure provides a copy/paste sequence that restores archived data to primary tables while **strictly prohibiting `DELETE` or `TRUNCATE` actions**.
+All diagnostic steps are marked `[READ-ONLY]`. Archive tables remain intact as immutable cold records.
+
+### Proof Principles & Invariants
+- **Non-Destructive Guarantee:** Restored rows are inserted using `ON CONFLICT DO NOTHING`. Archive source tables are **never** deleted or truncated.
+- **Canonical Table Safety Invariant:** Canonical tables (`Listing`, `Auction`, `Offer`, `Bid`, `RoyaltyPayment`, `Collection`, `WhitelistedToken`, `SyncState`, `TrackedContract`) represent authoritative on-chain state. They are strictly excluded from restore mutation.
+- **Reconciliation Proof:** Restoration is considered complete only when the post-restore row count proof returns `0` discrepancy.
+
+---
+
+### Step 1: Canonical-Table Safety Baseline [READ-ONLY]
+
+Record row count baselines for canonical tables before initiating any restore:
+
+```sql
+-- [READ-ONLY] Baseline canonical table safety check
+SELECT 'Listing' AS canonical_table, COUNT(*) AS baseline_count FROM "Listing"
+UNION ALL
+SELECT 'Auction', COUNT(*) FROM "Auction"
+UNION ALL
+SELECT 'Offer', COUNT(*) FROM "Offer"
+UNION ALL
+SELECT 'Bid', COUNT(*) FROM "Bid"
+UNION ALL
+SELECT 'RoyaltyPayment', COUNT(*) FROM "RoyaltyPayment"
+UNION ALL
+SELECT 'Collection', COUNT(*) FROM "Collection";
+```
+
+---
+
+### Step 2: Pre-Restore Row Count & Range Proof [READ-ONLY]
+
+Audit the candidate rows in the archive table for the target ledger window:
+
+```sql
+-- [READ-ONLY] Count target archive records and determine boundary
+SELECT
+  COUNT(*) AS candidate_archive_rows,
+  MIN("ledgerSequence") AS min_ledger,
+  MAX("ledgerSequence") AS max_ledger
+FROM "ArchivedMarketplaceEvent"
+WHERE "ledgerSequence" BETWEEN $START_LEDGER AND $END_LEDGER;
+```
+
+---
+
+### Step 3: Non-Destructive Restore Execution [NON-DESTRUCTIVE RESTORE]
+
+Execute idempotent copy into the primary table without modifying or deleting archive source rows:
+
+```sql
+-- [NON-DESTRUCTIVE RESTORE] Insert into hot table; preserve archive intact
+INSERT INTO "MarketplaceEvent" (
+  "id",
+  "eventType",
+  "actor",
+  "data",
+  "ledgerSequence",
+  "eventHash",
+  "confirmed",
+  "listingId",
+  "createdAt",
+  "updatedAt"
+)
+SELECT
+  "id",
+  "eventType",
+  "actor",
+  "data",
+  "ledgerSequence",
+  "eventHash",
+  "confirmed",
+  "listingId",
+  "createdAt",
+  "updatedAt"
+FROM "ArchivedMarketplaceEvent"
+WHERE "ledgerSequence" BETWEEN $START_LEDGER AND $END_LEDGER
+ON CONFLICT ("id") DO NOTHING;
+```
+
+---
+
+### Step 4: Post-Restore Reconciliation Proof [READ-ONLY]
+
+Verify that 100% of candidate archive records now exist in the hot table:
+
+```sql
+-- [READ-ONLY] Prove full reconciliation between archive and hot table
+SELECT
+  archive_stats.total_archived,
+  hot_stats.total_hot,
+  (archive_stats.total_archived - hot_stats.total_hot) AS missing_rows
+FROM
+  (SELECT COUNT(*) AS total_archived
+   FROM "ArchivedMarketplaceEvent"
+   WHERE "ledgerSequence" BETWEEN $START_LEDGER AND $END_LEDGER) archive_stats,
+  (SELECT COUNT(*) AS total_hot
+   FROM "MarketplaceEvent"
+   WHERE "ledgerSequence" BETWEEN $START_LEDGER AND $END_LEDGER) hot_stats;
+-- Expected output: missing_rows = 0
+```
+
+---
+
+### Step 5: Checksum Integrity Proof [READ-ONLY]
+
+Verify checksum and provenance values attached to the archived rows:
+
+```sql
+-- [READ-ONLY] Inspect checksum integrity across restored samples
+SELECT
+  a."id",
+  a."ledgerSequence",
+  a."eventHash",
+  a."archiveChecksum",
+  a."archivedAt"
+FROM "ArchivedMarketplaceEvent" a
+INNER JOIN "MarketplaceEvent" m ON m."id" = a."id"
+WHERE a."ledgerSequence" BETWEEN $START_LEDGER AND $END_LEDGER
+LIMIT 25;
+```
+
+---
+
+### Step 6: Post-Restore Canonical Safety Verification [READ-ONLY]
+
+Re-run the canonical table count query to prove that no canonical records were mutated:
+
+```sql
+-- [READ-ONLY] Assert canonical tables match baseline counts exactly
+SELECT 'Listing' AS canonical_table, COUNT(*) FROM "Listing"
+UNION ALL
+SELECT 'Auction', COUNT(*) FROM "Auction"
+UNION ALL
+SELECT 'Offer', COUNT(*) FROM "Offer"
+UNION ALL
+SELECT 'Bid', COUNT(*) FROM "Bid"
+UNION ALL
+SELECT 'RoyaltyPayment', COUNT(*) FROM "RoyaltyPayment"
+UNION ALL
+SELECT 'Collection', COUNT(*) FROM "Collection";
+```
+
+---
+
+### Operator Notes: Review & Rollback Procedures
+
+#### Review Checklist
+1. Pre- and post-canonical table counts must match identically.
+2. Step 4 reconciliation query must yield `missing_rows = 0`.
+3. Confirm no `DELETE FROM "ArchivedMarketplaceEvent"` or `TRUNCATE` was run.
+4. Record operator handle, execution date, ledger sequence window, and checksum samples in the maintenance log.
+
+#### Rollback Procedure
+If a restore was executed with an erroneous ledger range or caused unexpected query latency:
+1. Since the archive source table was never modified or deleted, original archival provenance remains completely preserved.
+2. Remove only the restored rows from the hot table:
    ```sql
-   INSERT INTO "MarketplaceEvent" SELECT * FROM "ArchivedMarketplaceEvent"
-   ON CONFLICT DO NOTHING;
+   DELETE FROM "MarketplaceEvent"
+   WHERE "id" IN (
+     SELECT "id" FROM "ArchivedMarketplaceEvent"
+     WHERE "ledgerSequence" BETWEEN $START_LEDGER AND $END_LEDGER
+   );
    ```
-3. Delete the restored rows from the archive table.
-4. Restart the indexer.
+3. Verify that `ArchivedMarketplaceEvent` row count and checksums remain untouched.
 
-All archive tables include `archiveChecksum` so operators can verify row
-integrity before and after restore.
 
 ## Provenance
 

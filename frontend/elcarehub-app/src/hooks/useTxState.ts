@@ -45,6 +45,7 @@ import {
   TxErrorCategory,
   TxError,
   txStateLabel,
+  txStatusMessage,
   isTxTerminal,
   isTxActive,
 } from "./useTxLifecycle";
@@ -58,7 +59,7 @@ export type {
   TxLifecycleOptions,
   UseTxLifecycleResult,
 };
-export { txStateLabel, isTxTerminal, isTxActive };
+export { txStateLabel, txStatusMessage, isTxTerminal, isTxActive };
 
 // ── Context ───────────────────────────────────────────────────────────────────
 
@@ -153,5 +154,5 @@ export function useTxHash(): string | null {
  */
 export function useTxLabel(): string {
   const { txState } = useTxStateContext();
-  return txStateLabel(txState.state);
+  return txStatusMessage(txState);
 }

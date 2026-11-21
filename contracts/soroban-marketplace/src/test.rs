@@ -1,4 +1,4 @@
-﻿use super::*;
+use super::*;
 use crate::types::{AuctionStatus, BatchCreateListingInput, BatchUpdateListingInput, ListingStatus, OfferStatus, Recipient};
 
 // â”€â”€ Mock NFT collection â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -12447,4 +12447,220 @@ fn test_distinct_recipients_total_bounds_still_enforced() {
         &token_id, &collection_id, &1u64, &1u64,
         &recipients, &None::<u64>,
     );
+}
+
+// ══════════════════════════════════════════════════════════════
+// SECTION: Issue #1084 — Bid History Eviction & Chronological Order Evidence
+// ══════════════════════════════════════════════════════════════
+
+#[test]
+fn test_bid_history_cap_plus_one_evidence() {
+    // Verifies that when exactly (cap + 1) bids are submitted to an auction:
+    // 1. History length equals cap (20).
+    // 2. Oldest bid (#1) is evicted from index 0.
+    // 3. Strict chronological order is maintained across all 20 retained slots.
+    // 4. Index k holds bid #(k + 2) with amount (k + 2) * 1_000_000.
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&artist, &token_id);
+    client.set_bid_history_cap(&artist, &20u32);
+
+    let auction_id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1_000_000_i128,
+        &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    let cap: u32 = 20;
+    let total_bids: u32 = cap + 1; // 21 bids
+    let sac = soroban_sdk::token::StellarAssetClient::new(&env, &token_id);
+
+    let mut bidders: soroban_sdk::Vec<Address> = soroban_sdk::Vec::new(&env);
+    for _ in 0..total_bids {
+        let b = Address::generate(&env);
+        sac.mint(&b, &100_000_000_000_i128);
+        bidders.push_back(b);
+    }
+
+    for i in 0..total_bids {
+        let amount = (i as i128 + 1) * 1_000_000_i128;
+        client.place_bid(&bidders.get(i).unwrap(), &auction_id, &amount);
+    }
+
+    let history = client.get_auction_bids(&auction_id);
+    assert_eq!(history.len(), cap, "history length must strictly equal configured cap");
+
+    // Check each retained entry: bid #1 was evicted, so index k corresponds to bid #(k + 2).
+    for k in 0..cap {
+        let entry = history.get(k).unwrap();
+        let expected_bid_index = k + 1; // 0-based index in bidders vector: 1..=20
+        let expected_amount = (expected_bid_index as i128 + 1) * 1_000_000_i128;
+        assert_eq!(entry.bidder, bidders.get(expected_bid_index).unwrap(), "bidder address mismatch at slot {}", k);
+        assert_eq!(entry.amount, expected_amount, "amount mismatch at slot {}", k);
+        if k > 0 {
+            let prev_entry = history.get(k - 1).unwrap();
+            assert!(entry.amount > prev_entry.amount, "chronological amount monotonicity violated between {} and {}", k - 1, k);
+        }
+    }
+}
+
+#[test]
+fn test_bid_history_cap_plus_many_evidence() {
+    // Verifies that when many bids beyond cap are submitted (45 bids on cap=20, 25 evictions):
+    // 1. History length remains capped at 20.
+    // 2. The first 25 bids are evicted in FIFO order.
+    // 3. Retained bids strictly match bids #26 through #45 without index alteration.
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&artist, &token_id);
+    client.set_bid_history_cap(&artist, &20u32);
+
+    let auction_id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1_000_000_i128,
+        &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    let cap: u32 = 20;
+    let total_bids: u32 = 45; // 25 evictions
+    let sac = soroban_sdk::token::StellarAssetClient::new(&env, &token_id);
+
+    let mut bidders: soroban_sdk::Vec<Address> = soroban_sdk::Vec::new(&env);
+    for _ in 0..total_bids {
+        let b = Address::generate(&env);
+        sac.mint(&b, &100_000_000_000_i128);
+        bidders.push_back(b);
+    }
+
+    for i in 0..total_bids {
+        let amount = (i as i128 + 1) * 1_000_000_i128;
+        client.place_bid(&bidders.get(i).unwrap(), &auction_id, &amount);
+    }
+
+    let history = client.get_auction_bids(&auction_id);
+    assert_eq!(history.len(), cap, "history length must remain at cap of 20");
+
+    // Evicted bids: 0..25 (bids #1 through #25)
+    // Retained bids: 25..45 (bids #26 through #45)
+    for k in 0..cap {
+        let entry = history.get(k).unwrap();
+        let expected_bid_index = 25 + k;
+        let expected_amount = (expected_bid_index as i128 + 1) * 1_000_000_i128;
+        assert_eq!(entry.bidder, bidders.get(expected_bid_index).unwrap(), "bidder address mismatch at slot {}", k);
+        assert_eq!(entry.amount, expected_amount, "amount mismatch at slot {}", k);
+        if k > 0 {
+            let prev_entry = history.get(k - 1).unwrap();
+            assert!(entry.amount > prev_entry.amount, "monotonic order violated at index {}", k);
+        }
+    }
+}
+
+// ══════════════════════════════════════════════════════════════
+// SECTION: Issue #1086 — Reserve-Price Auction Fixtures & Outcomes
+// ══════════════════════════════════════════════════════════════
+
+#[test]
+fn test_reserve_price_below_reserve_bid_rejected() {
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&artist, &token_id);
+
+    let reserve_price = 5_000_000_i128;
+    let auction_id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &reserve_price,
+        &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    // Bid strictly below reserve price must fail with BidTooLow (#11).
+    let result = client.try_place_bid(&buyer, &auction_id, &(reserve_price - 1));
+    assert!(result.is_err(), "below-reserve bid must be rejected");
+
+    let auction = client.get_auction(&auction_id);
+    assert_eq!(auction.highest_bid, 0, "highest_bid must remain 0 after rejected bid");
+    assert!(auction.highest_bidder.is_none(), "highest_bidder must remain None");
+}
+
+#[test]
+fn test_reserve_price_exact_reserve_bid_accepted() {
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&artist, &token_id);
+
+    let reserve_price = 5_000_000_i128;
+    let auction_id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &reserve_price,
+        &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    // Bid exactly equal to reserve price must succeed.
+    client.place_bid(&buyer, &auction_id, &reserve_price);
+
+    let auction = client.get_auction(&auction_id);
+    assert_eq!(auction.highest_bid, reserve_price, "highest_bid must equal reserve_price");
+    assert_eq!(auction.highest_bidder, Some(buyer.clone()));
+
+    // When finalized, settles to Finalized status with winner receiving NFT
+    env.ledger().set_timestamp(env.ledger().timestamp() + 3601);
+    client.finalize_auction(&buyer, &auction_id);
+    assert_eq!(client.get_auction(&auction_id).status, AuctionStatus::Finalized);
+    assert_eq!(mock_nft::MockNftClient::new(&env, &collection_id).owner_of(&1u64), buyer);
+}
+
+#[test]
+fn test_reserve_not_met_finalization_outcome_distinguishable() {
+    // Tests that when an auction expires with no bids meeting the reserve:
+    // 1. Status is Cancelled (distinguishable from Finalized).
+    // 2. AuctionFinalizedEvent has winner=None and amount=0.
+    // 3. AuctionCancelledEvent is emitted with reason Owner and escrow=0.
+    // 4. NFT is returned to creator.
+    // 5. Zero funds transferred.
+    let (env, client, artist, _buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&artist, &token_id);
+
+    let reserve_price = 10_000_000_i128;
+    let auction_id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &reserve_price,
+        &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    let nft = mock_nft::MockNftClient::new(&env, &collection_id);
+    assert_eq!(nft.owner_of(&1u64), client.address, "NFT must be in contract escrow");
+
+    // Advance ledger past auction duration without placing any bids
+    env.ledger().set_timestamp(env.ledger().timestamp() + 3601);
+
+    // Finalize auction — reserve not met
+    client.finalize_auction(&artist, &auction_id);
+
+    let auction = client.get_auction(&auction_id);
+    assert_eq!(auction.status, AuctionStatus::Cancelled, "reserve-not-met must transition to Cancelled, NOT Finalized");
+    assert!(auction.highest_bidder.is_none());
+    assert_eq!(auction.highest_bid, 0);
+
+    // NFT returned to creator
+    assert_eq!(nft.owner_of(&1u64), artist, "NFT must be returned to creator when reserve is not met");
 }

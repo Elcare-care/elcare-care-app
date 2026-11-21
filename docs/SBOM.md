@@ -132,6 +132,22 @@ scripts) and writes `sbom-*.cdx.json` / `sbom-*.meta.json` to the repo root
 https://github.com/anchore/syft#installation) — without it, the docker SBOM
 step is skipped with a note that CI generates it via `anchore/sbom-action`.
 
+## Ownership, trigger, expected output, rollback
+
+This section closes the accountability loop: who owns SBOM provenance, when it
+runs, what it must produce, and what to do when it doesn't.
+
+| | |
+|---|---|
+| **Owner** | Release Lead owns the release-artifact upload; DevOps owns the docker-image SBOM. Each `*.meta.json` pins the exact lockfile + commit a package came from |
+| **Trigger** | [`../.github/workflows/sbom.yml`](../.github/workflows/sbom.yml) — on a `v*` tag push (release), on every pull request, and on `workflow_dispatch`. Local: `./scripts/sbom/generate-all.sh` |
+| **Expected output** | Four CycloneDX SBOMs + four `*.meta.json` provenance records, one per artifact (frontend, indexer, contracts, docker-indexer). On a tag: attached to the GitHub Release for that tag. On a PR/manual run: the `sbom-bundle-<sha>` workflow artifact (90-day retention) |
+| **Lockfile → SBOM mapping** | `sbom-frontend` → `frontend/elcarehub-app/package-lock.json` · `sbom-indexer` → `indexer/package-lock.json` · `sbom-contracts` → root `Cargo.lock` (via `cargo metadata --locked`) · `sbom-docker-indexer` → the built `indexer` image (source lockfile `indexer/package-lock.json`) |
+| **Refresh command** | `./scripts/sbom/generate-all.sh` regenerates every SBOM + meta from the currently checked-out lockfiles. Re-running against the same commit reproduces an identical `generatedAt` (the commit timestamp, not wall-clock build time) |
+| **Measurable check** | `node scripts/sbom/check-freshness.mjs <lockfile> <meta.json>` recomputes the lockfile sha256 and fails if it differs from `lockfileSha256` in the meta — i.e. the SBOM is tied to the lockfile actually checked out, not a stale or cached one. `sbom-attach-and-check` runs this for all four pairs |
+| **Rollback** | A failing freshness/emptiness check means SBOM generation is broken — do not bypass it and do not attach stale SBOMs. Roll back the release by re-running `generate-all.sh` from the previous good commit/tag and re-attaching: `gh release upload <tag> sboms/*.cdx.json sboms/*.meta.json --clobber` |
+| **Escalation** | Persistent generation failure → Release Lead. A package that cannot be traced to its lockfile (other than the documented `vendored-patch` exception below) blocks the release and escalates to @admin |
+
 ## Review guidance for exceptions
 
 Some components genuinely can't be resolved to a public registry entry, and

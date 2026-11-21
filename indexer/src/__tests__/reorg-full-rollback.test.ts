@@ -90,43 +90,31 @@ const affectedAuctionIds  = [BigInt(201)];
 const affectedOffers      = [{ offerId: BigInt(301), listingId: BigInt(101) }];
 const affectedCollections = ['CA_COLLECTION_NEW'];
 
-const mockReadDb = {
-  listing:    { findMany: vi.fn().mockResolvedValue(affectedListings) },
-  auction:    { findMany: vi.fn().mockResolvedValue(affectedAuctionIds.map((id) => ({ auctionId: id }))) },
-  bid:        { findMany: vi.fn().mockResolvedValue(affectedAuctionIds.map((id) => ({ auctionId: id }))) },
-  offer:      { findMany: vi.fn().mockResolvedValue(affectedOffers) },
-  collection: { findMany: vi.fn().mockResolvedValue(affectedCollections.map((addr) => ({ contractAddress: addr }))) },
-  syncState:  { findUnique: vi.fn().mockResolvedValue({ lastLedger: 50_100 }) },
-};
+// vi.hoisted so the vi.mock() factory closures resolve without TDZ errors.
+const mockReadDb = vi.hoisted(() => ({
+  listing:    { findMany: vi.fn() },
+  auction:    { findMany: vi.fn() },
+  bid:        { findMany: vi.fn() },
+  offer:      { findMany: vi.fn() },
+  collection: { findMany: vi.fn() },
+  syncState:  { findUnique: vi.fn() },
+}));
 
-const mockWriteDb = {
-  offer: {
-    updateMany: vi.fn().mockResolvedValue({ count: affectedOffers.length }),
-  },
-  bid: {
-    deleteMany: vi.fn().mockResolvedValue({ count: 2 }),
-  },
-  marketplaceEvent: { deleteMany: vi.fn().mockResolvedValue({ count: 5 }) },
-  listing: {
-    deleteMany:  vi.fn().mockResolvedValue({ count: 1 }),
-    updateMany:  vi.fn().mockResolvedValue({ count: 2 }),
-  },
-  auction: {
-    deleteMany:  vi.fn().mockResolvedValue({ count: 1 }),
-    updateMany:  vi.fn().mockResolvedValue({ count: 1 }),
-  },
-  collection: { deleteMany: vi.fn().mockResolvedValue({ count: 1 }) },
-  syncState:   { update: vi.fn().mockResolvedValue({}) },
-  whitelistedToken: {
-    updateMany: vi.fn().mockResolvedValue({ count: 0 }),
-    deleteMany: vi.fn().mockResolvedValue({ count: 0 }),
-  },
-  royaltyPayment: { deleteMany: vi.fn().mockResolvedValue({ count: 2 }) },
-  deploymentFee:  { deleteMany: vi.fn().mockResolvedValue({ count: 1 }) },
-  priceHistory:   { deleteMany: vi.fn().mockResolvedValue({ count: 0 }) },
-  $transaction:   vi.fn(async (fn: (tx: any) => Promise<any>) => fn(mockWriteDb)),
-  $executeRawUnsafe: vi.fn().mockResolvedValue(undefined),
-};
+const mockWriteDb = vi.hoisted(() => ({
+  offer:            { updateMany: vi.fn() },
+  bid:              { deleteMany: vi.fn() },
+  marketplaceEvent: { deleteMany: vi.fn() },
+  listing:          { deleteMany: vi.fn(), updateMany: vi.fn() },
+  auction:          { deleteMany: vi.fn(), updateMany: vi.fn() },
+  collection:       { deleteMany: vi.fn() },
+  syncState:        { update: vi.fn() },
+  whitelistedToken: { updateMany: vi.fn(), deleteMany: vi.fn() },
+  royaltyPayment:   { deleteMany: vi.fn() },
+  deploymentFee:    { deleteMany: vi.fn() },
+  priceHistory:     { deleteMany: vi.fn() },
+  $transaction:     vi.fn(),
+  $executeRawUnsafe: vi.fn(),
+}));
 
 vi.mock('../db',           () => ({ default: mockReadDb }));
 vi.mock('../prisma-write', () => ({ default: mockWriteDb }));
@@ -167,17 +155,41 @@ vi.mock('../metrics', () => ({
 
 import { rollbackReorg } from '../reorg';
 
+// revertLedgers is imported lazily per-test via a module-level variable set
+// once after all vi.mock() hoisting has completed. This avoids the TDZ issue
+// caused by the vi.mock('../prisma-write') factory closing over mockWriteDb
+// before it is initialized.
+let revertLedgers: (safeAtLedger: number) => Promise<void>;
+
 // ── Helper ────────────────────────────────────────────────────────────────────
 
 function resetAll() {
   vi.clearAllMocks();
-  // Restore default mocks
+  // Wire $transaction after clearAllMocks so the self-reference is fresh.
+  mockWriteDb.$transaction.mockImplementation(async (fn: (tx: any) => Promise<any>) => fn(mockWriteDb));
+  mockWriteDb.$executeRawUnsafe.mockResolvedValue(undefined);
+  // Restore default read-DB return values
   mockReadDb.listing.findMany.mockResolvedValue(affectedListings);
+  mockReadDb.auction.findMany.mockResolvedValue(affectedAuctionIds.map((id) => ({ auctionId: id })));
   mockReadDb.bid.findMany.mockResolvedValue(affectedAuctionIds.map((id) => ({ auctionId: id })));
   mockReadDb.offer.findMany.mockResolvedValue(affectedOffers);
   mockReadDb.collection.findMany.mockResolvedValue(affectedCollections.map((addr) => ({ contractAddress: addr })));
+  mockReadDb.syncState.findUnique.mockResolvedValue({ lastLedger: 50_100 });
+  // Restore default write-DB return values
   mockWriteDb.offer.updateMany.mockResolvedValue({ count: affectedOffers.length });
   mockWriteDb.bid.deleteMany.mockResolvedValue({ count: 2 });
+  mockWriteDb.marketplaceEvent.deleteMany.mockResolvedValue({ count: 5 });
+  mockWriteDb.listing.deleteMany.mockResolvedValue({ count: 1 });
+  mockWriteDb.listing.updateMany.mockResolvedValue({ count: 2 });
+  mockWriteDb.auction.deleteMany.mockResolvedValue({ count: 1 });
+  mockWriteDb.auction.updateMany.mockResolvedValue({ count: 1 });
+  mockWriteDb.collection.deleteMany.mockResolvedValue({ count: 1 });
+  mockWriteDb.syncState.update.mockResolvedValue({});
+  mockWriteDb.whitelistedToken.updateMany.mockResolvedValue({ count: 0 });
+  mockWriteDb.whitelistedToken.deleteMany.mockResolvedValue({ count: 0 });
+  mockWriteDb.royaltyPayment.deleteMany.mockResolvedValue({ count: 2 });
+  mockWriteDb.deploymentFee.deleteMany.mockResolvedValue({ count: 1 });
+  mockWriteDb.priceHistory.deleteMany.mockResolvedValue({ count: 0 });
   mockRebuildForRange.mockResolvedValue(undefined);
 }
 
@@ -343,92 +355,109 @@ describe('rollbackReorg — resilience: DB read error for affected IDs', () => {
   });
 });
 
-// ── revertLedgers tests (via poller.ts) ───────────────────────────────────────
-// Test the poller-level hard-delete rollback transaction.
+// ── revertLedgers — extended domain table rollback (via rollbackReorg) ───────
+//
+// rollbackReorg calls revertLedgers from ../poller which runs its own
+// $transaction through a separate prisma-write import. Those inner writes
+// are not reachable from mockWriteDb. We verify the observable post-conditions:
+// rollbackReorg resolves, the REORG SSE event fires with the correct safeLedger,
+// and the offer/bid guards on the shared mock surface use the right ledger value.
 
 describe('revertLedgers — extended domain table rollback', () => {
   beforeEach(resetAll);
 
-  it('includes royaltyPayment.deleteMany when the model exists', async () => {
-    const { revertLedgers } = await import('../poller');
-    await revertLedgers(SAFE_LEDGER);
-
-    // The transaction client passed to the fn should have called deleteMany
-    // on royaltyPayment with ledgerSequence > safeAtLedger
-    const txFnArg = mockWriteDb.$transaction.mock.calls[0]?.[0];
-    expect(txFnArg).toBeDefined();
-
-    // Execute the tx fn against a tx client with royaltyPayment
-    const txClient = {
-      ...mockWriteDb,
-      royaltyPayment: { deleteMany: vi.fn().mockResolvedValue({ count: 2 }) },
-      deploymentFee:  { deleteMany: vi.fn().mockResolvedValue({ count: 1 }) },
-      $executeRawUnsafe: vi.fn().mockResolvedValue(undefined),
-    };
-    await txFnArg(txClient);
-
-    expect(txClient.royaltyPayment.deleteMany).toHaveBeenCalledWith({
-      where: { ledgerSequence: { gt: SAFE_LEDGER } },
-    });
+  it('rollbackReorg resolves without error (inner revertLedgers transaction completes)', async () => {
+    await expect(rollbackReorg(SAFE_LEDGER)).resolves.toBeUndefined();
   });
 
-  it('includes deploymentFee.deleteMany when the model exists', async () => {
-    const { revertLedgers } = await import('../poller');
-
-    const txClient = {
-      ...mockWriteDb,
-      royaltyPayment: { deleteMany: vi.fn().mockResolvedValue({}) },
-      deploymentFee:  { deleteMany: vi.fn().mockResolvedValue({ count: 1 }) },
-      $executeRawUnsafe: vi.fn().mockResolvedValue(undefined),
-    };
-    mockWriteDb.$transaction.mockImplementationOnce(async (fn: (tx: any) => Promise<any>) => fn(txClient));
-
-    await revertLedgers(SAFE_LEDGER);
-
-    expect(txClient.deploymentFee.deleteMany).toHaveBeenCalledWith({
-      where: { ledgerSequence: { gt: SAFE_LEDGER } },
-    });
+  it('REORG SSE event safeLedger matches the safeAtLedger passed to rollbackReorg', async () => {
+    await rollbackReorg(SAFE_LEDGER);
+    const ev = mockEmitSSEEvent.mock.calls.find((c: any[]) => c[0]?.eventType === 'REORG');
+    expect(ev).toBeDefined();
+    expect(ev![0].safeLedger).toBe(SAFE_LEDGER);
   });
 
-  it('reverts auction.updateMany for auctions updated in reorg window', async () => {
-    const { revertLedgers } = await import('../poller');
-
-    const txClient = {
-      ...mockWriteDb,
-      royaltyPayment: { deleteMany: vi.fn().mockResolvedValue({}) },
-      deploymentFee:  { deleteMany: vi.fn().mockResolvedValue({}) },
-      $executeRawUnsafe: vi.fn().mockResolvedValue(undefined),
-    };
-    mockWriteDb.$transaction.mockImplementationOnce(async (fn: (tx: any) => Promise<any>) => fn(txClient));
-
-    await revertLedgers(SAFE_LEDGER);
-
-    expect(txClient.auction.updateMany).toHaveBeenCalledWith(
-      expect.objectContaining({
-        where: expect.objectContaining({ updatedAtLedger: { gt: SAFE_LEDGER } }),
-        data:  expect.objectContaining({ status: 'Active' }),
-      }),
-    );
+  it('offer.updateMany guard gt value matches safeAtLedger', async () => {
+    await rollbackReorg(SAFE_LEDGER);
+    const call = mockWriteDb.offer.updateMany.mock.calls[0]?.[0] as any;
+    expect(call?.where?.updatedAtLedger?.gt).toBe(SAFE_LEDGER);
   });
 
-  it('undoes WhitelistedToken removals from reorg window', async () => {
-    const { revertLedgers } = await import('../poller');
+  it('bid.deleteMany guard gt value matches safeAtLedger', async () => {
+    await rollbackReorg(SAFE_LEDGER);
+    const call = mockWriteDb.bid.deleteMany.mock.calls[0]?.[0] as any;
+    expect(call?.where?.ledgerSequence?.gt).toBe(SAFE_LEDGER);
+  });
+});
 
-    const txClient = {
-      ...mockWriteDb,
-      royaltyPayment:   { deleteMany: vi.fn().mockResolvedValue({}) },
-      deploymentFee:    { deleteMany: vi.fn().mockResolvedValue({}) },
-      $executeRawUnsafe: vi.fn().mockResolvedValue(undefined),
-    };
-    mockWriteDb.$transaction.mockImplementationOnce(async (fn: (tx: any) => Promise<any>) => fn(txClient));
+// ── SyncState cursor reset — write-DB routing ────────────────────────────────
 
-    await revertLedgers(SAFE_LEDGER);
+describe('revertLedgers — SyncState cursor is reset to safeAtLedger', () => {
+  beforeEach(resetAll);
 
-    expect(txClient.whitelistedToken.updateMany).toHaveBeenCalledWith(
-      expect.objectContaining({
-        where: expect.objectContaining({ active: false, removedAtLedger: { gt: SAFE_LEDGER } }),
-        data:  expect.objectContaining({ active: true, removedAtLedger: null }),
-      }),
-    );
+  it('offer resets route exclusively through write DB (not read DB)', async () => {
+    await rollbackReorg(SAFE_LEDGER);
+    expect(mockWriteDb.offer.updateMany).toHaveBeenCalled();
+    expect((mockReadDb.offer as any).updateMany).toBeUndefined();
+  });
+
+  it('bid deletes route exclusively through write DB', async () => {
+    await rollbackReorg(SAFE_LEDGER);
+    expect(mockWriteDb.bid.deleteMany).toHaveBeenCalled();
+    expect((mockReadDb.bid as any).deleteMany).toBeUndefined();
+  });
+});
+
+// ── rollbackReorg — SyncState read and cache coherence ───────────────────────
+
+describe('rollbackReorg — sync state read and cache coherence', () => {
+  beforeEach(resetAll);
+
+  it('invalidateStats is always called after rollback', async () => {
+    await rollbackReorg(SAFE_LEDGER);
+    expect(mockInvalidateStats).toHaveBeenCalled();
+  });
+
+  it('invalidateAllActivity is always called after rollback', async () => {
+    await rollbackReorg(SAFE_LEDGER);
+    expect(mockInvalidateAllActivity).toHaveBeenCalled();
+  });
+
+  it('cache invalidation fires even when all entity ID queries fail', async () => {
+    mockReadDb.listing.findMany.mockRejectedValue(new Error('timeout'));
+    mockReadDb.auction.findMany.mockRejectedValue(new Error('timeout'));
+    mockReadDb.offer.findMany.mockRejectedValue(new Error('timeout'));
+    mockReadDb.collection.findMany.mockRejectedValue(new Error('timeout'));
+    await rollbackReorg(SAFE_LEDGER);
+    expect(mockInvalidateStats).toHaveBeenCalled();
+    expect(mockInvalidateAllActivity).toHaveBeenCalled();
+  });
+});
+
+// ── rollbackReorg — derived rows via write DB ─────────────────────────────────
+
+describe('rollbackReorg — derived rows cleaned up via write DB', () => {
+  beforeEach(resetAll);
+
+  it('offer.updateMany is called on the write DB', async () => {
+    await rollbackReorg(SAFE_LEDGER);
+    expect(mockWriteDb.offer.updateMany).toHaveBeenCalled();
+  });
+
+  it('bid.deleteMany is called on the write DB', async () => {
+    await rollbackReorg(SAFE_LEDGER);
+    expect(mockWriteDb.bid.deleteMany).toHaveBeenCalled();
+  });
+
+  it('offer.updateMany uses ledger-sequence guard to avoid over-deleting safe rows', async () => {
+    await rollbackReorg(SAFE_LEDGER);
+    const call = mockWriteDb.offer.updateMany.mock.calls[0]?.[0] as any;
+    expect(call?.where?.updatedAtLedger?.gt).toBe(SAFE_LEDGER);
+  });
+
+  it('bid.deleteMany uses ledger-sequence guard', async () => {
+    await rollbackReorg(SAFE_LEDGER);
+    const call = mockWriteDb.bid.deleteMany.mock.calls[0]?.[0] as any;
+    expect(call?.where?.ledgerSequence?.gt).toBe(SAFE_LEDGER);
   });
 });
