@@ -229,6 +229,11 @@ npm run build
 
 ## 6. Release Versioning
 
+> The [API & Event-Schema Versioning and Deprecation Policy](../api-versioning-policy.md)
+> defines breaking-change classification, deprecation windows, and owner
+> approvals for the HTTP API, SSE streams, and on-chain event schemas.
+> Post-deploy CORS checks are in [CORS Configuration Validation](cors-validation.md).
+
 ElcareHub uses a multi-component versioning scheme. Each component (contracts, indexer, frontend, event schema, database migrations) has an independent version number tracked in `versions.toml` at the repository root.
 
 ### Version Source of Truth

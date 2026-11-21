@@ -194,7 +194,7 @@ CORS_ORIGIN=https://app.elcarehub.xyz,https://partner.example.com,https://dashbo
 
 ### SSE (`/events`)
 
-The SSE endpoint adds `X-Accel-Buffering: no` so nginx reverse proxies forward chunks immediately rather than buffering the full response body.
+The SSE endpoint adds `X-Accel-Buffering: no` so nginx reverse proxies forward chunks immediately rather than buffering the full response body. Frame format, replay/`Last-Event-ID` semantics, re-org frames, and a browser reconnection checklist are in the [SSE Protocol Specification](../docs/sse-protocol.md).
 
 ### Debug endpoint
 
@@ -209,9 +209,21 @@ curl -H "Origin: http://localhost:3000" http://localhost:4000/cors-test
   "origin": "http://localhost:3000",
   "allowed": true,
   "whitelist": [],
-  "mode": "development (all origins)"
+  "mode": "development (all origins)",
+  "headers": {
+    "access-control-allow-origin": "http://localhost:3000",
+    "access-control-allow-credentials": "true"
+  }
 }
 ```
+
+> ⚠️ The allow-all mode depends **only** on `CORS_ORIGIN` being empty, not on
+> `NODE_ENV`. Always set `CORS_ORIGIN` in staging and production.
+> `/cors-test` is registered only when `NODE_ENV !== 'production'`.
+
+For the full `Origin`/preflight behaviour matrix across local, staging, and
+production, plus read-only `curl` checks, see
+[CORS Configuration Validation](../docs/guides/cors-validation.md).
 
 ---
 
@@ -573,7 +585,7 @@ The indexer handles graceful shutdown gracefully when Kubernetes sends `SIGTERM`
 - **No stale polling** — The poller completes its current batch and saves cursor state
 - **No open HTTP handlers** — The server drains in-flight requests before closing
 - **No incomplete Prisma transactions** — All database transactions commit or rollback cleanly
-- **No stale SSE connections** — Connected clients receive a `server-shutdown` event before disconnection
+- **No stale SSE connections** — `closeSSEClients()` ends every open stream during shutdown (no final frame is sent; clients observe a close and reconnect per the [SSE reconnection checklist](../docs/sse-protocol.md#browser-reconnection-checklist))
 
 See **[Graceful Shutdown Handling](docs/graceful-shutdown.md)** for:
 - Full shutdown sequence documentation
