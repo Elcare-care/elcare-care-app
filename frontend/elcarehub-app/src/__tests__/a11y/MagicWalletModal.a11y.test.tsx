@@ -1,5 +1,5 @@
 import React from 'react';
-import { render, screen } from '@testing-library/react';
+import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { axe } from 'jest-axe';
 
@@ -8,6 +8,53 @@ const mockLoginWithPasskey = jest.fn();
 
 let mockStatus = 'DISCONNECTED';
 let mockError: string | null = null;
+
+type MagicValidationCase = {
+  name: string;
+  email?: string;
+  expectedEmail?: string;
+  expectEmailCall: boolean;
+  expectPasskeyCall: boolean;
+  providerError?: string;
+  expectedError?: RegExp;
+};
+
+const magicValidationCases: MagicValidationCase[] = [
+  {
+    name: 'blank email blocks submission',
+    email: '   ',
+    expectEmailCall: false,
+    expectPasskeyCall: false,
+  },
+  {
+    name: 'malformed email surfaces a validation error',
+    email: 'not-an-email',
+    expectEmailCall: false,
+    expectPasskeyCall: false,
+    expectedError: /valid email/i,
+  },
+  {
+    name: 'valid email calls loginWithEmail with the value',
+    email: 'user@example.com',
+    expectedEmail: 'user@example.com',
+    expectEmailCall: true,
+    expectPasskeyCall: false,
+  },
+  {
+    name: 'valid passkey calls loginWithPasskey',
+    expectEmailCall: false,
+    expectPasskeyCall: true,
+  },
+  {
+    name: 'provider failure surfaces the error message',
+    email: 'user@example.com',
+    expectedEmail: 'user@example.com',
+    expectEmailCall: true,
+    expectPasskeyCall: false,
+    providerError: 'Provider unavailable. Please try again.',
+    expectedError: /provider unavailable/i,
+  },
+];
 
 jest.mock('@/hooks/useMagicWallet', () => ({
   useMagicWallet: () => ({
@@ -73,5 +120,56 @@ describe('MagicWalletModal accessibility', () => {
     const describedBy = input.getAttribute('aria-describedby');
     expect(describedBy).toBeTruthy();
     expect(document.getElementById(describedBy as string)).toHaveTextContent(/login session timed out/i);
+  });
+
+  describe('validation fixture matrix', () => {
+    beforeEach(() => {
+      mockLoginWithEmail.mockReset();
+      mockLoginWithPasskey.mockReset();
+    });
+
+    it.each(magicValidationCases)('$name', async (testCase) => {
+      if (testCase.providerError) {
+        mockLoginWithEmail.mockRejectedValueOnce(new Error(testCase.providerError));
+      } else {
+        mockLoginWithEmail.mockResolvedValueOnce(undefined);
+      }
+      mockLoginWithPasskey.mockResolvedValueOnce(undefined);
+
+      const user = userEvent.setup();
+      render(<MagicWalletModal isOpen onClose={() => {}} />);
+
+      if (testCase.email !== undefined) {
+        await user.click(screen.getByRole('button', { name: /email magic link/i }));
+        await user.type(screen.getByLabelText(/email address/i), testCase.email);
+        await user.click(screen.getByRole('button', { name: /send magic link|continue|sign in/i }));
+      } else {
+        await user.click(screen.getByRole('button', { name: /passkey/i }));
+      }
+
+      if (testCase.expectEmailCall) {
+        expect(mockLoginWithEmail).toHaveBeenCalledTimes(1);
+        expect(mockLoginWithEmail).toHaveBeenCalledWith(testCase.expectedEmail);
+      } else {
+        expect(mockLoginWithEmail).not.toHaveBeenCalled();
+      }
+
+      if (testCase.expectPasskeyCall) {
+        expect(mockLoginWithPasskey).toHaveBeenCalledTimes(1);
+      } else {
+        expect(mockLoginWithPasskey).not.toHaveBeenCalled();
+      }
+
+      if (testCase.expectedError) {
+        const liveRegion = document.querySelector('[aria-live="assertive"]');
+        expect(liveRegion).toBeTruthy();
+        await waitFor(() => {
+          expect(liveRegion).toHaveTextContent(testCase.expectedError as RegExp);
+        });
+      }
+
+      // No real credentials or external calls: only the mocked hooks are exercised.
+      expect(mockLoginWithEmail.mock.calls.flat()).not.toContain(undefined);
+    });
   });
 });
