@@ -15,6 +15,9 @@ mod registry_tests;
 #[cfg(test)]
 mod marketplace_fee_tests;
 
+#[cfg(test)]
+mod migration_tests;
+
 pub use contract::Launchpad;
 pub use storage::MigrationProgress;
 pub use types::{CollectionKind, CollectionRecord, DataKey, Error, WasmHashes, CONTRACT_VERSION};
