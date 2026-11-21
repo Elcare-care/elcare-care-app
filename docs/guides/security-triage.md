@@ -20,6 +20,7 @@ The repository runs automated security checks on every pull request to enforce s
 
 - [`SECURITY_SCANNING_TRIAGE.md`](file:///Users/sam/Desktop/Grantfox/elcare-care-app/SECURITY_SCANNING_TRIAGE.md): In-depth triage procedure for advisories and false positives.
 - [`SECURITY.md`](file:///Users/sam/Desktop/Grantfox/elcare-care-app/SECURITY.md): Responsible vulnerability disclosure policy.
+- [`docs/advisory-exceptions.md`](../advisory-exceptions.md): Time-bound register of accepted cargo/npm audit findings (owner + expiry), enforced by `scripts/check-advisory-exceptions.mjs` (the `advisory-exceptions` CI job). Every `.cargo/audit.toml` ignore must have a matching register row.
 
 ---
 

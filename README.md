@@ -462,7 +462,10 @@ ElcareHub handles on-chain value on behalf of artists and collectors. We take se
 - **Threat model:** [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) — attack surface analysis for the contract, indexer, and frontend.
 - **Incident runbook:** [docs/INCIDENT_RUNBOOK.md](docs/INCIDENT_RUNBOOK.md) — pause procedure, admin key rotation, indexer re-org recovery, and secret rotation.
 - **Operational runbooks:** [docs/runbooks/](docs/runbooks/README.md) — detailed procedures for stalled ingestion, reorgs, DB/Redis outage, compromised keys, Pinata outage, wallet issues, and deployment config errors.
-- **Secret inventory:** [docs/secret-inventory.md](docs/secret-inventory.md) — every secret classified with storage location, owner, and rotation schedule.
+- **Secret inventory:** [docs/secret-inventory.md](docs/secret-inventory.md) — every secret classified with storage location, owner, and rotation schedule, reconciled with the `.gitleaks.toml` scan rules.
+- **SBOM & dependency provenance:** [docs/SBOM.md](docs/SBOM.md) — CycloneDX SBOM per release artifact, each traced to its lockfile by a sha256 provenance record (owner, trigger, rollback).
+- **Audit-finding exceptions:** [docs/advisory-exceptions.md](docs/advisory-exceptions.md) — time-bound register of accepted cargo/npm audit findings (owner + expiry), enforced by `scripts/check-advisory-exceptions.mjs` in CI.
+- **Contract/network config:** [docs/contract-network-config-checklist.md](docs/contract-network-config-checklist.md) — the contract IDs and Stellar network settings that must match across frontend, indexer, and deploy scripts, checked by `scripts/check-contract-network-consistency.mjs` in CI.
 - **Reliability program:** [docs/reliability/](docs/reliability/README.md) — quarterly reviews, domain owners, scored backlog, and decision records aligned with `versions.toml`.
 - **Release verification:** [docs/RELEASE_VERIFICATION.md](docs/RELEASE_VERIFICATION.md) — how contract WASM, ABI, frontend, and indexer image release artifacts are signed (GitHub build provenance + keyless cosign) and how to independently verify each one before deploying.
 
