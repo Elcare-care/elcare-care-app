@@ -9,6 +9,8 @@
 import type { Listing, Offer } from "@/lib/contract";
 import type { ArtworkMetadata } from "@/lib/ipfs";
 import type { AppNotification } from "@/lib/watchlist";
+import type { FreshnessMetadata } from "@/lib/indexerFreshness";
+import { STALE_THRESHOLDS_MS } from "@/lib/indexerFreshness";
 
 // ── Listing fixture ───────────────────────────────────────────────────────────
 
@@ -29,6 +31,50 @@ export function makeListing(overrides: Partial<Listing> = {}): Listing {
     status: "Active",
     owner: null,
     created_at: 1000,
+    ...overrides,
+  };
+}
+
+export function makeSoldListing(overrides: Partial<Listing> = {}): Listing {
+  return makeListing({ status: "Sold", owner: null, ...overrides });
+}
+
+export function makeCancelledListing(overrides: Partial<Listing> = {}): Listing {
+  return makeListing({ status: "Cancelled", owner: null, ...overrides });
+}
+
+// ── Auction fixture ───────────────────────────────────────────────────────────
+
+export interface AuctionFixture {
+  auction_id: number;
+  listing_id: number;
+  seller: string;
+  token: string;
+  highest_bid: bigint;
+  reserve_price: bigint;
+  min_increment: bigint;
+  currency: string;
+  end_time: number;
+  status: "Active" | "Finalized" | "Cancelled";
+  highest_bidder: string | null;
+}
+
+let _auctionSeq = 1;
+
+export function makeAuction(overrides: Partial<AuctionFixture> = {}): AuctionFixture {
+  const id = _auctionSeq++;
+  return {
+    auction_id: id,
+    listing_id: id,
+    seller: `GARTIST${String(id).padStart(49, "0")}`,
+    token: `CTOKEN${String(id).padStart(50, "0")}`,
+    highest_bid: 10_000_000n,   // 1 XLM
+    reserve_price: 5_000_000n,  // 0.5 XLM
+    min_increment: 1_000_000n,  // 0.1 XLM
+    currency: "XLM",
+    end_time: 2_000,
+    status: "Active",
+    highest_bidder: null,
     ...overrides,
   };
 }
@@ -140,172 +186,37 @@ export function makeActivityEvent(
   };
 }
 
-// ── Offer fixture ─────────────────────────────────────────────────────────────
-
-/** Offer statuses surfaced by the offer pages (pending + terminal states). */
-export type OfferStatusFixture =
-  | "Pending"
-  | "Accepted"
-  | "Rejected"
-  | "Withdrawn"
-  | "Expired"
-  | "Stale";
-
-/** Direction of an offer relative to the connected wallet. */
-export type OfferDirectionFixture = "incoming" | "outgoing";
-
-let _offerSeq = 1;
+// ── FreshnessMetadata fixture ─────────────────────────────────────────────────
 
 /**
- * Builds a valid pending offer. Defaults represent an *incoming* offer so the
- * receiving party can accept/reject it; use `makeOutgoingOffer` for the
- * counterparty view.
+ * Build a deterministic FreshnessMetadata snapshot.
+ *
+ * `fetchedAt` is an absolute epoch-ms value so tests never depend on the wall
+ * clock. Pass `ageMs` to derive it relative to a fixed reference instead.
  */
-export function makeOffer(overrides: Partial<Offer> = {}): Offer {
-  const id = _offerSeq++;
-  const counterparty = `GARTIST${String(id).padStart(49, "0")}`;
+export function makeFreshness(
+  overrides: Partial<FreshnessMetadata> = {}
+): FreshnessMetadata {
   return {
-    offer_id: id,
-    listing_id: id,
-    buyer: counterparty,
-    offerer: counterparty,
-    amount: 5_000_000n,     // 0.5 XLM in stroops
-    currency: "XLM",
-    status: "Pending",
-    created_at: 1000,
-    expires_at: 2000,
-    ...overrides,
-  } as Offer;
-}
-
-export function makeIncomingOffer(overrides: Partial<Offer> = {}): Offer {
-  return makeOffer(overrides);
-}
-
-export function makeOutgoingOffer(overrides: Partial<Offer> = {}): Offer {
-  const id = _offerSeq++;
-  return makeOffer({
-    buyer: `GBUYER${String(id).padStart(50, "0")}`,
-    ...overrides,
-  });
-}
-
-export function makePendingOffer(overrides: Partial<Offer> = {}): Offer {
-  return makeOffer({ status: "Pending", ...overrides });
-}
-
-export function makeAcceptedOffer(overrides: Partial<Offer> = {}): Offer {
-  return makeOffer({ status: "Accepted", ...overrides });
-}
-
-export function makeRejectedOffer(overrides: Partial<Offer> = {}): Offer {
-  return makeOffer({ status: "Rejected", ...overrides });
-}
-
-export function makeWithdrawnOffer(overrides: Partial<Offer> = {}): Offer {
-  return makeOffer({ status: "Withdrawn", ...overrides });
-}
-
-export function makeExpiredOffer(overrides: Partial<Offer> = {}): Offer {
-  return makeOffer({ status: "Expired", ...overrides });
-}
-
-export function makeStaleOffer(overrides: Partial<Offer> = {}): Offer {
-  return makeOffer({ status: "Stale", ...overrides });
-}
-
-/**
- * Every offer status paired with the direction it is rendered in. Tests can
- * iterate this to assert badge text, action availability and empty-state copy
- * for each combination without duplicating fixtures.
- */
-export const offerStatusCases: ReadonlyArray<{
-  status: OfferStatusFixture;
-  direction: OfferDirectionFixture;
-  /** Whether accept/reject actions should be available. */
-  actionable: boolean;
-  /** Expected badge label rendered by the offer page. */
-  badge: string;
-}> = [
-  { status: "Pending", direction: "incoming", actionable: true, badge: "Pending" },
-  { status: "Pending", direction: "outgoing", actionable: false, badge: "Pending" },
-  { status: "Accepted", direction: "incoming", actionable: false, badge: "Accepted" },
-  { status: "Accepted", direction: "outgoing", actionable: false, badge: "Accepted" },
-  { status: "Rejected", direction: "incoming", actionable: false, badge: "Rejected" },
-  { status: "Rejected", direction: "outgoing", actionable: false, badge: "Rejected" },
-  { status: "Withdrawn", direction: "incoming", actionable: false, badge: "Withdrawn" },
-  { status: "Withdrawn", direction: "outgoing", actionable: false, badge: "Withdrawn" },
-  { status: "Expired", direction: "incoming", actionable: false, badge: "Expired" },
-  { status: "Expired", direction: "outgoing", actionable: false, badge: "Expired" },
-  { status: "Stale", direction: "incoming", actionable: false, badge: "Stale" },
-  { status: "Stale", direction: "outgoing", actionable: false, badge: "Stale" },
-];
-
-// ── Magic wallet fixture ──────────────────────────────────────────────────────
-
-export interface MagicAccountFixture {
-  /** Deterministic pseudo-address derived from the email (no real wallet). */
-  address: string;
-  email: string;
-  /** Whether the account is a passkey-backed (vs email OTP) account. */
-  isPasskey: boolean;
-}
-
-export function makeMagicAccount(
-  overrides: Partial<MagicAccountFixture> = {}
-): MagicAccountFixture {
-  const email = overrides.email ?? "collector@example.test";
-  const address = `G${email
-    .replace(/[^a-z0-9]/gi, "")
-    .toUpperCase()
-    .padEnd(55, "0")
-    .slice(0, 55)}`;
-  return {
-    address,
-    email,
-    isPasskey: false,
+    fetchedAt: 1_700_000_000_000,
+    sseConnected: true,
     ...overrides,
   };
 }
 
-export type MagicValidationCaseKind =
-  | "blank"
-  | "malformed"
-  | "valid-email"
-  | "valid-passkey"
-  | "provider-failure";
-
-export interface MagicValidationCase {
-  kind: MagicValidationCaseKind;
-  /** Raw input passed to the modal's validation/submit handler. */
-  input: string;
-  /** Whether client-side validation should accept the input. */
-  valid: boolean;
-  /** Expected inline error copy, or null when no error is shown. */
-  error: string | null;
-  /** Simulated provider rejection message (never a real network call). */
-  providerError?: string;
-}
-
 /**
- * Validation matrix for MagicWalletModal tests. All values are synthetic and
- * deterministic; provider failures are simulated strings, not real calls.
+ * Freshness snapshot that is older than the auction staleness threshold and
+ * has no live SSE connection — i.e. the indexer data is stale.
  */
-export const magicValidationCases: ReadonlyArray<MagicValidationCase> = [
-  { kind: "blank", input: "", valid: false, error: "Email is required" },
-  { kind: "blank", input: "   ", valid: false, error: "Email is required" },
-  { kind: "malformed", input: "not-an-email", valid: false, error: "Enter a valid email" },
-  { kind: "malformed", input: "user@", valid: false, error: "Enter a valid email" },
-  { kind: "valid-email", input: "collector@example.test", valid: true, error: null },
-  { kind: "valid-passkey", input: "passkey-user@example.test", valid: true, error: null },
-  {
-    kind: "provider-failure",
-    input: "collector@example.test",
-    valid: true,
-    error: "Unable to sign in. Please try again.",
-    providerError: "provider_unavailable",
-  },
-];
+export function makeStaleFreshness(
+  overrides: Partial<FreshnessMetadata> = {}
+): FreshnessMetadata {
+  return makeFreshness({
+    fetchedAt: 1_700_000_000_000 - STALE_THRESHOLDS_MS.auction - 60_000,
+    sseConnected: false,
+    ...overrides,
+  });
+}
 
 // ── Reset sequences (call in beforeEach for deterministic IDs) ────────────────
 
@@ -313,5 +224,5 @@ export function resetFixtureSequences(): void {
   _listingSeq = 1;
   _notifSeq = 1;
   _activitySeq = 1;
-  _offerSeq = 1;
+  _auctionSeq = 1;
 }

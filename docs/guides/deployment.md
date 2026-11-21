@@ -124,6 +124,59 @@ The indexer exposes HTTP probes:
 - Liveness Probe: `GET http://localhost:4000/livez` (Returns HTTP 200)
 - Readiness Probe: `GET http://localhost:4000/readyz` (Checks DB connection & ingestion stall status)
 
+> **Readiness before migrations:** The readiness probe must remain **false** until all pending Prisma migrations have completed. Do not route traffic to a pod that reports ready while migrations are still running.
+
+> **Probe changes:** Before modifying any probe path, timing, or dependency, review the readiness probe review and release checklist in [DEPLOYMENT.md](../../DEPLOYMENT.md#kubernetes-readiness-probe-review).
+
+---
+
+## 3a. Docker Compose Profiles and Services
+
+Local compose commands can start too many or too few services and confuse readiness checks. Use the inventory below to pick the right compose file and profile before running `docker compose up`.
+
+### Compose File Inventory
+
+| File | Purpose | Default profile behavior |
+|---|---|---|
+| `docker-compose.yml` (root) | Base stack: database, cache, indexer, frontend | All services start (no explicit profile) |
+| `docker-compose.prod.yml` (root) | Hardened production overlay (non-root, read-only FS, dropped caps) | Overlay only; combine with base file |
+| `docker-compose.live-e2e.yml` (root) | Live end-to-end test stack against a real network | `e2e` profile |
+| `indexer/docker-compose.yml` | Indexer-only local stack | All services start |
+| `indexer/docker-compose.prod.yml` | Indexer hardened overlay | Overlay only |
+| `frontend/elcarehub-app/docker-compose.yml` | Frontend-only local stack | All services start |
+| `frontend/elcarehub-app/docker-compose.prod.yml` | Frontend hardened overlay | Overlay only |
+
+### Service, Profile, Command, and Health Dependency Table
+
+| Service | Compose file | Profile | Default command | Health dependency |
+|---|---|---|---|---|
+| `postgres` | `docker-compose.yml` (root), `indexer/docker-compose.yml` | default | `postgres` (image entrypoint) | `healthcheck`: `pg_isready`; required by `indexer` via `depends_on: condition: service_healthy` |
+| `redis` | `docker-compose.yml` (root), `indexer/docker-compose.yml` | default | `redis-server` (image entrypoint) | `healthcheck`: `redis-cli ping`; required by `indexer` via `depends_on: condition: service_healthy` |
+| `indexer` | `docker-compose.yml` (root), `indexer/docker-compose.yml` | default | `node dist/index.js` | `depends_on` `postgres` + `redis` (`service_healthy`); exposes `/livez` and `/readyz` |
+| `frontend` | `docker-compose.yml` (root), `frontend/elcarehub-app/docker-compose.yml` | default | `npm run start` | `depends_on` `indexer` (`service_started`); readiness via `NEXT_PUBLIC_INDEXER_URL` reachability |
+| `indexer` (hardened) | `docker-compose.prod.yml` (root), `indexer/docker-compose.prod.yml` | overlay | inherits base command | inherits base `depends_on`; adds `read_only`, `cap_drop: [ALL]`, `runAsNonRoot` |
+| `frontend` (hardened) | `docker-compose.prod.yml` (root), `frontend/elcarehub-app/docker-compose.prod.yml` | overlay | inherits base command | inherits base `depends_on`; adds `read_only`, `cap_drop: [ALL]`, `runAsNonRoot` |
+| `e2e-runner` | `docker-compose.live-e2e.yml` (root) | `e2e` | `npm run test:e2e` | `depends_on` `indexer` (`service_healthy`); waits for `/readyz` before running |
+
+> **Note:** Overlay files (`*.prod.yml`) do not define standalone services; they must be combined with their base file using `-f`. Running an overlay alone will fail with "no such service".
+
+### Choosing a Profile for Readiness Checks
+
+- **Local development / readiness checks:** use the base file only — `docker compose up -d` from the repository root. This starts `postgres`, `redis`, `indexer`, and `frontend` with healthchecks wired through `depends_on`.
+- **Production-like readiness validation:** combine base + hardened overlay — `docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d`. Verify `/readyz` returns HTTP 200 before declaring the stack ready.
+- **Live end-to-end validation:** use the `e2e` profile — `docker compose -f docker-compose.live-e2e.yml --profile e2e up -d`. The `e2e-runner` service only starts once `indexer` reports healthy.
+- **Package-scoped checks:** run from `indexer/` or `frontend/elcarehub-app/` with that package's compose file when validating a single tier in isolation.
+
+### Pre-flight Configuration Check
+
+Before starting any profile, validate that required environment variables and compose files are present:
+
+```bash
+bash scripts/docker/init-config-check.sh
+```
+
+This script checks for missing `.env` files, unresolved required variables, and compose file syntax. A non-zero exit means the stack is not ready to start — fix the reported items before running `docker compose up`.
+
 ---
 
 ## 4. Frontend Deployment Workflow (Next.js / Vercel)
@@ -235,7 +288,7 @@ See [COMPATIBILITY.md](../../COMPATIBILITY.md) for the full matrix of tested and
 
 ---
 
-## 7. Safe Redaction Guidance
+## 8. Safe Redaction Guidance
 
 > [!WARNING]
 > During deployment procedures:
