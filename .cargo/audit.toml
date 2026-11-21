@@ -1,8 +1,13 @@
+# cargo-audit ignore list. Every id below MUST have a matching Open row in
+# docs/advisory-exceptions.md with an owner and an expiry — enforced by
+# scripts/check-advisory-exceptions.mjs (the `advisory-exceptions` CI job).
+# Do not add an id here without adding the register row in the same change.
 [advisories]
-# RUSTSEC-2024-0388: `derivative` is unmaintained.
-# Pulled in transitively by soroban-sdk. Cannot update without upgrading
-# the entire SDK. No known exploit path in our usage.
 ignore = [
+    # `derivative` — unmaintained; build-time derive macro, transitive via
+    # soroban-sdk. No runtime path in our contracts. See docs/advisory-exceptions.md
     "RUSTSEC-2024-0388",
+    # `paste` — unmaintained; build-time proc-macro, transitive via the
+    # Soroban toolchain. See docs/advisory-exceptions.md
     "RUSTSEC-2024-0436",
 ]

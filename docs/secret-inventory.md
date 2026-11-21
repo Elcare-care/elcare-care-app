@@ -1,7 +1,7 @@
 # ElcareHub Secret Inventory and Management
 
-**Document Version:** 1.0  
-**Last Updated:** 2026-07-27  
+**Document Version:** 1.1  
+**Last Updated:** 2026-11-21  
 **Owner:** Security Team | ops@elcarehub.xyz
 
 This document inventories all secrets, credentials, and environment variables used across ElcareHub's infrastructure, classifies their sensitivity, documents storage locations, and defines rotation procedures.
@@ -263,6 +263,31 @@ git push --force origin main
 
 ---
 
+## Secret-to-scan-rule reconciliation
+
+Cross-reference between this inventory and [`.gitleaks.toml`](../.gitleaks.toml),
+run by [`secret-scan.yml`](../.github/workflows/secret-scan.yml). The point is to
+make scan coverage auditable: every CRITICAL/SENSITIVE secret is either matched
+by a gitleaks rule or explicitly marked storage-only.
+
+| Secret | Class | `.gitleaks.toml` coverage | Notes |
+|---|---|---|---|
+| `KEEPER_SECRET`, `ADMIN_SECRET`, `STELLAR_SECRET_KEY` (Stellar `S…` seeds) | CRITICAL | ✅ `stellar-secret-key` | Synthetic test key `SAAAA…A3` allowlisted |
+| `DATABASE_URL` (postgres/mysql, embedded password) | SENSITIVE | ✅ `database-connection-string` | `.env.example` paths allowlisted; placeholders are safe |
+| `PINATA_JWT` | SENSITIVE | ✅ `pinata-jwt` | Test placeholders `pj_test_secret` / `e2e-test-pinata-jwt` allowlisted |
+| `PINATA_API_KEY`, `PINATA_SECRET_API_KEY` | SENSITIVE | ✅ `pinata-api-key` | |
+| `SENTRY_AUTH_TOKEN` | SENSITIVE | ⚠️ Partial — `generic-bearer-or-api-token` matches the `auth_token` keyword | Store in GitHub Secrets; never commit |
+| `VERCEL_TOKEN`, `DOCKER_HUB_TOKEN`, `OPERATOR_TOKEN`, `HEALTH_DETAILS_TOKEN` | SENSITIVE | ⚠️ Not matched by the custom rule (names lack the rule's keywords); may be caught by gitleaks' built-in high-entropy rules via `useDefault = true` | **Do not rely on pattern scanning** — store only in GitHub/K8s Secrets. If one is at risk of being committed, add its keyword to the `generic-bearer-or-api-token` alternation |
+| `REDIS_URL` with password | OPERATIONAL | ❌ Not covered — `database-connection-string` targets postgres/mysql only | Rely on K8s Secret storage + runtime redaction (`indexer/src/redact.ts` masks `redis://…:…@`). Add a redis rule if prod Redis auth moves into the connection string |
+| `KUBECONFIG` (PEM private key) | SENSITIVE | ✅ gitleaks built-in `private-key` rule (`useDefault = true`) | |
+| `SENTRY_DSN`, `NEXT_PUBLIC_*`, PostHog key, Magic publishable key | PUBLIC | N/A — not secrets | Intentionally public/write-only; `.env.example` paths allowlisted |
+
+**Reconciliation rule:** a secret marked storage-only above must never appear
+in a committed file outside an allowlisted `.env.example` template. If a future
+secret can't be matched by a gitleaks rule and must be committed in a non-template
+path, add a rule (or a narrowly-scoped allowlist with a documented reason) in the
+same change and add the rule id to this table.
+
 ## Automated Checks
 
 ### Pre-Commit Hook (Gitleaks)
@@ -282,21 +307,22 @@ if [ $? -ne 0 ]; then
 fi
 ```
 
-### CI Secret Scanning (.github/workflows/ci.yml)
+### CI Secret Scanning ([.github/workflows/secret-scan.yml](../.github/workflows/secret-scan.yml))
 
-Already enabled:
-```yaml
-secret-scan:
-  name: Secret Scanning (Gitleaks)
-  runs-on: ubuntu-latest
-  steps:
-    - name: Checkout Repository
-      uses: actions/checkout@v4
-      with:
-        fetch-depth: 0  # Full history for Gitleaks
-    - name: Run Gitleaks
-      run: gitleaks detect --source . --redact --log-level warn
-```
+Two jobs, both using [`.gitleaks.toml`](../.gitleaks.toml) and `--redact` so the
+scanner's own output never prints a full secret:
+
+- **`gitleaks`** — `gitleaks/gitleaks-action@v2` on every pull request (scoped
+  to that PR's commits, full history checked out) and a weekly scheduled
+  full-history scan (Mondays 06:00 UTC) plus `workflow_dispatch`.
+- **`gitleaks-docker-context`** — the `gitleaks` CLI in filesystem (`--no-git`)
+  mode against `indexer/` (the Docker build context for `indexer/Dockerfile`),
+  so a secret baked into a generated image can't slip past a source-only scan.
+
+Any non-allowlisted finding fails the job and blocks merge; see
+[`SECURITY_SCANNING_TRIAGE.md`](../SECURITY_SCANNING_TRIAGE.md) for triage, and
+the [reconciliation table above](#secret-to-scan-rule-reconciliation) for which
+secret class each rule catches.
 
 Fails the build if secrets are detected.
 
@@ -431,7 +457,16 @@ When logging or displaying environment values:
 | **Incident response** | Security Team + CTO | On-demand |
 | **Secrets manager access audit** | Security Team | Monthly |
 
-**Next scheduled review:** [90 days from document date]
+**Last reviewed:** 2026-11-21 — reconciled scan-rule coverage with `.gitleaks.toml` (see [reconciliation table](#secret-to-scan-rule-reconciliation)).
+**Next scheduled review:** 2027-01-05 (first Tuesday of January — Q1, per the [quarterly review calendar](./reliability/quarterly-review-process.md)).
+
+Rotation is reviewable **before each quarter**: at every quarterly review the
+Security Lead walks this inventory and the reconciliation table, confirms each
+CRITICAL (90d) / SENSITIVE (180d) / OPERATIONAL (365d) secret is within its
+rotation window, and either rotates it or records the delay with a reason and a
+new target date in this inventory's change log. A secret past its rotation
+interval at review time is an action item, not silently deferred.
 
 **Document change log:**  
+- 2026-11-21: Reconciled scan-rule coverage with `.gitleaks.toml`; corrected the CI secret-scanning reference to `secret-scan.yml`; added per-quarter rotation review.
 - 2026-07-27: Initial version (v1.0)
