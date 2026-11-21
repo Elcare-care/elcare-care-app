@@ -58,8 +58,8 @@ const trackedContractSchema = z.object({
  * LAUNCHPAD_CONTRACT_ID variables so existing deployments keep working
  * without any config changes.
  */
-export function parseTrackedContracts(): TrackedContractConfig[] {
-  const raw = process.env.TRACKED_CONTRACTS;
+export function parseTrackedContracts(env: NodeJS.ProcessEnv = process.env): TrackedContractConfig[] {
+  const raw = env.TRACKED_CONTRACTS;
 
   if (raw && raw.trim() !== '') {
     let parsed: unknown;
@@ -95,17 +95,17 @@ export function parseTrackedContracts(): TrackedContractConfig[] {
 
   // ── Legacy fallback ────────────────────────────────────────────────────────
   const contracts: TrackedContractConfig[] = [];
-  if (process.env.MARKETPLACE_CONTRACT_ID) {
+  if (env.MARKETPLACE_CONTRACT_ID) {
     contracts.push({
-      id: process.env.MARKETPLACE_CONTRACT_ID,
+      id: env.MARKETPLACE_CONTRACT_ID,
       type: 'marketplace',
       label: 'marketplace',
       startLedger: 0,
     });
   }
-  if (process.env.LAUNCHPAD_CONTRACT_ID) {
+  if (env.LAUNCHPAD_CONTRACT_ID) {
     contracts.push({
-      id: process.env.LAUNCHPAD_CONTRACT_ID,
+      id: env.LAUNCHPAD_CONTRACT_ID,
       type: 'launchpad',
       label: 'launchpad',
       startLedger: 0,
@@ -159,48 +159,48 @@ export function validateRequiredEnv(): void {
   }
 }
 
-export function loadConfig() {
+export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
   // MAX_ROLLBACK_DEPTH: the maximum number of ledgers the poller will roll back
   // automatically when a re-org is detected.  If a re-org requires rolling back
   // MORE than this many ledgers the poller halts and emits a CRITICAL_REORG SSE
   // event rather than executing a potentially destructive deep rollback.
   const maxRollbackDepth = parsePositiveInt(
     'MAX_ROLLBACK_DEPTH',
-    process.env.MAX_ROLLBACK_DEPTH,
+    env.MAX_ROLLBACK_DEPTH,
     100
   );
 
   // REORG_HALT_ON_DEEP: when true (default) the poller halts on deep re-orgs
   // instead of attempting them.  Set to "false" to disable the safety guard
   // (not recommended for production).
-  const reorgHaltOnDeep = process.env.REORG_HALT_ON_DEEP !== 'false';
+  const reorgHaltOnDeep = env.REORG_HALT_ON_DEEP !== 'false';
 
   return {
-    pollIntervalMs: parsePositiveInt('POLL_INTERVAL_MS', process.env.POLL_INTERVAL_MS, 5000),
-    maxLedgersPerCycle: parsePositiveInt('MAX_LEDGERS_PER_CYCLE', process.env.MAX_LEDGERS_PER_CYCLE, 1000),
-    shutdownTimeoutMs: parsePositiveInt('SHUTDOWN_TIMEOUT_MS', process.env.SHUTDOWN_TIMEOUT_MS, 30_000),
+    pollIntervalMs: parsePositiveInt('POLL_INTERVAL_MS', env.POLL_INTERVAL_MS, 5000),
+    maxLedgersPerCycle: parsePositiveInt('MAX_LEDGERS_PER_CYCLE', env.MAX_LEDGERS_PER_CYCLE, 1000),
+    shutdownTimeoutMs: parsePositiveInt('SHUTDOWN_TIMEOUT_MS', env.SHUTDOWN_TIMEOUT_MS, 30_000),
     // ── Stall detection thresholds ────────────────────────────────────────
     // Time without ledger progress before the stall monitor escalates:
     //   warning  → emit metric + log (non-paged)
     //   critical → emit metric + log (on-call alert)
     //   fatal    → poller halts, SSE CRITICAL_REORG emitted
-    stallWarningMs:  parsePositiveInt('STALL_WARNING_MS',  process.env.STALL_WARNING_MS,  30_000),   // 30 s
-    stallCriticalMs: parsePositiveInt('STALL_CRITICAL_MS', process.env.STALL_CRITICAL_MS, 120_000),  // 2 min
-    stallFatalMs:    parsePositiveInt('STALL_FATAL_MS',    process.env.STALL_FATAL_MS,    300_000),  // 5 min
+    stallWarningMs:  parsePositiveInt('STALL_WARNING_MS',  env.STALL_WARNING_MS,  30_000),   // 30 s
+    stallCriticalMs: parsePositiveInt('STALL_CRITICAL_MS', env.STALL_CRITICAL_MS, 120_000),  // 2 min
+    stallFatalMs:    parsePositiveInt('STALL_FATAL_MS',    env.STALL_FATAL_MS,    300_000),  // 5 min
     // ── Reconciler config ──────────────────────────────────────────────────
     /**
      * When true, the reconciler writes DB corrections when chain state disagrees.
      * Defaults to false (detect-only / dry-run safe).
      * Set RECONCILER_AUTO_REPAIR=true to enable.
      */
-    reconcilerAutoRepair: process.env.RECONCILER_AUTO_REPAIR === 'true',
+    reconcilerAutoRepair: env.RECONCILER_AUTO_REPAIR === 'true',
     /**
      * Maximum total number of records (listings + auctions) the reconciler
      * will read from chain in a single run.  Prevents runaway RPC spend.
      */
     reconcilerBudgetPerRun: parsePositiveInt(
       'RECONCILER_BUDGET_PER_RUN',
-      process.env.RECONCILER_BUDGET_PER_RUN,
+      env.RECONCILER_BUDGET_PER_RUN,
       200
     ),
     /**
@@ -208,7 +208,7 @@ export function loadConfig() {
      *   ledger_entries (default) — getLedgerEntries with DataKey ScVal keys
      *   simulate                  — simulateTransaction of get_listing/get_auction
      */
-    chainStateMode: (process.env.CHAIN_STATE_MODE === 'simulate'
+    chainStateMode: (env.CHAIN_STATE_MODE === 'simulate'
       ? 'simulate'
       : 'ledger_entries') as 'ledger_entries' | 'simulate',
     /**
@@ -224,7 +224,7 @@ export function loadConfig() {
      *
      * Configurable via CONFIRMATION_DEPTH environment variable.
      */
-    confirmationDepth: parsePositiveInt('CONFIRMATION_DEPTH', process.env.CONFIRMATION_DEPTH, 10),
+    confirmationDepth: parsePositiveInt('CONFIRMATION_DEPTH', env.CONFIRMATION_DEPTH, 10),
   };
 }
 

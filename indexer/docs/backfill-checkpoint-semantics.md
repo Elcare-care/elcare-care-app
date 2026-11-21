@@ -51,15 +51,24 @@ inside a **single Prisma transaction** that atomically:
 2. Updates `BackfillJob.checkpointLedger` to the highest ledger in the batch.
 
 If the process crashes between two batches, the `checkpointLedger` column
-records the last *fully committed* batch.  The next run — whether via
-`--resume` or by passing the same `--start` / `--end` again — resumes from:
+records the last *fully committed* batch.  A run with `--resume=<jobId>`
+(or `npm run cli -- backfill resume <jobId>`) resumes from:
 
 ```
 resumeFrom = checkpointLedger + 1
 ```
 
-It does **not** restart from `--start`.  Replayed batches are safe because
-duplicate event inserts are rejected by the `eventHash` unique constraint.
+It does **not** restart from `--start`.  Passing the same `--start` / `--end`
+again **without** `--resume` creates a *new* job that re-scans the full range.
+That is safe but slower.  Replayed batches are safe because duplicate event
+inserts are rejected by the `eventHash` unique constraint.
+
+> With `--concurrency` > 1, several batches commit in parallel and each writes
+> its own max ledger, so `checkpointLedger` reflects the batch that committed
+> **last**, not the lowest contiguous ledger.  A batch that throws is only logged
+> (`backfill: batch failed`), and the job still ends `Completed`.  See
+> [BackfillJob status](../../docs/runbooks/backfill-job-status.md) for the full
+> status table, safe restart rules, and stuck-job ownership.
 
 ---
 

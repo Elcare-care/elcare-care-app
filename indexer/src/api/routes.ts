@@ -60,7 +60,7 @@ import { rpc } from '@stellar/stellar-sdk';
 import { apiRequestDurationHistogram } from '../metrics.js';
 import { TTL } from '../cache-warmer.js';
 import { withDecimalAmounts } from '../token-metadata.js';
-import { authMiddleware } from './auth-middleware.js';
+import { authMiddleware, operatorActorLabel } from './auth-middleware.js';
 import { queryCostGuard, handleQueryCostDiagnostics } from './query-cost.js';
 import { getCached as getCachedService } from './cache-service.js';
 import { logger } from '../logger.js';
@@ -2472,7 +2472,7 @@ router.post(
       if (!reason || typeof reason !== 'string' || reason.trim().length === 0) {
         return next(badRequest('remediationReason is required'));
       }
-      const actor = (req.headers['x-operator-token'] as string | undefined) ?? req.ip ?? 'unknown';
+      const actor = operatorActorLabel(req);
       await remediateDeadLetter(id, {
         remediationReason: reason.trim(),
         actor,
@@ -2496,7 +2496,7 @@ router.post(
       const { replayDeadLetter } = await import('../dead-letter-service.js');
       const id = parseInt(req.params.id, 10);
       if (isNaN(id)) return next(badRequest('id must be a number'));
-      const actor          = (req.headers['x-operator-token'] as string | undefined) ?? req.ip ?? 'unknown';
+      const actor          = operatorActorLabel(req);
       const dryRun         = req.body?.dryRun === true;
       const idempotencyKey = req.body?.idempotencyKey as string | undefined;
       const result = await replayDeadLetter(id, {
@@ -2523,7 +2523,7 @@ router.post(
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const { replayDeadLetterBatch } = await import('../dead-letter-service.js');
-      const actor  = (req.headers['x-operator-token'] as string | undefined) ?? req.ip ?? 'unknown';
+      const actor  = operatorActorLabel(req);
       const dryRun = req.body?.dryRun === true;
       const ids    = Array.isArray(req.body?.ids) ? (req.body.ids as number[]) : undefined;
       const limit  = Math.min(parseInt(req.body?.limit ?? '10', 10), 50);
@@ -2585,7 +2585,7 @@ router.post(
       const { verifySnapshot } = await import('../snapshot.js');
       const id = parseInt(req.params.id, 10);
       if (isNaN(id)) return next(badRequest('id must be a number'));
-      const actor = (req.headers['x-operator-token'] as string | undefined) ?? req.ip ?? 'unknown';
+      const actor = operatorActorLabel(req);
       const result = await verifySnapshot(id, { actor, ipAddress: req.ip });
       res.json({ ok: true, ...result });
     } catch (err: any) {
