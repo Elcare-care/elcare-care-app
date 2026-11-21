@@ -14,6 +14,7 @@ import { fetchMetadata, cidToGatewayUrl, ArtworkMetadata } from "@/lib/ipfs";
 import { AuctionCardGridSkeleton } from "@/components/Skeletons";
 import { EmptyState, ResourceState } from "@/components/PageStates";
 import { useFilterUrlSync } from "@/hooks/useFilterUrlSync";
+import { ArtworkImage } from "@/components/ArtworkImage";
 import {
   Gavel,
   Clock,
@@ -89,12 +90,18 @@ function TimeRemaining({ endTime }: { endTime: number }) {
 
 function AuctionCard({ auction }: { auction: Auction }) {
   const [metadata, setMetadata] = useState<ArtworkMetadata | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
+  const [metadataError, setMetadataError] = useState(false);
 
   useEffect(() => {
-    getCachedMetadata(auction.metadata_cid).then(setMetadata);
+    setIsLoading(true);
+    setMetadataError(false);
+    getCachedMetadata(auction.metadata_cid)
+      .then(setMetadata)
+      .catch(() => setMetadataError(true))
+      .finally(() => setIsLoading(false));
   }, [auction.metadata_cid]);
 
-  const imageUrl = metadata?.image ? cidToGatewayUrl(metadata.image) : null;
   const currentBidXlm = parseFloat(stroopsToXlm(auction.highest_bid));
 
   return (
@@ -104,19 +111,14 @@ function AuctionCard({ auction }: { auction: Auction }) {
     >
       {/* Image */}
       <div className="relative aspect-square bg-brand-50">
-        {imageUrl ? (
-          <Image
-            src={imageUrl}
-            alt={metadata?.title ?? "Auction artwork"}
-            fill
-            className="object-cover group-hover:scale-105 transition-transform duration-500"
-            unoptimized
-          />
-        ) : (
-          <div className="flex h-full items-center justify-center text-5xl text-brand-300">
-            <Gavel size={48} />
-          </div>
-        )}
+        <ArtworkImage
+          metadata={metadata}
+          isLoading={isLoading}
+          metadataError={metadataError}
+          fallbackId={auction.auction_id}
+          imageClassName="group-hover:scale-105"
+          showContentAdvisory={false}
+        />
 
         {/* Status badge */}
         <span

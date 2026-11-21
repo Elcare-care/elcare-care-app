@@ -71,6 +71,13 @@ export const translations = {
     view_details: 'View Details',
     back: 'Back',
 
+    // artwork image fallback
+    artwork_loading: 'Loading artwork',
+    artwork_unavailable: 'Content unavailable',
+    artwork_retry: 'Retry',
+    artwork_missing: 'No Artwork',
+    content_advisory: 'Content Advisory',
+
     // wizard
     wizard_step: 'Step',
     wizard_of: 'of',
@@ -231,6 +238,13 @@ export const translations = {
     view_details: 'Angalia Maelezo',
     back: 'Rudi',
 
+    // artwork image fallback
+    artwork_loading: 'Inapakia sanaa',
+    artwork_unavailable: 'Maudiko hayapatikani',
+    artwork_retry: 'Jaribu Tena',
+    artwork_missing: 'Hakuna Sanaa',
+    content_advisory: 'Maonyo ya Maudiko',
+
     // wizard
     wizard_step: 'Hatua',
     wizard_of: 'ya',
@@ -342,7 +356,9 @@ export const translations = {
 
 // ── Type helpers ──────────────────────────────────────────────
 
-export type TranslationKey = keyof typeof translations.en;
+type EnKeys = keyof typeof translations.en;
+type SwKeys = keyof typeof translations.sw;
+export type TranslationKey = EnKeys | SwKeys;
 
 // ── Locale persistence ────────────────────────────────────────
 

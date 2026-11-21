@@ -18,6 +18,19 @@ import {
   Countdown,
 } from "@/app/auctions/[id]/page";
 
+// ArtworkImage component mock
+jest.mock("@/components/ArtworkImage", () => ({
+  ArtworkImage: ({ metadata, isLoading }: any) => {
+    if (isLoading) {
+      return <div data-testid="artwork-loading">Loading…</div>;
+    }
+    if (!metadata?.image) {
+      return <div data-testid="artwork-missing">No Artwork</div>;
+    }
+    return <div data-testid="artwork-img">{metadata.title || 'Artwork'}</div>;
+  },
+}));
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /** A thin wrapper that exposes hook values as data attributes for assertions. */

@@ -20,7 +20,7 @@ export interface UseLocaleReturn {
   /** Switch the active locale (updates state + persists to localStorage) */
   setLocale: (locale: Locale) => void;
   /** Translate a key using the currently active locale */
-  t: (key: TranslationKey) => string;
+  t: (key: TranslationKey | string) => string;
 }
 
 export function useLocale(): UseLocaleReturn {
@@ -38,7 +38,7 @@ export function useLocale(): UseLocaleReturn {
   }, []);
 
   const t = useCallback(
-    (key: TranslationKey) => translate(key, locale),
+    (key: TranslationKey | string) => translate(key as TranslationKey, locale),
     [locale],
   );
 

@@ -42,6 +42,19 @@ jest.mock("@/lib/ipfs", () => ({
   cidToGatewayUrl: (cid: string) => `https://ipfs.io/ipfs/${cid}`,
 }));
 
+// ArtworkImage component mock
+jest.mock("@/components/ArtworkImage", () => ({
+  ArtworkImage: ({ metadata, isLoading }: any) => {
+    if (isLoading) {
+      return <div data-testid="artwork-loading">Loading…</div>;
+    }
+    if (!metadata?.image) {
+      return <div data-testid="artwork-missing">No Artwork</div>;
+    }
+    return <div data-testid="artwork-img">{metadata.title || 'Artwork'}</div>;
+  },
+}));
+
 import { FeaturedListings } from "@/components/FeaturedListings";
 import type { Listing } from "@/lib/contract";
 
