@@ -9,6 +9,8 @@
 import type { Listing } from "@/lib/contract";
 import type { ArtworkMetadata } from "@/lib/ipfs";
 import type { AppNotification } from "@/lib/watchlist";
+import type { FreshnessMetadata } from "@/lib/indexerFreshness";
+import { STALE_THRESHOLDS_MS } from "@/lib/indexerFreshness";
 
 // ── Listing fixture ───────────────────────────────────────────────────────────
 
@@ -138,6 +140,38 @@ export function makeActivityEvent(
     summary: `New listing #${id}`,
     ...overrides,
   };
+}
+
+// ── FreshnessMetadata fixture ─────────────────────────────────────────────────
+
+/**
+ * Build a deterministic FreshnessMetadata snapshot.
+ *
+ * `fetchedAt` is an absolute epoch-ms value so tests never depend on the wall
+ * clock. Pass `ageMs` to derive it relative to a fixed reference instead.
+ */
+export function makeFreshness(
+  overrides: Partial<FreshnessMetadata> = {}
+): FreshnessMetadata {
+  return {
+    fetchedAt: 1_700_000_000_000,
+    sseConnected: true,
+    ...overrides,
+  };
+}
+
+/**
+ * Freshness snapshot that is older than the auction staleness threshold and
+ * has no live SSE connection — i.e. the indexer data is stale.
+ */
+export function makeStaleFreshness(
+  overrides: Partial<FreshnessMetadata> = {}
+): FreshnessMetadata {
+  return makeFreshness({
+    fetchedAt: 1_700_000_000_000 - STALE_THRESHOLDS_MS.auction - 60_000,
+    sseConnected: false,
+    ...overrides,
+  });
 }
 
 // ── Reset sequences (call in beforeEach for deterministic IDs) ────────────────
