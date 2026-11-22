@@ -83,6 +83,18 @@ jest.mock("@/lib/ipfs", () => ({
   cidToGatewayUrl: (cid: string) => `https://ipfs.io/ipfs/${cid}`,
 }));
 
+jest.mock("@/components/ArtworkImage", () => ({
+  ArtworkImage: ({ metadata, isLoading }: any) => {
+    if (isLoading) {
+      return <div data-testid="artwork-loading">Loading…</div>;
+    }
+    if (!metadata?.image) {
+      return <div data-testid="artwork-missing">No Artwork</div>;
+    }
+    return <div data-testid="artwork-img">{metadata.title || 'Artwork'}</div>;
+  },
+}));
+
 jest.mock("@/lib/indexer", () => ({
   getListingHistory: jest.fn().mockResolvedValue({ events: [], total: 0, hasMore: false }),
   getListingActivity: jest.fn().mockResolvedValue([]),
@@ -101,6 +113,8 @@ jest.mock("@/config/tokens", () => ({
   SUPPORTED_TOKENS: [
     { symbol: "XLM", name: "Stellar Lumens", address: "CTOKEN_XLM", decimals: 7 },
   ],
+  getTokenConfigByAddress: jest.fn().mockReturnValue({ symbol: "XLM", name: "Stellar Lumens", decimals: 7 }),
+  DEFAULT_TOKEN: { symbol: "XLM", name: "Stellar Lumens", address: "CTOKEN_XLM", decimals: 7 },
 }));
 
 // ── Offer hook mocks ─────────────────────────────────────────────────────────
@@ -567,5 +581,125 @@ describe("SocialShare", () => {
     render(<SocialShare title="Sunset over Sahara" url="https://elcarehub.art/listings/2" />);
     const btn = screen.getByTestId("share-twitter-btn");
     expect(btn).toHaveAttribute("aria-label", expect.stringContaining("Sunset over Sahara"));
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 5. ListingDetailPage — metadata handling
+// ═════════════════════════════════════════════════════════════════════════════
+
+describe("ListingDetailPage — metadata handling", () => {
+  const mockListing = {
+    listing_id: 1,
+    artist: ADDR_ARTIST,
+    metadata_cid: "QmTestCid",
+    collection: "GCollection123456789012345678901234567890123456789012345",
+    token_id: 42,
+    price: BigInt(10_000_000),
+    currency: "XLM",
+    token: "CTOKEN_XLM",
+    recipients: [],
+    status: "Active" as const,
+    owner: null,
+    created_at: 1_700_000_000,
+  };
+
+  const mockAuction = {
+    auction_id: 1,
+    creator: ADDR_ARTIST,
+    metadata_cid: "QmTestCid",
+    collection: "GCollection123456789012345678901234567890123456789012345",
+    token_id: 42,
+    token: "CTOKEN_XLM",
+    reserve_price: BigInt(10_000_000),
+    highest_bid: BigInt(0),
+    highest_bidder: null,
+    end_time: 1_700_086_400,
+    status: "Active" as const,
+    recipients: [],
+    created_at: 1_700_000_000,
+  };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it("renders with missing metadata without showing undefined/null", async () => {
+    const { fetchMetadata } = jest.requireMock("@/lib/ipfs");
+    const { getListing } = jest.requireMock("@/lib/contract");
+    
+    fetchMetadata.mockResolvedValueOnce(null);
+    getListing.mockResolvedValueOnce(mockListing);
+
+    const ListingDetailPage = (await import("@/app/listings/[id]/ListingClient")).default;
+    render(<ListingDetailPage id="1" />);
+
+    await waitFor(() => {
+      expect(screen.getByText("No description provided by the artist.")).toBeInTheDocument();
+    });
+
+    // Ensure no undefined or null text is rendered
+    expect(screen.queryByText(/undefined/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/null/i)).not.toBeInTheDocument();
+  });
+
+  it("renders collection address truncated when available", async () => {
+    const { fetchMetadata } = jest.requireMock("@/lib/ipfs");
+    const { getListing } = jest.requireMock("@/lib/contract");
+    
+    fetchMetadata.mockResolvedValueOnce({
+      title: "Test Artwork",
+      description: "A test piece",
+      image: "QmImageCid",
+      artist: "Test Artist",
+    });
+    getListing.mockResolvedValueOnce(mockListing);
+
+    const ListingDetailPage = (await import("@/app/listings/[id]/ListingClient")).default;
+    render(<ListingDetailPage id="1" />);
+
+    await waitFor(() => {
+      // Collection should be displayed truncated
+      expect(screen.getByText(/GCollec…7890/)).toBeInTheDocument();
+    });
+  });
+
+  it("renders token ID when available", async () => {
+    const { fetchMetadata } = jest.requireMock("@/lib/ipfs");
+    const { getListing } = jest.requireMock("@/lib/contract");
+    
+    fetchMetadata.mockResolvedValueOnce({
+      title: "Test Artwork",
+      description: "A test piece",
+      image: "QmImageCid",
+      artist: "Test Artist",
+    });
+    getListing.mockResolvedValueOnce(mockListing);
+
+    const ListingDetailPage = (await import("@/app/listings/[id]/ListingClient")).default;
+    render(<ListingDetailPage id="1" />);
+
+    await waitFor(() => {
+      expect(screen.getByText("42")).toBeInTheDocument();
+    });
+  });
+
+  it("renders fallback for missing artist", async () => {
+    const { fetchMetadata } = jest.requireMock("@/lib/ipfs");
+    const { getListing } = jest.requireMock("@/lib/contract");
+    
+    fetchMetadata.mockResolvedValueOnce({
+      title: "Test Artwork",
+      description: "A test piece",
+      image: "QmImageCid",
+    });
+    getListing.mockResolvedValueOnce({ ...mockListing, artist: "" });
+
+    const ListingDetailPage = (await import("@/app/listings/[id]/ListingClient")).default;
+    render(<ListingDetailPage id="1" />);
+
+    await waitFor(() => {
+      expect(screen.getByText("Unknown Artist")).toBeInTheDocument();
+    });
   });
 });

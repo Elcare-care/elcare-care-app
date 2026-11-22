@@ -6,7 +6,6 @@
 
 import { useState, useEffect, useCallback, useRef } from "react";
 import { useRouter } from "next/navigation";
-import Image from "next/image";
 import {
     stroopsToXlm,
     Listing,
@@ -14,7 +13,8 @@ import {
     getListing,
     getAuction,
 } from "@/lib/contract";
-import { fetchMetadata, cidToGatewayUrl, ArtworkMetadata } from "@/lib/ipfs";
+import { fetchMetadata, ArtworkMetadata } from "@/lib/ipfs";
+import { ArtworkImage } from "@/components/ArtworkImage";
 import { useWalletContext } from "@/context/WalletContext";
 import { useBuyArtwork } from "@/hooks/useMarketplace";
 import { usePlaceBid } from "@/hooks/usePlaceBid";
@@ -34,6 +34,7 @@ import { GuardButton } from "@/components/WalletGuard";
 import { ResourceState } from "@/components/PageStates";
 import { Breadcrumb } from "@/components/Breadcrumb";
 import { StaleBanner } from "@/components/StaleBanner";
+import { getTokenConfigByAddress, DEFAULT_TOKEN } from "@/config/tokens";
 import { categorizePageError, PageStateError } from "@/lib/pageState";
 import { config } from "@/lib/config";
 import {
@@ -91,13 +92,9 @@ export default function ListingDetailPage({ id }: ListingClientProps) {
     const [auction, setAuction] = useState<Auction | null>(null);
     const [metadata, setMetadata] = useState<ArtworkMetadata | null>(null);
     const [isLoading, setIsLoading] = useState(true);
+    const [metadataError, setMetadataError] = useState(false);
     const [pageError, setPageError] = useState<PageStateError | null>(null);
     const [activeTab, setActiveTab] = useState<'details' | 'history' | 'offers'>('details');
-    // Issue 009 — track whether the detail image failed to load from its
-    // gateway URL. When true the fallback placeholder is shown instead.
-    // This is purely local presentation state: it never touches listing or
-    // auction data, and resets whenever the resolved imageUrl changes.
-    const [detailImageError, setDetailImageError] = useState(false);
 
     // Stable ref to the latest loadData implementation, so callbacks created
     // before loadData is defined (e.g. the reorg-reset handler below) always
@@ -173,6 +170,7 @@ export default function ListingDetailPage({ id }: ListingClientProps) {
     const loadData = useCallback(async () => {
         if (!id) return;
         setIsLoading(true);
+        setMetadataError(false);
         setPageError(null);
 
         let l: Listing | null = null;
@@ -211,6 +209,7 @@ export default function ListingDetailPage({ id }: ListingClientProps) {
                 setMetadata(m);
             } catch {
                 // Metadata (IPFS) is best-effort — the listing/auction itself loaded fine.
+                setMetadataError(true);
             }
         }
         setIsLoading(false);
@@ -392,11 +391,6 @@ export default function ListingDetailPage({ id }: ListingClientProps) {
         );
     }
 
-    const imageUrl = metadata?.image ? cidToGatewayUrl(metadata.image) : null;
-    // Reset the image error flag any time we get a new URL to try.
-    useEffect(() => {
-        setDetailImageError(false);
-    }, [imageUrl]);
     const artist = listing?.artist || auction?.creator;
     const isOwn = publicKey === artist;
     const status = listing?.status || auction?.status;
@@ -408,6 +402,11 @@ export default function ListingDetailPage({ id }: ListingClientProps) {
         : auction
         ? stroopsToXlm(auction.highest_bid || auction.reserve_price)
         : "0";
+
+    // Get token symbol from token address
+    const tokenAddress = listing?.token || auction?.token;
+    const tokenConfig = tokenAddress ? getTokenConfigByAddress(tokenAddress) : DEFAULT_TOKEN;
+    const tokenSymbol = tokenConfig?.symbol || "XLM";
 
     const royaltyPercent = "0.0";
 
@@ -457,34 +456,16 @@ export default function ListingDetailPage({ id }: ListingClientProps) {
                 <div className="space-y-8 animate-fade-in-left">
                     {/* Main Artwork Frame */}
                     <div className="relative aspect-square overflow-hidden rounded-[2.5rem] bg-midnight-900 border border-white/5 shadow-2xl group">
-                        {imageUrl && !detailImageError ? (
-                            <Image
-                                src={imageUrl}
-                                alt={
-                                    metadata?.isDecorativeImage
-                                        ? ""
-                                        : (metadata?.altText ?? metadata?.title ?? "Artwork")
-                                }
-                                fill
-                                className="object-cover transition-transform duration-700 group-hover:scale-105"
-                                priority
-                                unoptimized
-                                onError={() => setDetailImageError(true)}
-                                data-testid="detail-artwork-img"
-                            />
-                        ) : (
-                            // Shown when: no image CID, gateway URL resolves to nothing, or
-                            // the <img> fires an error event (Issue 009).  The placeholder
-                            // intentionally does NOT claim to depict the artwork.
-                            <div
-                                className="flex h-full flex-col items-center justify-center text-8xl opacity-20"
-                                aria-label="Artwork image unavailable"
-                                data-testid="detail-artwork-missing"
-                            >
-                                🎨
-                                <span className="text-lg font-display mt-4 italic">No media available</span>
-                            </div>
-                        )}
+                        <ArtworkImage
+                            metadata={metadata}
+                            isLoading={isLoading}
+                            metadataError={metadataError}
+                            fallbackId={id}
+                            aspectRatio="aspect-square"
+                            bgColor="bg-midnight-900"
+                            imageClassName="group-hover:scale-105"
+                            showContentAdvisory={true}
+                        />
 
                         {/* Status Badge (+ provisional marker, Issue #520) */}
                         <div className="absolute top-6 right-6 flex flex-col items-end gap-2">
@@ -552,7 +533,7 @@ export default function ListingDetailPage({ id }: ListingClientProps) {
                                                 <User size={14} />
                                             </div>
                                             <span className="font-mono text-sm group-hover:text-brand-400 transition-all">
-                                                {artist?.slice(0, 6)}…{artist?.slice(-4)}
+                                                {artist ? `${artist.slice(0, 6)}…${artist.slice(-4)}` : "Unknown Artist"}
                                             </span>
                                         </div>
                                     </div>
@@ -568,6 +549,32 @@ export default function ListingDetailPage({ id }: ListingClientProps) {
                                             </div>
                                         </div>
                                     )}
+
+                                    <div className="space-y-1">
+                                        <span className="text-[10px] uppercase tracking-widest text-white/30 font-bold">Collection</span>
+                                        <div className="flex items-center gap-2">
+                                            <div className="w-8 h-8 rounded-full bg-white/5 flex items-center justify-center text-white/60">
+                                                <Tag size={14} />
+                                            </div>
+                                            <span className="text-sm font-medium">
+                                                {listing?.collection || auction?.collection
+                                                    ? `${(listing?.collection || auction?.collection)?.slice(0, 8)}…${(listing?.collection || auction?.collection)?.slice(-4)}`
+                                                    : "Unknown Collection"}
+                                            </span>
+                                        </div>
+                                    </div>
+
+                                    <div className="space-y-1">
+                                        <span className="text-[10px] uppercase tracking-widest text-white/30 font-bold">Token ID</span>
+                                        <div className="flex items-center gap-2">
+                                            <div className="w-8 h-8 rounded-full bg-white/5 flex items-center justify-center text-white/60">
+                                                <Hash size={14} />
+                                            </div>
+                                            <span className="text-sm font-medium">
+                                                {listing?.token_id || auction?.token_id || "N/A"}
+                                            </span>
+                                        </div>
+                                    </div>
 
                                     <div className="space-y-1">
                                         <span className="text-[10px] uppercase tracking-widest text-white/30 font-bold">Metadata</span>
@@ -661,7 +668,11 @@ export default function ListingDetailPage({ id }: ListingClientProps) {
                                     <div className="w-8 h-8 rounded-full bg-terracotta-500 border-2 border-midnight-950 flex items-center justify-center text-white font-bold text-xs ring-2 ring-terracotta-500/20">B</div>
                                 </div>
                                 <p className="text-sm text-white/40 font-medium">
-                                    Collection: <span className="text-white">Elcare-Hub Origins</span>
+                                    Collection: <span className="text-white">
+                                        {listing?.collection || auction?.collection
+                                            ? `${(listing?.collection || auction?.collection)?.slice(0, 8)}…${(listing?.collection || auction?.collection)?.slice(-4)}`
+                                            : "Unknown Collection"}
+                                    </span>
                                 </p>
                             </div>
 
@@ -675,9 +686,13 @@ export default function ListingDetailPage({ id }: ListingClientProps) {
                                             </p>
                                             <div className="flex items-baseline gap-2">
                                                 <span className="text-5xl font-display font-bold text-white">{priceDisplay}</span>
-                                                <span className="text-brand-400 font-bold">XLM</span>
+                                                <span className="text-brand-400 font-bold">{tokenSymbol}</span>
                                             </div>
-                                            <p className="text-xs text-white/30 mt-1 font-mono">≈ {(Number(priceDisplay) * 0.12).toFixed(2)} USD</p>
+                                            {tokenSymbol === "XLM" && (
+                                                <p className="text-xs text-white/30 mt-1 font-mono">
+                                                    ≈ {(Number(priceDisplay) * 0.12).toFixed(2)} USD
+                                                </p>
+                                            )}
                                         </div>
 
                                         {auction && (
@@ -796,7 +811,7 @@ export default function ListingDetailPage({ id }: ListingClientProps) {
                                     {/* Social share buttons */}
                                     <SocialShare
                                         title={metadata?.title ?? `Listing #${id}`}
-                                        price={`${priceDisplay} XLM`}
+                                        price={`${priceDisplay} ${tokenSymbol}`}
                                         url={listingUrl}
                                         className="flex-1"
                                     />
@@ -849,6 +864,10 @@ export default function ListingDetailPage({ id }: ListingClientProps) {
                         <div className="flex justify-between text-[10px] font-bold text-white/30 uppercase tracking-widest border-t border-white/5 pt-4">
                             <span>Contract ID</span>
                             <span className="font-mono">{id}</span>
+                        </div>
+                        <div className="flex justify-between text-[10px] font-bold text-white/30 uppercase tracking-widest border-t border-white/5 pt-2 mt-2">
+                            <span>Token</span>
+                            <span className="font-mono">{tokenSymbol}</span>
                         </div>
                     </div>
                 </div>

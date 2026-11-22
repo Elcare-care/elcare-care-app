@@ -10,12 +10,11 @@ import Link from "next/link";
 import { Listing, stroopsToXlm } from "@/lib/contract";
 import { getTokenConfigByAddress, DEFAULT_TOKEN, baseUnitsToDisplay } from "@/config/tokens";
 import { buildExpectedBuyArtworkIntent } from "@/lib/tx-intent";
-import { ArtworkMetadata, fetchMetadata, getGatewayUrls } from "@/lib/ipfs";
+import { ArtworkMetadata, fetchMetadata } from "@/lib/ipfs";
 import { useWalletContext } from "@/context/WalletContext";
 import { useBuyArtwork } from "@/hooks/useMarketplace";
 import {
   ShoppingCart, User, Calendar, Tag, ShieldAlert, Clock, Hourglass,
-  RefreshCw, WifiOff,
 } from "lucide-react";
 import { GuardButton } from "./WalletGuard";
 import posthog from "posthog-js";
@@ -44,7 +43,6 @@ export function ListingCard({ listing, onPurchased }: ListingCardProps) {
   const { buy, isBuying, error: buyError } = useBuyArtwork(publicKey);
 
   const [metadata, setMetadata] = useState<ArtworkMetadata | null>(null);
-  const [gatewayIndex, setGatewayIndex] = useState(0);
   const [isLoading, setIsLoading] = useState(true);
   const [metadataError, setMetadataError] = useState(false);
   const [metadataRetries, setMetadataRetries] = useState(0);
@@ -98,22 +96,15 @@ export function ListingCard({ listing, onPurchased }: ListingCardProps) {
   const handleRetry = () => {
     if (metadataRetries >= MAX_METADATA_RETRIES) return;
     setMetadataRetries((n) => n + 1);
-    setGatewayIndex(0);
     void loadMetadata();
   };
-
-  const imageUrls: string[] | null = metadata?.image
-    ? getGatewayUrls(metadata.image)
-    : null;
-
-  const currentImageUrl = imageUrls?.[gatewayIndex] ?? null;
-  const allGatewaysExhausted = imageUrls !== null && gatewayIndex >= imageUrls.length;
 
   const isOwn = publicKey === listing.artist;
   const isExpired =
     listing.status === "Cancelled" &&
     !!listing.expires_at &&
     listing.expires_at < Date.now() / 1000;
+  const hasRetriesRemaining = metadataRetries < MAX_METADATA_RETRIES;
 
   // Countdown for active listings with an expiry deadline
   const [countdown, setCountdown] = useState<string | null>(null);

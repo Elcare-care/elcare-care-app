@@ -12,8 +12,9 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { AlertTriangle, CheckCircle2, ImageOff, Loader2 } from "lucide-react";
-import { ArtworkMetadata, cidToGatewayUrl, fetchMetadata } from "@/lib/ipfs";
+import { AlertTriangle, CheckCircle2, Loader2 } from "lucide-react";
+import { ArtworkMetadata, fetchMetadata } from "@/lib/ipfs";
+import { ArtworkImage } from "./ArtworkImage";
 
 /** Timeout (ms) after which a pending metadata fetch is treated as failed. */
 export const METADATA_FETCH_TIMEOUT_MS = 10_000;
@@ -105,7 +106,6 @@ export function IpfsMetadataPreview({ cid, metadata: providedMetadata }: IpfsMet
     (field) => !metadata[field] || String(metadata[field]).trim() === ""
   );
   const schemaValid = missingFields.length === 0;
-  const imageUrl = metadata.image ? cidToGatewayUrl(metadata.image) : null;
 
   return (
     <div className="rounded-2xl border border-gray-200 bg-white p-5 space-y-4">
