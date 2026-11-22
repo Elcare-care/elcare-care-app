@@ -35,7 +35,8 @@
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short,
-    token::Client as TokenClient, xdr::ToXdr, Address, Bytes, BytesN, Env, Map, String, Symbol, Vec,
+    token::Client as TokenClient, xdr::ToXdr, Address, Bytes, BytesN, Env, Map, String, Symbol,
+    Vec,
 };
 
 /// Shared metadata validation rules (Issue #476).
@@ -168,13 +169,13 @@ pub enum DataKey {
     BalanceOf(Address),
     ApprovedForAll(Address, Address),
     ApprovedForAllExpiry(Address, Address), // (owner, operator) → u32 ledger sequence
-    UsedVoucher(u64),    // nonce → bool  (redeemed)
-    RevokedVoucher(u64), // nonce → bool  (creator-revoked, per-nonce)
-    MerkleRoot,          // BytesN<32> — root of allowlist Merkle tree
-    IsPublicPhase,       // bool — true once public minting is enabled
+    UsedVoucher(u64),                       // nonce → bool  (redeemed)
+    RevokedVoucher(u64),                    // nonce → bool  (creator-revoked, per-nonce)
+    MerkleRoot,                             // BytesN<32> — root of allowlist Merkle tree
+    IsPublicPhase,                          // bool — true once public minting is enabled
     /// Network passphrase bound at initialization.
     /// Included in the signed digest to prevent cross-network replay (#273).
-    NetworkPassphrase,   // String
+    NetworkPassphrase, // String
     /// On-chain version string written by migrate().
     ContractVersion,
     /// Migration completion marker (version string → bool).
@@ -334,7 +335,14 @@ impl LazyMint721 {
 
     /// Mint a single token after all checks have passed.
     /// Updates Owner, TokenUri, UsedVoucher (keyed by nonce), BalanceOf, TotalSupply, NextTokenId.
-    fn mint_token(env: &Env, buyer: &Address, token_id: u64, nonce: u64, uri: &String, next_id: u64) {
+    fn mint_token(
+        env: &Env,
+        buyer: &Address,
+        token_id: u64,
+        nonce: u64,
+        uri: &String,
+        next_id: u64,
+    ) {
         env.storage()
             .persistent()
             .set(&DataKey::Owner(token_id), buyer);
@@ -348,12 +356,16 @@ impl LazyMint721 {
         env.storage()
             .persistent()
             .extend_ttl(&DataKey::Owner(token_id), TTL_THRESHOLD, TTL_BUMP);
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::TokenUri(token_id), TTL_THRESHOLD, TTL_BUMP);
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::UsedVoucher(nonce), TTL_THRESHOLD, TTL_BUMP);
+        env.storage().persistent().extend_ttl(
+            &DataKey::TokenUri(token_id),
+            TTL_THRESHOLD,
+            TTL_BUMP,
+        );
+        env.storage().persistent().extend_ttl(
+            &DataKey::UsedVoucher(nonce),
+            TTL_THRESHOLD,
+            TTL_BUMP,
+        );
 
         let bal: u64 = env
             .storage()
@@ -363,9 +375,11 @@ impl LazyMint721 {
         env.storage()
             .persistent()
             .set(&DataKey::BalanceOf(buyer.clone()), &(bal + 1));
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::BalanceOf(buyer.clone()), TTL_THRESHOLD, TTL_BUMP);
+        env.storage().persistent().extend_ttl(
+            &DataKey::BalanceOf(buyer.clone()),
+            TTL_THRESHOLD,
+            TTL_BUMP,
+        );
 
         let supply: u64 = env
             .storage()
@@ -416,8 +430,13 @@ impl LazyMint721 {
         env.storage().instance().set(&DataKey::Creator, &creator);
         // OriginalCreator is set once at initialization and never overwritten
         // by succession — it preserves historical attribution (#484).
-        env.storage().instance().set(&DataKey::OriginalCreator, &creator);
-        env.storage().instance().set(&DataKey::CurrentWasmHash, &BytesN::from_array(&env, &[0u8; 32]));
+        env.storage()
+            .instance()
+            .set(&DataKey::OriginalCreator, &creator);
+        env.storage().instance().set(
+            &DataKey::CurrentWasmHash,
+            &BytesN::from_array(&env, &[0u8; 32]),
+        );
         env.storage()
             .instance()
             .set(&DataKey::CreatorPubkey, &creator_pubkey);
@@ -458,11 +477,10 @@ impl LazyMint721 {
         env.storage()
             .instance()
             .set(&DataKey::CurrentWasmHash, &new_wasm_hash);
-        env.deployer().update_current_contract_wasm(new_wasm_hash.clone());
-        env.events().publish(
-            (symbol_short!("upgraded"),),
-            (old_wasm_hash, new_wasm_hash),
-        );
+        env.deployer()
+            .update_current_contract_wasm(new_wasm_hash.clone());
+        env.events()
+            .publish((symbol_short!("upgraded"),), (old_wasm_hash, new_wasm_hash));
         Ok(())
     }
 
@@ -665,7 +683,14 @@ impl LazyMint721 {
         let mut next_id = next_id_start;
         for item in items.iter() {
             let token_id = item.voucher.token_id;
-            Self::mint_token(&env, &buyer, token_id, item.voucher.nonce, &item.voucher.uri, next_id);
+            Self::mint_token(
+                &env,
+                &buyer,
+                token_id,
+                item.voucher.nonce,
+                &item.voucher.uri,
+                next_id,
+            );
             if token_id >= next_id {
                 next_id = token_id + 1;
             }
@@ -688,19 +713,17 @@ impl LazyMint721 {
         Self::extend_instance_ttl(&env);
         let creator = Self::only_creator(&env)?;
 
-        if env
-            .storage()
-            .persistent()
-            .has(&DataKey::UsedVoucher(nonce))
-        {
+        if env.storage().persistent().has(&DataKey::UsedVoucher(nonce)) {
             return Err(Error::VoucherAlreadyRedeemed);
         }
         env.storage()
             .persistent()
             .set(&DataKey::RevokedVoucher(nonce), &true);
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::RevokedVoucher(nonce), TTL_THRESHOLD, TTL_BUMP);
+        env.storage().persistent().extend_ttl(
+            &DataKey::RevokedVoucher(nonce),
+            TTL_THRESHOLD,
+            TTL_BUMP,
+        );
         env.events()
             .publish((symbol_short!("revoke"), creator), nonce);
         Ok(())
@@ -714,11 +737,7 @@ impl LazyMint721 {
 
         // Validate all first (all-or-nothing)
         for nonce in nonces.iter() {
-            if env
-                .storage()
-                .persistent()
-                .has(&DataKey::UsedVoucher(nonce))
-            {
+            if env.storage().persistent().has(&DataKey::UsedVoucher(nonce)) {
                 return Err(Error::VoucherAlreadyRedeemed);
             }
         }
@@ -753,7 +772,11 @@ impl LazyMint721 {
     /// contract sets both flags is surfaced as "Revoked" (the creator-visible
     /// terminal state), consistent with the on-chain check order in check_voucher.
     pub fn voucher_status(env: Env, nonce: u64) -> String {
-        if env.storage().persistent().has(&DataKey::RevokedVoucher(nonce)) {
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::RevokedVoucher(nonce))
+        {
             String::from_str(&env, "Revoked")
         } else if env.storage().persistent().has(&DataKey::UsedVoucher(nonce)) {
             String::from_str(&env, "Redeemed")
@@ -809,9 +832,11 @@ impl LazyMint721 {
         env.storage()
             .persistent()
             .set(&DataKey::Approved(token_id), &approved);
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::Approved(token_id), TTL_THRESHOLD, TTL_BUMP);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Approved(token_id),
+            TTL_THRESHOLD,
+            TTL_BUMP,
+        );
         Ok(())
     }
 
@@ -837,7 +862,9 @@ impl LazyMint721 {
         let expiry_key = DataKey::ApprovedForAllExpiry(owner.clone(), operator.clone());
 
         env.storage().persistent().set(&key, &approved);
-        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_BUMP);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_THRESHOLD, TTL_BUMP);
 
         match (approved, expires_at) {
             (true, Some(exp)) => {
@@ -895,9 +922,7 @@ impl LazyMint721 {
     /// Returns true if the voucher nonce has already been redeemed.
     /// Uses the voucher's `nonce` field (not token_id) for lookup (#273).
     pub fn is_voucher_redeemed(env: Env, nonce: u64) -> bool {
-        env.storage()
-            .persistent()
-            .has(&DataKey::UsedVoucher(nonce))
+        env.storage().persistent().has(&DataKey::UsedVoucher(nonce))
     }
 
     /// Returns the current ledger sequence at query time, which callers can
@@ -997,11 +1022,7 @@ impl LazyMint721 {
     /// Step 1 of the two-step creator succession (#484).
     /// Proposes `new_creator` as the next collection administrator.
     /// The proposal expires at `expires_at` (ledger sequence).
-    pub fn propose_creator(
-        env: Env,
-        new_creator: Address,
-        expires_at: u32,
-    ) -> Result<(), Error> {
+    pub fn propose_creator(env: Env, new_creator: Address, expires_at: u32) -> Result<(), Error> {
         Self::extend_instance_ttl(&env);
         let current = Self::only_creator(&env)?;
         if env.ledger().sequence() >= expires_at {
@@ -1053,10 +1074,8 @@ impl LazyMint721 {
         env.storage()
             .instance()
             .remove(&DataKey::PendingCreatorExpiry);
-        env.events().publish(
-            (symbol_short!("cr_acc"), old_creator),
-            new_creator,
-        );
+        env.events()
+            .publish((symbol_short!("cr_acc"), old_creator), new_creator);
         Ok(())
     }
 
@@ -1073,10 +1092,8 @@ impl LazyMint721 {
         env.storage()
             .instance()
             .remove(&DataKey::PendingCreatorExpiry);
-        env.events().publish(
-            (symbol_short!("cr_canc"), current),
-            pending,
-        );
+        env.events()
+            .publish((symbol_short!("cr_canc"), current), pending);
         Ok(())
     }
 
@@ -1085,9 +1102,7 @@ impl LazyMint721 {
         env.storage()
             .instance()
             .get(&DataKey::OriginalCreator)
-            .unwrap_or_else(|| {
-                env.storage().instance().get(&DataKey::Creator).unwrap()
-            })
+            .unwrap_or_else(|| env.storage().instance().get(&DataKey::Creator).unwrap())
     }
 
     /// Returns the pending creator and expiry, or None (#484).
@@ -1283,9 +1298,11 @@ impl LazyMint721 {
             &DataKey::BalanceOf(from.clone()),
             &(from_bal.saturating_sub(1)),
         );
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::BalanceOf(from.clone()), TTL_THRESHOLD, TTL_BUMP);
+        env.storage().persistent().extend_ttl(
+            &DataKey::BalanceOf(from.clone()),
+            TTL_THRESHOLD,
+            TTL_BUMP,
+        );
         let to_bal: u64 = env
             .storage()
             .persistent()
@@ -1294,9 +1311,11 @@ impl LazyMint721 {
         env.storage()
             .persistent()
             .set(&DataKey::BalanceOf(to.clone()), &(to_bal + 1));
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::BalanceOf(to.clone()), TTL_THRESHOLD, TTL_BUMP);
+        env.storage().persistent().extend_ttl(
+            &DataKey::BalanceOf(to.clone()),
+            TTL_THRESHOLD,
+            TTL_BUMP,
+        );
         env.storage()
             .persistent()
             .set(&DataKey::Owner(token_id), to);
@@ -1331,13 +1350,13 @@ impl LazyMint721 {
             .get::<DataKey, bool>(&DataKey::ApprovedForAll(from.clone(), spender.clone()))
             .unwrap_or(false);
         if all_approved {
-            let expiry: Option<u32> = env
-                .storage()
-                .persistent()
-                .get::<DataKey, u32>(&DataKey::ApprovedForAllExpiry(
-                    from.clone(),
-                    spender.clone(),
-                ));
+            let expiry: Option<u32> =
+                env.storage()
+                    .persistent()
+                    .get::<DataKey, u32>(&DataKey::ApprovedForAllExpiry(
+                        from.clone(),
+                        spender.clone(),
+                    ));
             let expired = expiry.map_or(false, |exp| env.ledger().sequence() >= exp);
             if !expired {
                 return Ok(());

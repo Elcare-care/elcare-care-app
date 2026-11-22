@@ -155,8 +155,8 @@ pub enum DataKey {
     RedeemedVoucher(u64),
     /// Revoked voucher nonce → bool (creator-revoked, per-nonce).
     RevokedVoucher(u64),
-    MerkleRoot,      // BytesN<32>
-    IsPublicPhase,   // bool
+    MerkleRoot,    // BytesN<32>
+    IsPublicPhase, // bool
     /// Network passphrase bound at initialization for cross-network domain
     /// separation (#273).
     NetworkPassphrase, // String
@@ -382,10 +382,9 @@ impl LazyMint1155 {
             .persistent()
             .get(&DataKey::TotalSupply(voucher.token_id))
             .unwrap_or(0);
-        env.storage().persistent().set(
-            &DataKey::TotalSupply(voucher.token_id),
-            &(supply + amount),
-        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::TotalSupply(voucher.token_id), &(supply + amount));
         env.storage().persistent().extend_ttl(
             &DataKey::TotalSupply(voucher.token_id),
             TTL_THRESHOLD,
@@ -444,8 +443,13 @@ impl LazyMint1155 {
         env.storage().instance().set(&DataKey::Creator, &creator);
         // OriginalCreator is set once at initialization and never overwritten
         // by succession (#484).
-        env.storage().instance().set(&DataKey::OriginalCreator, &creator);
-        env.storage().instance().set(&DataKey::CurrentWasmHash, &BytesN::from_array(&env, &[0u8; 32]));
+        env.storage()
+            .instance()
+            .set(&DataKey::OriginalCreator, &creator);
+        env.storage().instance().set(
+            &DataKey::CurrentWasmHash,
+            &BytesN::from_array(&env, &[0u8; 32]),
+        );
         env.storage()
             .instance()
             .set(&DataKey::CreatorPubkey, &creator_pubkey);
@@ -480,11 +484,10 @@ impl LazyMint1155 {
         env.storage()
             .instance()
             .set(&DataKey::CurrentWasmHash, &new_wasm_hash);
-        env.deployer().update_current_contract_wasm(new_wasm_hash.clone());
-        env.events().publish(
-            (symbol_short!("upgraded"),),
-            (old_wasm_hash, new_wasm_hash),
-        );
+        env.deployer()
+            .update_current_contract_wasm(new_wasm_hash.clone());
+        env.events()
+            .publish((symbol_short!("upgraded"),), (old_wasm_hash, new_wasm_hash));
         Ok(())
     }
 
@@ -606,7 +609,14 @@ impl LazyMint1155 {
             seen_nonces.push_back(nonce);
 
             Self::check_allowlist(&env, &buyer, &item.merkle_proof)?;
-            Self::check_voucher(&env, &item.voucher, item.amount, &item.signature, &pubkey, &buyer)?;
+            Self::check_voucher(
+                &env,
+                &item.voucher,
+                item.amount,
+                &item.signature,
+                &pubkey,
+                &buyer,
+            )?;
         }
 
         // Phase 2: aggregate payments per currency.
@@ -671,9 +681,11 @@ impl LazyMint1155 {
         env.storage()
             .persistent()
             .set(&DataKey::RevokedVoucher(nonce), &true);
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::RevokedVoucher(nonce), TTL_THRESHOLD, TTL_BUMP);
+        env.storage().persistent().extend_ttl(
+            &DataKey::RevokedVoucher(nonce),
+            TTL_THRESHOLD,
+            TTL_BUMP,
+        );
         env.events()
             .publish((symbol_short!("revoke"), creator), nonce);
         Ok(())
@@ -733,9 +745,7 @@ impl LazyMint1155 {
     pub fn set_public_phase(env: Env) -> Result<(), Error> {
         Self::extend_instance_ttl(&env);
         Self::only_creator(&env)?;
-        env.storage()
-            .instance()
-            .set(&DataKey::IsPublicPhase, &true);
+        env.storage().instance().set(&DataKey::IsPublicPhase, &true);
         Ok(())
     }
 
@@ -1102,11 +1112,7 @@ impl LazyMint1155 {
 
     /// Step 1 of the two-step creator succession (#484).
     /// Proposes `new_creator` as the next collection administrator.
-    pub fn propose_creator(
-        env: Env,
-        new_creator: Address,
-        expires_at: u32,
-    ) -> Result<(), Error> {
+    pub fn propose_creator(env: Env, new_creator: Address, expires_at: u32) -> Result<(), Error> {
         Self::extend_instance_ttl(&env);
         let current = Self::only_creator(&env)?;
         if env.ledger().sequence() >= expires_at {
@@ -1158,10 +1164,8 @@ impl LazyMint1155 {
         env.storage()
             .instance()
             .remove(&DataKey::PendingCreatorExpiry);
-        env.events().publish(
-            (symbol_short!("cr_acc"), old_creator),
-            new_creator,
-        );
+        env.events()
+            .publish((symbol_short!("cr_acc"), old_creator), new_creator);
         Ok(())
     }
 
@@ -1178,10 +1182,8 @@ impl LazyMint1155 {
         env.storage()
             .instance()
             .remove(&DataKey::PendingCreatorExpiry);
-        env.events().publish(
-            (symbol_short!("cr_canc"), current),
-            pending,
-        );
+        env.events()
+            .publish((symbol_short!("cr_canc"), current), pending);
         Ok(())
     }
 
@@ -1190,9 +1192,7 @@ impl LazyMint1155 {
         env.storage()
             .instance()
             .get(&DataKey::OriginalCreator)
-            .unwrap_or_else(|| {
-                env.storage().instance().get(&DataKey::Creator).unwrap()
-            })
+            .unwrap_or_else(|| env.storage().instance().get(&DataKey::Creator).unwrap())
     }
 
     /// Returns the pending creator and expiry, or None (#484).
@@ -1398,13 +1398,13 @@ impl LazyMint1155 {
         if !approved {
             return false;
         }
-        if let Some(exp) = env
-            .storage()
-            .persistent()
-            .get::<DataKey, u32>(&DataKey::ApprovedForAllExpiry(
-                owner.clone(),
-                operator.clone(),
-            ))
+        if let Some(exp) =
+            env.storage()
+                .persistent()
+                .get::<DataKey, u32>(&DataKey::ApprovedForAllExpiry(
+                    owner.clone(),
+                    operator.clone(),
+                ))
         {
             if env.ledger().sequence() >= exp {
                 return false;

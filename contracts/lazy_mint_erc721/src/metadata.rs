@@ -28,7 +28,7 @@
 
 #![allow(dead_code)]
 
-use soroban_sdk::{String as SorobanString};
+use soroban_sdk::String as SorobanString;
 
 /// Maximum collection name length in bytes (UTF-8 encoded).
 pub const MAX_NAME_LEN: u32 = 64;

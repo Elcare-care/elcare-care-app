@@ -56,7 +56,13 @@ pub fn publish_deployment_fee_collected(
 ) {
     env.events().publish(
         (symbol_short!("fee_coll"), creator.clone(), treasury.clone()),
-        (amount, currency.clone(), collection.clone(), kind_tag, platform_fee_bps),
+        (
+            amount,
+            currency.clone(),
+            collection.clone(),
+            kind_tag,
+            platform_fee_bps,
+        ),
     );
 }
 
@@ -127,8 +133,10 @@ pub fn publish_paused(env: &Env, admin: &Address, paused: bool) {
 /// Data:   (pauser: Address)
 #[allow(deprecated)]
 pub fn publish_emergency_pauser_updated(env: &Env, pauser: &Address) {
-    env.events()
-        .publish((symbol_short!("pauser"), symbol_short!("set")), pauser.clone());
+    env.events().publish(
+        (symbol_short!("pauser"), symbol_short!("set")),
+        pauser.clone(),
+    );
 }
 
 /// Emitted when the admin records a new set of collection WASM hashes.
@@ -167,9 +175,9 @@ pub fn publish_collection_wasm_updated(
     new_wasm: &BytesN<32>,
 ) {
     let tag = match kind {
-        crate::types::CollectionKind::Normal721    => symbol_short!("n721"),
-        crate::types::CollectionKind::Normal1155   => symbol_short!("n1155"),
-        crate::types::CollectionKind::LazyMint721  => symbol_short!("l721"),
+        crate::types::CollectionKind::Normal721 => symbol_short!("n721"),
+        crate::types::CollectionKind::Normal1155 => symbol_short!("n1155"),
+        crate::types::CollectionKind::LazyMint721 => symbol_short!("l721"),
         crate::types::CollectionKind::LazyMint1155 => symbol_short!("l1155"),
     };
     env.events().publish(
@@ -202,8 +210,10 @@ pub fn publish_collection_upgraded(
 /// Data:   (creator: Address, deployed_address: Address)
 #[allow(deprecated)]
 pub fn publish_deploy_idempotent(env: &Env, creator: &Address, address: &Address) {
-    env.events()
-        .publish((symbol_short!("dep_idem"),), (creator.clone(), address.clone()));
+    env.events().publish(
+        (symbol_short!("dep_idem"),),
+        (creator.clone(), address.clone()),
+    );
 }
 
 /// Emitted when a collection is paused by its creator or admin (Issue #478).
@@ -212,8 +222,10 @@ pub fn publish_deploy_idempotent(env: &Env, creator: &Address, address: &Address
 /// Data:   (paused_by: Address)
 #[allow(deprecated)]
 pub fn publish_collection_paused(env: &Env, collection: &Address, paused_by: &Address) {
-    env.events()
-        .publish((symbol_short!("c_psd"), collection.clone()), paused_by.clone());
+    env.events().publish(
+        (symbol_short!("c_psd"), collection.clone()),
+        paused_by.clone(),
+    );
 }
 
 /// Emitted when a collection is unpaused by its creator or admin (Issue #478).
@@ -250,7 +262,12 @@ pub fn publish_migration_completed(env: &Env, version: &soroban_sdk::String) {
 /// audit record that its admin requested it, alongside the marketplace's own
 /// `collection_fee_set`.
 #[allow(deprecated)]
-pub fn publish_collection_fee_configured(env: &Env, collection: &Address, bps: u32, admin: &Address) {
+pub fn publish_collection_fee_configured(
+    env: &Env,
+    collection: &Address,
+    bps: u32,
+    admin: &Address,
+) {
     env.events().publish(
         (symbol_short!("fee_cfg"), collection.clone()),
         (bps, admin.clone()),

@@ -410,7 +410,7 @@ fn test_pause_regression_mutation_blocked_read_available() {
     let err = result.unwrap_err().unwrap();
     assert_eq!(
         err,
-        crate::types::MarketplaceError::ContractPaused,
+        crate::types::MarketplaceError::ContractPaused.into(),
         "paused mutation must return ContractPaused (#23)"
     );
 

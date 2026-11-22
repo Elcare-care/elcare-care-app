@@ -32,7 +32,7 @@
 /// * `role_fallback_survives_admin_rotation` — after the admin is rotated, an
 ///   unassigned role falls back to the **new** admin.
 
-#![cfg(test)]
+#[cfg(test)]
 
 use soroban_sdk::{testutils::Address as _, Address, Env};
 

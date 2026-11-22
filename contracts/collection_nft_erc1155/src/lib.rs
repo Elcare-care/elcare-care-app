@@ -204,9 +204,14 @@ impl NormalNFT1155 {
         env.storage().instance().set(&DataKey::Creator, &creator);
         // OriginalCreator is set once at initialization and never overwritten
         // by succession — preserves historical royalty attribution (#484).
-        env.storage().instance().set(&DataKey::OriginalCreator, &creator);
+        env.storage()
+            .instance()
+            .set(&DataKey::OriginalCreator, &creator);
         env.storage().instance().set(&DataKey::Name, &name);
-        env.storage().instance().set(&DataKey::CurrentWasmHash, &BytesN::from_array(&env, &[0u8; 32]));
+        env.storage().instance().set(
+            &DataKey::CurrentWasmHash,
+            &BytesN::from_array(&env, &[0u8; 32]),
+        );
         env.storage().instance().set(&DataKey::NextTokenId, &0u64);
         env.storage()
             .instance()
@@ -232,11 +237,10 @@ impl NormalNFT1155 {
         env.storage()
             .instance()
             .set(&DataKey::CurrentWasmHash, &new_wasm_hash);
-        env.deployer().update_current_contract_wasm(new_wasm_hash.clone());
-        env.events().publish(
-            (symbol_short!("upgraded"),),
-            (old_wasm_hash, new_wasm_hash),
-        );
+        env.deployer()
+            .update_current_contract_wasm(new_wasm_hash.clone());
+        env.events()
+            .publish((symbol_short!("upgraded"),), (old_wasm_hash, new_wasm_hash));
         Ok(())
     }
 
@@ -340,10 +344,8 @@ impl NormalNFT1155 {
         validate_uri(&base_uri)?;
         let old_uri: Option<String> = env.storage().instance().get(&DataKey::BaseUri);
         env.storage().instance().set(&DataKey::BaseUri, &base_uri);
-        env.events().publish(
-            (symbol_short!("meta_upd"), creator),
-            (old_uri, base_uri),
-        );
+        env.events()
+            .publish((symbol_short!("meta_upd"), creator), (old_uri, base_uri));
         Ok(())
     }
 
@@ -368,8 +370,7 @@ impl NormalNFT1155 {
         env.storage()
             .instance()
             .set(&DataKey::MetadataFrozen, &true);
-        env.events()
-            .publish((symbol_short!("meta_frz"),), creator);
+        env.events().publish((symbol_short!("meta_frz"),), creator);
         Ok(())
     }
 
@@ -438,7 +439,7 @@ impl NormalNFT1155 {
     pub fn set_token_uri(env: Env, token_id: u64, uri: String) -> Result<(), Error> {
         Self::extend_instance_ttl(&env);
         let creator = Self::only_creator(&env)?;
-        
+
         // Check collection-level freeze
         if env
             .storage()
@@ -448,7 +449,7 @@ impl NormalNFT1155 {
         {
             return Err(Error::MetadataFrozen);
         }
-        
+
         // Check token-level freeze
         if env
             .storage()
@@ -458,12 +459,12 @@ impl NormalNFT1155 {
         {
             return Err(Error::MetadataFrozen);
         }
-        
+
         // Verify token exists
         if !env.storage().persistent().has(&DataKey::TokenUri(token_id)) {
             return Err(Error::TokenNotFound);
         }
-        
+
         validate_uri(&uri)?;
         let old_uri: Option<String> = env.storage().persistent().get(&DataKey::TokenUri(token_id));
         env.storage()
@@ -474,7 +475,7 @@ impl NormalNFT1155 {
             TTL_THRESHOLD,
             TTL_BUMP,
         );
-        
+
         env.events().publish(
             (symbol_short!("meta_upd"), creator),
             (token_id, old_uri, uri),
@@ -912,7 +913,9 @@ impl NormalNFT1155 {
         let expiry_key = DataKey::ApprovedForAllExpiry(owner.clone(), operator.clone());
 
         env.storage().persistent().set(&key, &approved);
-        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_BUMP);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_THRESHOLD, TTL_BUMP);
 
         match (approved, expires_at) {
             (true, Some(exp)) => {
@@ -1101,11 +1104,7 @@ impl NormalNFT1155 {
 
     /// Step 1 of the two-step creator succession (#484).
     /// Proposes `new_creator` as the next collection administrator.
-    pub fn propose_creator(
-        env: Env,
-        new_creator: Address,
-        expires_at: u32,
-    ) -> Result<(), Error> {
+    pub fn propose_creator(env: Env, new_creator: Address, expires_at: u32) -> Result<(), Error> {
         Self::extend_instance_ttl(&env);
         let current = Self::only_creator(&env)?;
         if env.ledger().sequence() >= expires_at {
@@ -1157,10 +1156,8 @@ impl NormalNFT1155 {
         env.storage()
             .instance()
             .remove(&DataKey::PendingCreatorExpiry);
-        env.events().publish(
-            (symbol_short!("cr_acc"), old_creator),
-            new_creator,
-        );
+        env.events()
+            .publish((symbol_short!("cr_acc"), old_creator), new_creator);
         Ok(())
     }
 
@@ -1177,10 +1174,8 @@ impl NormalNFT1155 {
         env.storage()
             .instance()
             .remove(&DataKey::PendingCreatorExpiry);
-        env.events().publish(
-            (symbol_short!("cr_canc"), current),
-            pending,
-        );
+        env.events()
+            .publish((symbol_short!("cr_canc"), current), pending);
         Ok(())
     }
 
@@ -1189,9 +1184,7 @@ impl NormalNFT1155 {
         env.storage()
             .instance()
             .get(&DataKey::OriginalCreator)
-            .unwrap_or_else(|| {
-                env.storage().instance().get(&DataKey::Creator).unwrap()
-            })
+            .unwrap_or_else(|| env.storage().instance().get(&DataKey::Creator).unwrap())
     }
 
     /// Returns the pending creator and expiry, or None (#484).
@@ -1405,13 +1398,13 @@ impl NormalNFT1155 {
         if !approved {
             return false;
         }
-        if let Some(exp) = env
-            .storage()
-            .persistent()
-            .get::<DataKey, u32>(&DataKey::ApprovedForAllExpiry(
-                owner.clone(),
-                operator.clone(),
-            ))
+        if let Some(exp) =
+            env.storage()
+                .persistent()
+                .get::<DataKey, u32>(&DataKey::ApprovedForAllExpiry(
+                    owner.clone(),
+                    operator.clone(),
+                ))
         {
             if env.ledger().sequence() >= exp {
                 return false;

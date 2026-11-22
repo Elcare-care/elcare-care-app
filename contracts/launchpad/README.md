@@ -59,6 +59,38 @@ Launchpad (factory — deployed once)
 
 ---
 
+## Collection Kind × Input Validation Matrix
+
+Each `deploy_*` / `preflight_deploy_*` call validates inputs through a shared helper before touching storage. The table below documents accepted ranges and the error codes returned on violation.
+
+### Input Bounds by Kind
+
+| Field | Normal721 | Normal1155 | LazyMint721 | LazyMint1155 | Error on violation |
+|---|---|---|---|---|---|
+| `name` | 1–64 chars | 1–64 chars | 1–64 chars | 1–64 chars | `EmptyName` (#12) / `NameTooLong` (#18) |
+| `symbol` | 1–16 chars | _(none)_ | 1–16 chars | _(none)_ | `EmptySymbol` (#13) / `SymbolTooLong` (#19) |
+| `max_supply` | 1–1 000 000 000 | _(none)_ | 1–1 000 000 000 | _(none)_ | `InvalidMaxSupply` (#14) / `MaxSupplyTooLarge` (#20) |
+| `royalty_bps` | 0–10 000 | 0–10 000 | 0–10 000 | 0–10 000 | `InvalidRoyaltyBps` (#11) |
+| `platform_fee_bps` | 0–2 000 | 0–2 000 | 0–2 000 | 0–2 000 | `InvalidFeeBps` (#5) |
+| `salt` | unique per creator | unique per creator | unique per creator | unique per creator | `DuplicateSalt` (#10) |
+
+**Notes:**
+- `preflight_deploy_*` runs the same validation as `deploy_*` without requiring auth or touching storage. All errors are returned as `Vec<u32>` in `PreflightResult.errors`; an empty vector means the deployment is expected to succeed.
+- `WasmHashNotSet` (#4) is included in `errors` when the WASM for that kind has not yet been registered via `set_wasm_hashes`. This is expected on a fresh factory and does not indicate an input error.
+- `ContractPaused` (#6) is included when the factory is in the paused state.
+- When multiple validations fail, all error codes are returned simultaneously — not just the first.
+
+### Kind × Shape Mapping
+
+| CollectionKind | Rust variant | deploy function | shape |
+|---|---|---|---|
+| Normal ERC-721 | `CollectionKind::Normal721` | `deploy_normal_721` | 721-shaped (name, symbol, max_supply) |
+| Normal ERC-1155 | `CollectionKind::Normal1155` | `deploy_normal_1155` | 1155-shaped (name only) |
+| Lazy ERC-721 | `CollectionKind::LazyMint721` | `deploy_lazy_721` | 721-shaped + creator_pubkey + network_passphrase |
+| Lazy ERC-1155 | `CollectionKind::LazyMint1155` | `deploy_lazy_1155` | 1155-shaped + creator_pubkey + network_passphrase |
+
+---
+
 ## Contract Functions
 
 | Function | Auth | Description |
@@ -80,6 +112,62 @@ The `salt` parameter prevents front-running — two `deploy` calls with the same
 `pause()` / `unpause()` halt all four `deploy_*` functions and were previously gated by the single `Admin` key only. `set_emergency_pauser(pauser)` (admin-only) now lets an operator designate a separate `EmergencyPauser` address — a dedicated incident-response multisig, for example — that can call `pause`/`unpause` independently of the routine admin authority. While no pauser has been configured, `pause`/`unpause` fall back to `Admin` unchanged, so existing deployments need no migration. `emergency_pauser()` returns the current explicit holder, or `None` while on the admin fallback. Every reassignment emits a `("pauser", "set")` event.
 
 This mirrors the marketplace contract's fuller role-separation model (see `contracts/soroban-marketplace/README.md`'s "Role-Based Authorization" section) scoped to launchpad's smaller privileged surface — routine admin config (`set_wasm_hashes`, `set_fee_config`) and irreversible admin-transfer remain on the existing two-step `Admin` flow.
+
+---
+
+## Salt Security & Address Determinism
+
+### How salts work
+
+Every `deploy_*` call requires a `salt: BytesN<32>` chosen by the creator. The factory derives a **secure salt** internally:
+
+```
+secure_salt = sha256(creator.to_xdr() ‖ raw_salt)
+```
+
+The deployed address is then:
+```
+address = sha256(factory_address ‖ secure_salt)
+```
+
+### Front-running resistance
+
+Because `secure_salt` incorporates the creator's XDR-encoded address, two different creators passing the same `raw_salt` will deploy to two completely different on-chain addresses. A malicious actor who copies Alice's raw salt and submits their own transaction first cannot occupy Alice's target address.
+
+| Scenario | Outcome |
+|---|---|
+| Alice: `raw_salt = X` | deploys to `sha256(factory ‖ sha256(alice_xdr ‖ X))` |
+| Bob: `raw_salt = X` (same) | deploys to `sha256(factory ‖ sha256(bob_xdr ‖ X))` ≠ Alice's |
+| Alice: `raw_salt = X` (second call) | returns existing address (`dep_idem` event, no new deployment) |
+
+### Valid / invalid / deployed salt sequences
+
+| Salt state | Preflight result | Deploy result |
+|---|---|---|
+| **Valid** — new (creator, raw_salt) pair | `errors = []` (or `[4]` if WASM not registered) | Deploys to predicted address |
+| **Invalid** — `DuplicateSalt` | `errors` contains `10` | Reverts (after deploy already consumed the salt) |
+| **Deployed** — same (creator, raw_salt) already used | `errors` contains `10` | Returns existing address idempotently (`dep_idem` event) |
+
+### Cross-kind collision
+
+The secure salt is derived from `(creator, raw_salt)` only — not from the collection kind. Two calls with the same creator+salt but different kinds (`deploy_normal_721` vs `deploy_normal_1155`) produce the **same** `predicted_address`. After the first deployment, the second returns the existing address idempotently regardless of kind.
+
+### Pre-computing the address
+
+```typescript
+import { Address, hash, xdr } from "@stellar/stellar-sdk";
+
+function predictAddress(factory: Address, creator: Address, rawSalt: Buffer): string {
+  const creatorXdr = creator.toXDRObject().toXDR();
+  const secureSalt = hash(Buffer.concat([creatorXdr, rawSalt]));
+  // The Soroban deployer uses SHA256(factory_contract_id XDR || "contract" || secure_salt)
+  // Use stellar-sdk's Contract.deploymentAddress helper when available.
+  // Alternatively: call preflight_deploy_* on-chain (read-only, no fee).
+  return "use preflight_deploy_* for the exact address";
+}
+```
+
+The most reliable pre-computation is to call `preflight_deploy_*` read-only — it returns `predicted_address` using the same derivation path as the real deploy.
 
 ---
 

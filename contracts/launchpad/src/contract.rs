@@ -34,11 +34,11 @@ use soroban_sdk::{
     Vec,
 };
 
+use crate::types::DataKey;
 use crate::{
     events, storage,
     types::{CollectionKind, CollectionRecord, Error, PreflightResult, WasmHashes},
 };
-use crate::types::DataKey;
 
 /// Semantic version â€” bump on every breaking storage change.
 const CONTRACT_VERSION: &str = "1.0.0";
@@ -261,7 +261,13 @@ fn validate_1155_shape(
 /// `currency` cannot cover the flat `deploy_fee`. Read-only â€” used only by
 /// the preflight path, since the real transfer in `collect_deploy_fee`
 /// already fails atomically if the balance is insufficient.
-fn check_sufficient_fee(env: &Env, creator: &Address, currency: &Address, deploy_fee: i128, errors: &mut Vec<Error>) {
+fn check_sufficient_fee(
+    env: &Env,
+    creator: &Address,
+    currency: &Address,
+    deploy_fee: i128,
+    errors: &mut Vec<Error>,
+) {
     if deploy_fee > 0 {
         let balance = token::TokenClient::new(env, currency).balance(creator);
         if balance < deploy_fee {
@@ -366,11 +372,7 @@ impl Launchpad {
         Ok(target)
     }
 
-    fn run_migration(
-        env: &Env,
-        version: &soroban_sdk::String,
-        mut budget: u32,
-    ) -> u64 {
+    fn run_migration(env: &Env, version: &soroban_sdk::String, mut budget: u32) -> u64 {
         let mut p = storage::get_migration_progress(env, version);
 
         // Phase 0: migrate legacy ByCreator + AllCollections Vec entries into
@@ -396,10 +398,9 @@ impl Launchpad {
                         //  only need to survive).
                         for (i, rec) in records.iter().enumerate() {
                             let global_idx = current_count + i as u64;
-                            env.storage().persistent().set(
-                                &DataKey::CollectionByIndex(global_idx),
-                                &rec,
-                            );
+                            env.storage()
+                                .persistent()
+                                .set(&DataKey::CollectionByIndex(global_idx), &rec);
                             env.storage().persistent().extend_ttl(
                                 &DataKey::CollectionByIndex(global_idx),
                                 50_000,
@@ -507,7 +508,14 @@ impl Launchpad {
             .with_current_contract(secure_salt.clone())
             .deployed_address();
 
-        collect_deploy_fee(&env, &creator, &currency, &addr, symbol_short!("n721"), platform_fee_bps);
+        collect_deploy_fee(
+            &env,
+            &creator,
+            &currency,
+            &addr,
+            symbol_short!("n721"),
+            platform_fee_bps,
+        );
 
         let addr = env
             .deployer()
@@ -624,7 +632,14 @@ impl Launchpad {
             .with_current_contract(secure_salt.clone())
             .deployed_address();
 
-        collect_deploy_fee(&env, &creator, &currency, &addr, symbol_short!("n1155"), platform_fee_bps);
+        collect_deploy_fee(
+            &env,
+            &creator,
+            &currency,
+            &addr,
+            symbol_short!("n1155"),
+            platform_fee_bps,
+        );
 
         let addr = env
             .deployer()
@@ -742,7 +757,14 @@ impl Launchpad {
             .with_current_contract(secure_salt.clone())
             .deployed_address();
 
-        let platform_fee_receiver = collect_deploy_fee(&env, &creator, &currency, &pred_addr, symbol_short!("l721"), platform_fee_bps);
+        let platform_fee_receiver = collect_deploy_fee(
+            &env,
+            &creator,
+            &currency,
+            &pred_addr,
+            symbol_short!("l721"),
+            platform_fee_bps,
+        );
 
         let addr = env
             .deployer()
@@ -862,7 +884,14 @@ impl Launchpad {
             .with_current_contract(secure_salt.clone())
             .deployed_address();
 
-        let platform_fee_receiver = collect_deploy_fee(&env, &creator, &currency, &pred_addr, symbol_short!("l1155"), platform_fee_bps);
+        let platform_fee_receiver = collect_deploy_fee(
+            &env,
+            &creator,
+            &currency,
+            &pred_addr,
+            symbol_short!("l1155"),
+            platform_fee_bps,
+        );
 
         let addr = env
             .deployer()
@@ -1014,9 +1043,8 @@ impl Launchpad {
     ) -> Result<(), Error> {
         storage::extend_instance_ttl(&env);
         storage::require_admin(&env)?;
-        let old_wasm = storage::get_wasm_for_kind(&env, &kind).unwrap_or_else(|| {
-            BytesN::from_array(&env, &[0u8; 32])
-        });
+        let old_wasm = storage::get_wasm_for_kind(&env, &kind)
+            .unwrap_or_else(|| BytesN::from_array(&env, &[0u8; 32]));
         storage::set_wasm_hash_for_kind(&env, &kind, &new_wasm_hash);
         events::publish_collection_wasm_updated(&env, &kind, &old_wasm, &new_wasm_hash);
         Ok(())
@@ -1028,8 +1056,8 @@ impl Launchpad {
 
         let record = storage::get_collection_by_address(&env, &collection_address)
             .ok_or(Error::CollectionNotFound)?;
-        let new_wasm = storage::get_wasm_for_kind(&env, &record.kind)
-            .ok_or(Error::WasmHashNotSet)?;
+        let new_wasm =
+            storage::get_wasm_for_kind(&env, &record.kind).ok_or(Error::WasmHashNotSet)?;
         let from_wasm = new_wasm.clone();
 
         match record.kind {
@@ -1069,10 +1097,7 @@ impl Launchpad {
 
     /// Set the marketplace address this launchpad configures collection fee
     /// overrides on (Issue #849). Admin-only.
-    pub fn set_marketplace_address(
-        env: Env,
-        marketplace: Address,
-    ) -> Result<(), Error> {
+    pub fn set_marketplace_address(env: Env, marketplace: Address) -> Result<(), Error> {
         storage::extend_instance_ttl(&env);
         storage::require_admin(&env)?;
         storage::set_marketplace(&env, &marketplace);
@@ -1120,7 +1145,10 @@ impl Launchpad {
     /// for `collection_address` at deploy time (#482).  Returns `None` when the
     /// collection address is not in the registry.  Callers should use this as the
     /// fallback when no per-listing royalty override is present.
-    pub fn collection_royalty_defaults(env: Env, collection_address: Address) -> Option<(u32, Address)> {
+    pub fn collection_royalty_defaults(
+        env: Env,
+        collection_address: Address,
+    ) -> Option<(u32, Address)> {
         storage::get_collection_by_address(&env, &collection_address)
             .map(|rec| (rec.royalty_bps, rec.royalty_receiver))
     }
@@ -1221,7 +1249,11 @@ impl Launchpad {
 
     /// Returns the collection address that was deployed for `(creator, raw_salt)`,
     /// or None if that pair has never been used.
-    pub fn get_deployment_by_salt(env: Env, creator: Address, raw_salt: BytesN<32>) -> Option<Address> {
+    pub fn get_deployment_by_salt(
+        env: Env,
+        creator: Address,
+        raw_salt: BytesN<32>,
+    ) -> Option<Address> {
         let secure_salt = make_secure_salt(&env, &creator, &raw_salt);
         storage::get_salt_deployment(&env, &secure_salt)
     }
@@ -1252,5 +1284,4 @@ impl Launchpad {
     pub fn is_collection_paused(env: Env, collection: Address) -> bool {
         storage::is_collection_paused(&env, &collection)
     }
-
 }

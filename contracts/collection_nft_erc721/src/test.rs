@@ -1227,7 +1227,9 @@ fn approve_with_expiry_is_valid_before_deadline() {
 
     // Still before expiry → approved
     assert_eq!(client.get_approved(&id), Some(bob.clone()));
-    assert!(client.try_transfer_from(&bob, &alice, &Address::generate(&env), &id).is_ok());
+    assert!(client
+        .try_transfer_from(&bob, &alice, &Address::generate(&env), &id)
+        .is_ok());
 }
 
 #[test]
@@ -1411,7 +1413,14 @@ fn revoke_all_approvals_by_non_owner_fails() {
     let creator2 = Address::generate(&env2);
     let rx2 = Address::generate(&env2);
     let alice = Address::generate(&env2);
-    c2.initialize(&creator2, &String::from_str(&env2, "T"), &String::from_str(&env2, "T"), &100u64, &0u32, &rx2);
+    c2.initialize(
+        &creator2,
+        &String::from_str(&env2, "T"),
+        &String::from_str(&env2, "T"),
+        &100u64,
+        &0u32,
+        &rx2,
+    );
     let id = c2.mint(&alice, &String::from_str(&env2, "uri"));
     c2.approve(&alice, &alice, &id, &None::<u32>);
 
@@ -1473,7 +1482,10 @@ fn transfer_clears_expiry_key_alongside_approval() {
             .persistent()
             .get::<DataKey, u32>(&DataKey::ApprovedExpiry(id))
     });
-    assert!(expiry_after.is_none(), "expiry key must be cleared after transfer");
+    assert!(
+        expiry_after.is_none(),
+        "expiry key must be cleared after transfer"
+    );
 }
 
 // ── Migration tests ───────────────────────────────────────────────────────────

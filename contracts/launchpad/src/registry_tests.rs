@@ -27,15 +27,17 @@ use crate::{CollectionKind, Error, Launchpad, LaunchpadClient};
 fn wasm_bytes(name: &str) -> std::vec::Vec<u8> {
     let exe = std::env::current_exe().unwrap();
     let target_dir = exe
-        .parent().and_then(|p| p.parent()).and_then(|p| p.parent())
-        .unwrap().to_path_buf();
+        .parent()
+        .and_then(|p| p.parent())
+        .and_then(|p| p.parent())
+        .unwrap()
+        .to_path_buf();
     let path = target_dir
-        .join("wasm32v1-none").join("release")
+        .join("wasm32v1-none")
+        .join("release")
         .join(std::format!("{name}.wasm"));
-    std::fs::read(&path).unwrap_or_else(|_| panic!(
-        "missing wasm at {}. Build first.",
-        path.display()
-    ))
+    std::fs::read(&path)
+        .unwrap_or_else(|_| panic!("missing wasm at {}. Build first.", path.display()))
 }
 
 fn setup(env: &Env) -> (LaunchpadClient<'_>, Address, Address, Address) {
@@ -50,10 +52,18 @@ fn setup(env: &Env) -> (LaunchpadClient<'_>, Address, Address, Address) {
 
     client.initialize(&admin, &fee_receiver, &0i128);
 
-    let w721  = env.deployer().upload_contract_wasm(wasm_bytes("collection_nft_erc721").as_slice());
-    let w1155 = env.deployer().upload_contract_wasm(wasm_bytes("collection_nft_erc1155").as_slice());
-    let wl721 = env.deployer().upload_contract_wasm(wasm_bytes("lazy_mint_erc721").as_slice());
-    let wl1155= env.deployer().upload_contract_wasm(wasm_bytes("lazy_mint_erc1155").as_slice());
+    let w721 = env
+        .deployer()
+        .upload_contract_wasm(wasm_bytes("collection_nft_erc721").as_slice());
+    let w1155 = env
+        .deployer()
+        .upload_contract_wasm(wasm_bytes("collection_nft_erc1155").as_slice());
+    let wl721 = env
+        .deployer()
+        .upload_contract_wasm(wasm_bytes("lazy_mint_erc721").as_slice());
+    let wl1155 = env
+        .deployer()
+        .upload_contract_wasm(wasm_bytes("lazy_mint_erc1155").as_slice());
     client.set_wasm_hashes(&w721, &w1155, &wl721, &wl1155);
 
     (client, admin, fee_receiver, creator)
@@ -61,7 +71,9 @@ fn setup(env: &Env) -> (LaunchpadClient<'_>, Address, Address, Address) {
 
 fn setup_token(env: &Env, holder: &Address, amount: i128) -> Address {
     let token_admin = Address::generate(env);
-    let token = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
     StellarAssetClient::new(env, &token).mint(holder, &amount);
     token
 }
@@ -195,7 +207,9 @@ fn preflight_reports_invalid_royalty_bps() {
         &0u32,
         &salt,
     );
-    assert!(preflight.errors.contains(&(Error::InvalidRoyaltyBps as u32)));
+    assert!(preflight
+        .errors
+        .contains(&(Error::InvalidRoyaltyBps as u32)));
 }
 
 #[test]
@@ -366,36 +380,68 @@ fn all_four_deploy_kinds_are_tracked_in_registry() {
     let creator_pubkey = BytesN::from_array(&env, &[0x11u8; 32]);
 
     let addr_721 = client.deploy_normal_721(
-        &creator, &currency,
-        &String::from_str(&env, "N721"), &String::from_str(&env, "N721"),
-        &100u64, &0u32, &royalty_receiver, &0u32,
+        &creator,
+        &currency,
+        &String::from_str(&env, "N721"),
+        &String::from_str(&env, "N721"),
+        &100u64,
+        &0u32,
+        &royalty_receiver,
+        &0u32,
         &BytesN::from_array(&env, &[0xD1u8; 32]),
     );
     let addr_1155 = client.deploy_normal_1155(
-        &creator, &currency,
-        &String::from_str(&env, "N1155"), &0u32, &royalty_receiver, &0u32,
+        &creator,
+        &currency,
+        &String::from_str(&env, "N1155"),
+        &0u32,
+        &royalty_receiver,
+        &0u32,
         &BytesN::from_array(&env, &[0xD2u8; 32]),
     );
     let addr_l721 = client.deploy_lazy_721(
-        &creator, &currency, &creator_pubkey,
-        &String::from_str(&env, "L721"), &String::from_str(&env, "L721"),
-        &100u64, &0u32, &royalty_receiver, &0u32,
+        &creator,
+        &currency,
+        &creator_pubkey,
+        &String::from_str(&env, "L721"),
+        &String::from_str(&env, "L721"),
+        &100u64,
+        &0u32,
+        &royalty_receiver,
+        &0u32,
         &BytesN::from_array(&env, &[0xD3u8; 32]),
         &String::from_str(&env, "Test Network; September 2015"),
     );
     let addr_l1155 = client.deploy_lazy_1155(
-        &creator, &currency, &creator_pubkey,
-        &String::from_str(&env, "L1155"), &0u32, &royalty_receiver, &0u32,
+        &creator,
+        &currency,
+        &creator_pubkey,
+        &String::from_str(&env, "L1155"),
+        &0u32,
+        &royalty_receiver,
+        &0u32,
         &BytesN::from_array(&env, &[0xD4u8; 32]),
         &String::from_str(&env, "Test Network; September 2015"),
     );
 
     assert_eq!(client.collection_count(), 4u64);
 
-    assert!(matches!(client.get_collection(&addr_721).unwrap().kind, CollectionKind::Normal721));
-    assert!(matches!(client.get_collection(&addr_1155).unwrap().kind, CollectionKind::Normal1155));
-    assert!(matches!(client.get_collection(&addr_l721).unwrap().kind, CollectionKind::LazyMint721));
-    assert!(matches!(client.get_collection(&addr_l1155).unwrap().kind, CollectionKind::LazyMint1155));
+    assert!(matches!(
+        client.get_collection(&addr_721).unwrap().kind,
+        CollectionKind::Normal721
+    ));
+    assert!(matches!(
+        client.get_collection(&addr_1155).unwrap().kind,
+        CollectionKind::Normal1155
+    ));
+    assert!(matches!(
+        client.get_collection(&addr_l721).unwrap().kind,
+        CollectionKind::LazyMint721
+    ));
+    assert!(matches!(
+        client.get_collection(&addr_l1155).unwrap().kind,
+        CollectionKind::LazyMint1155
+    ));
 }
 
 // ── Acceptance criterion 6: wasm version bumps monotonically ─────────────────
@@ -454,9 +500,15 @@ fn get_collection_by_address_matches_all_collections_record() {
 
     let salt = BytesN::from_array(&env, &[0xE1u8; 32]);
     let addr = client.deploy_normal_721(
-        &creator, &Address::generate(&env),
-        &String::from_str(&env, "Alpha"), &String::from_str(&env, "ALP"),
-        &100u64, &0u32, &Address::generate(&env), &0u32, &salt,
+        &creator,
+        &Address::generate(&env),
+        &String::from_str(&env, "Alpha"),
+        &String::from_str(&env, "ALP"),
+        &100u64,
+        &0u32,
+        &Address::generate(&env),
+        &0u32,
+        &salt,
     );
 
     let by_addr = client.get_collection(&addr).unwrap();
@@ -481,10 +533,17 @@ fn get_collections_paginated_is_consistent_with_collection_count() {
     for i in 0u8..5u8 {
         let salt = BytesN::from_array(&env, &[i; 32]);
         let name = soroban_sdk::String::from_str(&env, &std::format!("Coll{i}"));
-        let sym  = soroban_sdk::String::from_str(&env, &std::format!("C{i}"));
+        let sym = soroban_sdk::String::from_str(&env, &std::format!("C{i}"));
         client.deploy_normal_721(
-            &creator, &currency, &name, &sym,
-            &100u64, &0u32, &royalty_receiver, &0u32, &salt,
+            &creator,
+            &currency,
+            &name,
+            &sym,
+            &100u64,
+            &0u32,
+            &royalty_receiver,
+            &0u32,
+            &salt,
         );
     }
 
@@ -520,25 +579,39 @@ fn collections_by_creator_only_returns_that_creators_collections() {
     // Creator A deploys 2
     for i in 0u8..2u8 {
         client.deploy_normal_721(
-            &creator_a, &currency,
+            &creator_a,
+            &currency,
             &soroban_sdk::String::from_str(&env, &std::format!("A{i}")),
             &soroban_sdk::String::from_str(&env, &std::format!("A{i}")),
-            &100u64, &0u32, &royalty_receiver, &0u32,
+            &100u64,
+            &0u32,
+            &royalty_receiver,
+            &0u32,
             &BytesN::from_array(&env, &[i; 32]),
         );
     }
 
     // Creator B deploys 1
     client.deploy_normal_721(
-        &creator_b, &currency,
-        &String::from_str(&env, "B0"), &String::from_str(&env, "B0"),
-        &100u64, &0u32, &royalty_receiver, &0u32,
+        &creator_b,
+        &currency,
+        &String::from_str(&env, "B0"),
+        &String::from_str(&env, "B0"),
+        &100u64,
+        &0u32,
+        &royalty_receiver,
+        &0u32,
         &BytesN::from_array(&env, &[0xFFu8; 32]),
     );
 
     assert_eq!(client.collections_by_creator(&creator_a).len(), 2);
     assert_eq!(client.collections_by_creator(&creator_b).len(), 1);
-    assert_eq!(client.collections_by_creator(&Address::generate(&env)).len(), 0);
+    assert_eq!(
+        client
+            .collections_by_creator(&Address::generate(&env))
+            .len(),
+        0
+    );
 }
 
 // ── Deploy fee invariants ─────────────────────────────────────────────────────
@@ -556,14 +629,18 @@ fn deploy_fee_is_transferred_before_deploy_state_mutation() {
     let royalty_receiver = Address::generate(&env);
 
     client.deploy_normal_1155(
-        &creator, &token,
+        &creator,
+        &token,
         &String::from_str(&env, "FeeTest"),
-        &0u32, &royalty_receiver, &0u32,
+        &0u32,
+        &royalty_receiver,
+        &0u32,
         &BytesN::from_array(&env, &[0xF1u8; 32]),
     );
 
     // Treasury must have received the fee
-    let treasury_balance = soroban_sdk::token::TokenClient::new(&env, &token).balance(&fee_receiver);
+    let treasury_balance =
+        soroban_sdk::token::TokenClient::new(&env, &token).balance(&fee_receiver);
     assert_eq!(treasury_balance, FEE);
 
     // Creator's balance must have decreased by fee

@@ -399,6 +399,7 @@ pub enum OptionalPayoutLeg {
 ///
 /// Invariant, enforced before this value is ever returned or acted upon:
 /// `royalty.amount (if any) + fee + sum(recipients[i].amount) == total == amount`.
+#[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PayoutPlan {
     /// `None` when no royalty applies (zero bps, or the royalty receiver is

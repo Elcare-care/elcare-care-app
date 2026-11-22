@@ -405,7 +405,7 @@ fn batch_create_too_large_returns_batch_too_large() {
     assert!(result.is_err());
     // Confirm error code 36 (BatchTooLarge).
     let err = result.unwrap_err().unwrap();
-    assert_eq!(err, MarketplaceError::BatchTooLarge);
+    assert_eq!(err, MarketplaceError::BatchTooLarge.into());
 }
 
 // ── Exactly at the cap (50 items) succeeds ───────────────────────────────
@@ -694,7 +694,7 @@ fn batch_update_too_large_returns_batch_too_large() {
     let result = client.try_update_listings(&artist, &items);
     assert!(result.is_err());
     let err = result.unwrap_err().unwrap();
-    assert_eq!(err, MarketplaceError::BatchTooLarge);
+    assert_eq!(err, MarketplaceError::BatchTooLarge.into());
 }
 
 // ── update_listings: invalid price fails preflight ────────────────────────
@@ -892,7 +892,7 @@ fn batch_cancel_too_large_returns_batch_too_large() {
     let result = client.try_cancel_listings(&artist, &ids);
     assert!(result.is_err());
     let err = result.unwrap_err().unwrap();
-    assert_eq!(err, MarketplaceError::BatchTooLarge);
+    assert_eq!(err, MarketplaceError::BatchTooLarge.into());
 }
 
 // ── cancel_listings: exactly 50 items at cap succeeds ────────────────────

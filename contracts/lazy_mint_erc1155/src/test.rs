@@ -134,11 +134,26 @@ fn digest_byte_layout_is_stable() {
 
     // Mutating each field must change the digest.
     let mutations: &[MintVoucher1155] = &[
-        MintVoucher1155 { token_id: 2, ..v.clone() },
-        MintVoucher1155 { nonce: 43, ..v.clone() },
-        MintVoucher1155 { buyer_quota: 11, ..v.clone() },
-        MintVoucher1155 { price_per_unit: 501, ..v.clone() },
-        MintVoucher1155 { valid_until: 1, ..v.clone() },
+        MintVoucher1155 {
+            token_id: 2,
+            ..v.clone()
+        },
+        MintVoucher1155 {
+            nonce: 43,
+            ..v.clone()
+        },
+        MintVoucher1155 {
+            buyer_quota: 11,
+            ..v.clone()
+        },
+        MintVoucher1155 {
+            price_per_unit: 501,
+            ..v.clone()
+        },
+        MintVoucher1155 {
+            valid_until: 1,
+            ..v.clone()
+        },
         MintVoucher1155 {
             uri_hash: BytesN::from_array(&env, &[0xbbu8; 32]),
             ..v.clone()
@@ -192,7 +207,10 @@ fn redeem_expired_voucher_returns_error() {
     client.register_edition(&token_id, &100u128);
     env.ledger().with_mut(|li| li.sequence_number = 100);
     let buyer = Address::generate(&env);
-    let v = MintVoucher1155 { valid_until: 50, ..make_voucher(&env, token_id, 2) };
+    let v = MintVoucher1155 {
+        valid_until: 50,
+        ..make_voucher(&env, token_id, 2)
+    };
     let sig = sign_voucher(&env, &client.address, &v);
     let res = client.try_redeem(&buyer, &v, &1u128, &sig, &empty_proof(&env));
     assert_eq!(res, Err(Ok(Error::VoucherExpired)));
@@ -207,7 +225,9 @@ fn redeem_wrong_key_fails() {
     let buyer = Address::generate(&env);
     let v = make_voucher(&env, token_id, 3);
     let bad_sig = BytesN::from_array(&env, &[0u8; 64]);
-    assert!(client.try_redeem(&buyer, &v, &1u128, &bad_sig, &empty_proof(&env)).is_err());
+    assert!(client
+        .try_redeem(&buyer, &v, &1u128, &bad_sig, &empty_proof(&env))
+        .is_err());
 }
 
 #[test]
@@ -223,7 +243,9 @@ fn redeem_tampered_uri_fails_sig() {
         uri_hash: BytesN::from_array(&env, &[0xffu8; 32]),
         ..v
     };
-    assert!(client.try_redeem(&buyer, &v_bad, &1u128, &sig, &empty_proof(&env)).is_err());
+    assert!(client
+        .try_redeem(&buyer, &v_bad, &1u128, &sig, &empty_proof(&env))
+        .is_err());
 }
 
 #[test]
@@ -257,7 +279,10 @@ fn redeem_exceeds_buyer_quota_returns_error() {
     let token_id = 7u64;
     client.register_edition(&token_id, &1000u128);
     let buyer = Address::generate(&env);
-    let v = MintVoucher1155 { buyer_quota: 3, ..make_voucher(&env, token_id, 7) };
+    let v = MintVoucher1155 {
+        buyer_quota: 3,
+        ..make_voucher(&env, token_id, 7)
+    };
     let sig = sign_voucher(&env, &client.address, &v);
     let res = client.try_redeem(&buyer, &v, &10u128, &sig, &empty_proof(&env));
     assert_eq!(res, Err(Ok(Error::ExceedsVoucherMax)));
@@ -522,7 +547,13 @@ fn batch_n_items_all_minted() {
     let buyer = Address::generate(&env);
     let mut items = Vec::new(&env);
     for (i, tid) in (200u64..205u64).enumerate() {
-        items.push_back(make_batch_item(&env, &client.address, tid, 200 + i as u64, 1));
+        items.push_back(make_batch_item(
+            &env,
+            &client.address,
+            tid,
+            200 + i as u64,
+            1,
+        ));
     }
     client.redeem_batch(&buyer, &items);
     for tid in 200u64..205u64 {
@@ -541,7 +572,10 @@ fn batch_one_expired_reverts_all() {
     env.ledger().with_mut(|li| li.sequence_number = 200);
     let buyer = Address::generate(&env);
     let good = make_batch_item(&env, &client.address, t1, 300, 1);
-    let expired_v = MintVoucher1155 { valid_until: 100, ..make_voucher(&env, t2, 301) };
+    let expired_v = MintVoucher1155 {
+        valid_until: 100,
+        ..make_voucher(&env, t2, 301)
+    };
     let expired_sig = sign_voucher(&env, &client.address, &expired_v);
     let bad = BatchVoucherItem1155 {
         voucher: expired_v,
@@ -664,7 +698,13 @@ fn batch_mixed_free_vouchers_aggregate_correctly() {
     let buyer = Address::generate(&env);
     let mut items = Vec::new(&env);
     for (i, tid) in (800u64..803u64).enumerate() {
-        items.push_back(make_batch_item(&env, &client.address, tid, 800 + i as u64, 3));
+        items.push_back(make_batch_item(
+            &env,
+            &client.address,
+            tid,
+            800 + i as u64,
+            3,
+        ));
     }
     client.redeem_batch(&buyer, &items);
     for tid in 800u64..803u64 {

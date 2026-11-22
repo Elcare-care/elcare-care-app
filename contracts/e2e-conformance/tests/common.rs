@@ -11,9 +11,7 @@ extern crate std;
 
 use soroban_launchpad::{Launchpad, LaunchpadClient};
 use soroban_sdk::{
-    testutils::Address as _,
-    token::StellarAssetClient,
-    Address, BytesN, Env, String,
+    testutils::Address as _, token::StellarAssetClient, Address, BytesN, Env, String,
 };
 
 pub fn wasm_bytes(name: &str) -> std::vec::Vec<u8> {

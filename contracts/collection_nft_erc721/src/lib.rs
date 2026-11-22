@@ -119,8 +119,8 @@ pub enum DataKey {
     /// Optional expiry (ledger sequence) for an operator-level approval.
     /// Absent means the approval never expires.
     ApprovedForAllExpiry(Address, Address),
-    BaseUri,        // String — collection-level base URI (optional)
-    MetadataFrozen, // bool   — permanently frozen when true
+    BaseUri,          // String — collection-level base URI (optional)
+    MetadataFrozen,   // bool   — permanently frozen when true
     TokenFrozen(u64), // bool  — per-token metadata frozen when true
     // Per-token royalty overrides (persistent, optional)
     TokenRoyaltyReceiver(u64), // Address
@@ -204,7 +204,9 @@ impl NormalNFT721 {
         env.storage().instance().set(&DataKey::Creator, &creator);
         // OriginalCreator is set once at initialization and never overwritten
         // by succession — it preserves historical royalty attribution (#484).
-        env.storage().instance().set(&DataKey::OriginalCreator, &creator);
+        env.storage()
+            .instance()
+            .set(&DataKey::OriginalCreator, &creator);
         env.storage().instance().set(&DataKey::Name, &name);
         env.storage().instance().set(&DataKey::Symbol, &symbol);
         env.storage()
@@ -480,9 +482,11 @@ impl NormalNFT721 {
         env.storage()
             .persistent()
             .set(&DataKey::Approved(token_id), &approved);
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::Approved(token_id), TTL_THRESHOLD, TTL_BUMP);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Approved(token_id),
+            TTL_THRESHOLD,
+            TTL_BUMP,
+        );
 
         // Store or clear expiry
         match expires_at {
@@ -490,9 +494,11 @@ impl NormalNFT721 {
                 env.storage()
                     .persistent()
                     .set(&DataKey::ApprovedExpiry(token_id), &exp);
-                env.storage()
-                    .persistent()
-                    .extend_ttl(&DataKey::ApprovedExpiry(token_id), TTL_THRESHOLD, TTL_BUMP);
+                env.storage().persistent().extend_ttl(
+                    &DataKey::ApprovedExpiry(token_id),
+                    TTL_THRESHOLD,
+                    TTL_BUMP,
+                );
             }
             None => {
                 env.storage()
@@ -539,7 +545,9 @@ impl NormalNFT721 {
         let expiry_key = DataKey::ApprovedForAllExpiry(owner.clone(), operator.clone());
 
         env.storage().persistent().set(&key, &approved);
-        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_BUMP);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_THRESHOLD, TTL_BUMP);
 
         // Store or clear expiry
         match (approved, expires_at) {
@@ -576,10 +584,7 @@ impl NormalNFT721 {
             .ok_or(Error::TokenNotFound)?;
         owner.require_auth();
 
-        let had_approval = env
-            .storage()
-            .persistent()
-            .has(&DataKey::Approved(token_id));
+        let had_approval = env.storage().persistent().has(&DataKey::Approved(token_id));
 
         env.storage()
             .persistent()
@@ -590,10 +595,8 @@ impl NormalNFT721 {
 
         if had_approval {
             // Emit ApprovalRevoked event
-            env.events().publish(
-                (symbol_short!("appr_rev"), owner),
-                token_id,
-            );
+            env.events()
+                .publish((symbol_short!("appr_rev"), owner), token_id);
         }
         Ok(())
     }
@@ -863,11 +866,7 @@ impl NormalNFT721 {
     /// - Overwrites any previously pending proposal.
     /// - Does NOT transfer any authority until `accept_creator` is called.
     /// - If `expires_at` is in the past the call reverts with `ApprovalExpired`.
-    pub fn propose_creator(
-        env: Env,
-        new_creator: Address,
-        expires_at: u32,
-    ) -> Result<(), Error> {
+    pub fn propose_creator(env: Env, new_creator: Address, expires_at: u32) -> Result<(), Error> {
         Self::extend_instance_ttl(&env);
         let current = Self::only_creator(&env)?;
         if env.ledger().sequence() >= expires_at {
@@ -924,10 +923,8 @@ impl NormalNFT721 {
         env.storage()
             .instance()
             .remove(&DataKey::PendingCreatorExpiry);
-        env.events().publish(
-            (symbol_short!("cr_acc"), old_creator),
-            new_creator,
-        );
+        env.events()
+            .publish((symbol_short!("cr_acc"), old_creator), new_creator);
         Ok(())
     }
 
@@ -945,10 +942,8 @@ impl NormalNFT721 {
         env.storage()
             .instance()
             .remove(&DataKey::PendingCreatorExpiry);
-        env.events().publish(
-            (symbol_short!("cr_canc"), current),
-            pending,
-        );
+        env.events()
+            .publish((symbol_short!("cr_canc"), current), pending);
         Ok(())
     }
 
@@ -961,9 +956,7 @@ impl NormalNFT721 {
             // Fallback for collections initialized before #484: treat the
             // current Creator as the original creator (safe because succession
             // could not have happened without OriginalCreator being set first).
-            .unwrap_or_else(|| {
-                env.storage().instance().get(&DataKey::Creator).unwrap()
-            })
+            .unwrap_or_else(|| env.storage().instance().get(&DataKey::Creator).unwrap())
     }
 
     /// Returns the pending creator address and expiry, or None if no proposal
@@ -1085,10 +1078,8 @@ impl NormalNFT721 {
         validate_uri(&base_uri)?;
         let old_uri: Option<String> = env.storage().instance().get(&DataKey::BaseUri);
         env.storage().instance().set(&DataKey::BaseUri, &base_uri);
-        env.events().publish(
-            (symbol_short!("meta_upd"), creator),
-            (old_uri, base_uri),
-        );
+        env.events()
+            .publish((symbol_short!("meta_upd"), creator), (old_uri, base_uri));
         Ok(())
     }
 
@@ -1108,8 +1099,7 @@ impl NormalNFT721 {
         env.storage()
             .instance()
             .set(&DataKey::MetadataFrozen, &true);
-        env.events()
-            .publish((symbol_short!("meta_frz"),), creator);
+        env.events().publish((symbol_short!("meta_frz"),), creator);
         Ok(())
     }
 
@@ -1127,20 +1117,20 @@ impl NormalNFT721 {
     pub fn freeze_token(env: Env, caller: Address, token_id: u64) -> Result<(), Error> {
         Self::extend_instance_ttl(&env);
         caller.require_auth();
-        
+
         // Verify token exists
         let owner: Address = env
             .storage()
             .persistent()
             .get(&DataKey::Owner(token_id))
             .ok_or(Error::TokenNotFound)?;
-        
+
         // Allow creator or token owner
         let creator = Self::only_creator(&env).ok();
         if creator != Some(caller.clone()) && owner != caller {
             return Err(Error::NotOwner);
         }
-        
+
         if env
             .storage()
             .persistent()
@@ -1149,7 +1139,7 @@ impl NormalNFT721 {
         {
             return Err(Error::AlreadyFrozen);
         }
-        
+
         env.storage()
             .persistent()
             .set(&DataKey::TokenFrozen(token_id), &true);
@@ -1158,7 +1148,7 @@ impl NormalNFT721 {
             TTL_THRESHOLD,
             TTL_BUMP,
         );
-        
+
         env.events()
             .publish((symbol_short!("token_frz"),), token_id);
         Ok(())
@@ -1169,7 +1159,7 @@ impl NormalNFT721 {
     pub fn set_token_uri(env: Env, token_id: u64, uri: String) -> Result<(), Error> {
         Self::extend_instance_ttl(&env);
         let creator = Self::only_creator(&env)?;
-        
+
         // Check collection-level freeze
         if env
             .storage()
@@ -1179,7 +1169,7 @@ impl NormalNFT721 {
         {
             return Err(Error::MetadataFrozen);
         }
-        
+
         // Check token-level freeze
         if env
             .storage()
@@ -1189,12 +1179,12 @@ impl NormalNFT721 {
         {
             return Err(Error::MetadataFrozen);
         }
-        
+
         // Verify token exists
         if !env.storage().persistent().has(&DataKey::Owner(token_id)) {
             return Err(Error::TokenNotFound);
         }
-        
+
         validate_uri(&uri)?;
         let old_uri: Option<String> = env.storage().persistent().get(&DataKey::TokenUri(token_id));
         env.storage()
@@ -1205,7 +1195,7 @@ impl NormalNFT721 {
             TTL_THRESHOLD,
             TTL_BUMP,
         );
-        
+
         env.events().publish(
             (symbol_short!("meta_upd"), creator),
             (token_id, old_uri, uri),
@@ -1271,21 +1261,17 @@ impl NormalNFT721 {
 
         // Record completion marker (persistent so it survives instance bumps).
         env.storage().persistent().set(&done_key, &true);
-        env.storage().persistent().extend_ttl(
-            &done_key,
-            TTL_THRESHOLD,
-            TTL_BUMP,
-        );
+        env.storage()
+            .persistent()
+            .extend_ttl(&done_key, TTL_THRESHOLD, TTL_BUMP);
 
         // Write the version to instance storage for operator verification.
         env.storage()
             .instance()
             .set(&DataKey::ContractVersion, &target);
 
-        env.events().publish(
-            (soroban_sdk::symbol_short!("migrated"), target),
-            (),
-        );
+        env.events()
+            .publish((soroban_sdk::symbol_short!("migrated"), target), ());
         Ok(())
     }
 
