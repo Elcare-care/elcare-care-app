@@ -1904,3 +1904,99 @@ use crate::{
         let cleared = client.cleanup_expired_locks(&admin, &listing_ids, &auction_ids);
         assert_eq!(cleared, 0);
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // SECTION 21: Migration marker — admin-rotation edge cases
+    //
+    // The MigrationDone key is DataKey::MigrationDone(version_string).
+    // It is NOT keyed by the admin address, so the idempotency guard must
+    // hold regardless of who the current admin is at the time of a second
+    // migrate call.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Completing a migration and then rotating to a new admin must NOT let
+    /// the new admin re-run the same migration.  The done marker is keyed by
+    /// version string only, so it is immutable across admin changes.
+    #[test]
+    fn migration_marker_persists_after_admin_rotation() {
+        let (env, client, admin, token, col, _cid) = migration_setup();
+        create_n_listings(&env, &client, &admin, &token, &col, 2);
+
+        // Complete the migration under the original admin.
+        client.migrate(&admin);
+        assert!(client.get_migration_status().is_done);
+
+        // Rotate admin: propose → accept.
+        let new_admin = Address::generate(&env);
+        client.transfer_admin(&admin, &new_admin);
+        client.accept_admin(&new_admin);
+
+        // The new admin must be rejected with AlreadyMigrated — the marker is
+        // version-scoped, not admin-scoped.
+        assert_eq!(
+            client.try_migrate(&new_admin).unwrap_err().unwrap(),
+            MarketplaceError::AlreadyMigrated.into(),
+            "AlreadyMigrated must fire for the new admin — marker is version-keyed"
+        );
+        assert_eq!(
+            client.try_migrate_step(&new_admin, &1u32).unwrap_err().unwrap(),
+            MarketplaceError::AlreadyMigrated.into(),
+            "migrate_step must also be blocked after admin rotation"
+        );
+    }
+
+    /// A migration started by admin_A, interrupted, and resumed (or even
+    /// completed) by admin_B after a rotation must still reach the same
+    /// done state — the cursor and done marker are version-keyed, not
+    /// admin-keyed.
+    #[test]
+    fn interrupted_migration_resumed_by_new_admin_after_rotation() {
+        let (env, client, admin, token, col, _cid) = migration_setup();
+        create_n_listings(&env, &client, &admin, &token, &col, 4);
+
+        // Step once under the original admin, leaving an in-progress cursor.
+        client.migrate_step(&admin, &1u32);
+        let status = client.get_migration_status();
+        assert!(status.is_in_progress, "migration must be in progress");
+        assert!(status.is_stuck, "stuck marker must be set");
+
+        // Rotate admin.
+        let new_admin = Address::generate(&env);
+        client.transfer_admin(&admin, &new_admin);
+        client.accept_admin(&new_admin);
+
+        // The new admin must be able to resume from the cursor written by the
+        // old admin.
+        let mut remaining = u64::MAX;
+        while remaining > 0 {
+            remaining = client.migrate_step(&new_admin, &5u32);
+        }
+
+        let final_status = client.get_migration_status();
+        assert!(final_status.is_done, "migration must complete after new admin resumes it");
+        assert!(!final_status.is_in_progress);
+        assert!(!final_status.is_stuck, "stuck marker must be cleared on completion");
+
+        // All 4 listings must still be reachable.
+        assert_eq!(client.get_active_listings_count(), 4);
+    }
+
+    /// Call-one (first migrate) succeeds; call-two (immediate repeat by the
+    /// *same* admin) reverts with AlreadyMigrated.  Documents the documented
+    /// idempotency boundary explicitly.
+    #[test]
+    fn call_one_succeeds_call_two_always_reverts_same_admin() {
+        let (env, client, admin, token, col, _cid) = migration_setup();
+        create_n_listings(&env, &client, &admin, &token, &col, 1);
+
+        // Call 1 — must succeed.
+        client.migrate(&admin);
+        assert!(client.get_migration_status().is_done, "call 1 must mark migration done");
+
+        // Call 2 — must revert, same admin, same version.
+        assert_eq!(
+            client.try_migrate(&admin).unwrap_err().unwrap(),
+            MarketplaceError::AlreadyMigrated.into(),
+            "call 2 must revert with AlreadyMigrated (error code 37)"
+        );
+    }

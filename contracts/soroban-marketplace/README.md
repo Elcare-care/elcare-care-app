@@ -207,7 +207,43 @@ All pause checks fail with the single stable `ContractPaused` (23) error
 code, so the frontend can map any pause-related rejection to one actionable
 message regardless of which axis fired.
 
----
+### Per-Function Pause — Entry-Point Map
+
+The table below records the exact function-name Symbol that must be passed to
+`pause_function` / `unpause_function` to target each entry point, the error
+code returned on a blocked call, and whether the call is in the "always
+available" (fund-recovery) set.
+
+| Entry point | Function Symbol (`pause_function` arg) | Blocked by global pause | Blocked by collection pause | Blocked by per-function pause | Error code | Always available? |
+|---|---|---|---|---|---|---|
+| `create_listing` | `"create_listing"` | ✓ | ✓ (matching collection) | ✓ | #23 `ContractPaused` | No |
+| `update_listing` | `"update_listing"` | ✓ | ✓ | ✓ | #23 | No |
+| `update_listing_price` | `"update_listing_price"` | ✓ | ✓ | ✓ | #23 | No |
+| `buy_artwork` | `"buy_artwork"` | ✓ | ✓ | ✓ | #23 | No |
+| `create_auction` | `"create_auction"` | ✓ | ✓ | ✓ | #23 | No |
+| `place_bid` | `"place_bid"` | ✓ | ✓ | ✓ | #23 | No |
+| `make_offer` | `"make_offer"` | ✓ | ✓ | ✓ | #23 | No |
+| `accept_offer` | `"accept_offer"` | ✓ | ✓ | ✓ | #23 | No |
+| `cancel_listing` | — (not pausable) | No | No | No | — | **Yes** |
+| `cancel_listings` | — | No | No | No | — | **Yes** |
+| `cancel_artist_listings` | — | No | No | No | — | **Yes** |
+| `expire_listing` | — | No | No | No | — | **Yes** |
+| `cancel_auction` | — | No | No | No | — | **Yes** |
+| `admin_cancel_auction` | — | No | No | No | — | **Yes** |
+| `finalize_auction` | — | No | No | No | — | **Yes** |
+| `withdraw_offer` | — | No | No | No | — | **Yes** |
+| `reject_offer` | — | No | No | No | — | **Yes** |
+| `reclaim_offer` | — | No | No | No | — | **Yes** |
+
+Notes:
+- "Blocked by collection pause" applies when the listing or auction being acted
+  on belongs to the paused collection. A second, different collection is not
+  affected.
+- All pause checks fire the same `ContractPaused` (#23) error code regardless
+  of which axis triggered, so callers need only handle one error variant.
+- Each cell is backed by a unit test in `settlement_pause_tests.rs`.
+
+
 
 ## Role-Based Authorization (Issue #267)
 
