@@ -10,10 +10,11 @@ Redis, RPC), see the companion files in this directory.
 
 | Alert | Severity | What it means |
 |---|---|---|
-| IndexerSyncLagHigh | warning | >100 ledgers behind network tip |
-| IndexerSyncLagCritical | critical | >1,000 ledgers behind — likely stalled |
-| IndexerStalled | critical | Poller completely stopped for 3+ minutes |
-| IndexerPollerRestartHigh | critical | 3+ automatic restarts in 10 min (process exit imminent) |
+| IndexerSyncLagHigh | warning / mild | >100 ledgers behind network tip for 2 min |
+| IndexerSyncLagCritical | critical / degraded | >1,000 ledgers behind for 1 min |
+| IndexerSyncLagSustained | critical / down | >1,000 ledgers sustained for 10+ min |
+| IndexerStalled | critical / degraded | Poller completely stopped for 3+ minutes |
+| IndexerPollerRestartHigh | critical / down | 3+ automatic restarts in 10 min (process exit imminent) |
 | HighDecodeErrorRate | warning | XDR parse failures spike — possible contract schema drift |
 | UnsupportedSchemaVersionSeen | warning | Contract upgrade shipped without indexer update |
 | DeadLetterQueueGrowing | warning | >50 events stuck in dead-letter storage |
@@ -23,6 +24,10 @@ Redis, RPC), see the companion files in this directory.
 | ReentrancyGuardTriggeredFrequently | warning | Possible exploit probe — contract reentrancy guard firing |
 | RpcRetryExhausted | critical | Stellar RPC unreachable after all retries |
 | ReconcilerDriftHigh | warning | >100 records with on-chain drift in one reconciliation run |
+
+> **Stalled ingestion severity classification** (mild / degraded / down) is documented in
+> [stalled-ingestion-severity.md](./stalled-ingestion-severity.md). The `ingestion_severity`
+> label on each sync alert carries the level directly in the alert payload.
 
 ---
 
@@ -42,12 +47,17 @@ Key panels to check first during an incident:
 
 ## Response Procedures
 
-### IndexerSyncLagHigh / IndexerSyncLagCritical
+### IndexerSyncLagHigh / IndexerSyncLagCritical / IndexerSyncLagSustained
+
+Severity classification: **High** = mild, **Critical** = degraded, **Sustained** = down.
+See [stalled-ingestion-severity.md](./stalled-ingestion-severity.md) for the full decision tree.
+The `ingestion_severity` label on each alert (`mild` / `degraded` / `down`) tells you which tier
+fired without reading the description.
 
 1. Open the Grafana **Sync Lag Over Time** panel and check whether lag is growing or stable.
 2. Check Stellar RPC health:
-   ```
-   GET /health  →  checks.stellar_rpc.status
+   ```bash
+   curl http://localhost:4000/health | jq '.checks.stellar_rpc'
    ```
 3. Check the poller logs for connection errors or repeated timeouts:
    ```bash
@@ -55,7 +65,11 @@ Key panels to check first during an incident:
    ```
 4. If the RPC endpoint is healthy but lag is growing, check whether a ledger gap
    has formed — see [stalled-ingestion.md](./stalled-ingestion.md).
-5. If lag exceeds 10,000 ledgers, consider triggering a targeted backfill.
+5. If `IndexerSyncLagSustained` fires (down — 10+ minutes), treat the indexer as stopped:
+   check the process state (`docker compose ps indexer`) and follow
+   [stalled-ingestion.md](./stalled-ingestion.md) for the appropriate root-cause branch (§A RPC,
+   §B DB, §C re-org).
+6. If lag exceeds 10,000 ledgers, consider triggering a targeted backfill.
 
 ---
 

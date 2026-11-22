@@ -11,6 +11,8 @@
 - **Health endpoint:** `GET /health` returns `"redis": { "status": "down" }` (overall status may still be `degraded`, not `down`, since Redis is non-critical)
 - **Logs:** `Redis connection error: ECONNREFUSED`, `Redis client not connected`
 - **Prometheus:** `http_request_duration_seconds` p95 increases (cache misses)
+- **Prometheus:** `elcarehub_sse_degraded_fallback_total` increasing (SSE falling back to in-memory ring)
+- **Prometheus:** `elcarehub_abuse_detection_redis_failures_total` increasing (abuse detection bypassed)
 
 ### Manual Check
 ```bash
@@ -23,20 +25,33 @@ docker compose ps redis
 # Test Redis directly
 redis-cli -u "$REDIS_URL" PING
 # Expected: PONG
+
+# Check SSE degraded-fallback counter (non-zero means SSE is using in-memory ring)
+curl -s http://localhost:4000/metrics | grep elcarehub_sse_degraded_fallback_total
+
+# Check abuse-detection Redis bypass counter
+curl -s http://localhost:4000/metrics | grep elcarehub_abuse_detection_redis_failures_total
 ```
 
 ---
 
 ## Impact Assessment
 
-| Feature | Redis Down | Fallback Behavior |
-|---|---|---|
-| API responses | Cache misses | Falls back to direct DB reads — slower but functional |
-| SSE event stream | New events still broadcast | Replay buffer unavailable — reconnecting clients miss history |
-| Rate limiting | Disabled | All requests pass through (minor risk) |
-| Session/auth | Not used | No impact |
+> For the full surface-by-surface breakdown with exact fail-open behavior and recovery
+> observations, see **[redis-failure-modes.md](./redis-failure-modes.md)**.
 
-**User impact:** API responses are slower (DB read latency instead of Redis ~1ms). The marketplace remains functional but may appear sluggish under load.
+| Surface | Redis Down | Fail-open? | Fallback behavior |
+|---|---|---|---|
+| HTTP response cache | Cache misses | ✅ Yes | Direct DB reads — slower but correct |
+| Thundering-herd lock | Lock not acquired | ✅ Yes | Per-process coalescing via in-memory Map |
+| Per-endpoint rate limiting | Unaffected | N/A | In-memory store; not Redis-dependent |
+| SSE fan-out (publish) | Redis publish fails | ✅ Yes | In-memory ring buffer (200 events), local pod delivery only |
+| SSE replay (`Last-Event-ID`) | Stream unavailable | ✅ Yes | In-memory ring replay; older events lost to reconnecting clients |
+| Abuse detection — quota | Quota not enforced | ✅ Yes | All requests proceed; in-memory rate limiter still active |
+| Abuse detection — blocklist (passive) | Blocklist not checked | ✅ Yes | Operator-blocked clients bypass the block |
+| Abuse detection — blocklist (write) | Write rejected | ❌ No | Admin block/unblock returns 500 — explicit failure |
+
+**User impact:** API responses are slower (Redis ~1 ms vs DB 5–50 ms). The marketplace remains functional but may appear sluggish under load. SSE clients may miss events that arrived while disconnected during the outage.
 
 **Funds safety:** Redis holds no financial state. All fund-relevant data is in PostgreSQL and Soroban contracts.
 
@@ -231,5 +246,6 @@ full performance. No data or funds are at risk.
 
 ## Related Runbooks
 
+- [redis-failure-modes.md](./redis-failure-modes.md) — full surface-by-surface fail-open matrix with recovery observations
 - [Database Outage](./database-outage.md)
 - [Stalled Ingestion](./stalled-ingestion.md)
