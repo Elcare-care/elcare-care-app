@@ -17,6 +17,7 @@
 - [Prerequisites](#prerequisites)
 - [Build](#build)
 - [Deploy](#deploy)
+- [Upgrading & Migrating](#upgrading--migrating)
 - [Creating a Collection](#creating-a-collection)
 - [Lazy Mint — Voucher Signing](#lazy-mint--voucher-signing)
 - [Royalty Interface](#royalty-interface)
