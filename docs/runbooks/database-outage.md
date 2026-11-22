@@ -293,6 +293,7 @@ psql "$DATABASE_URL" -c "
 
 - [Stalled Ingestion](./stalled-ingestion.md)
 - [Redis Outage](./redis-outage.md)
+- [Backup Restore Drill](./backup-restore-drill-runbook.md) — step-by-step procedure for verifying a backup is restorable in an isolated environment before it is needed for real recovery
 
 ---
 
