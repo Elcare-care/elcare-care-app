@@ -115,8 +115,14 @@ This starts PostgreSQL, Redis, and the indexer together.
 If the indexer was offline and the live RPC window has moved past your last indexed ledger, backfill from an archival RPC:
 
 ```bash
+# MUTATING: writes events and projections; run the READ-ONLY dry review first
 npm run backfill -- --start=123456 --end=124999 --rpc=https://your-archival-rpc
 ```
+
+Operational runbooks:
+- [Gap repair](../docs/runbooks/gap-repair.md): dry review (READ-ONLY) vs. repair execution (MUTATING), expected logs, rollback boundaries, reconciliation.
+- [BackfillJob status](../docs/runbooks/backfill-job-status.md): status table, safe restart, stuck-job ownership, read-only diagnostic SQL.
+- [Dead-letter review](../docs/runbooks/dead-letter-review.md): view → classify → redact → resolve → replay for parser failures (`/admin/dead-letters*`).
 
 ---
 
@@ -140,6 +146,13 @@ npm run backfill -- --start=123456 --end=124999 --rpc=https://your-archival-rpc
 | `CORS_ORIGIN` | ⬜ | — | Comma-separated list of allowed origins (see CORS section) |
 | `LOG_LEVEL` | ⬜ | `info` | Minimum log level emitted: `debug` \| `info` \| `warn` \| `error` (see [Logging](#logging)) |
 | `LOG_FORMAT` | ⬜ | `json` | `json` for machine-readable logs, `pretty` for colorized human-readable local dev output |
+
+**Startup configuration report.** At boot the indexer logs `[startup] configuration report`. It lists
+the network, passphrase label, contract IDs, RPC/Horizon/DB/Redis targets (scheme, host and port
+only: credentials, paths and query strings are never logged), poll settings, and the **names** of
+the credentials that are set. It also logs one `[startup] configuration warning: <CODE>` line per
+testnet/mainnet misconfiguration it detects. See
+[Startup configuration report](../docs/runbooks/startup-config-report.md).
 
 ### Connection Pool Sizing Matrix
 

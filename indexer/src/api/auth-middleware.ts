@@ -3,6 +3,25 @@ import { logger } from '../logger.js';
 import { unauthorized, forbidden } from './errors.js';
 import { getAuditService, AuditActionType, AuditOutcome } from '../audit/audit-service.js';
 import { PrismaClient } from '@prisma/client';
+import { createHash } from 'node:crypto';
+
+/**
+ * Non-secret actor label for operator-initiated mutations (Issue #1066).
+ *
+ * Audit rows (DeadLetterReplayAttempt.actor, OperationalAudit, snapshot
+ * verification) must identify WHICH credential acted without storing the
+ * credential itself. Returns `operator:tok-<12 hex of sha256(token)>` when an
+ * X-Operator-Token header is present (stable per token, not reversible),
+ * otherwise `operator:ip-<ip>` / `operator:unknown`.
+ */
+export function operatorActorLabel(req: Request): string {
+  const raw = req.headers['x-operator-token'];
+  const token = Array.isArray(raw) ? raw[0] : raw;
+  if (typeof token === 'string' && token.length > 0) {
+    return `operator:tok-${createHash('sha256').update(token).digest('hex').slice(0, 12)}`;
+  }
+  return req.ip ? `operator:ip-${req.ip}` : 'operator:unknown';
+}
 
 // ── Route classification ────────────────────────────────────────────────────────
 //
