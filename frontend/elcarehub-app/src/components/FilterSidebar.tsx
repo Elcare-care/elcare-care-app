@@ -118,8 +118,8 @@ export function FilterSidebar({ filters, dispatch, isOpen, setIsOpen, recentArti
             <h2 className="text-lg font-semibold text-gray-900">Filters</h2>
             <button
               onClick={() => setIsOpen(false)}
-              className="rounded-lg p-2 text-gray-400 hover:bg-gray-100 lg:hidden"
               aria-label="Close filters"
+              className="rounded-lg p-2 text-gray-400 hover:bg-gray-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring-color)] lg:hidden"
             >
               <X size={20} />
             </button>
@@ -138,7 +138,7 @@ export function FilterSidebar({ filters, dispatch, isOpen, setIsOpen, recentArti
                       value={status}
                       checked={filters.status === status}
                       onChange={() => dispatch({ type: "SET_STATUS", payload: status })}
-                      className="h-4 w-4 border-gray-300 text-brand-600 focus:ring-brand-500"
+                      className="h-4 w-4 border-gray-300 text-brand-600 focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring-color)]"
                     />
                     <span className="text-sm text-gray-700">{status}</span>
                   </label>
@@ -155,7 +155,8 @@ export function FilterSidebar({ filters, dispatch, isOpen, setIsOpen, recentArti
                   placeholder="Min"
                   value={filters.minPrice}
                   onChange={(e) => dispatch({ type: "SET_MIN_PRICE", payload: e.target.value })}
-                  className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-brand-500 focus:outline-none focus:ring-1 focus:ring-brand-500"
+                  aria-label="Minimum price"
+                  className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-brand-500 focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring-color)]"
                 />
                 <span className="text-gray-500">-</span>
                 <input
@@ -163,7 +164,8 @@ export function FilterSidebar({ filters, dispatch, isOpen, setIsOpen, recentArti
                   placeholder="Max"
                   value={filters.maxPrice}
                   onChange={(e) => dispatch({ type: "SET_MAX_PRICE", payload: e.target.value })}
-                  className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-brand-500 focus:outline-none focus:ring-1 focus:ring-brand-500"
+                  aria-label="Maximum price"
+                  className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-brand-500 focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring-color)]"
                 />
               </div>
             </div>
@@ -176,7 +178,11 @@ export function FilterSidebar({ filters, dispatch, isOpen, setIsOpen, recentArti
                   collections.map((coll) => (
                     <label key={coll.contractAddress} className="flex items-center gap-3 cursor-pointer">
                       <div
-                        className={`flex h-4 w-4 items-center justify-center rounded border ${
+                        role="checkbox"
+                        tabIndex={0}
+                        aria-checked={filters.collection.includes(coll.contractAddress)}
+                        aria-label={coll.name || "Unnamed"}
+                        className={`flex h-4 w-4 items-center justify-center rounded border focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring-color)] ${
                           filters.collection.includes(coll.contractAddress)
                             ? "border-brand-500 bg-brand-500 text-white"
                             : "border-gray-300 bg-white"
@@ -184,6 +190,12 @@ export function FilterSidebar({ filters, dispatch, isOpen, setIsOpen, recentArti
                         onClick={(e) => {
                           e.preventDefault();
                           dispatch({ type: "TOGGLE_COLLECTION", payload: coll.contractAddress });
+                        }}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter" || e.key === " ") {
+                            e.preventDefault();
+                            dispatch({ type: "TOGGLE_COLLECTION", payload: coll.contractAddress });
+                          }
                         }}
                       >
                         {filters.collection.includes(coll.contractAddress) && <Check size={12} />}
@@ -210,7 +222,8 @@ export function FilterSidebar({ filters, dispatch, isOpen, setIsOpen, recentArti
                 value={filters.artist}
                 onChange={(e) => dispatch({ type: "SET_ARTIST", payload: e.target.value })}
                 list="recent-artists"
-                className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-brand-500 focus:outline-none focus:ring-1 focus:ring-brand-500"
+                aria-label="Artist address"
+                className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-brand-500 focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring-color)]"
               />
               <datalist id="recent-artists">
                 {recentArtists.map((address) => (
@@ -228,7 +241,7 @@ export function FilterSidebar({ filters, dispatch, isOpen, setIsOpen, recentArti
                   dispatch({ type: "SET_SORT", payload: e.target.value as SortOption })
                 }
                 aria-label="Sort listings"
-                className="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm focus:border-brand-500 focus:outline-none focus:ring-1 focus:ring-brand-500"
+                className="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm focus:border-brand-500 focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring-color)]"
               >
                 <option value="newest">Newest First</option>
                 <option value="oldest">Oldest First</option>
@@ -247,13 +260,13 @@ export function FilterSidebar({ filters, dispatch, isOpen, setIsOpen, recentArti
                 dispatch({ type: "CLEAR_ALL" });
                 setIsOpen(false);
               }}
-              className="w-full rounded-lg bg-brand-500 px-4 py-2.5 text-sm font-semibold text-white hover:bg-brand-600 transition-colors"
+              className="w-full rounded-lg bg-brand-500 px-4 py-2.5 text-sm font-semibold text-white hover:bg-brand-600 transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring-color)]"
             >
               Reset all filters
             </button>
             <button
               onClick={() => setIsOpen(false)}
-              className="w-full rounded-lg border border-gray-300 px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50 transition-colors lg:hidden"
+              className="w-full rounded-lg border border-gray-300 px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50 transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring-color)] lg:hidden"
             >
               Close
             </button>

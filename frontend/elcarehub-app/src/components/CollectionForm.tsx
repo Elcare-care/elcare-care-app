@@ -17,7 +17,11 @@ import { DEFAULT_TOKEN } from "@/config/tokens";
 import { useSupportedTokens } from "@/hooks/useSupportedTokens";
 import { getDefaultSupportedToken } from "@/lib/token-support";
 import { config } from "@/lib/config";
-import { validateCollectionName } from "@/lib/validation";
+import {
+  validateCollectionName,
+  validateCollectionMaxSupply,
+  COLLECTION_MAX_SUPPLY_LIMIT,
+} from "@/lib/validation";
 import { t } from "@/lib/i18n";
 
 function isValidStellarAddress(addr: string): boolean {
@@ -220,9 +224,8 @@ export function CollectionForm() {
         } else if (!/^[A-Z0-9]{1,10}$/.test(form.symbol)) {
           errors.symbol = "Symbol must be 1–10 uppercase letters or digits (A–Z, 0–9).";
         }
-        if (!Number.isInteger(form.maxSupply) || form.maxSupply < 1) {
-          errors.maxSupply = "Max supply must be a whole number of at least 1.";
-        }
+        const maxSupplyError = validateCollectionMaxSupply(form.maxSupply);
+        if (maxSupplyError) errors.maxSupply = maxSupplyError;
       }
     }
     if (step === 2) {
@@ -244,7 +247,7 @@ export function CollectionForm() {
         if (validateCollectionName(form.name)) return false;
         if (is721 && !form.symbol.trim()) return false;
         if (is721 && !/^[A-Z0-9]{1,10}$/.test(form.symbol)) return false;
-        if (is721 && form.maxSupply < 1) return false;
+        if (is721 && validateCollectionMaxSupply(form.maxSupply)) return false;
         return true;
       case 2:
         if (form.royaltyBps < 0 || form.royaltyBps > 10000) return false;
@@ -260,6 +263,8 @@ export function CollectionForm() {
 
   const handleDeploy = async () => {
     if (!publicKey || validateCollectionName(form.name)) return;
+    if (is721 && validateCollectionMaxSupply(form.maxSupply)) return;
+    if (form.royaltyBps < 0 || form.royaltyBps > 10000) return;
 
     const input: DeployCollectionInput = {
       ...form,
@@ -609,12 +614,17 @@ export function CollectionForm() {
                       required
                       type="number"
                       min={1}
+                      max={COLLECTION_MAX_SUPPLY_LIMIT}
+                      step={1}
                       value={form.maxSupply}
                       onChange={(e) =>
                         setForm({ ...form, maxSupply: parseInt(e.target.value) || 1 })
                       }
                       className={`w-full rounded-2xl border bg-gray-50/50 px-5 py-4 text-base focus:bg-white focus:outline-none transition-all shadow-sm font-inter ${nextAttempted && fieldErrors.maxSupply ? "border-red-400 focus:border-red-500" : "border-gray-200 focus:border-brand-500"}`}
                     />
+                    <p className="text-xs text-gray-500 font-inter">
+                      Whole number between 1 and {COLLECTION_MAX_SUPPLY_LIMIT.toLocaleString()}.
+                    </p>
                     {nextAttempted && fieldErrors.maxSupply && (
                       <p className="mt-1.5 flex items-center gap-1.5 text-xs font-medium text-red-600" role="alert">
                         <AlertTriangle size={12} aria-hidden="true" />{fieldErrors.maxSupply}
@@ -651,7 +661,7 @@ export function CollectionForm() {
                     onChange={(e) =>
                       setForm({ ...form, royaltyBps: parseInt(e.target.value) || 0 })
                     }
-                    className="w-full rounded-2xl border border-gray-200 bg-gray-50/50 px-5 py-4 pr-16 text-base focus:border-brand-500 focus:bg-white focus:outline-none transition-all shadow-sm font-inter"
+                    className={`w-full rounded-2xl border bg-gray-50/50 px-5 py-4 pr-16 text-base focus:bg-white focus:outline-none transition-all shadow-sm font-inter ${nextAttempted && fieldErrors.royaltyBps ? "border-red-400 focus:border-red-500" : "border-gray-200 focus:border-brand-500"}`}
                   />
                   <span className="absolute right-5 top-1/2 -translate-y-1/2 text-sm font-bold text-brand-600">
                     {((form.royaltyBps / 10000) * 100).toFixed(1)}%

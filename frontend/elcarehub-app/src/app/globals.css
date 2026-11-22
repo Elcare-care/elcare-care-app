@@ -21,6 +21,17 @@
   --green:       #1E9E63;
   --canvas:      #FBF7F0;
   --canvas-warm: #F5ECD8;
+
+  /* Focus ring tokens — consumed by :focus-visible rules below */
+  --focus-ring-color:  #C1440E;
+  --focus-ring-offset: 2px;
+  --focus-ring-width:  3px;
+}
+
+/* Dark / mudcloth theme override — keeps the ring visible on dark surfaces */
+[data-theme='dark'],
+.theme-dark {
+  --focus-ring-color: #FCD34D;
 }
 
 @layer base {
@@ -45,6 +56,12 @@
   ::selection {
     background: rgba(212, 160, 23, 0.28);
     color: #3D2B04;
+  }
+
+  /* ── Focus ring — visible in every supported theme ─────── */
+  :where(a, button, input, select, textarea, summary, [tabindex]):focus-visible {
+    outline: var(--focus-ring-width) solid var(--focus-ring-color);
+    outline-offset: var(--focus-ring-offset);
   }
 }
 
@@ -241,4 +258,45 @@
   .animation-delay-600  { animation-delay: 0.6s; }
   .animation-delay-800  { animation-delay: 0.8s; }
   .animation-delay-1000 { animation-delay: 1s; }
+}
+
+/* ── Reduced motion — decorative animation stops, status stays ── */
+@media (prefers-reduced-motion: reduce) {
+  .shimmer-text,
+  .hover-lift,
+  .stat-card,
+  .btn-primary,
+  .btn-outline,
+  .adinkra-pattern,
+  .corner-accent,
+  .kente-divider,
+  .african-divider,
+  .animation-delay-100,
+  .animation-delay-200,
+  .animation-delay-300,
+  .animation-delay-400,
+  .animation-delay-600,
+  .animation-delay-800,
+  .animation-delay-1000 {
+    animation-duration: 0.01ms;
+    animation-iteration-count: 1;
+    transition-duration: 0.01ms;
+  }
+
+  html {
+    scroll-behavior: auto;
+  }
+
+  /* Transaction feedback must remain visible (never hidden) */
+  [role='status'],
+  [role='alert'],
+  [aria-live],
+  .toast,
+  .tx-status {
+    visibility: visible;
+    opacity: 1;
+    animation-duration: 0.01ms;
+    animation-iteration-count: 1;
+    transition-duration: 0.01ms;
+  }
 }

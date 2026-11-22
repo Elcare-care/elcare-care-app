@@ -117,13 +117,73 @@ function clearListingDraft(publicKey: string): void {
 // ── Validation ────────────────────────────────────────────────
 
 /**
+ * Validates a metadata input value, accepting either a bare IPFS CID
+ * (CIDv0 `Qm…` or CIDv1 `b…`) or a well-formed `ipfs://` / `https://` URL
+ * whose path component is a valid CID. Returns an error message string,
+ * or `null` when the value is acceptable.
+ *
+ * Locale-aware: messages are resolved through `lib/i18n` so the same
+ * validation surface renders translated copy in `en` and `sw`.
+ */
+export function validateIpfsCid(value: string): string | null {
+  const trimmed = (value ?? "").trim();
+
+  if (!trimmed) {
+    return t("listing_metadata_required");
+  }
+
+  // Reject obviously malformed URLs / unsupported schemes up front so the
+  // user gets a precise message rather than a generic CID failure.
+  const schemeMatch = /^([a-zA-Z][a-zA-Z0-9+.-]*):\/\//.exec(trimmed);
+  if (schemeMatch) {
+    const scheme = schemeMatch[1].toLowerCase();
+    if (scheme !== "ipfs" && scheme !== "https") {
+      return t("listing_metadata_invalid_scheme");
+    }
+    let parsed: URL;
+    try {
+      parsed = new URL(trimmed);
+    } catch {
+      return t("listing_metadata_invalid_url");
+    }
+    // `ipfs://<cid>` puts the CID in the host; `https://gateway/<cid>` puts
+    // it in the path. Extract whichever applies and validate that segment.
+    const candidate =
+      scheme === "ipfs"
+        ? parsed.hostname
+        : parsed.pathname.split("/").filter(Boolean).pop() ?? "";
+    if (!candidate) {
+      return t("listing_metadata_invalid_url");
+    }
+    return isValidCid(candidate) ? null : t("listing_metadata_invalid_cid");
+  }
+
+  // Bare value — must itself be a CID.
+  return isValidCid(trimmed) ? null : t("listing_metadata_invalid_cid");
+}
+
+/** Structural CIDv0 / CIDv1 check (length + alphabet + prefix). */
+function isValidCid(value: string): boolean {
+  if (!value) return false;
+  // CIDv0: base58btc, always starts with "Qm", 46 chars.
+  if (value.startsWith("Qm")) {
+    return value.length === 46 && /^Qm[1-9A-HJ-NP-Za-km-z]{44}$/.test(value);
+  }
+  // CIDv1: base32, starts with "b", 46–100 chars, lowercase a–z / 2–7.
+  if (value.startsWith("b")) {
+    return value.length >= 46 && value.length <= 100 && /^b[a-z2-7]+$/.test(value);
+  }
+  return false;
+}
+
+/**
  * Validates all form fields against the contract constraints.
  * Returns an error map; an empty object means the form is valid.
  */
 export function validateListingForm(form: FormState): FieldErrors {
   const errors: FieldErrors = {};
 
-  // Metadata CID — must be a valid IPFS CIDv0 or CIDv1
+  // Metadata CID — must be a valid IPFS CIDv0/CIDv1 or ipfs:// / https:// URL
   const cidError = validateIpfsCid(form.metadataCid);
   if (cidError) {
     errors.metadataCid = cidError;
@@ -670,15 +730,23 @@ export function ListingForm({ listing, onSuccess, onCancel }: ListingFormProps) 
 
             {/* Metadata CID */}
             <div className="sm:col-span-2 space-y-2">
-              <label className="block text-sm font-bold text-gray-950 uppercase tracking-wider font-inter">
+              <label
+                htmlFor="listing-metadata-cid"
+                className="block text-sm font-bold text-gray-950 uppercase tracking-wider font-inter"
+              >
                 Artwork Metadata CID *
               </label>
               <input
+                id="listing-metadata-cid"
                 value={form.metadataCid}
                 onChange={(e) => setForm({ ...form, metadataCid: e.target.value })}
                 onBlur={() => markTouched("metadataCid")}
                 aria-invalid={shouldShowError("metadataCid") && !!errors.metadataCid}
-                aria-describedby={errors.metadataCid ? "err-metadata-cid" : undefined}
+                aria-describedby={
+                  shouldShowError("metadataCid") && errors.metadataCid
+                    ? "err-metadata-cid"
+                    : "hint-metadata-cid"
+                }
                 className={`w-full rounded-2xl border px-5 py-4 text-base font-mono focus:outline-none transition-all shadow-sm ${
                   shouldShowError("metadataCid") && errors.metadataCid
                     ? "border-red-400 bg-red-50/40 focus:border-red-500"
@@ -687,13 +755,21 @@ export function ListingForm({ listing, onSuccess, onCancel }: ListingFormProps) 
                 placeholder="bafybeig… or Qm…"
               />
               {shouldShowError("metadataCid") && errors.metadataCid ? (
-                <p id="err-metadata-cid" className="text-sm text-red-600 mt-1" role="alert">
+                <p
+                  id="err-metadata-cid"
+                  className="text-sm text-red-600 mt-1"
+                  role="alert"
+                  aria-live="polite"
+                  data-testid="metadata-cid-error"
+                >
                   {errors.metadataCid}
                 </p>
               ) : (
-                <p className="text-xs text-gray-400 font-inter">
+                <p id="hint-metadata-cid" className="text-xs text-gray-400 font-inter">
                   CIDv1 starts with <code className="font-mono">b</code> (46–100 chars) or
-                  CIDv0 starts with <code className="font-mono">Qm</code> (46 chars).
+                  CIDv0 starts with <code className="font-mono">Qm</code> (46 chars). An{" "}
+                  <code className="font-mono">ipfs://</code> or{" "}
+                  <code className="font-mono">https://</code> URL is also accepted.
                 </p>
               )}
             </div>
@@ -799,178 +875,3 @@ export function ListingForm({ listing, onSuccess, onCancel }: ListingFormProps) 
                   shouldShowError("nftTokenId") && errors.nftTokenId
                     ? "border-red-400 bg-red-50/40 focus:border-red-500"
                     : "border-gray-200 bg-gray-50/50 focus:border-brand-500 focus:bg-white"
-                }`}
-              />
-              {shouldShowError("nftTokenId") && errors.nftTokenId && (
-                <p id="err-tokenid" className="text-sm text-red-600 mt-1" role="alert">
-                  {errors.nftTokenId}
-                </p>
-              )}
-            </div>
-
-            {/* Price */}
-            <div className="space-y-2">
-              <label className="block text-sm font-bold text-gray-950 uppercase tracking-wider font-inter">
-                Price ({selectedToken.symbol}) *
-              </label>
-              <div className="relative">
-                <input
-                  type="number"
-                  min={MIN_PRICE_XLM}
-                  max={MAX_PRICE_XLM}
-                  step="any"
-                  value={Number.isNaN(form.price) ? "" : form.price}
-                  onChange={(e) => handlePriceChange(e.target.value, selectedToken)}
-                  onBlur={() => markTouched("price")}
-                  aria-invalid={shouldShowError("price") && !!(priceInputError || errors.price)}
-                  aria-describedby={priceInputError || errors.price ? "err-price" : undefined}
-                  className={`w-full rounded-2xl border px-5 py-4 pr-16 text-base focus:outline-none transition-all shadow-sm font-inter ${
-                    shouldShowError("price") && (priceInputError || errors.price)
-                      ? "border-red-400 bg-red-50/40 focus:border-red-500"
-                      : "border-gray-200 bg-gray-50/50 focus:border-brand-500 focus:bg-white"
-                  }`}
-                />
-                <span className="absolute right-5 top-1/2 -translate-y-1/2 text-sm font-bold text-brand-600">
-                  {selectedToken.symbol}
-                </span>
-              </div>
-              {shouldShowError("price") && (priceInputError || errors.price) && (
-                <p id="err-price" className="text-sm text-red-600 mt-1" role="alert">
-                  {priceInputError || errors.price}
-                </p>
-              )}
-            </div>
-
-            {/* Payment Token */}
-            <div className="space-y-2">
-              <label className="block text-sm font-bold text-gray-950 uppercase tracking-wider font-inter">
-                Payment Token *
-              </label>
-              <select
-                disabled={!hasTokenOptions || isEdit}
-                value={form.tokenAddress}
-                onChange={(e) => {
-                  setForm({ ...form, tokenAddress: e.target.value });
-                  markTouched("tokenAddress");
-                }}
-                onBlur={() => markTouched("tokenAddress")}
-                aria-invalid={shouldShowError("tokenAddress") && !!errors.tokenAddress}
-                aria-describedby={errors.tokenAddress ? "err-tokenaddress" : undefined}
-                className={`w-full appearance-none rounded-2xl border px-5 py-4 text-base focus:outline-none transition-all shadow-sm font-inter ${
-                  shouldShowError("tokenAddress") && errors.tokenAddress
-                    ? "border-red-400 bg-red-50/40 focus:border-red-500"
-                    : "border-gray-200 bg-gray-50/50 focus:border-brand-500 focus:bg-white"
-                }`}
-              >
-                {hasTokenOptions ? (
-                  tokenOptions.map((token) => (
-                    <option key={token.address} value={token.address}>
-                      {token.name} ({token.symbol})
-                    </option>
-                  ))
-                ) : (
-                  <option value="">No supported tokens available</option>
-                )}
-              </select>
-              {shouldShowError("tokenAddress") && errors.tokenAddress && (
-                <p id="err-tokenaddress" className="text-sm text-red-600 mt-1" role="alert">
-                  {errors.tokenAddress}
-                </p>
-              )}
-            </div>
-          </div>
-
-          {/* ── Royalty Recipients ── */}
-          <RoyaltySplitEditor
-            recipients={form.recipients}
-            onChange={(recipients) => setForm((cur) => ({ ...cur, recipients }))}
-            maxRecipients={MAX_RECIPIENTS}
-            protocolFeeBps={protocolFeeBps}
-            collectionDefault={collectionDefault}
-            disabled={isAnyLoading}
-            forceShowErrors={submitAttempted}
-          />
-
-          {/* Progress / lifecycle state label */}
-          {isLoading && progress && (
-            <div className="flex items-center gap-3 rounded-2xl bg-brand-50 px-6 py-4 text-sm font-semibold text-brand-700 animate-pulse">
-              <Loader2 size={20} className="animate-spin" />
-              {progress}
-            </div>
-          )}
-
-          {/* Typed transaction error — distinguishes wallet rejection, simulation
-              failure, and chain failure with per-category recovery instructions */}
-          {listingTxState.state === "error" && listingTxState.error && (
-            <TxErrorPanel
-              error={listingTxState.error}
-              txHash={listingTxState.txHash}
-              onRetry={resetListingTx}
-              onDismiss={resetListingTx}
-            />
-          )}
-
-          {/* Tx hash recovery link — visible once hash is known */}
-          {listingTxState.txHash && listingTxState.state !== "success" && (
-            <p className="text-xs text-gray-400 text-center">
-              Transaction:{" "}
-              <Link
-                href={`/tx/${listingTxState.txHash}`}
-                className="font-mono text-blue-500 hover:underline"
-                target="_blank"
-              >
-                {listingTxState.txHash.slice(0, 12)}…
-              </Link>
-            </p>
-          )}
-
-          {/* Fallback hook error string (e.g. IPFS upload failures that happen
-              before the tx is submitted) */}
-          {hookError && listingTxState.state !== "error" && (
-            <p className="rounded-2xl bg-red-50 px-6 py-4 text-sm font-bold text-red-600 border border-red-100">
-              {hookError}
-            </p>
-          )}
-
-          {/* Buttons */}
-          <div className="flex flex-col sm:flex-row gap-4 pt-4">
-            {isEdit && (
-              <button
-                type="button"
-                onClick={onCancel}
-                disabled={isAnyLoading}
-                className="flex-1 rounded-2xl border border-gray-200 py-4 text-lg font-semibold text-gray-600 hover:bg-gray-50 transition-all disabled:opacity-50"
-              >
-                Cancel
-              </button>
-            )}
-            <GuardButton
-              type="submit"
-              disabled={
-                isAnyLoading ||
-                !hasTokenOptions ||
-                !!priceInputError ||
-                (submitAttempted && !formIsValid) ||
-                (!isEdit && approvalStatus === false)
-              }
-              actionName={isEdit ? "to update your listing" : "to list your artwork"}
-              className="flex-[2] flex items-center justify-center gap-3 rounded-2xl bg-brand-500 py-5 text-xl font-bold text-white shadow-2xl shadow-brand-500/30 hover:bg-brand-600 hover:scale-[1.01] transition-all active:scale-[0.98] disabled:opacity-50 disabled:hover:scale-100"
-            >
-              {isAnyLoading ? (
-                <>
-                  <Loader2 size={24} className="animate-spin" />
-                  {progress || (isCheckingApproval ? "Checking approval…" : isApprovingMarketplace ? "Approving…" : "Processing…")}
-                </>
-              ) : (
-                <>
-                  {isEdit ? <Save size={24} /> : <Upload size={24} />}
-                  {isEdit ? "Update Listing" : "Create Listing"}
-                </>
-              )}
-            </GuardButton>
-          </div>
-        </form>
-      </div>
-    </div>
-  );
-}

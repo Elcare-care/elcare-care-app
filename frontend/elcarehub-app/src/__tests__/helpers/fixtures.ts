@@ -6,9 +6,11 @@
  * the fields it cares about.
  */
 
-import type { Listing } from "@/lib/contract";
+import type { Listing, Offer } from "@/lib/contract";
 import type { ArtworkMetadata } from "@/lib/ipfs";
 import type { AppNotification } from "@/lib/watchlist";
+import type { FreshnessMetadata } from "@/lib/indexerFreshness";
+import { STALE_THRESHOLDS_MS } from "@/lib/indexerFreshness";
 
 // ── Listing fixture ───────────────────────────────────────────────────────────
 
@@ -29,6 +31,50 @@ export function makeListing(overrides: Partial<Listing> = {}): Listing {
     status: "Active",
     owner: null,
     created_at: 1000,
+    ...overrides,
+  };
+}
+
+export function makeSoldListing(overrides: Partial<Listing> = {}): Listing {
+  return makeListing({ status: "Sold", owner: null, ...overrides });
+}
+
+export function makeCancelledListing(overrides: Partial<Listing> = {}): Listing {
+  return makeListing({ status: "Cancelled", owner: null, ...overrides });
+}
+
+// ── Auction fixture ───────────────────────────────────────────────────────────
+
+export interface AuctionFixture {
+  auction_id: number;
+  listing_id: number;
+  seller: string;
+  token: string;
+  highest_bid: bigint;
+  reserve_price: bigint;
+  min_increment: bigint;
+  currency: string;
+  end_time: number;
+  status: "Active" | "Finalized" | "Cancelled";
+  highest_bidder: string | null;
+}
+
+let _auctionSeq = 1;
+
+export function makeAuction(overrides: Partial<AuctionFixture> = {}): AuctionFixture {
+  const id = _auctionSeq++;
+  return {
+    auction_id: id,
+    listing_id: id,
+    seller: `GARTIST${String(id).padStart(49, "0")}`,
+    token: `CTOKEN${String(id).padStart(50, "0")}`,
+    highest_bid: 10_000_000n,   // 1 XLM
+    reserve_price: 5_000_000n,  // 0.5 XLM
+    min_increment: 1_000_000n,  // 0.1 XLM
+    currency: "XLM",
+    end_time: 2_000,
+    status: "Active",
+    highest_bidder: null,
     ...overrides,
   };
 }
@@ -140,10 +186,43 @@ export function makeActivityEvent(
   };
 }
 
+// ── FreshnessMetadata fixture ─────────────────────────────────────────────────
+
+/**
+ * Build a deterministic FreshnessMetadata snapshot.
+ *
+ * `fetchedAt` is an absolute epoch-ms value so tests never depend on the wall
+ * clock. Pass `ageMs` to derive it relative to a fixed reference instead.
+ */
+export function makeFreshness(
+  overrides: Partial<FreshnessMetadata> = {}
+): FreshnessMetadata {
+  return {
+    fetchedAt: 1_700_000_000_000,
+    sseConnected: true,
+    ...overrides,
+  };
+}
+
+/**
+ * Freshness snapshot that is older than the auction staleness threshold and
+ * has no live SSE connection — i.e. the indexer data is stale.
+ */
+export function makeStaleFreshness(
+  overrides: Partial<FreshnessMetadata> = {}
+): FreshnessMetadata {
+  return makeFreshness({
+    fetchedAt: 1_700_000_000_000 - STALE_THRESHOLDS_MS.auction - 60_000,
+    sseConnected: false,
+    ...overrides,
+  });
+}
+
 // ── Reset sequences (call in beforeEach for deterministic IDs) ────────────────
 
 export function resetFixtureSequences(): void {
   _listingSeq = 1;
   _notifSeq = 1;
   _activitySeq = 1;
+  _auctionSeq = 1;
 }

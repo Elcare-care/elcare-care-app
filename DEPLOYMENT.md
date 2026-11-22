@@ -183,9 +183,63 @@ kubectl rollout undo deployment/indexer -n elcarehub
 kubectl rollout status deployment/indexer -n elcarehub
 ```
 
+## Release Rollback Decision Template
+
+Use this template to decide between **full rollback**, **partial rollback**, and **forward-fix** based on the failure scope. It builds on the [deployment guide](docs/guides/deployment.md), the release workflow ([`.github/workflows/release.yml`](.github/workflows/release.yml)), and artifact verification ([`scripts/release/verify-artifact.sh`](scripts/release/verify-artifact.sh)).
+
+### Pre-Decision Evidence
+
+Before choosing a path, confirm the release artifact and current state:
+
+```bash
+# 1. Verify the promoted artifact (run before any promotion)
+./scripts/release/verify-artifact.sh <artifact-path>
+
+# 2. Confirm the release workflow run for the candidate version
+#    See .github/workflows/release.yml (run id / commit SHA)
+
+# 3. Capture current version and health
+kubectl describe deployment indexer -n elcarehub | grep Image:
+curl -s http://indexer:4000/health | jq .
+```
+
+### Decision Table
+
+| Scope | Trigger condition | Decision | Owner | Expected output | Escalation path |
+|-------|-------------------|----------|-------|-----------------|-----------------|
+| Frontend | Broken UI/API contract after release; error rate > 5% for > 10 min | **Partial rollback** (frontend only) | Frontend on-call | Previous frontend image restored; error rate back to baseline | Frontend lead → Release manager |
+| Indexer | `indexer_stalled == 1` for > 5 min, or `indexer_open_gaps_count > 20` for > 10 min | **Full rollback** | Indexer on-call | `kubectl rollout undo` complete; gaps draining; no duplicate polling | Indexer lead → Release manager → Incident commander |
+| Indexer | Sync lag elevated but reads healthy; no data loss | **Forward-fix** | Indexer on-call | Patch release with fix; lag trending down | Indexer lead → Release manager |
+| Contract | Contract address/ABI mismatch or failed artifact verification | **Full rollback** (halt promotion) | Release manager | Promotion halted; previous contract config restored | Release manager → Security lead |
+| Contract | Non-breaking config drift detected post-promotion | **Forward-fix** | Release manager | Corrected config deployed; verification re-run | Release manager → Contract owner |
+| Cross-cutting | Artifact verification fails (`verify-artifact.sh` non-zero) | **Full rollback** (block promotion) | Release manager | Promotion blocked; artifact rebuilt | Release manager → Security lead |
+
+### Rollback vs. Forward-Fix Rules
+
+- **Full rollback** when the indexer or contract scope is affected, or artifact verification fails.
+- **Partial rollback** when the failure is isolated to the frontend and the indexer/contract state is healthy.
+- **Forward-fix** only when reads remain available, no data loss occurred, and a patch can ship within the alert window.
+
+### Post-Decision Record
+
+Record the outcome in the issue file:
+
+- **Owner**: named on-call/lead from the table above
+- **Trigger**: the condition that fired
+- **Expected output**: restored version or patch release
+- **Rollback/escalation**: path taken and final state
+
+Credentials (operator token, registry auth) are referenced as placeholders only — never commit live values:
+
+```bash
+export OPERATOR_TOKEN="<operator-token>"
+export REGISTRY_AUTH="<registry-credentials>"
+```
+
 ## Configuration Changes
 
 ### Version Metadata
+=======
 
 Version metadata is embedded at build time and passed as environment variables:
 
@@ -405,6 +459,78 @@ services:
       - ./scripts:/scripts:ro
     command: ["sh", "-c", "node scripts/validate-config.js && npx prisma migrate deploy && node dist/index.js"]
 ```
+
+## Kubernetes Readiness Probe Review
+
+This section documents the health signals exposed by the indexer and database, the probe timing and dependencies, and the release checklist that must be followed whenever probe configuration or health endpoints change.
+
+### Health Endpoints
+
+The source of truth for probe behavior is `indexer/src/health.ts` (HTTP handlers and status aggregation) and `indexer/src/db-health.ts` (database connectivity and migration-state checks). Any change to probe semantics must be made there first, then reflected in the manifests below.
+
+| Endpoint | Purpose | Auth | Used by |
+|----------|---------|------|---------|
+| `/livez` | Liveness — process is running and event loop responsive | None | `livenessProbe` |
+| `/readyz` | Readiness — safe to receive traffic (DB reachable, migrations applied, sync lag within bounds) | None | `readinessProbe` |
+| `/health` | Aggregate health summary (status, version, uptime) | None | Smoke tests, dashboards |
+| `/health/details` | Full diagnostics (pool stats, migration version, dependency status) | `X-Admin-Token` | Operators, incident triage |
+
+### Probe Timing
+
+| Probe | Path | initialDelaySeconds | periodSeconds | timeoutSeconds | failureThreshold | successThreshold |
+|-------|------|---------------------|---------------|----------------|------------------|------------------|
+| Liveness | `/livez` | 60 | 15 | 5 | 3 | 1 |
+| Readiness | `/readyz` | 30 | 10 | 3 | 3 | 1 |
+| Startup | `/livez` | 10 | 10 | 3 | 30 | 1 |
+
+Notes:
+- The startup probe gives the process up to ~5 minutes to boot before liveness checks begin, preventing restart loops during slow cold starts.
+- Readiness `initialDelaySeconds` is intentionally shorter than liveness so a pod is only marked ready after `/readyz` passes its dependency checks.
+- `terminationGracePeriodSeconds: 60` must remain greater than the readiness `periodSeconds * failureThreshold` window so in-flight SSE clients drain before the pod is removed from endpoints.
+
+### Probe Dependencies
+
+`/readyz` returns non-200 (unready) when any of the following fail. Each dependency is evaluated in `indexer/src/health.ts` using helpers from `indexer/src/db-health.ts`:
+
+| Dependency | Check | Failure behavior |
+|------------|-------|------------------|
+| PostgreSQL connection | `SELECT 1` within timeout | Unready; pod removed from endpoints |
+| Prisma migrations | `_prisma_migrations` latest applied matches `DB_MIGRATION_VERSION` | Unready; **no traffic until migrations complete** |
+| Sync lag | `indexer_ledger_lag` below configured threshold | Unready if lag exceeds threshold for `failureThreshold` periods |
+| Redis | `PING` succeeds | Unready; SSE replay unavailable |
+| Stellar RPC | Recent successful poll within `RPC_STALE_THRESHOLD` | Unready if RPC unreachable beyond threshold |
+
+### Traffic Gating on Migrations
+
+Pods **must not receive traffic before Prisma migrations complete**. The readiness probe enforces this:
+
+1. The migration job (`k8s/migration-job.yaml`) runs `npx prisma migrate deploy` and completes before the rollout proceeds.
+2. `/readyz` compares the applied migration version against `DB_MIGRATION_VERSION`; a mismatch returns 503.
+3. The Deployment's `readinessProbe` keeps new pods out of the Service endpoints until `/readyz` returns 200.
+4. `maxUnavailable: 1` combined with readiness gating ensures at least one healthy, migration-compatible pod serves traffic at all times.
+
+Do not weaken or bypass the migration check in `/readyz` to "speed up" a rollout — it is the primary guard against serving traffic against an incompatible schema.
+
+### Release Checklist for Probe Changes
+
+**Owner**: DevOps Engineer
+
+**Trigger**: Any change to probe configuration (paths, timing, thresholds) in `k8s/indexer-deployment.yaml`, `docker-compose.prod.yml`, or any change to the behavior of `/livez`, `/readyz`, `/health`, or `/health/details` in `indexer/src/health.ts` or `indexer/src/db-health.ts`.
+
+**Expected output**: All gates pass in `scripts/deploy/health-gate.sh` (exit code 0), and the deployment reaches `kubectl rollout status` success with all pods Ready.
+
+- [ ] Change reviewed against `indexer/src/health.ts` and `indexer/src/db-health.ts` (source of truth)
+- [ ] Probe timing verified: `terminationGracePeriodSeconds` > readiness `periodSeconds * failureThreshold`
+- [ ] Migration gating confirmed: `/readyz` still returns 503 on migration version mismatch
+- [ ] Dependency checks (DB, Redis, Stellar RPC, sync lag) still covered by `/readyz`
+- [ ] `scripts/deploy/health-gate.sh` run locally against a staging-equivalent target and passes
+- [ ] Rollback plan documented in the change/PR
+
+**Rollback / escalation**:
+1. If `health-gate.sh` fails or pods do not become Ready: **do not shift traffic** to the new version.
+2. Revert the probe configuration change (`kubectl rollout undo deployment/indexer -n elcarehub` or `git revert` of the manifest change).
+3. Re-run `scripts/deploy/health-gate.sh` to confirm the previous configuration is healthy.
+4. If the previous configuration also fails the gate, **page the on-call engineer** and follow the Rollback Criteria table above.
 
 ## Monitoring Dashboard
 

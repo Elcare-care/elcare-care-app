@@ -35,6 +35,9 @@ const STATUS_BADGE: Record<string, string> = {
 /** How many times a listing card will attempt to reload stale/failed metadata before giving up. */
 const MAX_METADATA_RETRIES = 2;
 
+/** How long (ms) an image may stay pending before the card shows a fallback. */
+const IMAGE_LOAD_TIMEOUT_MS = 10_000;
+
 export function ListingCard({ listing, onPurchased }: ListingCardProps) {
   const { publicKey, status } = useWalletContext();
   const { buy, isBuying, error: buyError } = useBuyArtwork(publicKey);
@@ -43,6 +46,8 @@ export function ListingCard({ listing, onPurchased }: ListingCardProps) {
   const [isLoading, setIsLoading] = useState(true);
   const [metadataError, setMetadataError] = useState(false);
   const [metadataRetries, setMetadataRetries] = useState(0);
+  const [imageLoaded, setImageLoaded] = useState(false);
+  const [imageTimedOut, setImageTimedOut] = useState(false);
   const [showCheckout, setShowCheckout] = useState(false);
   const [purchaseSuccess, setPurchaseSuccess] = useState(false);
 
@@ -69,6 +74,24 @@ export function ListingCard({ listing, onPurchased }: ListingCardProps) {
   useEffect(() => {
     void loadMetadata();
   }, [loadMetadata]);
+
+  // Reset gateway index when metadata changes (new image to load).
+  useEffect(() => {
+    setGatewayIndex(0);
+  }, [metadata?.image]);
+
+  // Reset image load state whenever the candidate URL changes.
+  useEffect(() => {
+    setImageLoaded(false);
+    setImageTimedOut(false);
+  }, [currentImageUrl]);
+
+  // Deterministic timeout: if the image never fires load/error, fall back.
+  useEffect(() => {
+    if (!currentImageUrl || imageLoaded || imageTimedOut) return;
+    const id = setTimeout(() => setImageTimedOut(true), IMAGE_LOAD_TIMEOUT_MS);
+    return () => clearTimeout(id);
+  }, [currentImageUrl, imageLoaded, imageTimedOut]);
 
   const handleRetry = () => {
     if (metadataRetries >= MAX_METADATA_RETRIES) return;
@@ -155,19 +178,87 @@ export function ListingCard({ listing, onPurchased }: ListingCardProps) {
         className="block focus:outline-none focus:ring-2 focus:ring-brand-500 focus:ring-inset"
       >
         <div className="relative aspect-square overflow-hidden bg-brand-50">
-          <ArtworkImage
-            metadata={metadata}
-            isLoading={isLoading}
-            metadataError={metadataError}
-            onRetry={hasRetriesRemaining ? handleRetry : undefined}
-            retryCount={metadataRetries}
-            maxRetries={MAX_METADATA_RETRIES}
-            fallbackId={listing.listing_id}
-            imageClassName="group-hover:scale-105"
-          />
+          {isLoading ? (
+            /* Loading skeleton */
+            <div
+              className="flex h-full w-full items-center justify-center bg-gray-100 animate-pulse"
+              aria-label="Loading artwork"
+              data-testid="artwork-loading"
+            >
+              <span className="sr-only">Loading artwork…</span>
+            </div>
+          ) : metadataError && metadataRetries < MAX_METADATA_RETRIES ? (
+            /* Recoverable error: offer a retry */
+            <div
+              className="flex h-full w-full flex-col items-center justify-center gap-3 bg-gray-50 text-gray-400"
+              aria-label="Artwork unavailable"
+              data-testid="artwork-unavailable"
+            >
+              <WifiOff size={28} />
+              <span className="text-xs font-medium">Content unavailable</span>
+              <button
+                type="button"
+                onClick={(e) => { e.preventDefault(); handleRetry(); }}
+                className="flex items-center gap-1.5 rounded-lg bg-brand-50 px-3 py-1.5 text-xs font-semibold text-brand-600 hover:bg-brand-100 focus:outline-none focus:ring-2 focus:ring-brand-500 focus:ring-offset-1 transition-colors"
+                data-testid="artwork-retry-btn"
+                aria-label={`Retry loading artwork: ${metadata?.title ?? `Artwork #${listing.listing_id}`}`}
+              >
+                <RefreshCw size={11} />
+                Retry
+              </button>
+            </div>
+          ) : currentImageUrl && !allGatewaysExhausted && !imageTimedOut ? (
+            <Image
+              key={currentImageUrl}
+              src={currentImageUrl}
+              alt={
+                metadata?.isDecorativeImage
+                  ? ""
+                  : (metadata?.altText ?? metadata?.title ?? `Listing #${listing.listing_id}`)
+              }
+              fill
+              className="object-cover transition-transform duration-300 group-hover:scale-105"
+              onLoad={() => setImageLoaded(true)}
+              onError={() => setGatewayIndex((i) => i + 1)}
+              unoptimized
+            />
+          ) : (
+            /* All gateways exhausted or no image field */
+            <div
+              className="flex h-full w-full flex-col items-center justify-center bg-gray-50 text-gray-400"
+              aria-label="Artwork missing"
+              data-testid="artwork-missing"
+              data-fallback-reason={imageTimedOut ? "timeout" : "missing"}
+            >
+              <span className="text-4xl mb-2">🖼️</span>
+              <span className="text-xs font-medium uppercase tracking-wider">
+                {imageTimedOut ? "Artwork timed out" : "No Artwork"}
+              </span>
+            </div>
+          )}
+
+          {/* Content advisory overlay (Issue #7) */}
+          {!isLoading && metadata?.contentAdvisory && (
+            <div
+              className="absolute inset-0 flex items-center justify-center bg-black/60 backdrop-blur-sm opacity-0 group-hover:opacity-100 transition-opacity duration-200"
+              data-testid="content-advisory-overlay"
+              aria-live="polite"
+            >
+              <div className="mx-3 rounded-xl bg-midnight-900/90 px-3 py-2 text-center">
+                <p className="text-[10px] font-bold text-amber-400 uppercase tracking-widest mb-1">
+                  Content Advisory
+                </p>
+                <p className="text-[11px] text-white/80 leading-snug">
+                  {metadata.contentAdvisory}
+                </p>
+              </div>
+            </div>
+          )}
 
           {/* Status badge */}
           <span
+            data-testid="listing-status-badge"
+            data-status={isExpired ? "Expired" : listing.status}
             className={`absolute right-3 top-3 rounded-full px-2.5 py-0.5 text-xs font-semibold ${
               isExpired
                 ? "bg-orange-100 text-orange-600"
@@ -263,6 +354,7 @@ export function ListingCard({ listing, onPurchased }: ListingCardProps) {
           {listing.status === "Active" && (
             <GuardButton
               data-testid="buy-now-button"
+              data-action="purchase"
               onAction={() => setShowCheckout(true)}
               disabled={isBuying || isOwn}
               actionName="To purchase this artwork"
