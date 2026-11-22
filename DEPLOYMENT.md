@@ -30,6 +30,17 @@ This guide documents the tested rolling deployment sequence for the indexer serv
 └──────────────────────────────────────────────────┘
 ```
 
+## Compatibility Gate
+
+Before you deploy, confirm the release follows the
+[API & Event-Schema Versioning and Deprecation Policy](docs/api-versioning-policy.md):
+
+- For a new event `schema_version`, **deploy the indexer (decoder) before the contract**.
+- No REST/SSE contract is removed before its deprecation window ends.
+- [`COMPATIBILITY.md`](COMPATIBILITY.md) has a row for the combination being deployed.
+- `CORS_ORIGIN` is set (non-empty) for the target environment. See
+  [CORS Configuration Validation](docs/guides/cors-validation.md).
+
 ## Rolling Deployment Sequence
 
 ### Phase 1: Pre-Deployment Checks
@@ -137,8 +148,9 @@ kubectl logs -n elcarehub deploy/indexer | grep "Duplicate ledger" | wc -l
 # 2. Verify sync lag is acceptable
 curl -s http://indexer:4000/metrics | grep indexer_ledger_lag
 
-# 3. Verify SSE clients reconnect
+# 3. Verify SSE clients reconnect (read-only; see docs/sse-protocol.md#browser-reconnection-checklist)
 curl -s http://indexer:4000/health | jq .status
+curl -sN --max-time 5 -D - http://indexer:4000/events | head -n 12
 
 # 4. Run smoke test
 curl -s http://indexer:4000/api/marketplace/listings | jq '.data | length'

@@ -19,6 +19,7 @@ Stellar Soroban RPC (Default 5s poll interval)
         │
         ▼
    parser.ts  ───────► 3. Decode XDR events & compute unique eventHash
+        │                 (dedup keys & uniqueness: see event-deduplication.md)
         │
         ▼
    poller.ts  ───────► 4. Check ledger hash continuity (Re-org Detection)
@@ -33,6 +34,8 @@ Stellar Soroban RPC (Default 5s poll interval)
 ```
 
 ---
+
+> **Deduplication:** for how replayed RPC deliveries are rejected (the `eventHash` identity, DB unique indexes, the `elcarehub_duplicate_events_total` metric) and the open discrepancies, see [Event Deduplication Keys](event-deduplication.md).
 
 ## 2. Owning Files
 
