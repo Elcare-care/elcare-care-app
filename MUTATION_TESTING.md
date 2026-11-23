@@ -179,3 +179,46 @@ jq '.[-5:] | map({ timestamp: .timestamp, scores: .files | map({ (.file | split(
 
 Operators that produce compile errors (type mismatches, borrow violations) are
 automatically filtered by cargo-mutants and do not appear in results.
+
+---
+
+## Triage Procedure
+
+When a mutation run produces survivors, the following procedure applies. The full
+step-by-step process, decision tree, and worked example live in
+[`docs/runbooks/mutation-triage-runbook.md`](docs/runbooks/mutation-triage-runbook.md).
+
+**Owner:** @contracts-team (Backend Lead)  
+**Trigger:** Any nightly `mutation-full` or PR `mutation-pr` CI run that produces a
+`mutation-tests/reports/survivors-<timestamp>.md` report with one or more surviving mutants.  
+**Expected output:** Every surviving mutant is classified as Keep, Fix, or Retire and recorded
+(in this file or in a new test) within 5 business days.  
+**Rollback / escalation:** If the CI job is broken and not generating outcomes, re-trigger via
+manual dispatch (`mode=full`) from the GitHub Actions UI. If `cargo-mutants` itself is the
+failure, escalate to DevOps Engineer — do not suppress the CI failure while the tool is broken.
+
+### Classification summary
+
+| Classification | Meaning | Record in |
+|---|---|---|
+| **Fix** | Test gap — a real defect with this mutation would not be caught | New or strengthened test; re-run to confirm mutant is killed |
+| **Keep** | Semantically equivalent mutant — cannot change observable behaviour | `MUTATION_TESTING.md §Known Survivors` for the relevant module |
+| **Retire** | Dead code — mutated path is unreachable | `mutants.toml [[filters]] exclude_globs` + entry in `§Exclusions` |
+
+### Quick reference
+
+```bash
+# Reproduce a surviving mutant locally (no deployment, no network)
+FILE=contracts/soroban-marketplace/src/math.rs \
+  bash mutation-tests/run-mutation-tests.sh
+
+# Inspect raw survivors from the last run
+jq '[.[] | select(.outcome == "survived")]' cargo-mutants-out/outcomes.json
+
+# Check score trend for the last 3 runs
+jq '.[-3:] | map({ timestamp: .timestamp, scores: (.files | map({ (.file | split("/") | last): .score }) | add) })' \
+  mutation-tests/reports/trend.json
+```
+
+See [`docs/runbooks/mutation-triage-runbook.md`](docs/runbooks/mutation-triage-runbook.md) for the full
+decision tree, per-classification action steps, and a worked example from `math.rs`.
