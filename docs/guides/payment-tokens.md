@@ -141,3 +141,21 @@ since become unsupported can never reach a wallet-signing prompt, let alone sett
   `withDecimalAmounts`.
 - `indexer/src/api/routes.ts` — `serializeListing(s)`, `serializeAuction(s)`, `serializeOffers`.
 - `indexer/src/api/openapi.ts` — `ListingSchema` / `AuctionSchema` / `OfferSchema` field docs.
+
+---
+
+## 6. Token Whitelist Operational Matrix (Issue #1093)
+
+The marketplace token whitelist (`DataKey::TokenWhitelist`, managed via `add_token_to_whitelist`, `remove_token_from_whitelist`, `is_token_whitelisted`, and `get_token_whitelist`) governs which Stellar Asset Contract (SAC) addresses are accepted across listings, auctions, and offers. Operators must understand the exact lifecycle impact when adding or removing a token:
+
+| Whitelist State / Operator Action | New Listing / Auction / Offer Creation | Already-Active Listing (`buy_nft`) | Already-Active Auction (`place_bid` / `finalize_auction`) | Already-Pending Offer (`accept_offer` / `withdraw_offer` / `cancel_offer`) |
+|---|---|---|---|---|
+| **1. Empty Whitelist (Default Permissive Mode)** | Allowed for any valid SAC address passing `validate_token_asset` (non-self, non-NFT-collection). | Allowed using the listing's recorded `token`. | Allowed using the auction's recorded `token`. | Allowed using the offer's recorded `token`. |
+| **2. First Token Added (`add_token_to_whitelist`)** | Transitions contract to **Strict Whitelist Mode**: only explicitly whitelisted SAC addresses succeed; unlisted tokens fail with `ContractError::TokenNotWhitelisted`. | Listings whose `token` is whitelisted continue normally; see Row 4 if an existing listing's token is not in the whitelist. | Auctions whose `token` is whitelisted continue normally. | Pending offers whose `token` is whitelisted continue normally. |
+| **3. Additional Token Added (`add_token_to_whitelist`)** | Immediately enables new listings, auctions, and offers denominated in that SAC address (requires matching `TOKEN_METADATA` decimals entry off-chain). | No impact on existing listings. | No impact on existing auctions. | No impact on existing offers. |
+| **4. Token Removed (`remove_token_from_whitelist`)** | **Blocked immediately**: new `create_listing`, `create_auction`, and `make_offer` calls with the removed token fail with `ContractError::TokenNotWhitelisted`. | **Safe unwind**: `cancel_listing` remains available so sellers can delist; check `is_token_whitelisted` gate before delisting active inventory. | **Safe unwind**: in-flight escrowed bids and `cancel_auction` / `finalize_auction` settlement paths preserve escrowed bidder funds without stranding balances. | **Safe unwind**: `withdraw_offer` / `reject_offer` remain callable so buyers can always reclaim escrowed offer funds even after a token is delisted. |
+
+### Operator Procedure & Rollback for Token Delisting
+1. **Pre-removal audit (Read-Only):** Query the indexer (`GET /listings?status=Active`, `GET /auctions?status=Active`, `GET /offers?status=Pending`) filtered by the target `token` SAC address to inventory open positions before calling `remove_token_from_whitelist`.
+2. **Verification test command:** Run `cargo test -p soroban-marketplace whitelist` to verify all token whitelist addition, removal, and active-record unwind tests pass without mutating production state.
+3. **Rollback Path:** If removing a token disrupts an active partner settlement, re-add the SAC address via `add_token_to_whitelist(admin, token)` (restoring whitelist membership immediately without affecting historical records).

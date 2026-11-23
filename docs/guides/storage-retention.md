@@ -199,3 +199,22 @@ If a listing/auction TTL lapses, Soroban archives the entry. To recover:
    `renew_storage`) so the restored entry is re-bumped before the next archival.
 4. Prefer the indexer's DB for historical reads of terminal records; on-chain
    restore is for Active records that were unexpectedly archived.
+
+---
+
+## 7. Storage TTL Constants Inventory & Lifecycle Audit (Issue #1103)
+
+All TTL thresholds, extension targets, and batch bounds in `contracts/soroban-marketplace/src/storage.rs` are audited below without modifying on-chain contract storage layout:
+
+| Constant / Helper | Value (Ledgers) | Approx. Wall-Clock (`~5s`/ledger) | Storage Tier | Lifecycle & Bump Expectation |
+|---|---:|---|---|---|
+| `PERSISTENT_TTL_THRESHOLD` | `17_280` | ~1 day | Persistent (`DataKey::Listing`, `Auction`, `Offer`, paged indices) | If remaining TTL drops below `17_280` ledgers during any read/write or `extend_active_ttls` sweep, Soroban extends the entry to `PERSISTENT_TTL_BUMP`. |
+| `PERSISTENT_TTL_BUMP` | `518_400` | ~30 days | Persistent | Target lifetime after every `bump_entry_ttl` call on active listings, active auctions, pending offers, and index pages. |
+| `INSTANCE_TTL_THRESHOLD` | `17_280` | ~1 day | Instance (contract configuration, admin, roles, pause flags, fee bps, token whitelist) | Checked by `bump_instance_ttl` on contract invocations so contract-wide configuration remains hot alongside active traffic. |
+| `INSTANCE_TTL_BUMP` | `518_400` | ~30 days | Instance | Target lifetime for contract instance storage after `bump_instance_ttl`. |
+| `REENTRANCY_LOCK_TTL` | `100` | ~8.3 minutes | Temporary (`ListingLock`, `AuctionLock`) | Short-lived guard acquired during settlement and deleted before transaction exit; expires automatically if temporary storage is ever left untouched. |
+| `MAX_MAINTENANCE_ITEMS` | `100` items | Single transaction | Maintenance bound | Hard ceiling on `extend_active_ttls` and `cleanup_expired_locks` batch sizes so maintenance calls never exceed Soroban per-transaction read/write budgets. |
+
+### Operational Audit Conclusion
+- **Invariants Verified:** `cargo test -p soroban-marketplace` confirms that `bump_entry_ttl` and `extend_active_ttls` refresh only live records (`ListingStatus::Active`, `AuctionStatus::Active`, `OfferStatus::Pending`) while allowing terminal records to age out to Soroban archival storage without deleting provenance.
+- **Owner & Rollback:** Contract Maintainers; no contract storage mutation is required (no-action deployment conclusion). If ledger close times shift materially on Mainnet, keepers should adjust their off-chain `extend_active_ttls` polling frequency before modifying on-chain constants.

@@ -366,3 +366,68 @@ If pool adjustments cause database memory exhaustion or instability:
    SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = current_database() AND state = 'idle in transaction';
    ```
 
+---
+
+## Disposable Database Backup & Restore Drill Procedure (Issue #1113)
+
+A backup collected by `.github/workflows/db-backup.yml` is not considered verified until a restore has been exercised in a disposable container and schema/row integrity checks have passed. Production credentials must never be committed to the repository or copied into shared drill logs.
+
+### Prerequisites
+- Docker Engine (24+) and `psql` / `pg_restore` client tools installed locally or on an isolated runner.
+- A backup artifact downloaded from `.github/workflows/db-backup.yml` (or generated from a staging/local dump via `pg_dump -Fc`).
+- Zero production network bindings: the drill container runs on a loopback-only disposable port (`127.0.0.1:55432`) with a throwaway password.
+
+### Step-by-Step Disposable Restore Drill
+
+1. **Start a disposable PostgreSQL container:**
+   ```bash
+   docker run -d --rm \
+     --name elcare-restore-drill \
+     -e POSTGRES_USER=drill_user \
+     -e POSTGRES_PASSWORD=drill_disposable_pw \
+     -e POSTGRES_DB=elcare_drill \
+     -p 127.0.0.1:55432:5432 \
+     postgres:16-alpine
+   ```
+
+2. **Restore the backup artifact into the disposable instance:**
+   ```bash
+   pg_restore \
+     --host=127.0.0.1 \
+     --port=55432 \
+     --username=drill_user \
+     --dbname=elcare_drill \
+     --no-owner \
+     --no-privileges \
+     --exit-on-error \
+     /path/to/backup.dump
+   ```
+
+3. **Verify schema migrations and core table row counts (Success Criteria):**
+   ```bash
+   psql "postgresql://drill_user:drill_disposable_pw@127.0.0.1:55432/elcare_drill" -c "
+     SELECT table_name
+     FROM information_schema.tables
+     WHERE table_schema = 'public'
+     ORDER BY table_name;
+   "
+   psql "postgresql://drill_user:drill_disposable_pw@127.0.0.1:55432/elcare_drill" -c "
+     SELECT
+       (SELECT COUNT(*) FROM "_prisma_migrations" WHERE finished_at IS NOT NULL) AS applied_migrations,
+       (SELECT COUNT(*) FROM "Listing") AS listings_count,
+       (SELECT COUNT(*) FROM "Auction") AS auctions_count,
+       (SELECT COUNT(*) FROM "Offer") AS offers_count;
+   "
+   ```
+   - **Pass criteria:** `pg_restore` exits with code `0`, `applied_migrations > 0` with zero failed migrations, and core marketplace tables (`Listing`, `Auction`, `Offer`) query cleanly without corruption errors.
+
+4. **Destroy the disposable environment and scrub local artifacts:**
+   ```bash
+   docker stop elcare-restore-drill
+   shred -u /path/to/backup.dump 2>/dev/null || rm -f /path/to/backup.dump
+   ```
+
+### Drill Ownership, Cadence, & Escalation
+- **Owner:** Primary DevOps (`ops@elcarehub.xyz`) / Backend Lead (`backend-lead@elcarehub.xyz`).
+- **Trigger & Cadence:** Monthly scheduled drill (first Monday after the weekly `.github/workflows/db-backup.yml` run) and mandatory pre-release verification before any major Prisma schema upgrade.
+- **Rollback / Escalation Path:** If `pg_restore` fails or reports missing tables in the disposable container, **do not proceed with production schema migrations**. Open a P1 incident in `#alerts`, inspect `.github/workflows/db-backup.yml` logs, and trigger a fresh verified snapshot before any maintenance window.
