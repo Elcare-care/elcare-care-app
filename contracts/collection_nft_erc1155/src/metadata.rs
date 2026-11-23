@@ -175,7 +175,8 @@ pub fn validate_token_uri(uri: &SorobanString) -> Result<(), Error> {
         && bytes.get(1) == Some(97u8)  // 'a'
         && bytes.get(2) == Some(116u8) // 't'
         && bytes.get(3) == Some(97u8)  // 'a'
-        && bytes.get(4) == Some(58u8)  // ':'
+        && bytes.get(4) == Some(58u8)
+    // ':'
     {
         return Err(Error::InvalidUri);
     }

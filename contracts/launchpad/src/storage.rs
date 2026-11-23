@@ -96,16 +96,24 @@ pub fn set_wasm_hash_for_kind(env: &Env, kind: &CollectionKind, wasm_hash: &Byte
         .set(&DataKey::CollectionWasmHash(kind.clone()), wasm_hash);
     match kind {
         CollectionKind::Normal721 => {
-            env.storage().instance().set(&DataKey::WasmNormal721, wasm_hash);
+            env.storage()
+                .instance()
+                .set(&DataKey::WasmNormal721, wasm_hash);
         }
         CollectionKind::Normal1155 => {
-            env.storage().instance().set(&DataKey::WasmNormal1155, wasm_hash);
+            env.storage()
+                .instance()
+                .set(&DataKey::WasmNormal1155, wasm_hash);
         }
         CollectionKind::LazyMint721 => {
-            env.storage().instance().set(&DataKey::WasmLazy721, wasm_hash);
+            env.storage()
+                .instance()
+                .set(&DataKey::WasmLazy721, wasm_hash);
         }
         CollectionKind::LazyMint1155 => {
-            env.storage().instance().set(&DataKey::WasmLazy1155, wasm_hash);
+            env.storage()
+                .instance()
+                .set(&DataKey::WasmLazy1155, wasm_hash);
         }
     }
 }
@@ -451,7 +459,7 @@ pub fn creator_collection_by_index(
 #[soroban_sdk::contracttype]
 #[derive(Clone)]
 pub struct MigrationProgress {
-    pub phase:  u32,
+    pub phase: u32,
     pub cursor: u64,
 }
 
@@ -482,7 +490,10 @@ pub fn get_migration_progress(env: &Env, version: &soroban_sdk::String) -> Migra
     env.storage()
         .persistent()
         .get::<DataKey, MigrationProgress>(&DataKey::MigrationCursor(version.clone()))
-        .unwrap_or(MigrationProgress { phase: 0, cursor: 0 })
+        .unwrap_or(MigrationProgress {
+            phase: 0,
+            cursor: 0,
+        })
 }
 
 pub fn set_migration_progress(

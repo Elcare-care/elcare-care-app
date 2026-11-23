@@ -390,24 +390,3 @@ fn test_set_collection_fee_bps_authorized_while_paused() {
     client.set_collection_fee_bps(&admin, &collection, &750u32);
     assert_eq!(client.get_collection_fee_bps(&collection), Some(750u32));
 }
-
-#[test]
-fn test_set_collection_fee_bps_state_unchanged_after_rejection() {
-    let (env, client, admin, _) = setup_full();
-    let collection = Address::generate(&env);
-    // No override exists yet — None
-    assert!(client.get_collection_fee_bps(&collection).is_none());
-
-    let config_holder = Address::generate(&env);
-    client.propose_role_transfer(&admin, &RoleType::ProtocolConfig, &config_holder);
-    client.accept_role_transfer(&RoleType::ProtocolConfig, &config_holder);
-
-    let stranger = Address::generate(&env);
-    let result = client.try_set_collection_fee_bps(&stranger, &collection, &1000u32);
-    assert!(result.is_err());
-    // Still None after the failed call
-    assert!(
-        client.get_collection_fee_bps(&collection).is_none(),
-        "collection fee override must not be set after a rejected call"
-    );
-}

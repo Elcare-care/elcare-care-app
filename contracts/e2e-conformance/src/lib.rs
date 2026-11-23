@@ -4,8 +4,7 @@
 //! `cargo build --target wasm32v1-none --release -p collection-nft-erc721 -p collection-nft-erc1155 -p lazy-mint-erc721 -p lazy-mint-erc1155`
 
 use soroban_sdk::{
-    testutils::Address as _,
-    Address, Env, IntoVal, String, Symbol, TryFromVal, Val, Vec,
+    testutils::Address as _, Address, Env, IntoVal, String, Symbol, TryFromVal, Val, Vec,
 };
 
 /// Exercises a deployed collection contract against ERC-721 / ERC-1155 / lazy-mint expectations.
@@ -137,13 +136,7 @@ impl<'a> CollectionConformance<'a> {
         );
         self.invoke::<()>(
             "burn",
-            Vec::from_array(
-                self.env,
-                [
-                    recipient.to_val(),
-                    token_id.into_val(self.env),
-                ],
-            ),
+            Vec::from_array(self.env, [recipient.to_val(), token_id.into_val(self.env)]),
         );
 
         let uri2 = String::from_str(self.env, "ipfs://e2e/freeze");
@@ -154,26 +147,14 @@ impl<'a> CollectionConformance<'a> {
         self.invoke::<()>("freeze_metadata", Vec::new(self.env));
         self.invoke::<()>(
             "freeze_token",
-            Vec::from_array(
-                self.env,
-                [
-                    self.creator.to_val(),
-                    tid2.into_val(self.env),
-                ],
-            ),
+            Vec::from_array(self.env, [self.creator.to_val(), tid2.into_val(self.env)]),
         );
 
         let successor = Address::generate(self.env);
         let expiry = self.env.ledger().sequence() + 10_000;
         self.invoke::<()>(
             "propose_creator",
-            Vec::from_array(
-                self.env,
-                [
-                    successor.to_val(),
-                    expiry.into_val(self.env),
-                ],
-            ),
+            Vec::from_array(self.env, [successor.to_val(), expiry.into_val(self.env)]),
         );
         self.invoke::<()>(
             "accept_creator",
@@ -197,29 +178,15 @@ impl<'a> CollectionConformance<'a> {
             "mint_new",
             Vec::from_array(
                 self.env,
-                [
-                    holder.to_val(),
-                    10_u128.into_val(self.env),
-                    uri.to_val(),
-                ],
+                [holder.to_val(), 10_u128.into_val(self.env), uri.to_val()],
             ),
         );
 
         let balance: u128 = self.invoke(
             "balance_of",
-            Vec::from_array(
-                self.env,
-                [
-                    holder.to_val(),
-                    token_id.into_val(self.env),
-                ],
-            ),
+            Vec::from_array(self.env, [holder.to_val(), token_id.into_val(self.env)]),
         );
-        assert_eq!(
-            balance, 10,
-            "{}: balance_of after mint_new",
-            self.kind
-        );
+        assert_eq!(balance, 10, "{}: balance_of after mint_new", self.kind);
 
         let (royalty_recv, royalty_bps): (Address, u32) =
             self.invoke("royalty_info", Vec::new(self.env));
@@ -253,26 +220,22 @@ impl<'a> CollectionConformance<'a> {
         );
         let bal_holder: u128 = self.invoke(
             "balance_of",
-            Vec::from_array(
-                self.env,
-                [
-                    holder.to_val(),
-                    token_id.into_val(self.env),
-                ],
-            ),
+            Vec::from_array(self.env, [holder.to_val(), token_id.into_val(self.env)]),
         );
         let bal_recv: u128 = self.invoke(
             "balance_of",
-            Vec::from_array(
-                self.env,
-                [
-                    recipient.to_val(),
-                    token_id.into_val(self.env),
-                ],
-            ),
+            Vec::from_array(self.env, [recipient.to_val(), token_id.into_val(self.env)]),
         );
-        assert_eq!(bal_holder, 7, "{}: holder balance after partial transfer", self.kind);
-        assert_eq!(bal_recv, 3, "{}: recipient balance after partial transfer", self.kind);
+        assert_eq!(
+            bal_holder, 7,
+            "{}: holder balance after partial transfer",
+            self.kind
+        );
+        assert_eq!(
+            bal_recv, 3,
+            "{}: recipient balance after partial transfer",
+            self.kind
+        );
     }
 
     /// Lazy ERC-721: contract_type plus exported redeem entrypoint (full voucher path is integration-tested in launchpad).

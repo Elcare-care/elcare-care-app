@@ -16,10 +16,13 @@ use soroban_sdk::{
 };
 
 fn valid_recipients(env: &Env, artist: &Address) -> soroban_sdk::Vec<Recipient> {
-    vec![env, Recipient {
-        address: artist.clone(),
-        percentage: 10_000,
-    }]
+    vec![
+        env,
+        Recipient {
+            address: artist.clone(),
+            percentage: 10_000,
+        },
+    ]
 }
 
 fn setup_marketplace(
@@ -47,7 +50,12 @@ fn setup_marketplace(
     (client, artist, buyer, payment_token, contract_id)
 }
 
-fn mint_721_to_artist(env: &Env, collection: &Address, _creator: &Address, artist: &Address) -> u64 {
+fn mint_721_to_artist(
+    env: &Env,
+    collection: &Address,
+    _creator: &Address,
+    artist: &Address,
+) -> u64 {
     let uri = String::from_str(env, "ipfs://marketplace-e2e");
     env.invoke_contract::<u64>(
         collection,
@@ -135,17 +143,11 @@ fn erc721_listing_buy_transfers_with_royalty_bps_configured() {
         &valid_recipients(&env, &artist),
         &None::<u64>,
     );
-    assert_eq!(
-        mp.get_listing(&listing_id).status,
-        ListingStatus::Active
-    );
+    assert_eq!(mp.get_listing(&listing_id).status, ListingStatus::Active);
 
     let buyer_before = TokenClient::new(&env, &payment_token).balance(&buyer);
     mp.buy_artwork(&buyer, &listing_id);
-    assert_eq!(
-        mp.get_listing(&listing_id).status,
-        ListingStatus::Sold
-    );
+    assert_eq!(mp.get_listing(&listing_id).status, ListingStatus::Sold);
 
     let owner: Address = env.invoke_contract(
         &collection,

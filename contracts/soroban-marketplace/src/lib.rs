@@ -72,11 +72,15 @@ mod royalty_boundary_tests;
 #[cfg(test)]
 mod role_fallback_tests;
 
+#[cfg(test)]
+mod simulate_payout_tests;
+
 pub use contract::MarketplaceContract;
 pub use types::{
     Auction, AuctionCancelReason, AuctionStatus, BatchItemError, BidRecord, CancelReason,
     CollectionStandard, GovernanceProposal, GovernanceProposalType, Listing, ListingStatus,
-    MarketplaceError, Offer, OfferStatus, PauseMatrix, Recipient, RoleType,
+    MarketplaceError, Offer, OfferStatus, OptionalPayoutLeg, PauseMatrix, PayoutLeg, PayoutPlan,
+    Recipient, RoleType,
 };
 
 #[cfg(any(test, feature = "testutils"))]

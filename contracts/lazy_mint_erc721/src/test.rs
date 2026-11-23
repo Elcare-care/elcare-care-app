@@ -183,20 +183,37 @@ fn digest_byte_layout_is_stable() {
     // Digest must be deterministic.
     assert_eq!(digest1, digest2);
     // Field-mutation must change the digest (catches field-swap bugs).
-    let v_diff_id = MintVoucher { token_id: 2, ..v.clone() };
-    let d_diff = env.as_contract(&contract_id, || LazyMint721::_voucher_digest(&env, &v_diff_id));
+    let v_diff_id = MintVoucher {
+        token_id: 2,
+        ..v.clone()
+    };
+    let d_diff = env.as_contract(&contract_id, || {
+        LazyMint721::_voucher_digest(&env, &v_diff_id)
+    });
     assert_ne!(digest1, d_diff, "mutating token_id must change digest");
-    let v_diff_price = MintVoucher { price: 501, ..v.clone() };
-    let d_diff2 = env.as_contract(&contract_id, || LazyMint721::_voucher_digest(&env, &v_diff_price));
+    let v_diff_price = MintVoucher {
+        price: 501,
+        ..v.clone()
+    };
+    let d_diff2 = env.as_contract(&contract_id, || {
+        LazyMint721::_voucher_digest(&env, &v_diff_price)
+    });
     assert_ne!(digest1, d_diff2, "mutating price must change digest");
     let v_diff_uri = MintVoucher {
         uri_hash: BytesN::from_array(&env, &[0xbbu8; 32]),
         ..v.clone()
     };
-    let d_diff3 = env.as_contract(&contract_id, || LazyMint721::_voucher_digest(&env, &v_diff_uri));
+    let d_diff3 = env.as_contract(&contract_id, || {
+        LazyMint721::_voucher_digest(&env, &v_diff_uri)
+    });
     assert_ne!(digest1, d_diff3, "mutating uri_hash must change digest");
-    let v_diff_exp = MintVoucher { valid_until: 1, ..v.clone() };
-    let d_diff4 = env.as_contract(&contract_id, || LazyMint721::_voucher_digest(&env, &v_diff_exp));
+    let v_diff_exp = MintVoucher {
+        valid_until: 1,
+        ..v.clone()
+    };
+    let d_diff4 = env.as_contract(&contract_id, || {
+        LazyMint721::_voucher_digest(&env, &v_diff_exp)
+    });
     assert_ne!(digest1, d_diff4, "mutating valid_until must change digest");
 }
 
@@ -666,7 +683,10 @@ fn batch_one_expired_voucher_reverts_all() {
     env.ledger().with_mut(|li| li.sequence_number = 200);
     let buyer = Address::generate(&env);
     let good = make_batch_item(&env, &client.address, 400);
-    let expired_v = MintVoucher { valid_until: 100, ..make_voucher(&env, 401) };
+    let expired_v = MintVoucher {
+        valid_until: 100,
+        ..make_voucher(&env, 401)
+    };
     let expired_sig = sign_voucher(&env, &client.address, &expired_v);
     let bad = BatchVoucherItem {
         voucher: expired_v,
@@ -894,9 +914,13 @@ mod migration {
                 body.topics.iter().any(|t| {
                     if let ScVal::Symbol(s) = t {
                         core::str::from_utf8(s.0.as_slice()).unwrap_or("") == "migrated"
-                    } else { false }
+                    } else {
+                        false
+                    }
                 })
-            } else { false }
+            } else {
+                false
+            }
         });
         assert!(found, "expected 'migrated' event");
     }
@@ -989,8 +1013,12 @@ fn voucher_status_revoked_takes_priority_over_redeemed_flag() {
     let (env, client, _creator, _fee) = setup(0);
     // Simulate edge case: both flags set (revoked wins for display)
     env.as_contract(&client.address, || {
-        env.storage().persistent().set(&DataKey::RevokedVoucher(1003u64), &true);
-        env.storage().persistent().set(&DataKey::UsedVoucher(1003u64), &true);
+        env.storage()
+            .persistent()
+            .set(&DataKey::RevokedVoucher(1003u64), &true);
+        env.storage()
+            .persistent()
+            .set(&DataKey::UsedVoucher(1003u64), &true);
     });
     let status = client.voucher_status(&1003u64);
     assert_eq!(status, String::from_str(&env, "Revoked"));
@@ -1007,7 +1035,10 @@ fn revoke_and_redeem_are_mutually_exclusive_revoke_first() {
     let sig = sign_voucher(&env, &client.address, &v);
     let result = client.try_redeem(&buyer, &v, &sig, &empty_proof(&env));
     assert_eq!(result, Err(Ok(Error::VoucherRevoked)));
-    assert_eq!(client.voucher_status(&2000u64), String::from_str(&env, "Revoked"));
+    assert_eq!(
+        client.voucher_status(&2000u64),
+        String::from_str(&env, "Revoked")
+    );
     assert!(!client.is_voucher_redeemed(&2000u64));
 }
 
@@ -1023,7 +1054,10 @@ fn revoke_after_redeem_returns_already_redeemed_error() {
     assert!(client.is_voucher_redeemed(&2001u64));
     let result = client.try_revoke_voucher(&2001u64);
     assert_eq!(result, Err(Ok(Error::VoucherAlreadyRedeemed)));
-    assert_eq!(client.voucher_status(&2001u64), String::from_str(&env, "Redeemed"));
+    assert_eq!(
+        client.voucher_status(&2001u64),
+        String::from_str(&env, "Redeemed")
+    );
 }
 
 #[test]
@@ -1042,7 +1076,10 @@ fn batch_revoke_all_or_nothing_partially_redeemed() {
     let result = client.try_revoke_vouchers(&nonces);
     assert_eq!(result, Err(Ok(Error::VoucherAlreadyRedeemed)));
     // Fresh nonce must NOT have been revoked (all-or-nothing)
-    assert_eq!(client.voucher_status(&2003u64), String::from_str(&env, "Issued"));
+    assert_eq!(
+        client.voucher_status(&2003u64),
+        String::from_str(&env, "Issued")
+    );
 }
 
 // ── Security hardening regression tests (issue #6) ───────────────────────────

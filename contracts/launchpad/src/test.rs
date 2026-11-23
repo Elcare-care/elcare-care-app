@@ -250,7 +250,6 @@ fn deploys_lazy_721_twice_with_unique_addresses() {
         &royalty_receiver,
         &0u32,
         &salt_a,
-
         &String::from_str(&env, "Test Network; September 2015"),
     );
 
@@ -265,7 +264,6 @@ fn deploys_lazy_721_twice_with_unique_addresses() {
         &royalty_receiver,
         &0u32,
         &salt_b,
-
         &String::from_str(&env, "Test Network; September 2015"),
     );
 
@@ -305,7 +303,6 @@ fn deploys_lazy_1155_twice_with_unique_addresses() {
         &royalty_receiver,
         &0u32,
         &salt_a,
-
         &String::from_str(&env, "Test Network; September 2015"),
     );
 
@@ -318,7 +315,6 @@ fn deploys_lazy_1155_twice_with_unique_addresses() {
         &royalty_receiver,
         &0u32,
         &salt_b,
-
         &String::from_str(&env, "Test Network; September 2015"),
     );
 
@@ -514,7 +510,6 @@ fn same_salt_different_creators_lazy_721_yields_different_addresses() {
         &royalty_receiver,
         &0u32,
         &salt,
-
         &String::from_str(&env, "Test Network; September 2015"),
     );
 
@@ -529,7 +524,6 @@ fn same_salt_different_creators_lazy_721_yields_different_addresses() {
         &royalty_receiver,
         &0u32,
         &salt,
-
         &String::from_str(&env, "Test Network; September 2015"),
     );
 
@@ -559,7 +553,6 @@ fn same_salt_different_creators_lazy_1155_yields_different_addresses() {
         &royalty_receiver,
         &0u32,
         &salt,
-
         &String::from_str(&env, "Test Network; September 2015"),
     );
 
@@ -572,7 +565,6 @@ fn same_salt_different_creators_lazy_1155_yields_different_addresses() {
         &royalty_receiver,
         &0u32,
         &salt,
-
         &String::from_str(&env, "Test Network; September 2015"),
     );
 
@@ -691,7 +683,6 @@ fn front_runner_cannot_grief_lazy_721() {
         &royalty_receiver,
         &0u32,
         &salt,
-
         &String::from_str(&env, "Test Network; September 2015"),
     );
 
@@ -706,7 +697,6 @@ fn front_runner_cannot_grief_lazy_721() {
         &royalty_receiver,
         &0u32,
         &salt,
-
         &String::from_str(&env, "Test Network; September 2015"),
     );
 
@@ -736,7 +726,6 @@ fn front_runner_cannot_grief_lazy_1155() {
         &royalty_receiver,
         &0u32,
         &salt,
-
         &String::from_str(&env, "Test Network; September 2015"),
     );
 
@@ -749,7 +738,6 @@ fn front_runner_cannot_grief_lazy_1155() {
         &royalty_receiver,
         &0u32,
         &salt,
-
         &String::from_str(&env, "Test Network; September 2015"),
     );
 
@@ -871,7 +859,6 @@ fn duplicate_creator_salt_lazy_721_is_idempotent() {
         &royalty_receiver,
         &0u32,
         &salt,
-
         &String::from_str(&env, "Test Network; September 2015"),
     );
     env.events().all();
@@ -886,7 +873,6 @@ fn duplicate_creator_salt_lazy_721_is_idempotent() {
         &royalty_receiver,
         &0u32,
         &salt,
-
         &String::from_str(&env, "Test Network; September 2015"),
     );
     let launchpad_id = client.address.clone();
@@ -919,7 +905,6 @@ fn duplicate_creator_salt_lazy_1155_is_idempotent() {
         &royalty_receiver,
         &0u32,
         &salt,
-
         &String::from_str(&env, "Test Network; September 2015"),
     );
     env.events().all();
@@ -932,7 +917,6 @@ fn duplicate_creator_salt_lazy_1155_is_idempotent() {
         &royalty_receiver,
         &0u32,
         &salt,
-
         &String::from_str(&env, "Test Network; September 2015"),
     );
     let launchpad_id = client.address.clone();
@@ -1070,7 +1054,6 @@ fn deploy_without_wasm_hashes_fails_for_all_kinds() {
         &royalty_receiver,
         &0u32,
         &salt,
-
         &String::from_str(&env, "Test Network; September 2015"),
     );
     assert_eq!(result, Err(Ok(Error::WasmHashNotSet)));
@@ -1084,7 +1067,6 @@ fn deploy_without_wasm_hashes_fails_for_all_kinds() {
         &royalty_receiver,
         &0u32,
         &salt,
-
         &String::from_str(&env, "Test Network; September 2015"),
     );
     assert_eq!(result, Err(Ok(Error::WasmHashNotSet)));
@@ -1340,7 +1322,6 @@ fn deploys_revert_while_paused_for_all_kinds() {
             &royalty_receiver,
             &0u32,
             &BytesN::from_array(&env, &[0xB3u8; 32]),
-
             &String::from_str(&env, "Test Network; September 2015"),
         ),
         Err(Ok(Error::ContractPaused))
@@ -1355,7 +1336,6 @@ fn deploys_revert_while_paused_for_all_kinds() {
             &royalty_receiver,
             &0u32,
             &BytesN::from_array(&env, &[0xB4u8; 32]),
-
             &String::from_str(&env, "Test Network; September 2015"),
         ),
         Err(Ok(Error::ContractPaused))
@@ -1479,7 +1459,6 @@ fn zero_deploy_fee_charges_nothing_for_all_kinds() {
         &royalty_receiver,
         &0u32,
         &BytesN::from_array(&env, &[0xC3u8; 32]),
-
         &String::from_str(&env, "Test Network; September 2015"),
     );
     assert!(!event_with_tag_present(
@@ -1497,7 +1476,6 @@ fn zero_deploy_fee_charges_nothing_for_all_kinds() {
         &royalty_receiver,
         &0u32,
         &BytesN::from_array(&env, &[0xC4u8; 32]),
-
         &String::from_str(&env, "Test Network; September 2015"),
     );
     assert!(!event_with_tag_present(
@@ -1538,7 +1516,11 @@ fn flat_deploy_fee_charged_for_all_kinds() {
         &0u32,
         &BytesN::from_array(&env, &[0xD1u8; 32]),
     );
-    assert!(event_with_tag_present(&env, &client.address, symbol_short!("fee_coll")));
+    assert!(event_with_tag_present(
+        &env,
+        &client.address,
+        symbol_short!("fee_coll")
+    ));
     assert_eq!(token_client.balance(&treasury), FEE);
 
     client.deploy_normal_1155(
@@ -1550,7 +1532,11 @@ fn flat_deploy_fee_charged_for_all_kinds() {
         &0u32,
         &BytesN::from_array(&env, &[0xD2u8; 32]),
     );
-    assert!(event_with_tag_present(&env, &client.address, symbol_short!("fee_coll")));
+    assert!(event_with_tag_present(
+        &env,
+        &client.address,
+        symbol_short!("fee_coll")
+    ));
     assert_eq!(token_client.balance(&treasury), 2 * FEE);
 
     client.deploy_lazy_721(
@@ -1564,10 +1550,13 @@ fn flat_deploy_fee_charged_for_all_kinds() {
         &royalty_receiver,
         &0u32,
         &BytesN::from_array(&env, &[0xD3u8; 32]),
-
         &String::from_str(&env, "Test Network; September 2015"),
     );
-    assert!(event_with_tag_present(&env, &client.address, symbol_short!("fee_coll")));
+    assert!(event_with_tag_present(
+        &env,
+        &client.address,
+        symbol_short!("fee_coll")
+    ));
     assert_eq!(token_client.balance(&treasury), 3 * FEE);
 
     client.deploy_lazy_1155(
@@ -1579,10 +1568,13 @@ fn flat_deploy_fee_charged_for_all_kinds() {
         &royalty_receiver,
         &0u32,
         &BytesN::from_array(&env, &[0xD4u8; 32]),
-
         &String::from_str(&env, "Test Network; September 2015"),
     );
-    assert!(event_with_tag_present(&env, &client.address, symbol_short!("fee_coll")));
+    assert!(event_with_tag_present(
+        &env,
+        &client.address,
+        symbol_short!("fee_coll")
+    ));
     assert_eq!(token_client.balance(&treasury), 4 * FEE);
 
     assert_eq!(token_client.balance(&creator), 10_000 - 4 * FEE);
@@ -1716,7 +1708,6 @@ fn update_collection_wasm_and_upgrade_collection_emit_events() {
         &royalty_receiver,
         &0u32,
         &BytesN::from_array(&env, &[0xAAu8; 32]),
-
         &String::from_str(&env, "Test Network; September 2015"),
     );
 
@@ -1728,10 +1719,18 @@ fn update_collection_wasm_and_upgrade_collection_emit_events() {
     // Check wasm_upd immediately after update_collection_wasm (events().all()
     // only returns events from the most recent invocation).
     client.update_collection_wasm(&CollectionKind::LazyMint721, &wasm_v2);
-    assert!(event_with_tag_present(&env, &client.address, symbol_short!("wasm_upd")));
+    assert!(event_with_tag_present(
+        &env,
+        &client.address,
+        symbol_short!("wasm_upd")
+    ));
 
     client.upgrade_collection(&deployed);
-    assert!(event_with_tag_present(&env, &client.address, symbol_short!("coll_upg")));
+    assert!(event_with_tag_present(
+        &env,
+        &client.address,
+        symbol_short!("coll_upg")
+    ));
 }
 
 // ── Collections view tests ──────────────────────────────────────
@@ -1854,7 +1853,6 @@ fn deployed_lazy_721_rejects_invalid_ed25519_signature() {
         &royalty_receiver,
         &0u32,
         &salt,
-
         &String::from_str(&env, "Test Network; September 2015"),
     );
 
@@ -1901,7 +1899,6 @@ fn deployed_lazy_721_rejects_expired_voucher() {
         &royalty_receiver,
         &0u32,
         &salt,
-
         &String::from_str(&env, "Test Network; September 2015"),
     );
 
@@ -1957,7 +1954,6 @@ fn lazy_721_receives_platform_fee_receiver_and_bps() {
         &royalty_receiver,
         &750u32,
         &BytesN::from_array(&env, &[0xA3u8; 32]),
-
         &String::from_str(&env, "Test Network; September 2015"),
     );
 
@@ -1987,7 +1983,6 @@ fn lazy_1155_receives_platform_fee_receiver_and_bps() {
         &royalty_receiver,
         &900u32,
         &BytesN::from_array(&env, &[0xA4u8; 32]),
-
         &String::from_str(&env, "Test Network; September 2015"),
     );
 
@@ -2022,7 +2017,6 @@ fn lazy_deploy_uses_current_fee_config_receiver() {
         &royalty_receiver,
         &100u32,
         &BytesN::from_array(&env, &[0xA5u8; 32]),
-
         &String::from_str(&env, "Test Network; September 2015"),
     );
 
@@ -2288,7 +2282,6 @@ fn fee_stored_in_collection_record_for_all_types() {
         &royalty_receiver,
         &100u32,
         &BytesN::from_array(&env, &[0xE5u8; 32]),
-
         &String::from_str(&env, "Test Network; September 2015"),
     );
     assert_eq!(
@@ -2305,7 +2298,6 @@ fn fee_stored_in_collection_record_for_all_types() {
         &royalty_receiver,
         &200u32,
         &BytesN::from_array(&env, &[0xE6u8; 32]),
-
         &String::from_str(&env, "Test Network; September 2015"),
     );
     assert_eq!(
@@ -2350,7 +2342,6 @@ fn invalid_fee_rejected_for_all_deploy_variants() {
             &royalty_receiver,
             &5000u32,
             &BytesN::from_array(&env, &[0xF8u8; 32]),
-
             &String::from_str(&env, "Test Network; September 2015"),
         ),
         Err(Ok(Error::InvalidFeeBps))
@@ -2366,7 +2357,6 @@ fn invalid_fee_rejected_for_all_deploy_variants() {
             &royalty_receiver,
             &3000u32,
             &BytesN::from_array(&env, &[0xF9u8; 32]),
-
             &String::from_str(&env, "Test Network; September 2015"),
         ),
         Err(Ok(Error::InvalidFeeBps))
@@ -2431,7 +2421,9 @@ fn preflight_normal_721_predicts_the_deployed_address() {
         &salt,
     );
     assert_eq!(preflight_after.predicted_address, deployed);
-    assert!(preflight_after.errors.contains(&(Error::DuplicateSalt as u32)));
+    assert!(preflight_after
+        .errors
+        .contains(&(Error::DuplicateSalt as u32)));
 
     assert_eq!(
         client.try_deploy_normal_721(
@@ -2477,7 +2469,9 @@ fn preflight_normal_721_reports_every_error_deploy_would_raise() {
     assert!(preflight.errors.contains(&(Error::EmptyName as u32)));
     assert!(preflight.errors.contains(&(Error::EmptySymbol as u32)));
     assert!(preflight.errors.contains(&(Error::InvalidMaxSupply as u32)));
-    assert!(preflight.errors.contains(&(Error::InvalidRoyaltyBps as u32)));
+    assert!(preflight
+        .errors
+        .contains(&(Error::InvalidRoyaltyBps as u32)));
     assert!(preflight.errors.contains(&(Error::InvalidFeeBps as u32)));
 
     // The real deploy call rejects on the first violation it checks
@@ -2572,7 +2566,6 @@ fn preflight_lazy_1155_predicts_the_deployed_address_and_matches_deploy_errors()
         &royalty_receiver,
         &0u32,
         &salt,
-
         &String::from_str(&env, "Test Network; September 2015"),
     );
 
@@ -2725,7 +2718,10 @@ fn idempotent_deploy_different_salts_deploy_independently() {
         &salt_b,
     );
 
-    assert_ne!(addr_a, addr_b, "different salts must yield distinct addresses");
+    assert_ne!(
+        addr_a, addr_b,
+        "different salts must yield distinct addresses"
+    );
 }
 
 // ── Issue #478: Collection-level pause controls ───────────────────────────────

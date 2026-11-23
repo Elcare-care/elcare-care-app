@@ -77,7 +77,7 @@ fn test_withdraw_offer_unknown_id_returns_offer_not_found_error() {
     let result = client.try_withdraw_offer(&buyer, &42u64);
     assert_eq!(
         result,
-        Err(Ok(crate::types::MarketplaceError::OfferNotFound)),
+        Err(Ok(crate::types::MarketplaceError::OfferNotFound.into())),
         "unknown offer_id must return OfferNotFound"
     );
 }

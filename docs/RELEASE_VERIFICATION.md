@@ -195,3 +195,79 @@ This mirrors the existing fail-closed style of
 [`scripts/deploy/health-gate.sh`](../scripts/deploy/health-gate.sh) (which
 gates *post*-deploy traffic shifting on health checks) by adding a
 symmetrical *pre*-deploy gate on artifact provenance.
+
+## Deployment Evidence Checklist
+
+Copy this checklist into your release ticket or deployment log and fill in each item before promoting artifacts to any environment. Every field references the exact names from `versions.toml` and the scripts above.
+
+### Pre-deploy (verify artifacts before touching any infrastructure)
+
+- [ ] **Tag** being promoted: `v__.__.__`
+- [ ] **Release ID** from `versions.toml [release] release_id`: `__`
+- [ ] **Marketplace contract_version** from `versions.toml`: `__` (must match `stellar contract invoke --fn version` output after upload)
+- [ ] **Indexer version** from `versions.toml [components.indexer]`: `__`
+- [ ] **Artifact directory** downloaded from GitHub Release: `./release-assets/`
+- [ ] `./scripts/release/verify-artifact.sh --dir ./release-assets --repo your-org/elcarehub --tag v__.__.__` exits 0
+  - [ ] Step 1/3 SHA256SUMS: **PASS**
+  - [ ] Step 2/3 cosign: **PASS**
+  - [ ] Step 3/3 GitHub attestation: **PASS** for each of:
+    - [ ] `collection_nft_erc721.wasm`
+    - [ ] `collection_nft_erc1155.wasm`
+    - [ ] `lazy_mint_erc721.wasm`
+    - [ ] `lazy_mint_erc1155.wasm`
+    - [ ] `soroban_marketplace.wasm`
+    - [ ] `soroban_launchpad.wasm`
+    - [ ] `abi.json`
+    - [ ] `SHA256SUMS`
+    - [ ] `PROVENANCE.json`
+
+### Upload WASMs (run once per network, record hashes)
+
+| Artifact | SHA-256 (from SHA256SUMS) | WASM hash returned by `stellar contract upload` | Network |
+|---|---|---|---|
+| `soroban_marketplace.wasm` | | | |
+| `soroban_launchpad.wasm` | | | |
+| `collection_nft_erc721.wasm` | | | |
+| `collection_nft_erc1155.wasm` | | | |
+| `lazy_mint_erc721.wasm` | | | |
+| `lazy_mint_erc1155.wasm` | | | |
+
+- [ ] **Marketplace WASM hash** recorded above matches what `stellar contract upgrade` will use
+- [ ] **Launchpad WASM hash** recorded above matches what `stellar contract upgrade` will use
+
+### On-chain verification (run after each contract upgrade)
+
+- [ ] `stellar contract invoke --id $MARKETPLACE_ID -- version` → `"1.1.0"` (matches `versions.toml contract_version`)
+- [ ] `stellar contract invoke --id $LAUNCHPAD_ID -- version` → `"1.0.0"` (matches `versions.toml [components.contracts.launchpad]` → `contract_version` field, if present, or Cargo.toml)
+- [ ] `stellar contract invoke --id $MARKETPLACE_ID -- migrate --admin $ADMIN_PUBLIC` runs without error (or returns `AlreadyMigrated` (#37) if already applied — both are acceptable)
+
+### Compatibility cross-check (versions.toml `[compatibility]` table)
+
+The `versions.toml` compatibility entry for this release:
+
+```
+release_id = 1
+contracts_marketplace = "0.1.0"
+contracts_launchpad = "0.1.0"
+indexer = "1.0.0"
+frontend = "0.1.0"
+event_schema = "1"
+db_migration = "20260724000000"
+contract_version = "1.1.0"
+```
+
+- [ ] Indexer reports version `1.0.0` at `/health` or via `GET /api/version`
+- [ ] Indexer `db_migration_version` in deployment matches `20260724000000`
+- [ ] Frontend build version matches `0.1.0`
+- [ ] Event schema version in indexer config matches `1`
+
+### Rollback criteria
+
+If any verification step fails:
+
+1. **Checksum mismatch** → abort; do not upload any WASM. Download release assets again from the GitHub Release page and re-verify.
+2. **cosign or attestation failure** → treat artifact as untrusted; file a security incident (see `docs/INCIDENT_RUNBOOK.md`).
+3. **`version()` mismatch after upload** → the wrong WASM was deployed; redeploy with the correct artifact, then re-verify.
+4. **`migrate()` returns unexpected error** → check `versions.toml contract_version` against the deployed binary's `version()` output; a migration for a version that does not match the binary is a no-op but indicates a process error.
+
+No rollback of a Soroban WASM upload is possible once the upload transaction confirms (WASM is immutable once stored). A contract upgrade can be reversed by re-uploading the previous WASM hash and calling `stellar contract upgrade` again, provided you retained the previous release's artifacts.

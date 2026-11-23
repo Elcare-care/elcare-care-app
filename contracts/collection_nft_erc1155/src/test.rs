@@ -62,10 +62,13 @@ fn test_mint_batch_success_multiple() {
     let alice = Address::generate(&env);
     let token_ids = Vec::from_array(&env, [0u64, 1u64]);
     let amounts = Vec::from_array(&env, [100u128, 200u128]);
-    let uris = Vec::from_array(&env, [
-        String::from_str(&env, "uri-0"),
-        String::from_str(&env, "uri-1"),
-    ]);
+    let uris = Vec::from_array(
+        &env,
+        [
+            String::from_str(&env, "uri-0"),
+            String::from_str(&env, "uri-1"),
+        ],
+    );
     client.mint_batch(&alice, &token_ids, &amounts, &uris);
     assert_eq!(client.balance_of(&alice, &0u64), 100);
     assert_eq!(client.balance_of(&alice, &1u64), 200);
@@ -126,7 +129,9 @@ fn test_ttl_persistence() {
     let token_id = client.mint_new(&alice, &10u128, &String::from_str(&env, "uri"));
     jump_ledger(&env, 60_000);
     let exists = env.as_contract(&contract_id, || {
-        env.storage().persistent().has(&DataKey::TotalSupply(token_id))
+        env.storage()
+            .persistent()
+            .has(&DataKey::TotalSupply(token_id))
     });
     assert!(exists);
 }
@@ -153,7 +158,9 @@ fn persistent_ttl_is_extended_on_transfer_and_mint_keys() {
     jump_ledger(&env, 60_000);
     let (a_exists, s_exists) = env.as_contract(&contract_id, || {
         (
-            env.storage().persistent().has(&DataKey::Balance(alice.clone(), tid)),
+            env.storage()
+                .persistent()
+                .has(&DataKey::Balance(alice.clone(), tid)),
             env.storage().persistent().has(&DataKey::TotalSupply(tid)),
         )
     });
@@ -170,7 +177,9 @@ fn persistent_ttl_is_extended_on_burn_keys() {
     jump_ledger(&env, 60_000);
     let (a_exists, s_exists) = env.as_contract(&contract_id, || {
         (
-            env.storage().persistent().has(&DataKey::Balance(alice.clone(), tid)),
+            env.storage()
+                .persistent()
+                .has(&DataKey::Balance(alice.clone(), tid)),
             env.storage().persistent().has(&DataKey::TotalSupply(tid)),
         )
     });
@@ -200,7 +209,9 @@ fn burn_with_missing_total_supply_key_returns_zero_not_amount() {
     let alice = Address::generate(&env);
     let tid = client.mint_new(&alice, &5u128, &String::from_str(&env, "uri"));
     env.as_contract(&contract_id, || {
-        env.storage().persistent().remove(&DataKey::TotalSupply(tid));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::TotalSupply(tid));
     });
     client.burn(&alice, &alice, &tid, &3u128);
     assert_eq!(client.total_supply(&tid), 0u128);
@@ -247,7 +258,10 @@ fn mint_batch_supply_cap_enforced() {
     let ids = Vec::from_array(&env, [tid]);
     let amts = Vec::from_array(&env, [6u128]);
     let uris = Vec::from_array(&env, [String::from_str(&env, "uri-0")]);
-    assert_eq!(client.try_mint_batch(&alice, &ids, &amts, &uris), Err(Ok(Error::MaxSupplyReached)));
+    assert_eq!(
+        client.try_mint_batch(&alice, &ids, &amts, &uris),
+        Err(Ok(Error::MaxSupplyReached))
+    );
 }
 
 #[test]
@@ -312,19 +326,40 @@ fn mint_new_zero_amount_registers_token_type_without_supply() {
 // ─── Pause — auth matrix ──────────────────────────────────────────────────────
 
 #[test]
-fn is_paused_defaults_false() { let (_, c, _, _) = setup(); assert!(!c.is_paused()); }
+fn is_paused_defaults_false() {
+    let (_, c, _, _) = setup();
+    assert!(!c.is_paused());
+}
 
 #[test]
-fn pause_sets_flag() { let (_, c, _, _) = setup(); c.pause(); assert!(c.is_paused()); }
+fn pause_sets_flag() {
+    let (_, c, _, _) = setup();
+    c.pause();
+    assert!(c.is_paused());
+}
 
 #[test]
-fn unpause_clears_flag() { let (_, c, _, _) = setup(); c.pause(); c.unpause(); assert!(!c.is_paused()); }
+fn unpause_clears_flag() {
+    let (_, c, _, _) = setup();
+    c.pause();
+    c.unpause();
+    assert!(!c.is_paused());
+}
 
 #[test]
-fn pause_idempotent() { let (_, c, _, _) = setup(); c.pause(); c.pause(); assert!(c.is_paused()); }
+fn pause_idempotent() {
+    let (_, c, _, _) = setup();
+    c.pause();
+    c.pause();
+    assert!(c.is_paused());
+}
 
 #[test]
-fn unpause_idempotent_never_paused() { let (_, c, _, _) = setup(); c.unpause(); assert!(!c.is_paused()); }
+fn unpause_idempotent_never_paused() {
+    let (_, c, _, _) = setup();
+    c.unpause();
+    assert!(!c.is_paused());
+}
 
 #[test]
 fn pause_non_creator_fails() {
@@ -357,7 +392,10 @@ fn mint_new_blocked_when_paused() {
     let (env, c, _, _) = setup();
     let alice = Address::generate(&env);
     c.pause();
-    assert_eq!(c.try_mint_new(&alice, &1u128, &String::from_str(&env, "u")), Err(Ok(Error::CollectionPaused)));
+    assert_eq!(
+        c.try_mint_new(&alice, &1u128, &String::from_str(&env, "u")),
+        Err(Ok(Error::CollectionPaused))
+    );
 }
 
 #[test]
@@ -366,7 +404,10 @@ fn mint_blocked_when_paused() {
     let alice = Address::generate(&env);
     let tid = c.mint_new(&alice, &1u128, &String::from_str(&env, "u"));
     c.pause();
-    assert_eq!(c.try_mint(&alice, &tid, &1u128, &String::from_str(&env, "u")), Err(Ok(Error::CollectionPaused)));
+    assert_eq!(
+        c.try_mint(&alice, &tid, &1u128, &String::from_str(&env, "u")),
+        Err(Ok(Error::CollectionPaused))
+    );
 }
 
 #[test]
@@ -377,7 +418,10 @@ fn mint_batch_blocked_when_paused() {
     let ids = Vec::from_array(&env, [0u64]);
     let amts = Vec::from_array(&env, [1u128]);
     let uris = Vec::from_array(&env, [String::from_str(&env, "u")]);
-    assert_eq!(c.try_mint_batch(&alice, &ids, &amts, &uris), Err(Ok(Error::CollectionPaused)));
+    assert_eq!(
+        c.try_mint_batch(&alice, &ids, &amts, &uris),
+        Err(Ok(Error::CollectionPaused))
+    );
 }
 
 #[test]
@@ -387,7 +431,10 @@ fn transfer_blocked_when_paused() {
     let bob = Address::generate(&env);
     let tid = c.mint_new(&alice, &10u128, &String::from_str(&env, "u"));
     c.pause();
-    assert_eq!(c.try_transfer(&alice, &bob, &tid, &1u128), Err(Ok(Error::CollectionPaused)));
+    assert_eq!(
+        c.try_transfer(&alice, &bob, &tid, &1u128),
+        Err(Ok(Error::CollectionPaused))
+    );
 }
 
 #[test]
@@ -399,7 +446,10 @@ fn transfer_from_blocked_when_paused() {
     let tid = c.mint_new(&alice, &10u128, &String::from_str(&env, "u"));
     c.set_approval_for_all(&alice, &op, &true, &None::<u32>);
     c.pause();
-    assert_eq!(c.try_transfer_from(&op, &alice, &bob, &tid, &1u128), Err(Ok(Error::CollectionPaused)));
+    assert_eq!(
+        c.try_transfer_from(&op, &alice, &bob, &tid, &1u128),
+        Err(Ok(Error::CollectionPaused))
+    );
 }
 
 #[test]
@@ -411,7 +461,10 @@ fn batch_transfer_blocked_when_paused() {
     c.pause();
     let ids = Vec::from_array(&env, [tid]);
     let amts = Vec::from_array(&env, [1u128]);
-    assert_eq!(c.try_batch_transfer(&alice, &alice, &bob, &ids, &amts), Err(Ok(Error::CollectionPaused)));
+    assert_eq!(
+        c.try_batch_transfer(&alice, &alice, &bob, &ids, &amts),
+        Err(Ok(Error::CollectionPaused))
+    );
 }
 
 #[test]
@@ -420,14 +473,18 @@ fn burn_blocked_when_paused() {
     let alice = Address::generate(&env);
     let tid = c.mint_new(&alice, &10u128, &String::from_str(&env, "u"));
     c.pause();
-    assert_eq!(c.try_burn(&alice, &alice, &tid, &1u128), Err(Ok(Error::CollectionPaused)));
+    assert_eq!(
+        c.try_burn(&alice, &alice, &tid, &1u128),
+        Err(Ok(Error::CollectionPaused))
+    );
 }
 
 #[test]
 fn mint_new_succeeds_after_unpause() {
     let (env, c, _, _) = setup();
     let alice = Address::generate(&env);
-    c.pause(); c.unpause();
+    c.pause();
+    c.unpause();
     let id = c.mint_new(&alice, &5u128, &String::from_str(&env, "u"));
     assert_eq!(c.balance_of(&alice, &id), 5u128);
 }
@@ -437,11 +494,15 @@ fn multiple_pause_unpause_cycles_work() {
     let (env, c, _, _) = setup();
     let alice = Address::generate(&env);
     c.pause();
-    assert!(c.try_mint_new(&alice, &1u128, &String::from_str(&env, "u")).is_err());
+    assert!(c
+        .try_mint_new(&alice, &1u128, &String::from_str(&env, "u"))
+        .is_err());
     c.unpause();
     c.mint_new(&alice, &1u128, &String::from_str(&env, "u"));
     c.pause();
-    assert!(c.try_mint_new(&alice, &1u128, &String::from_str(&env, "u")).is_err());
+    assert!(c
+        .try_mint_new(&alice, &1u128, &String::from_str(&env, "u"))
+        .is_err());
     c.unpause();
     c.mint_new(&alice, &1u128, &String::from_str(&env, "u"));
 }
@@ -453,10 +514,16 @@ fn pause_interleaved_with_batch_ops() {
     let bob = Address::generate(&env);
     let ids = Vec::from_array(&env, [0u64, 1u64]);
     let amts = Vec::from_array(&env, [10u128, 20u128]);
-    let uris = Vec::from_array(&env, [String::from_str(&env, "u0"), String::from_str(&env, "u1")]);
+    let uris = Vec::from_array(
+        &env,
+        [String::from_str(&env, "u0"), String::from_str(&env, "u1")],
+    );
     c.mint_batch(&alice, &ids, &amts, &uris);
     c.pause();
-    assert_eq!(c.try_batch_transfer(&alice, &alice, &bob, &ids, &amts), Err(Ok(Error::CollectionPaused)));
+    assert_eq!(
+        c.try_batch_transfer(&alice, &alice, &bob, &ids, &amts),
+        Err(Ok(Error::CollectionPaused))
+    );
     c.unpause();
     let sub = Vec::from_array(&env, [5u128, 5u128]);
     c.batch_transfer(&alice, &alice, &bob, &ids, &sub);
@@ -482,7 +549,10 @@ fn views_callable_while_paused() {
 // ─── Metadata management ──────────────────────────────────────────────────────
 
 #[test]
-fn base_uri_initially_none() { let (_, c, _, _) = setup(); assert_eq!(c.base_uri(), None); }
+fn base_uri_initially_none() {
+    let (_, c, _, _) = setup();
+    assert_eq!(c.base_uri(), None);
+}
 
 #[test]
 fn set_base_uri_stores_value() {
@@ -508,14 +578,23 @@ fn set_base_uri_non_creator_fails() {
     let creator = Address::generate(&env);
     let recv = Address::generate(&env);
     c.initialize(&creator, &String::from_str(&env, "T"), &0u32, &recv);
-    assert!(c.try_set_base_uri(&String::from_str(&env, "ipfs://bad/")).is_err());
+    assert!(c
+        .try_set_base_uri(&String::from_str(&env, "ipfs://bad/"))
+        .is_err());
 }
 
 #[test]
-fn is_metadata_frozen_defaults_false() { let (_, c, _, _) = setup(); assert!(!c.is_metadata_frozen()); }
+fn is_metadata_frozen_defaults_false() {
+    let (_, c, _, _) = setup();
+    assert!(!c.is_metadata_frozen());
+}
 
 #[test]
-fn freeze_metadata_sets_frozen_flag() { let (_, c, _, _) = setup(); c.freeze_metadata(); assert!(c.is_metadata_frozen()); }
+fn freeze_metadata_sets_frozen_flag() {
+    let (_, c, _, _) = setup();
+    c.freeze_metadata();
+    assert!(c.is_metadata_frozen());
+}
 
 #[test]
 fn freeze_metadata_twice_returns_already_frozen() {
@@ -528,7 +607,10 @@ fn freeze_metadata_twice_returns_already_frozen() {
 fn set_base_uri_after_freeze_returns_metadata_frozen() {
     let (env, c, _, _) = setup();
     c.freeze_metadata();
-    assert_eq!(c.try_set_base_uri(&String::from_str(&env, "ipfs://late/")), Err(Ok(Error::MetadataFrozen)));
+    assert_eq!(
+        c.try_set_base_uri(&String::from_str(&env, "ipfs://late/")),
+        Err(Ok(Error::MetadataFrozen))
+    );
 }
 
 #[test]
@@ -536,7 +618,10 @@ fn set_base_uri_before_freeze_then_frozen_rejects_update() {
     let (env, c, _, _) = setup();
     c.set_base_uri(&String::from_str(&env, "ipfs://ok/"));
     c.freeze_metadata();
-    assert_eq!(c.try_set_base_uri(&String::from_str(&env, "ipfs://nope/")), Err(Ok(Error::MetadataFrozen)));
+    assert_eq!(
+        c.try_set_base_uri(&String::from_str(&env, "ipfs://nope/")),
+        Err(Ok(Error::MetadataFrozen))
+    );
     assert_eq!(c.base_uri(), Some(String::from_str(&env, "ipfs://ok/")));
 }
 
@@ -560,14 +645,20 @@ fn freeze_persists_after_ownership_transfer() {
     c.freeze_metadata();
     c.transfer_ownership(&new_creator);
     assert!(c.is_metadata_frozen());
-    assert_eq!(c.try_set_base_uri(&String::from_str(&env, "ipfs://nope/")), Err(Ok(Error::MetadataFrozen)));
+    assert_eq!(
+        c.try_set_base_uri(&String::from_str(&env, "ipfs://nope/")),
+        Err(Ok(Error::MetadataFrozen))
+    );
 }
 
 #[test]
 fn freeze_then_set_base_uri_reverts() {
     let (env, c, _, _) = setup();
     c.freeze_metadata();
-    assert_eq!(c.try_set_base_uri(&String::from_str(&env, "ipfs://any/")), Err(Ok(Error::MetadataFrozen)));
+    assert_eq!(
+        c.try_set_base_uri(&String::from_str(&env, "ipfs://any/")),
+        Err(Ok(Error::MetadataFrozen))
+    );
 }
 
 // ─── set_token_uri ────────────────────────────────────────────────────────────
@@ -587,7 +678,10 @@ fn set_token_uri_blocked_after_collection_freeze() {
     let alice = Address::generate(&env);
     let id = c.mint_new(&alice, &1u128, &String::from_str(&env, "uri"));
     c.freeze_metadata();
-    assert_eq!(c.try_set_token_uri(&id, &String::from_str(&env, "new")), Err(Ok(Error::MetadataFrozen)));
+    assert_eq!(
+        c.try_set_token_uri(&id, &String::from_str(&env, "new")),
+        Err(Ok(Error::MetadataFrozen))
+    );
 }
 
 #[test]
@@ -596,13 +690,19 @@ fn set_token_uri_blocked_after_token_freeze() {
     let alice = Address::generate(&env);
     let id = c.mint_new(&alice, &1u128, &String::from_str(&env, "uri"));
     c.freeze_token(&alice, &id);
-    assert_eq!(c.try_set_token_uri(&id, &String::from_str(&env, "new")), Err(Ok(Error::MetadataFrozen)));
+    assert_eq!(
+        c.try_set_token_uri(&id, &String::from_str(&env, "new")),
+        Err(Ok(Error::MetadataFrozen))
+    );
 }
 
 #[test]
 fn set_token_uri_on_nonexistent_token_fails() {
     let (env, c, _, _) = setup();
-    assert_eq!(c.try_set_token_uri(&999u64, &String::from_str(&env, "uri")), Err(Ok(Error::TokenNotFound)));
+    assert_eq!(
+        c.try_set_token_uri(&999u64, &String::from_str(&env, "uri")),
+        Err(Ok(Error::TokenNotFound))
+    );
 }
 
 #[test]
@@ -614,7 +714,9 @@ fn set_token_uri_non_creator_fails() {
     let creator = Address::generate(&env);
     let recv = Address::generate(&env);
     c.initialize(&creator, &String::from_str(&env, "T"), &0u32, &recv);
-    assert!(c.try_set_token_uri(&0u64, &String::from_str(&env, "uri")).is_err());
+    assert!(c
+        .try_set_token_uri(&0u64, &String::from_str(&env, "uri"))
+        .is_err());
 }
 
 // ─── freeze_token ─────────────────────────────────────────────────────────────
@@ -635,14 +737,20 @@ fn freeze_token_twice_returns_already_frozen() {
     let alice = Address::generate(&env);
     let id = c.mint_new(&alice, &1u128, &String::from_str(&env, "uri"));
     c.freeze_token(&alice, &id);
-    assert_eq!(c.try_freeze_token(&alice, &id), Err(Ok(Error::AlreadyFrozen)));
+    assert_eq!(
+        c.try_freeze_token(&alice, &id),
+        Err(Ok(Error::AlreadyFrozen))
+    );
 }
 
 #[test]
 fn freeze_token_on_nonexistent_token_fails() {
     let (env, c, _, _) = setup();
     let alice = Address::generate(&env);
-    assert_eq!(c.try_freeze_token(&alice, &999u64), Err(Ok(Error::TokenNotFound)));
+    assert_eq!(
+        c.try_freeze_token(&alice, &999u64),
+        Err(Ok(Error::TokenNotFound))
+    );
 }
 
 #[test]
@@ -662,7 +770,10 @@ fn token_freeze_persists_after_ownership_transfer() {
     let id = c.mint_new(&alice, &1u128, &String::from_str(&env, "uri"));
     c.freeze_token(&alice, &id);
     c.transfer_ownership(&new_owner);
-    assert_eq!(c.try_set_token_uri(&id, &String::from_str(&env, "new")), Err(Ok(Error::MetadataFrozen)));
+    assert_eq!(
+        c.try_set_token_uri(&id, &String::from_str(&env, "new")),
+        Err(Ok(Error::MetadataFrozen))
+    );
 }
 
 // ─── URI resolution order ─────────────────────────────────────────────────────
@@ -681,7 +792,10 @@ fn uri_returns_base_uri_plus_token_id_when_base_set() {
     let alice = Address::generate(&env);
     c.set_base_uri(&String::from_str(&env, "https://api.example.com/metadata/"));
     let id = c.mint_new(&alice, &1u128, &String::from_str(&env, "ignored"));
-    assert_eq!(c.uri(&id), String::from_str(&env, "https://api.example.com/metadata/0"));
+    assert_eq!(
+        c.uri(&id),
+        String::from_str(&env, "https://api.example.com/metadata/0")
+    );
 }
 
 #[test]
@@ -829,7 +943,10 @@ fn set_default_royalty_max_bps_succeeds() {
 fn set_default_royalty_exceeds_max_bps_returns_invalid_bps() {
     let (env, c, _, _) = setup();
     let recv = Address::generate(&env);
-    assert_eq!(c.try_set_default_royalty(&recv, &10_001u32), Err(Ok(Error::InvalidBps)));
+    assert_eq!(
+        c.try_set_default_royalty(&recv, &10_001u32),
+        Err(Ok(Error::InvalidBps))
+    );
 }
 
 #[test]
@@ -862,7 +979,9 @@ fn set_token_royalty_max_bps_succeeds() {
     let alice = Address::generate(&env);
     let token_recv = Address::generate(&env);
     let id = c.mint_new(&alice, &1u128, &String::from_str(&env, "uri"));
-    assert!(c.try_set_token_royalty(&id, &token_recv, &10_000u32).is_ok());
+    assert!(c
+        .try_set_token_royalty(&id, &token_recv, &10_000u32)
+        .is_ok());
     let (recv, amount) = c.royalty_info_for(&id, &1_000i128);
     assert_eq!(recv, token_recv);
     assert_eq!(amount, 1_000i128);
@@ -874,7 +993,10 @@ fn set_token_royalty_exceeds_max_bps_returns_invalid_bps() {
     let alice = Address::generate(&env);
     let token_recv = Address::generate(&env);
     let id = c.mint_new(&alice, &1u128, &String::from_str(&env, "uri"));
-    assert_eq!(c.try_set_token_royalty(&id, &token_recv, &10_001u32), Err(Ok(Error::InvalidBps)));
+    assert_eq!(
+        c.try_set_token_royalty(&id, &token_recv, &10_001u32),
+        Err(Ok(Error::InvalidBps))
+    );
 }
 
 #[test]
@@ -946,16 +1068,24 @@ fn royalty_math_property_checks_match_721_rounding() {
     let recv = Address::generate(&env);
     let id = c.mint_new(&alice, &1u128, &String::from_str(&env, "uri"));
     let cases: &[(u32, i128, i128)] = &[
-        (0, 1, 0), (0, 1_000_000, 0),
-        (1, 1, 0), (1, 10_000, 1),
-        (250, 1, 0), (250, 10_000, 250), (250, 100_000, 2_500),
-        (10_000, 1, 1), (10_000, 10_000, 10_000),
+        (0, 1, 0),
+        (0, 1_000_000, 0),
+        (1, 1, 0),
+        (1, 10_000, 1),
+        (250, 1, 0),
+        (250, 10_000, 250),
+        (250, 100_000, 2_500),
+        (10_000, 1, 1),
+        (10_000, 10_000, 10_000),
         (500, i128::MAX / 10_000, (i128::MAX / 10_000) * 500 / 10_000),
     ];
     for &(bps, sale_price, expected) in cases {
         c.set_default_royalty(&recv, &bps);
         let (_, amount) = c.royalty_info_for(&id, &sale_price);
-        assert_eq!(amount, expected, "bps={bps} price={sale_price}: expected {expected} got {amount}");
+        assert_eq!(
+            amount, expected,
+            "bps={bps} price={sale_price}: expected {expected} got {amount}"
+        );
     }
 }
 
@@ -993,8 +1123,14 @@ fn mint_batch_duplicate_ids_cannot_exceed_max_supply() {
     c.set_token_max_supply(&tid, &5u128);
     let ids = Vec::from_array(&env, [tid, tid]);
     let amts = Vec::from_array(&env, [3u128, 3u128]);
-    let uris = Vec::from_array(&env, [String::from_str(&env, "u"), String::from_str(&env, "u")]);
-    assert_eq!(c.try_mint_batch(&alice, &ids, &amts, &uris), Err(Ok(Error::MaxSupplyReached)));
+    let uris = Vec::from_array(
+        &env,
+        [String::from_str(&env, "u"), String::from_str(&env, "u")],
+    );
+    assert_eq!(
+        c.try_mint_batch(&alice, &ids, &amts, &uris),
+        Err(Ok(Error::MaxSupplyReached))
+    );
     assert_eq!(c.total_supply(&tid), 1u128);
 }
 
@@ -1006,13 +1142,19 @@ fn mint_batch_duplicate_ids_exactly_at_max_supply_succeeds() {
     c.set_token_max_supply(&tid, &6u128);
     let ids = Vec::from_array(&env, [tid, tid]);
     let amts = Vec::from_array(&env, [3u128, 3u128]);
-    let uris = Vec::from_array(&env, [String::from_str(&env, "u"), String::from_str(&env, "u")]);
+    let uris = Vec::from_array(
+        &env,
+        [String::from_str(&env, "u"), String::from_str(&env, "u")],
+    );
     c.mint_batch(&alice, &ids, &amts, &uris);
     assert_eq!(c.total_supply(&tid), 6u128);
     let ids2 = Vec::from_array(&env, [tid]);
     let amts2 = Vec::from_array(&env, [1u128]);
     let uris2 = Vec::from_array(&env, [String::from_str(&env, "u")]);
-    assert_eq!(c.try_mint_batch(&alice, &ids2, &amts2, &uris2), Err(Ok(Error::MaxSupplyReached)));
+    assert_eq!(
+        c.try_mint_batch(&alice, &ids2, &amts2, &uris2),
+        Err(Ok(Error::MaxSupplyReached))
+    );
 }
 
 #[test]
@@ -1023,8 +1165,14 @@ fn mint_batch_duplicate_ids_cannot_exceed_wallet_limit() {
     let tid = c.mint_new(&alice, &1u128, &String::from_str(&env, "uri"));
     let ids = Vec::from_array(&env, [tid, tid]);
     let amts = Vec::from_array(&env, [3u128, 3u128]);
-    let uris = Vec::from_array(&env, [String::from_str(&env, "u"), String::from_str(&env, "u")]);
-    assert_eq!(c.try_mint_batch(&alice, &ids, &amts, &uris), Err(Ok(Error::WalletLimitReached)));
+    let uris = Vec::from_array(
+        &env,
+        [String::from_str(&env, "u"), String::from_str(&env, "u")],
+    );
+    assert_eq!(
+        c.try_mint_batch(&alice, &ids, &amts, &uris),
+        Err(Ok(Error::WalletLimitReached))
+    );
     assert_eq!(c.wallet_minted(&alice, &tid), 1u128);
 }
 
@@ -1042,7 +1190,10 @@ fn mint_batch_supply_boundary_mint_to_exactly_max_then_one_more_reverts() {
     let ids2 = Vec::from_array(&env, [tid]);
     let amts2 = Vec::from_array(&env, [1u128]);
     let uris2 = Vec::from_array(&env, [String::from_str(&env, "u")]);
-    assert_eq!(c.try_mint_batch(&alice, &ids2, &amts2, &uris2), Err(Ok(Error::MaxSupplyReached)));
+    assert_eq!(
+        c.try_mint_batch(&alice, &ids2, &amts2, &uris2),
+        Err(Ok(Error::MaxSupplyReached))
+    );
 }
 
 // ─── balance_of_batch ────────────────────────────────────────────────────────
@@ -1104,7 +1255,10 @@ fn transfer_from_without_approval_fails() {
     let bob = Address::generate(&env);
     let eve = Address::generate(&env);
     let id = c.mint_new(&alice, &10u128, &String::from_str(&env, "uri"));
-    assert_eq!(c.try_transfer_from(&eve, &alice, &bob, &id, &1u128), Err(Ok(Error::NotApproved)));
+    assert_eq!(
+        c.try_transfer_from(&eve, &alice, &bob, &id, &1u128),
+        Err(Ok(Error::NotApproved))
+    );
 }
 
 #[test]
@@ -1123,7 +1277,10 @@ fn burn_insufficient_balance_fails() {
     let (env, c, _, _) = setup();
     let alice = Address::generate(&env);
     let id = c.mint_new(&alice, &5u128, &String::from_str(&env, "uri"));
-    assert_eq!(c.try_burn(&alice, &alice, &id, &10u128), Err(Ok(Error::InsufficientBalance)));
+    assert_eq!(
+        c.try_burn(&alice, &alice, &id, &10u128),
+        Err(Ok(Error::InsufficientBalance))
+    );
 }
 
 // ─── Ownership management ─────────────────────────────────────────────────────
@@ -1390,7 +1547,6 @@ fn set_base_uri_empty_string_returns_empty_uri_error() {
     assert_eq!(c.base_uri(), None);
 }
 
-
 // ════════════════════════════════════════════════════════════
 // Issue #851 — Metadata Validation Tests (NormalNFT1155)
 // ════════════════════════════════════════════════════════════
@@ -1411,13 +1567,19 @@ mod metadata_tests {
     #[test]
     fn test_empty_name_rejected() {
         let env = env();
-        assert_eq!(metadata::validate_collection_name(&s(&env, "")), Err(crate::Error::EmptyName));
+        assert_eq!(
+            metadata::validate_collection_name(&s(&env, "")),
+            Err(crate::Error::EmptyName)
+        );
     }
 
     #[test]
     fn test_name_at_max_len_accepted() {
         let env = env();
-        let name = s(&env, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+        let name = s(
+            &env,
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        );
         assert_eq!(name.len(), 64);
         assert!(metadata::validate_collection_name(&name).is_ok());
     }
@@ -1425,14 +1587,23 @@ mod metadata_tests {
     #[test]
     fn test_name_over_max_len_rejected() {
         let env = env();
-        let name = s(&env, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+        let name = s(
+            &env,
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        );
         assert_eq!(name.len(), 65);
-        assert_eq!(metadata::validate_collection_name(&name), Err(crate::Error::NameTooLong));
+        assert_eq!(
+            metadata::validate_collection_name(&name),
+            Err(crate::Error::NameTooLong)
+        );
     }
 
     #[test]
     fn test_zero_max_supply_rejected() {
-        assert_eq!(metadata::validate_max_supply(0), Err(crate::Error::InvalidMaxSupply));
+        assert_eq!(
+            metadata::validate_max_supply(0),
+            Err(crate::Error::InvalidMaxSupply)
+        );
     }
 
     #[test]
@@ -1442,13 +1613,19 @@ mod metadata_tests {
 
     #[test]
     fn test_max_supply_over_limit_rejected() {
-        assert_eq!(metadata::validate_max_supply(1_000_001), Err(crate::Error::InvalidMaxSupply));
+        assert_eq!(
+            metadata::validate_max_supply(1_000_001),
+            Err(crate::Error::InvalidMaxSupply)
+        );
     }
 
     #[test]
     fn test_empty_uri_rejected() {
         let env = env();
-        assert_eq!(metadata::validate_token_uri(&s(&env, "")), Err(crate::Error::EmptyUri));
+        assert_eq!(
+            metadata::validate_token_uri(&s(&env, "")),
+            Err(crate::Error::EmptyUri)
+        );
     }
 
     #[test]
@@ -1479,6 +1656,9 @@ mod metadata_tests {
 
     #[test]
     fn test_royalty_bps_over_max_rejected() {
-        assert_eq!(metadata::validate_royalty_bps(10_001), Err(crate::Error::InvalidBps));
+        assert_eq!(
+            metadata::validate_royalty_bps(10_001),
+            Err(crate::Error::InvalidBps)
+        );
     }
 }
