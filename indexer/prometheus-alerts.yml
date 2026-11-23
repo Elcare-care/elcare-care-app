@@ -4,51 +4,99 @@ groups:
     rules:
 
       # ── Sync health ──────────────────────────────────────────────────────────
+      #
+      # Stalled-ingestion severity model (see docs/runbooks/stalled-ingestion-severity.md):
+      #
+      #   MILD     — lag 101–999 ledgers for 2 min, OR stall gauge == 1 for < 3 min.
+      #              Users see data that is a few minutes stale. No data loss.
+      #              Action: monitor; no immediate page required.
+      #
+      #   DEGRADED — lag > 1 000 ledgers for 1 min, OR stall gauge == 1 for 3+ min,
+      #              OR 1–2 automatic poller restarts in 10 min.
+      #              Users cannot see recent transactions. Frontend may show stale state.
+      #              Action: on-call engineer investigates within 15 min.
+      #
+      #   DOWN     — lag > 1 000 ledgers for 10+ min (sustained), OR stall for 3+ min
+      #              AND poller has restarted 3+ times (process exit imminent).
+      #              Indexer is effectively stopped; all new on-chain activity invisible.
+      #              Action: immediate page; follow stalled-ingestion runbook.
 
       - alert: IndexerSyncLagHigh
         expr: elcarehub_sync_lag_ledgers > 100
         for: 2m
         labels:
           severity: warning
+          ingestion_severity: mild
+          owner: indexer-team
+          runbook: https://github.com/elcarehub/elcare-care-app/wiki/Runbook-Stalled-Ingestion
         annotations:
           summary: "Indexer is lagging behind the network tip"
           description: >
-            Sync lag is {{ $value }} ledgers. The indexer has not caught up
+            Sync lag is {{ $value }} ledgers (mild). The indexer has not caught up
             within 2 minutes. Check poller connectivity and Stellar RPC health.
+            Runbook: docs/runbooks/stalled-ingestion.md
 
       - alert: IndexerSyncLagCritical
         expr: elcarehub_sync_lag_ledgers > 1000
         for: 1m
         labels:
           severity: critical
+          ingestion_severity: degraded
+          owner: indexer-team
+          runbook: https://github.com/elcarehub/elcare-care-app/wiki/Runbook-Stalled-Ingestion
         annotations:
-          summary: "Indexer is critically far behind the network"
+          summary: "Indexer is critically far behind the network (degraded)"
           description: >
-            Sync lag is {{ $value }} ledgers — more than 1,000 ledgers behind.
+            Sync lag is {{ $value }} ledgers — more than 1,000 ledgers behind (degraded).
             The indexer may be stalled or the Stellar RPC unreachable.
+            Runbook: docs/runbooks/stalled-ingestion.md
+
+      - alert: IndexerSyncLagSustained
+        expr: elcarehub_sync_lag_ledgers > 1000
+        for: 10m
+        labels:
+          severity: critical
+          ingestion_severity: down
+          owner: indexer-team
+          runbook: https://github.com/elcarehub/elcare-care-app/wiki/Runbook-Stalled-Ingestion
+        annotations:
+          summary: "Indexer sync lag sustained > 1 000 ledgers for 10 minutes (DOWN)"
+          description: >
+            Sync lag is {{ $value }} ledgers and has remained above 1,000 for over
+            10 minutes. The indexer is effectively down — all new on-chain activity is
+            invisible to users. Immediate investigation required.
+            Runbook: docs/runbooks/stalled-ingestion.md
 
       - alert: IndexerStalled
         expr: indexer_stalled == 1
         for: 3m
         labels:
           severity: critical
+          ingestion_severity: degraded
+          owner: indexer-team
+          runbook: https://github.com/elcarehub/elcare-care-app/wiki/Runbook-Stalled-Ingestion
         annotations:
-          summary: "Indexer has stalled — no ledger progress"
+          summary: "Indexer has stalled — no ledger progress (degraded)"
           description: >
             The indexer stall watchdog has flagged a complete stop in ledger
-            processing for over 3 minutes. Check poller logs and RPC status.
+            processing for over 3 minutes (degraded). Check poller logs and RPC status.
+            Runbook: docs/runbooks/stalled-ingestion.md
 
       - alert: IndexerPollerRestartHigh
         expr: increase(elcarehub_poller_restart_total[10m]) >= 3
         for: 0m
         labels:
           severity: critical
+          ingestion_severity: down
+          owner: indexer-team
+          runbook: https://github.com/elcarehub/elcare-care-app/wiki/Runbook-Stalled-Ingestion
         annotations:
-          summary: "Indexer poller restarted 3+ times in 10 minutes"
+          summary: "Indexer poller restarted 3+ times in 10 minutes (DOWN — process exit imminent)"
           description: >
             The stall watchdog has restarted the poller {{ $value }} times in
             the last 10 minutes, which triggers a process exit on the next
-            failure. Investigate the root cause immediately.
+            failure (DOWN). Investigate the root cause immediately.
+            Runbook: docs/runbooks/stalled-ingestion.md
 
       # ── Event decode errors ──────────────────────────────────────────────────
 
